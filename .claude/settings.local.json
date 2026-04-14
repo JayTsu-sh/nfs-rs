@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(ls:*)",
+      "Bash(cargo test:*)",
+      "Bash(sed:*)",
+      "Bash(python3:*)",
+      "Bash(cargo component:*)",
+      "Bash(rustc:*)",
+      "Bash(rustup target:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo install:*)",
+      "Bash(rustup:*)",
+      "Bash(grep -n \"pub async fn.*_path\\\\|pub async fn [a-z]\" \"C:\\\\Jay\\\\rust\\\\nfs-rs/src/nfs3\"/*.rs)",
+      "Bash(grep -h \"pub async fn.*_path\" \"C:\\\\Jay\\\\rust\\\\nfs-rs/src/nfs3\"/*.rs)",
+      "Bash(grep -h \"pub async fn.*_path\" *.rs)",
+      "Bash(grep -v \"//\")",
+      "Bash(find /c/Jay/rust/nfs-rs -name \"*.rs\" -type f -exec grep -l \"XdrEncode\\\\|impl.*encode\" {})",
+      "Bash(xargs grep:*)",
+      "Bash(grep:*)",
+      "Bash(claude plugins:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(git clone:*)",
+      "Bash(find /c/Jay/rust/nfs-rs/src/nfs41/fastxdr -type f -name *.rs)",
+      "Bash(find /c/Jay/rust/nfs-rs -name README* -o -name *.md)",
+      "WebSearch",
+      "WebFetch(domain:www.tech-invite.com)",
+      "WebFetch(domain:www.rfc-editor.org)",
+      "WebFetch(domain:datatracker.ietf.org)",
+      "Bash(git push:*)",
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/error.rs\" \"C:/Jay/rust/nfs-rs/src/error.rs\")",
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/lib.rs\" \"C:/Jay/rust/nfs-rs/src/lib.rs\")",
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/mount.rs\" \"C:/Jay/rust/nfs-rs/src/mount.rs\")",
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/nfs3/mod.rs\" \"C:/Jay/rust/nfs-rs/src/nfs3/mod.rs\")",
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/nfs41/attrs.rs\" \"C:/Jay/rust/nfs-rs/src/nfs41/attrs.rs\")"
+    ]
+  }
+}

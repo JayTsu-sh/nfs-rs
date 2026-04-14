@@ -1,0 +1,60 @@
+// Copyright 2025 NetApp Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::{
+    diropargs3, filename3, from_post_op_fh3, nfs_fh3, nfspath3, sattr3, symlinkdata3,
+    Mount, ObjRes, Result, SYMLINK3args, SYMLINK3resok,
+};
+use crate::split_path;
+use bytes::Bytes;
+
+impl Mount {
+    pub async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes> {
+        let (dst_dir, dst_filename) = split_path(dst_path)?;
+        let dst_dir_fh = self.lookup_path(&dst_dir).await?.fh;
+        self.symlink(src_path, dst_dir_fh, &dst_filename).await
+    }
+
+    pub async fn symlink(
+        &self,
+        src_path: &str,
+        dst_dir_fh: Bytes,
+        dst_filename: &str,
+    ) -> Result<ObjRes> {
+        let args = SYMLINK3args {
+            where_: diropargs3 {
+                dir: nfs_fh3 {
+                    data: dst_dir_fh,
+                },
+                name: filename3(dst_filename.to_string()),
+            },
+            symlink: symlinkdata3 {
+                symlink_attributes: sattr3::default(),
+                symlink_data: nfspath3(src_path.to_string()),
+            },
+        };
+        self._symlink(args).await?.into()
+    }
+}
+
+impl From<SYMLINK3resok> for Result<ObjRes> {
+    fn from(value: SYMLINK3resok) -> Self {
+        Ok(ObjRes {
+            fh: from_post_op_fh3(value.obj)?,
+            attr: value.obj_attributes.into(),
+        })
+    }
+}

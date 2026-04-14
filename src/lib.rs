@@ -1,0 +1,1010 @@
+// Copyright 2025 NetApp Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#[cfg(target_os = "wasi")]
+#[allow(static_mut_refs, unused)]
+mod bindings;
+#[cfg(target_os = "wasi")]
+mod component;
+#[cfg(target_os = "wasi")]
+#[allow(unused)]
+mod wasi_ext;
+
+#[cfg(target_os = "wasi")]
+struct Component;
+
+#[cfg(target_os = "wasi")]
+pub struct NfsMount {
+    id: u32,
+}
+
+#[cfg(target_os = "wasi")]
+bindings::export!(Component with_types_in bindings);
+
+#[cfg(target_os = "wasi")]
+use component::{add_resource, get_resource, remove_resource};
+
+#[cfg(not(target_os = "wasi"))]
+use std::net::{SocketAddr, ToSocketAddrs,IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(not(target_os = "wasi"))]
+use tokio::net::{TcpStream, TcpSocket};
+#[cfg(target_os = "wasi")]
+use wasi_ext::{SocketAddr, TcpStream, ToSocketAddrs};
+
+pub(crate) async fn connect_to_target(addr: &SocketAddr) -> Result<TcpStream> {
+    // Bind to a random privileged port (< 1024), required by some NFS servers.
+    // Exclude well-known service ports to avoid conflicts.
+    const WELL_KNOWN_PORTS: &[u16] = &[
+        1,    // tcpmux
+        7,    // echo
+        9,    // discard
+        11,   // systat
+        13,   // daytime
+        15,   // netstat
+        20,   // ftp-data
+        21,   // ftp
+        22,   // ssh
+        23,   // telnet
+        25,   // smtp
+        37,   // time
+        42,   // nameserver
+        43,   // whois
+        49,   // tacacs
+        53,   // dns
+        67,   // dhcp server
+        68,   // dhcp client
+        69,   // tftp
+        70,   // gopher
+        79,   // finger
+        80,   // http
+        88,   // kerberos
+        102,  // iso-tsap
+        110,  // pop3
+        111,  // rpcbind/portmapper
+        119,  // nntp
+        123,  // ntp
+        135,  // msrpc
+        137,  // netbios-ns
+        138,  // netbios-dgm
+        139,  // netbios-ssn
+        143,  // imap
+        161,  // snmp
+        162,  // snmp-trap
+        179,  // bgp
+        389,  // ldap
+        427,  // svrloc
+        443,  // https
+        445,  // microsoft-ds
+        464,  // kpasswd
+        465,  // smtps
+        514,  // syslog
+        515,  // printer
+        520,  // rip
+        530,  // rpc
+        543,  // klogin
+        544,  // kshell
+        546,  // dhcpv6-client
+        547,  // dhcpv6-server
+        548,  // afp
+        554,  // rtsp
+        587,  // submission
+        593,  // http-rpc-epmap
+        631,  // ipp
+        636,  // ldaps
+        873,  // rsync
+        990,  // ftps
+        993,  // imaps
+        995,  // pop3s
+    ];
+    // 预计算可用端口列表（1-1023 排除已知端口），约 960 个可用
+    let available_ports: Vec<u16> = (1..1024u16)
+        .filter(|p| !WELL_KNOWN_PORTS.contains(p))
+        .collect();
+    let local_addr_base = if addr.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    };
+    // 外层循环：bind + connect 整体重试。
+    // Windows 上 SO_REUSEADDR 允许 bind() 成功即使端口已被占用（TIME_WAIT 或其他
+    // SO_REUSEADDR socket），冲突要到 connect() 时才以 WSAEADDRINUSE 暴露。
+    // 因此 connect() 失败时需要用新 socket + 新端口重试。
+    const MAX_CONNECT_ATTEMPTS: usize = 200;
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        // 允许 bind 到处于 TIME_WAIT 状态的端口，避免重复运行时端口耗尽
+        socket.set_reuseaddr(true)?;
+        let mut local_addr = local_addr_base;
+        let idx = rand::random_range(0..available_ports.len());
+        let local_port = available_ports[idx];
+        local_addr.set_port(local_port);
+        match socket.bind(local_addr) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                trace!(local_port, "source port bind failed (AddrInUse), trying another");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        debug!(local_port = local_addr.port(), addr = %addr, "bound to local port, connecting");
+        match socket.connect(*addr).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                const KEEPALIVE_TIME_SECS: u64 = 30;
+                const KEEPALIVE_INTERVAL_SECS: u64 = 5;
+                #[cfg(target_os = "linux")]
+                const KEEPALIVE_RETRIES: u32 = 3;
+
+                let sock_ref = socket2::SockRef::from(&stream);
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(KEEPALIVE_TIME_SECS))
+                    .with_interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+                #[cfg(target_os = "linux")]
+                let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
+                sock_ref.set_tcp_keepalive(&keepalive)?;
+                info!(addr = %addr, local_port = local_addr.port(), "TCP connection established");
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Windows: SO_REUSEADDR 让 bind() 成功了，但 connect() 时发现
+                // 4-tuple (local_port → remote_addr) 已被占用（TIME_WAIT 或并发 socket）。
+                // 换一个端口重试。
+                debug!(
+                    local_port,
+                    addr = %addr,
+                    attempt,
+                    error = %e,
+                    "connect failed with AddrInUse after successful bind, retrying with different port"
+                );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    warn!(addr = %addr, "exhausted all connect attempts ({MAX_CONNECT_ATTEMPTS}), all privileged source ports failed");
+    Err(NfsError::Io(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!("all privileged source ports (1-1023) failed to connect to {addr} after {MAX_CONNECT_ATTEMPTS} attempts"),
+    )))
+}
+
+pub mod error;
+mod mount;
+mod nfs3;
+mod nfs41;
+mod rpc;
+mod shared;
+
+pub use mount::{
+    Acl, AceFlags, AceMask, AceType, AclSupport, NfsAce,
+    Attr, ExportEntry, FSInfo, FSStat, Mount, NFSVersion, ObjRes, Pathconf, ReaddirEntry,
+    ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
+    OPEN_READ, OPEN_WRITE, OPEN_BOTH,
+};
+pub use shared::Time;
+pub use error::{NfsError, Result};
+// 公开 NFS 错误码类型，供外部 crate 进行错误匹配
+pub use nfs3::ErrorCode as Nfs3ErrorCode;
+pub use nfs3::MountErrorCode as Nfs3MountErrorCode;
+pub use nfs41::Nfs4ErrorCode;
+#[cfg(target_os = "wasi")]
+pub use std::io::Error;
+
+use rpc::auth::Auth;
+use tracing::{debug, info, trace, warn};
+use url::Url;
+
+#[derive(Debug)]
+struct MountArgs {
+    versions: Vec<NFSVersion>,
+    host: String,
+    dirpath: String,
+    mountport: u16,
+    nfsport: u16,
+    uid: u32,
+    gid: u32,
+    dircount: u32,
+    maxcount: u32,
+    rsize: u32,
+    wsize: u32,
+}
+
+/// Parses the specified URL and attempts to mount the relevant NFS export
+///
+/// # Example
+///
+/// ```no_run
+/// async fn example() {
+///     let mount = nfs_rs::parse_url_and_mount("nfs://127.0.0.1/some/export?version=4.1,4,3").await.unwrap();
+///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
+///         let contents = "hello rust".as_bytes().to_vec();
+///         let contents_len = contents.len();
+///         let num_bytes_written = mount.write(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
+///         assert_eq!(num_bytes_written as usize, contents_len);
+///         let bytes_read = mount.read(res.fh, 0, 16).await.unwrap_or_default();
+///         assert_eq!(&bytes_read, "hello rust".as_bytes());
+///     }
+/// }
+/// ```
+pub async fn parse_url_and_mount(url: &str) -> Result<Box<dyn Mount>> {
+    mount(parse_url(url)?).await
+}
+
+/// Queries the MOUNT service on the given host and returns all exported file systems.
+///
+/// Equivalent to running `showmount -e HOST`. Does not require an existing NFS mount.
+///
+/// `host` may be a bare hostname or IP address (e.g. `"192.168.1.1"`) or a full
+/// `nfs://` URL (query params `uid`, `gid`, and `mountport` are honoured; the path
+/// and `version` are ignored).
+///
+/// # Example
+///
+/// ```no_run
+/// async fn example() {
+///     let exports = nfs_rs::list_exports("192.168.1.1").await.unwrap();
+///     for e in exports {
+///         println!("{} {:?}", e.path, e.groups);
+///     }
+/// }
+/// ```
+pub async fn list_exports(host: &str) -> Result<Vec<ExportEntry>> {
+    let url = if host.starts_with("nfs://") {
+        host.to_string()
+    } else {
+        format!("nfs://{}/.", host)
+    };
+    nfs3::query_exports(&parse_url(&url)?).await
+}
+
+fn get_uid_gid() -> (u32, u32) {
+    #[cfg(not(unix))]
+    let uid_gid = || (65534, 65534);
+    #[cfg(unix)]
+    // SAFETY: getuid() and getgid() are always-safe POSIX calls with no preconditions.
+    let uid_gid = || unsafe { (nix::libc::getuid(), nix::libc::getgid()) };
+    uid_gid()
+}
+
+fn parse_url(url: &str) -> Result<MountArgs> {
+    let mut parsed_url = Url::parse_with_params(url, &[("version", "3"), ("readdir-buffer", "8192,8192")])
+        .map_err(|e| NfsError::InvalidInput(e.to_string()))?;
+    if parsed_url.scheme() != "nfs" {
+        return Err(NfsError::InvalidInput(
+            "specified URL does not have scheme nfs".to_string(),
+        ));
+    }
+    if !parsed_url.has_host() {
+        return Err(NfsError::InvalidInput(
+            "specified URL does not contain a host".to_string(),
+        ));
+    }
+    let addr_port = parsed_url.port();
+    let _ = parsed_url.set_port(None).map_err(|_| NfsError::InvalidInput("cannot clear port on URL".to_string()))?;
+    let params = parsed_url.query_pairs();
+    let version_str = params
+        .filter(|(name, _)| name == "version")
+        .next()
+        .ok_or_else(|| NfsError::InvalidInput("missing version parameter".to_string()))?
+        .1;
+    let mut versions = Vec::new();
+    for v in version_str.split(',') {
+        let version: NFSVersion = v.into();
+        match version {
+            NFSVersion::Unknown => {
+                return Err(NfsError::InvalidInput(
+                    "specified URL contains bad NFS version".to_string(),
+                ))
+            }
+            _ => versions.push(version),
+        }
+    }
+    if versions.is_empty() {
+        versions.push(NFSVersion::NFSv4p1);
+        versions.push(NFSVersion::NFSv3);
+    }
+    let (uid_def, gid_def) = get_uid_gid();
+    let uid = get_url_query_param(&params, "uid", uid_def, "specified URL contains bad UID")?;
+    let gid = get_url_query_param(&params, "gid", gid_def, "specified URL contains bad GID")?;
+    let readdir_buffer_str = params
+        .filter(|(name, _)| name == "readdir-buffer")
+        .next()
+        .ok_or_else(|| NfsError::InvalidInput("missing readdir-buffer parameter".to_string()))?
+        .1;
+    let (dircount, maxcount): (u32, u32) = parse_readdir_buffer_query_param(&readdir_buffer_str)?;
+    let nfsport = get_url_query_param(
+        &params,
+        "nfsport",
+        addr_port.unwrap_or_default(),
+        "specified URL contains bad NFS port",
+    )?;
+    let mountport = get_url_query_param(
+        &params,
+        "mountport",
+        Default::default(),
+        "specified URL contains bad mount port",
+    )?;
+    let txsize_def: u32 = 1048576; // mimic libnfs default of 1 MiB
+    let rsize = get_url_query_param(
+        &params,
+        "rsize",
+        txsize_def,
+        "specified URL contains bad max read size value",
+    )?;
+    let wsize = get_url_query_param(
+        &params,
+        "wsize",
+        txsize_def,
+        "specified URL contains bad max write size value",
+    )?;
+    let host = parsed_url.host_str().unwrap_or_default().to_string();
+    Ok(MountArgs {
+        versions,
+        host,
+        mountport,
+        nfsport,
+        dirpath: parsed_url.path().to_string(),
+        uid,
+        gid,
+        dircount,
+        maxcount,
+        rsize,
+        wsize,
+    })
+}
+
+fn get_url_query_param<T: std::str::FromStr>(
+    params: &url::form_urlencoded::Parse,
+    name: &str,
+    def: T,
+    err_msg: &str,
+) -> Result<T> {
+    if let Some(val) = params.filter(|(n, _)| n == name).next() {
+        val.1
+            .parse()
+            .map_err(|_| NfsError::InvalidInput(err_msg.to_string()))
+    } else {
+        Ok(def)
+    }
+}
+
+fn parse_readdir_buffer_query_param(param: &str) -> Result<(u32, u32)> {
+    if let Some((dircount_str, maxcount_str)) = param.split_once(',') {
+        let dircount: u32 = dircount_str.parse().map_err(|_| {
+            NfsError::InvalidInput(
+                "specified URL contains bad readdir-buffer value".to_string(),
+            )
+        })?;
+        let maxcount: u32 = maxcount_str.parse().map_err(|_| {
+            NfsError::InvalidInput(
+                "specified URL contains bad readdir-buffer value".to_string(),
+            )
+        })?;
+        Ok((dircount, maxcount))
+    } else {
+        let count: u32 = param.parse().map_err(|_| {
+            NfsError::InvalidInput(
+                "specified URL contains bad readdir-buffer value".to_string(),
+            )
+        })?;
+        Ok((count, count))
+    }
+}
+
+async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
+    let mut errs: Vec<NfsError> = Vec::new();
+    for version in &args.versions {
+        info!(version = ?version, host = %args.host, dirpath = %args.dirpath, "attempting NFS mount");
+        let res: Result<Box<dyn Mount>> = match version {
+            NFSVersion::NFSv3 => nfs3::mount(&args).await,
+            NFSVersion::NFSv4p1 => nfs41::mount::mount(&args).await,
+            NFSVersion::NFSv4 => Err(NfsError::Unsupported("NFSv4.0 is not supported".to_string())),
+            NFSVersion::NFSv4p2 => Err(NfsError::Unsupported(
+                "NFSv4.2 is not supported".to_string(),
+            )),
+            _ => unreachable!(),
+        };
+        match res {
+            Ok(_) => return res,
+            Err(err) => {
+                warn!(version = ?version, error = %err, "mount attempt failed for version");
+                errs.push(err);
+            }
+        }
+    }
+    Err(squash_mount_errors(errs))
+}
+
+/// Extract the inner message from an NfsError without the variant prefix.
+fn nfs_error_msg(err: &NfsError) -> String {
+    match err {
+        NfsError::Io(e) => e.to_string(),
+        NfsError::Nfs3(c) => c.to_string(),
+        NfsError::Nfs4(c) => c.to_string(),
+        NfsError::Mount(c) => c.to_string(),
+        NfsError::Rpc(s) | NfsError::Xdr(s) | NfsError::Unsupported(s) | NfsError::InvalidInput(s) => s.clone(),
+        NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
+    }
+}
+
+fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
+    let mut unsupported_err = "".to_string();
+    let errs: Vec<NfsError> = errs
+        .into_iter()
+        .map(|err| {
+            if matches!(&err, NfsError::Unsupported(_)) {
+                let msg = nfs_error_msg(&err);
+                if unsupported_err.is_empty() {
+                    unsupported_err = msg;
+                } else if unsupported_err != msg {
+                    unsupported_err = "NFSv4 and NFSv4.2 are not supported".to_string();
+                }
+                None
+            } else {
+                Some(err)
+            }
+        })
+        .flatten()
+        .collect();
+    if errs.is_empty() {
+        return NfsError::Unsupported(unsupported_err);
+    }
+    let mut msg = nfs_error_msg(&errs[0]);
+    for err in &errs[1..] {
+        msg = format!("{} - {}", msg, nfs_error_msg(err));
+    }
+    if !unsupported_err.is_empty() {
+        msg = format!("{} - {}", msg, unsupported_err);
+    }
+    NfsError::Rpc(msg)
+}
+
+fn split_path(path: &str) -> Result<(String, String)> {
+    let cleaned = path_clean::clean(format!("/=/{}", path));
+    if !cleaned.starts_with("/=/") {
+        return Err(NfsError::InvalidInput(
+            "invalid path specified".to_string(),
+        ));
+    }
+    if cleaned.eq(std::path::Path::new("/=/")) {
+        return Ok(("/".to_string(), "".to_string()));
+    }
+    let dir = cleaned
+        .parent()
+        .map(|x| {
+            let path_str = x.to_string_lossy();
+            let trimmed = &path_str[2..];
+            #[cfg(windows)]
+            {
+                // Windows platform: replace backslashes with forward slashes
+                trimmed.replace('\\', "/")
+            }
+            #[cfg(not(windows))]
+            {
+                // Non-Windows platform: keep original separators
+                trimmed.to_string()
+            }
+        })
+        .ok_or_else(|| NfsError::InvalidInput("invalid path specified".to_string()))?;
+
+    let name = cleaned
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    Ok((dir, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_url_bad_scheme() {
+        for scheme in ["ftp", "scp", "ssh"] {
+            let res = parse_url(&format!("{}://localhost/some/export/path", scheme));
+            assert!(res.is_err());
+            let err = res.unwrap_err();
+            assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not have scheme nfs"));
+        }
+    }
+
+    #[test]
+    fn parse_url_missing_host() {
+        let res = parse_url("nfs:///some/export/path");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not contain a host"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_version() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?version=5");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS version"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_uid() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?uid=nobody");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad UID"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_gid() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?gid=wheel");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad GID"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_nfsport() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?nfsport=default");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS port"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_mountport() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?mountport=nfsport");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad mount port"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_readdir_buffer_single_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=unlimited");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_readdir_buffer_pair_first_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=unlimited,4096");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_readdir_buffer_pair_second_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=4096,unlimited");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_readdir_buffer_triple_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=2048,4096,8192");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_rsize() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?rsize=sizable");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max read size value"));
+    }
+
+    #[test]
+    fn parse_url_with_bad_wsize() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?wsize=4mib");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max write size value"));
+    }
+
+    #[test]
+    fn parse_url_without_uid_and_gid() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "127.0.0.1".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_uid_and_gid_and_multi_version() {
+        let res = parse_url("nfs://localhost/some/export/path?version=4.1,4,3&uid=616&gid=666");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(
+            args.versions,
+            vec![NFSVersion::NFSv4p1, NFSVersion::NFSv4, NFSVersion::NFSv3]
+        );
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), (616, 666));
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_port() {
+        let res = parse_url("nfs://localhost:20490/some/export/path");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 20490);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_nfsport() {
+        let res = parse_url("nfs://localhost/some/export/path?nfsport=20490");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 20490);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_mountport() {
+        let res = parse_url("nfs://localhost/some/export/path?mountport=20490");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 20490);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_port_and_mountport() {
+        let res = parse_url("nfs://localhost:20389/some/export/path?mountport=20490");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 20389);
+        assert_eq!(args.mountport, 20490);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_nfsport_and_mountport() {
+        let res = parse_url("nfs://localhost/some/export/path?nfsport=20389&mountport=20490");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 20389);
+        assert_eq!(args.mountport, 20490);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_port_nfsport_and_mountport() {
+        let res = parse_url("nfs://localhost:20388/some/export/path?nfsport=20389&mountport=20490");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "localhost".to_string());
+        assert_eq!(args.nfsport, 20389);
+        assert_eq!(args.mountport, 20490);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_rsize() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?rsize=16384");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "127.0.0.1".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (16384, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_wsize() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?wsize=16384");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "127.0.0.1".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!((args.rsize, args.wsize), (1048576, 16384));
+    }
+
+    #[test]
+    fn parse_url_with_readdir_buffer_single_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=4096");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "127.0.0.1".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (4096, 4096));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[test]
+    fn parse_url_with_readdir_buffer_pair_value() {
+        let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=2048,4096");
+        assert!(res.is_ok(), "err = {}", res.unwrap_err());
+        let args = res.unwrap();
+        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
+        assert_eq!(args.host, "127.0.0.1".to_string());
+        assert_eq!(args.nfsport, 0);
+        assert_eq!(args.mountport, 0);
+        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!((args.uid, args.gid), get_uid_gid());
+        assert_eq!((args.dircount, args.maxcount), (2048, 4096));
+        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
+    }
+
+    #[tokio::test]
+    async fn mount_with_only_v4() {
+        let args = MountArgs {
+            versions: vec![NFSVersion::NFSv4],
+            host: Default::default(),
+            mountport: Default::default(),
+            nfsport: Default::default(),
+            dirpath: Default::default(),
+            gid: Default::default(),
+            uid: Default::default(),
+            dircount: Default::default(),
+            maxcount: Default::default(),
+            rsize: Default::default(),
+            wsize: Default::default(),
+        };
+        let res = mount(args).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.0 is not supported"));
+    }
+
+    #[tokio::test]
+    async fn mount_with_only_v4_2() {
+        let args = MountArgs {
+            versions: vec![NFSVersion::NFSv4p2],
+            host: Default::default(),
+            mountport: Default::default(),
+            nfsport: Default::default(),
+            dirpath: Default::default(),
+            gid: Default::default(),
+            uid: Default::default(),
+            dircount: Default::default(),
+            maxcount: Default::default(),
+            rsize: Default::default(),
+            wsize: Default::default(),
+        };
+        let res = mount(args).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.2 is not supported"));
+    }
+
+    #[tokio::test]
+    async fn mount_with_only_v4_and_v4_2() {
+        let args = MountArgs {
+            versions: vec![NFSVersion::NFSv4, NFSVersion::NFSv4p2],
+            host: Default::default(),
+            mountport: Default::default(),
+            nfsport: Default::default(),
+            dirpath: Default::default(),
+            gid: Default::default(),
+            uid: Default::default(),
+            dircount: Default::default(),
+            maxcount: Default::default(),
+            rsize: Default::default(),
+            wsize: Default::default(),
+        };
+        let res = mount(args).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_only_non_unsupported_err() {
+        let errs = vec![NfsError::Rpc("some error".to_string())];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_only_non_unsupported_errs() {
+        let errs = vec![
+            NfsError::Rpc("some error".to_string()),
+            NfsError::InvalidInput("some other error".to_string()),
+            NfsError::InvalidInput("some final error".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - some final error"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_only_unsupported_err() {
+        let errs = vec![
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()), // XXX: same NFS version ignored
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.2 is not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_only_unsupported_errs() {
+        let errs = vec![
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
+            NfsError::Unsupported("NFSv4 is not supported".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_unsupported_err_and_non_unsupported_err() {
+        let errs = vec![
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
+            NfsError::Rpc("some error".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4.2 is not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_unsupported_errs_and_non_unsupported_err() {
+        let errs = vec![
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
+            NfsError::Rpc("some error".to_string()),
+            NfsError::Unsupported("NFSv4 is not supported".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4 and NFSv4.2 are not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_unsupported_err_and_non_unsupported_errs() {
+        let errs = vec![
+            NfsError::Rpc("some error".to_string()),
+            NfsError::Unsupported("NFSv4 is not supported".to_string()),
+            NfsError::InvalidInput("some other error".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 is not supported"));
+    }
+
+    #[test]
+    fn squash_mount_errors_with_unsupported_errs_and_non_unsupported_errs() {
+        let errs = vec![
+            NfsError::Rpc("some error".to_string()),
+            NfsError::Unsupported("NFSv4 is not supported".to_string()),
+            NfsError::InvalidInput("some other error".to_string()),
+            NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
+        ];
+        let err = squash_mount_errors(errs);
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 and NFSv4.2 are not supported"));
+    }
+
+    #[test]
+    fn split_path_empty_path() {
+        let path = "";
+        let res = split_path(path);
+        assert!(res.is_ok());
+        let (dir, name) = res.unwrap();
+        assert_eq!(dir, "/".to_string());
+        assert_eq!(name, "".to_string());
+    }
+
+    #[test]
+    fn split_path_root_path() {
+        let path = "/";
+        let res = split_path(path);
+        assert!(res.is_ok());
+        let (dir, name) = res.unwrap();
+        assert_eq!(dir, "/".to_string());
+        assert_eq!(name, "".to_string());
+    }
+
+    #[test]
+    fn split_path_sneaky_one() {
+        let path = "..";
+        let res = split_path(path);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
+    }
+
+    #[test]
+    fn split_path_sneaky_two() {
+        let path = "/first/../..";
+        let res = split_path(path);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
+    }
+
+    #[test]
+    fn split_path_path_depth_one() {
+        let path = "/first/place/";
+        let res = split_path(path);
+        assert!(res.is_ok());
+        let (dir, name) = res.unwrap();
+        assert_eq!(dir, "/first".to_string());
+        assert_eq!(name, "place".to_string());
+    }
+
+    #[test]
+    fn split_path_path_depth_two() {
+        let path = "/first/place/1999.txt";
+        let res = split_path(path);
+        assert!(res.is_ok());
+        let (dir, name) = res.unwrap();
+        assert_eq!(dir, "/first/place".to_string());
+        assert_eq!(name, "1999.txt".to_string());
+    }
+}

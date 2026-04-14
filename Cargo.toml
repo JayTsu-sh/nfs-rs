@@ -1,0 +1,43 @@
+[package]
+name = "nfs-rs"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+byteorder = "1.5.0"
+bytes = "1.10.1"
+futures = "0.3.31"
+nix = "0.29.0"
+path-clean = "1.0.1"
+rand = "0.9.1"
+thiserror = "2.0.12"
+url = "2.5.4"
+wit-bindgen = { version = "0.43.0" }
+wit-bindgen-rt = { version = "0.43.0", features = ["bitflags"] }
+tokio = { version = "1.35.1", features = ["net", "io-util", "sync", "rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+async-trait = "0.1.77"
+socket2 = { version = "0.5", features = ["all"] }
+
+[build-dependencies]
+fastxdr = "=1.0.2"
+
+[package.metadata.component]
+package = "component:nfs-rs"
+
+[package.metadata.component.bindings]
+
+[package.metadata.component.target]
+path = "wit"
+world = "nfs-rs"
+
+[package.metadata.component.target.dependencies]
+"wasi:clocks" = { path = "wit/deps/clocks" }
+"wasi:io" = { path = "wit/deps/io" }
+"wasi:sockets" = { path = "wit/deps/sockets" }
