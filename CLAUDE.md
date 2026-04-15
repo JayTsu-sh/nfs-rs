@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 协议规范（强制参考）
+
+涉及协议行为、字段语义、错误码、状态机等任何协议相关的调研、设计和实现，**必须优先查阅对应 RFC**，不得凭经验推断。
+
+| 协议 | RFC | 说明 |
+|------|-----|------|
+| NFSv3 | [RFC 1813](https://www.rfc-editor.org/rfc/rfc1813) | NFSv3 主规范，含 MOUNT 协议 |
+| NFSv4.0 | [RFC 7530](https://www.rfc-editor.org/rfc/rfc7530) | NFSv4.0（废弃 RFC 3530） |
+| NFSv4.1 | [RFC 5661](https://www.rfc-editor.org/rfc/rfc5661) | NFSv4.1 主规范，含 pNFS、Sessions |
+| NFSv4.1 勘误 | [RFC 8178](https://www.rfc-editor.org/rfc/rfc8178) | NFSv4 minor version 扩展规则 |
+| NFSv4.2 | [RFC 7862](https://www.rfc-editor.org/rfc/rfc7862) | NFSv4.2 主规范（server-side copy、sparse files、IO_ADVISE、SEEK/ALLOCATE/DEALLOCATE） |
+| NFSv4.2 XDR | [RFC 7863](https://www.rfc-editor.org/rfc/rfc7863) | RFC 7862 的 XDR 配套定义 |
+| ONC RPC | [RFC 5531](https://www.rfc-editor.org/rfc/rfc5531) | RPC 协议基础（废弃 RFC 1831） |
+| XDR | [RFC 4506](https://www.rfc-editor.org/rfc/rfc4506) | XDR 编码规范 |
+| RPCSEC_GSS | [RFC 2203](https://www.rfc-editor.org/rfc/rfc2203) | RPC 安全层 |
+| NFSv4 xattr | [RFC 8276](https://www.rfc-editor.org/rfc/rfc8276) | NFSv4.2 扩展属性（GETXATTR/SETXATTR/LISTXATTRS/REMOVEXATTR） |
+| NFSv4 ACL | RFC 5661 §6 / RFC 7530 §6 | ACL 属性（acl/dacl/sacl）定义在主规范中，无单独 RFC |
+| NFSv3 ACL | 无 RFC（Sun 私有扩展） | program 100227，各厂商实现不一致，参考 Linux `nfs_acl` 模块行为 |
+
 ## Commands
 
 ```bash
@@ -193,6 +212,41 @@ pub type Result<T> = std::result::Result<T, NfsError>;
 
 > 注：当前代码仍使用 `std::io::Error` + `ErrorKind::Other` 包装所有错误。上述是目标方向，迁移可渐进完成。
 
+
+## 工作原则（强制）
+
+### 1. 先思考，再编码
+
+- 明确陈述假设；有歧义时先问，不要默默选一个
+- 若存在更简单的方案，说出来；必要时推回需求
+- 遇到不清楚的地方，停下来，点名说明哪里不清楚，然后提问
+
+### 2. 简单优先
+
+- 只写解决问题所需的最少代码，不做推测性实现
+- 不增加未被要求的功能、抽象、"灵活性"或配置项
+- 不为不可能发生的场景加错误处理
+- 自问："资深工程师会觉得这过度设计吗？"——如果会，简化
+
+### 3. 外科手术式修改
+
+- 只动必须动的代码；不"顺手改进"周边代码、注释或格式
+- 保持现有风格，即使你会做得不一样
+- 发现无关死代码：**提及，不删除**
+- 你的改动产生的孤儿（unused import/变量/函数）：**必须清理**
+- 检验标准：每一行改动都能直接追溯到用户的请求
+
+### 4. 目标驱动执行
+
+把任务转化为可验证的目标，多步骤任务先列计划：
+
+```
+1. [步骤] → 验证：[检查方式]
+2. [步骤] → 验证：[检查方式]
+```
+
+- "修复 bug" → 先写复现测试，再让测试通过
+- "重构 X" → 确保重构前后测试全部通过
 
 ## High-Performance IO / Async Patterns
 

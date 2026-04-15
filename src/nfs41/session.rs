@@ -239,7 +239,7 @@ impl Session {
             maxresponsesize: 1048576,
             maxresponsesize_cached: 4096,
             maxoperations: 16,
-            maxrequests: 4, // 4 slots
+            maxrequests: 64, // match Linux client default (NFS4_DEF_SLOT_TABLE_SIZE)
         };
         let back_attrs = ChannelAttrsArgs {
             headerpadsize: 0,
