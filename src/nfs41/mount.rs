@@ -255,7 +255,7 @@ impl Mount41 {
             };
             let resp = CompoundResponse::decode(response_bytes)?;
             // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
-            if resp.results.first().map_or(false, |r| {
+            if resp.results.first().is_some_and(|r| {
                 r.opcode == super::compound::OpNum::Sequence as u32
                     && matches!(r.status, nfsstat4::NFS4_OK)
             }) {
@@ -304,7 +304,7 @@ impl Mount41 {
                 Ok(()) => {}
             }
             resp.op_ok(0)?; // SEQUENCE
-            if let Some(seq_op) = resp.results.get(0) {
+            if let Some(seq_op) = resp.results.first() {
                 self.handle_seq_status(seq_op).await;
             }
             return Ok(resp);
@@ -378,7 +378,7 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(
         format!("{}:{}", args.host, nfsport)
     ).await
-        .map_err(|e| NfsError::Io(e))?
+        .map_err(NfsError::Io)?
         .collect();
     debug!(host = %args.host, port = nfsport, addr_count = addrs.len(), "resolved NFSv4.1 server addresses");
 
@@ -693,24 +693,18 @@ async fn get_fs_limits(
     let mut server_maxread = u64::MAX;
     let mut server_maxwrite = u64::MAX;
 
-    if has_lease_time {
-        if vals.remaining() >= 4 {
-            server_lease_secs = vals.get_u32();
-        }
+    if has_lease_time && vals.remaining() >= 4 {
+        server_lease_secs = vals.get_u32();
     }
-    if has_maxread {
-        if vals.remaining() >= 8 {
-            server_maxread = vals.get_u64();
-        }
+    if has_maxread && vals.remaining() >= 8 {
+        server_maxread = vals.get_u64();
     }
-    if has_maxwrite {
-        if vals.remaining() >= 8 {
-            server_maxwrite = vals.get_u64();
-        }
+    if has_maxwrite && vals.remaining() >= 8 {
+        server_maxwrite = vals.get_u64();
     }
 
     // Renewal interval = lease_time / 2, clamped to [5s, 45s]
-    let renewal_secs = (server_lease_secs / 2).max(5).min(45);
+    let renewal_secs = (server_lease_secs / 2).clamp(5, 45);
     let renewal_interval = std::time::Duration::from_secs(renewal_secs as u64);
 
     // Clamp requested sizes to server limits (same logic as v3)
@@ -1170,7 +1164,7 @@ mod tests {
     fn jitter_lands_in_half_to_full_range() {
         for _ in 0..200 {
             let d = backoff_jitter_ms(0, 200, 5000);
-            assert!(d >= 100 && d < 200, "attempt=0 produced {} ms", d);
+            assert!((100..200).contains(&d), "attempt=0 produced {} ms", d);
         }
     }
 
@@ -1178,7 +1172,7 @@ mod tests {
     fn jitter_caps_at_cap_ms() {
         for _ in 0..200 {
             let d = backoff_jitter_ms(20, 200, 5000);
-            assert!(d >= 2500 && d < 5000, "attempt=20 produced {} ms", d);
+            assert!((2500..5000).contains(&d), "attempt=20 produced {} ms", d);
         }
     }
 

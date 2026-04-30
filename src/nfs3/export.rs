@@ -99,7 +99,7 @@ mod tests {
         let mut v = Vec::new();
         v.extend_from_slice(&(len as u32).to_be_bytes());
         v.extend_from_slice(s.as_bytes());
-        v.extend(std::iter::repeat(0u8).take(pad));
+        v.extend(std::iter::repeat_n(0u8, pad));
         v
     }
 

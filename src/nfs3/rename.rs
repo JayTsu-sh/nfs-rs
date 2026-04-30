@@ -24,7 +24,7 @@ impl Mount {
         let (from_dir, from_filename) = split_path(from)?;
         let (to_dir, to_filename) = split_path(to)?;
         let from_dir_fh = self.lookup_path(&from_dir).await?.fh;
-        let to_dir_fh = if &from_dir == &to_dir {
+        let to_dir_fh = if from_dir == to_dir {
             from_dir_fh.clone()
         } else {
             self.lookup_path(&to_dir).await?.fh

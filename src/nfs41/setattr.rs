@@ -5,6 +5,7 @@ use super::state::StateId;
 use crate::error::{NfsError, Result};
 
 impl Mount41 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn setattr(
         &self,
         fh: Bytes,
@@ -32,6 +33,7 @@ impl Mount41 {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn setattr_path(
         &self,
         path: &str,
@@ -162,7 +164,7 @@ pub(super) fn encode_setattr(
         vals.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         vals.extend_from_slice(bytes);
         let pad = (4 - bytes.len() % 4) % 4;
-        for _ in 0..pad { vals.push(0); }
+        vals.extend(std::iter::repeat_n(0, pad));
     }
     // owner_group = attr #37 (word 1, bit 5)
     if let Some(g) = gid {
@@ -172,7 +174,7 @@ pub(super) fn encode_setattr(
         vals.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         vals.extend_from_slice(bytes);
         let pad = (4 - bytes.len() % 4) % 4;
-        for _ in 0..pad { vals.push(0); }
+        vals.extend(std::iter::repeat_n(0, pad));
     }
     // time_access_set = attr #48 (word 1, bit 16)
     if let Some(t) = atime {

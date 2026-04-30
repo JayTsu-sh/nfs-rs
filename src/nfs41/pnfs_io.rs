@@ -441,7 +441,7 @@ impl Mount41 {
             };
             let _ = self
                 .compound("layoutreturn", |b| {
-                    b.putfh(&fh).layoutreturn(
+                    b.putfh(fh).layoutreturn(
                         false,
                         1, // LAYOUT4_NFSV4_1_FILES
                         iomode,

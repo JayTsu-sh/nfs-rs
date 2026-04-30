@@ -59,9 +59,9 @@ impl CallbackService {
     /// Returns the service (with port number for CREATE_SESSION).
     pub async fn start(session_id: [u8; 16]) -> Result<Self> {
         let listener = TcpListener::bind("0.0.0.0:0").await
-            .map_err(|e| crate::error::NfsError::Io(e))?;
+            .map_err(crate::error::NfsError::Io)?;
         let port = listener.local_addr()
-            .map_err(|e| crate::error::NfsError::Io(e))?.port();
+            .map_err(crate::error::NfsError::Io)?.port();
         let (recall_tx, recall_rx) = mpsc::channel(32);
 
         info!(port, "callback service started");

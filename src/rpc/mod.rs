@@ -61,7 +61,7 @@ pub(crate) async fn portmap(
 ) -> Result<u16> {
     for addr in addrs {
         debug!(addr = %addr, prog, vers, "attempting portmapper lookup");
-        let res = portmap_on_addr(&addr, prog, vers, auth, max_retries).await;
+        let res = portmap_on_addr(addr, prog, vers, auth, max_retries).await;
         match &res {
             Ok(port) => {
                 info!(addr = %addr, prog, vers, port, "portmapper resolved port");
@@ -105,7 +105,7 @@ async fn portmap_calls(
         PORTMAP_PROG,
         PORTMAP_VERSION,
         PortmapProc2::Null as u32,
-        &auth,
+        auth,
         &Auth::new_null(),
     )
     .encode(&mut buf);
@@ -118,7 +118,7 @@ async fn portmap_calls(
             PORTMAP_PROG,
             PORTMAP_VERSION,
             PortmapProc2::GetPort as u32,
-            &auth,
+            auth,
             &Auth::new_null(),
         ),
         prog,
@@ -692,7 +692,7 @@ fn get_xid() -> u32 {
 pub(crate) fn get_current_time() -> u32 {
     let now = std::time::SystemTime::now();
     let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    (since_epoch.as_secs() as u32).wrapping_mul(1000) + since_epoch.subsec_nanos() / 1_000_000
+    (since_epoch.as_secs() as u32).wrapping_mul(1000) + since_epoch.subsec_millis()
 }
 
 #[cfg(test)]

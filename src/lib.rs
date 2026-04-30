@@ -297,11 +297,10 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         ));
     }
     let addr_port = parsed_url.port();
-    let _ = parsed_url.set_port(None).map_err(|_| NfsError::InvalidInput("cannot clear port on URL".to_string()))?;
-    let params = parsed_url.query_pairs();
-    let version_str = params
-        .filter(|(name, _)| name == "version")
-        .next()
+    parsed_url.set_port(None).map_err(|_| NfsError::InvalidInput("cannot clear port on URL".to_string()))?;
+    let version_str = parsed_url
+        .query_pairs()
+        .find(|(name, _)| name == "version")
         .ok_or_else(|| NfsError::InvalidInput("missing version parameter".to_string()))?
         .1;
     let mut versions = Vec::new();
@@ -321,35 +320,35 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         versions.push(NFSVersion::NFSv3);
     }
     let (uid_def, gid_def) = get_uid_gid();
-    let uid = get_url_query_param(&params, "uid", uid_def, "specified URL contains bad UID")?;
-    let gid = get_url_query_param(&params, "gid", gid_def, "specified URL contains bad GID")?;
-    let readdir_buffer_str = params
-        .filter(|(name, _)| name == "readdir-buffer")
-        .next()
+    let uid = get_url_query_param(&parsed_url, "uid", uid_def, "specified URL contains bad UID")?;
+    let gid = get_url_query_param(&parsed_url, "gid", gid_def, "specified URL contains bad GID")?;
+    let readdir_buffer_str = parsed_url
+        .query_pairs()
+        .find(|(name, _)| name == "readdir-buffer")
         .ok_or_else(|| NfsError::InvalidInput("missing readdir-buffer parameter".to_string()))?
         .1;
     let (dircount, maxcount): (u32, u32) = parse_readdir_buffer_query_param(&readdir_buffer_str)?;
     let nfsport = get_url_query_param(
-        &params,
+        &parsed_url,
         "nfsport",
         addr_port.unwrap_or_default(),
         "specified URL contains bad NFS port",
     )?;
     let mountport = get_url_query_param(
-        &params,
+        &parsed_url,
         "mountport",
         Default::default(),
         "specified URL contains bad mount port",
     )?;
     let txsize_def: u32 = 1048576; // mimic libnfs default of 1 MiB
     let rsize = get_url_query_param(
-        &params,
+        &parsed_url,
         "rsize",
         txsize_def,
         "specified URL contains bad max read size value",
     )?;
     let wsize = get_url_query_param(
-        &params,
+        &parsed_url,
         "wsize",
         txsize_def,
         "specified URL contains bad max write size value",
@@ -371,17 +370,16 @@ fn parse_url(url: &str) -> Result<MountArgs> {
 }
 
 fn get_url_query_param<T: std::str::FromStr>(
-    params: &url::form_urlencoded::Parse,
+    url: &url::Url,
     name: &str,
     def: T,
     err_msg: &str,
 ) -> Result<T> {
-    if let Some(val) = params.filter(|(n, _)| n == name).next() {
-        val.1
+    match url.query_pairs().find(|(n, _)| n == name) {
+        Some((_, val)) => val
             .parse()
-            .map_err(|_| NfsError::InvalidInput(err_msg.to_string()))
-    } else {
-        Ok(def)
+            .map_err(|_| NfsError::InvalidInput(err_msg.to_string())),
+        None => Ok(def),
     }
 }
 
@@ -448,7 +446,7 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
     let mut unsupported_err = "".to_string();
     let errs: Vec<NfsError> = errs
         .into_iter()
-        .map(|err| {
+        .filter_map(|err| {
             if matches!(&err, NfsError::Unsupported(_)) {
                 let msg = nfs_error_msg(&err);
                 if unsupported_err.is_empty() {
@@ -461,7 +459,6 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
                 Some(err)
             }
         })
-        .flatten()
         .collect();
     if errs.is_empty() {
         return NfsError::Unsupported(unsupported_err);

@@ -6,7 +6,7 @@
 //! Re-exports are intentionally broad — many types are used only by specific
 //! sub-modules (layout, delegation, state) that may not yet be fully wired in.
 
-#[allow(unused, non_camel_case_types, dead_code)]
+#[allow(unused, non_camel_case_types, dead_code, clippy::all, clippy::pedantic)]
 mod nfs4_generated {
     include!(concat!(env!("OUT_DIR"), "/nfs4_xdr.rs"));
 }

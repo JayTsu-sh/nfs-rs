@@ -208,7 +208,8 @@ mod tests {
     fn nfs4_error_copy_clone() {
         let e = Nfs4ErrorCode::NFS4ERR_NOENT;
         let e2 = e; // Copy
-        let e3 = e.clone(); // Clone
+        #[allow(clippy::clone_on_copy)]
+        let e3 = e.clone(); // Clone (intentional — verifying Clone impl exists)
         assert_eq!(e, e2);
         assert_eq!(e, e3);
     }

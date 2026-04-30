@@ -339,7 +339,7 @@ impl Session {
                 }
             }
             drop(slot);
-            return Err(NfsError::Rpc("RECLAIM_COMPLETE NFS4ERR_DELAY/GRACE retry exhausted".to_string()));
+            Err(NfsError::Rpc("RECLAIM_COMPLETE NFS4ERR_DELAY/GRACE retry exhausted".to_string()))
         }
     }
 }

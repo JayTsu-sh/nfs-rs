@@ -388,6 +388,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.setattr(fh, guard, None, None, None, None, Some(now), Some(now_clone)).await
     /// }
     /// ```
+    #[allow(clippy::too_many_arguments)]
     async fn setattr(
         &self,
         fh: Bytes,
@@ -424,6 +425,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.setattr_path(path, guard, None, None, None, None, Some(now), Some(now_clone)).await
     /// }
     /// ```
+    #[allow(clippy::too_many_arguments)]
     async fn setattr_path(
         &self,
         path: &str,
@@ -448,7 +450,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.link(src_fh, dst_dir_fh, dst_filename).await
     /// }
     /// ```
-
     async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_filename: &str) -> Result<Attr>;
 
     /// Same as [`Mount::link`] but instead of taking in a source file handle, destination directory file handle,
@@ -463,7 +464,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.link_path(src_path, dst_path).await
     /// }
     /// ```
-
     async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<Attr>;
 
     /// Procedure SYMLINK creates a new symbolic link.
@@ -475,7 +475,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.symlink(src_path, dst_dir_fh, dst_filename).await
     /// }
     /// ```
-
     async fn symlink(
         &self,
         src_path: &str,
@@ -494,7 +493,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.symlink_path(src_path, dst_path).await
     /// }
     /// ```
-
     async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes>;
 
     /// Procedure READLINK reads the data associated with a symbolic link.
@@ -506,7 +504,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.readlink(fh).await
     /// }
     /// ```
-
     async fn readlink(&self, fh: Bytes) -> Result<String>;
 
     /// Same as [`Mount::readlink`] but instead of taking in a file handle, takes in a path for which file handle is
@@ -519,7 +516,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.readlink_path(path).await
     /// }
     /// ```
-
     async fn readlink_path(&self, path: &str) -> Result<String> {
         let res = self.lookup_path(path).await?;
         self.readlink(res.fh).await
@@ -826,7 +822,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.remove(dir_fh, filename).await
     /// }
     /// ```
-
     async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()>;
 
     /// Same as [`Mount::remove`] but instead of taking in a directory file handle and filename, takes in a path for
@@ -839,7 +834,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.remove_path(path).await
     /// }
     /// ```
-
     async fn remove_path(&self, path: &str) -> Result<()>;
 
     /// Procedure RMDIR removes (deletes) a subdirectory from a directory.
@@ -851,7 +845,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.rmdir(dir_fh, dirname).await
     /// }
     /// ```
-
     async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()>;
 
     /// Same as [`Mount::rmdir`] but instead of taking in a directory file handle and directory name, takes in a path
@@ -864,7 +857,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.rmdir_path(path).await
     /// }
     /// ```
-
     async fn rmdir_path(&self, path: &str) -> Result<()>;
 
     // Procedure RENAME renames an entry.
@@ -882,7 +874,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.rename(from_dir_fh, from_filename, to_dir_fh, to_filename).await
     /// }
     /// ```
-
     async fn rename(
         &self,
         from_dir_fh: Bytes,
@@ -903,7 +894,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.rename_path(from_path, to_path).await
     /// }
     /// ```
-
     async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()>;
 
     /// Procedure UMOUNT unmounts the mount itself.
@@ -915,7 +905,6 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     mount.umount().await
     /// }
     /// ```
-
     async fn umount(&self) -> Result<()>;
 
     /// Return NFS version
@@ -1018,6 +1007,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::setattr`]
+    #[allow(clippy::too_many_arguments)]
     fn sync_setattr(
         &self,
         fh: Bytes,
@@ -1033,6 +1023,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::setattr_path`]
+    #[allow(clippy::too_many_arguments)]
     fn sync_setattr_path(
         &self,
         path: &str,
@@ -1241,9 +1232,9 @@ pub enum NFSVersion {
     NFSv4p2,
 }
 
-impl Into<NFSVersion> for &str {
-    fn into(self) -> NFSVersion {
-        match self {
+impl From<&str> for NFSVersion {
+    fn from(val: &str) -> Self {
+        match val {
             "3" => NFSVersion::NFSv3,
             "4" => NFSVersion::NFSv4,
             "4.1" => NFSVersion::NFSv4p1,

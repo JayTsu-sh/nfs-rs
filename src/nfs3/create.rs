@@ -35,7 +35,7 @@ impl Mount {
                 name: filename3(filename.to_string()),
             },
             how: createhow3::UNCHECKED(sattr3 {
-                mode: mode.map_or(set_mode3::default, |m| set_mode3::TRUE(m)),
+                mode: mode.map_or(set_mode3::default, set_mode3::TRUE),
                 uid: set_uid3::default,
                 gid: set_gid3::default,
                 size: set_size3::default,

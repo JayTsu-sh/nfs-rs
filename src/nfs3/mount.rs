@@ -250,7 +250,7 @@ pub(crate) async fn mount(
     info!(nfsport, mountport, "ports resolved");
     for mut addr in addrs {
         addr.set_port(nfsport); // replace portmapper port with NFS port obtained above
-        match mount_on_addr(&addr, &args, &auth, mountport).await {
+        match mount_on_addr(&addr, args, &auth, mountport).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "mount attempt failed on address");

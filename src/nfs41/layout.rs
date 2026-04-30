@@ -954,9 +954,7 @@ mod tests {
         buf.extend_from_slice(&body);
         // Pad if needed
         let pad = (4 - (body.len() % 4)) % 4;
-        for _ in 0..pad {
-            buf.push(0);
-        }
+        buf.extend(std::iter::repeat_n(0, pad));
 
         let mut bytes = Bytes::from(buf);
         let info = decode_getdeviceinfo_response(&mut bytes).unwrap();
@@ -993,9 +991,7 @@ mod tests {
         put_u32(&mut buf, body.len() as u32);
         buf.extend_from_slice(&body);
         let pad = (4 - (body.len() % 4)) % 4;
-        for _ in 0..pad {
-            buf.push(0);
-        }
+        buf.extend(std::iter::repeat_n(0, pad));
 
         let mut bytes = Bytes::from(buf);
         let info = decode_getdeviceinfo_response(&mut bytes).unwrap();

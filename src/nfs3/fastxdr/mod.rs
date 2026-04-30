@@ -1,12 +1,12 @@
 // Auto-generated NFS3 XDR types via fastxdr.
 // Response decoding uses TryFrom<Bytes>.
 
-#[allow(unused, non_camel_case_types, dead_code)]
+#[allow(unused, non_camel_case_types, dead_code, clippy::all, clippy::pedantic)]
 mod nfs_generated {
     include!(concat!(env!("OUT_DIR"), "/nfs_xdr.rs"));
 }
 
-#[allow(unused, non_camel_case_types, dead_code)]
+#[allow(unused, non_camel_case_types, dead_code, clippy::all, clippy::pedantic)]
 mod mount_generated {
     include!(concat!(env!("OUT_DIR"), "/mount_xdr.rs"));
 }
@@ -44,7 +44,6 @@ pub(crate) type entryplus3 = nfs_generated::xdr::entryplus3<Bytes>;
 pub(crate) type post_op_fh3 = nfs_generated::xdr::post_op_fh3<Bytes>;
 
 // Write stability enum.
-#[allow(non_camel_case_types)]
 pub(crate) use nfs_generated::xdr::stable_how;
 
 // Mount protocol types.

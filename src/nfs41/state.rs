@@ -48,12 +48,12 @@ impl AccessMode {
 
     /// Check if this mode covers (is compatible with) the requested mode.
     pub fn covers(&self, requested: AccessMode) -> bool {
-        match (self, requested) {
-            (AccessMode::Both, _) => true,
-            (AccessMode::Read, AccessMode::Read) => true,
-            (AccessMode::Write, AccessMode::Write) => true,
-            _ => false,
-        }
+        matches!(
+            (self, requested),
+            (AccessMode::Both, _)
+                | (AccessMode::Read, AccessMode::Read)
+                | (AccessMode::Write, AccessMode::Write)
+        )
     }
 
     /// Upgrade to cover both existing and requested access.

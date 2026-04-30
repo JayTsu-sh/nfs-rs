@@ -98,6 +98,25 @@ impl NfsError {
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, NfsError>;
 
+/// Convert NfsError back to std::io::Error for backward compatibility.
+impl From<NfsError> for std::io::Error {
+    fn from(e: NfsError) -> Self {
+        match e {
+            NfsError::Io(io) => io,
+            NfsError::Nfs3(code) => std::io::Error::other(code),
+            NfsError::Nfs4(code) => std::io::Error::other(code),
+            NfsError::Mount(code) => std::io::Error::other(code),
+            NfsError::Rpc(msg) => std::io::Error::other(msg),
+            NfsError::Xdr(msg) => std::io::Error::other(msg),
+            NfsError::Unsupported(msg) => std::io::Error::new(std::io::ErrorKind::Unsupported, msg),
+            NfsError::InvalidInput(msg) => std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
+            NfsError::RdattrError(code) => {
+                std::io::Error::other(format!("rdattr_error: nfsstat4 {}", code))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,24 +259,5 @@ mod tests {
         let nfs_err = NfsError::Io(original);
         let io_err: std::io::Error = nfs_err.into();
         assert_eq!(io_err.kind(), std::io::ErrorKind::BrokenPipe);
-    }
-}
-
-/// Convert NfsError back to std::io::Error for backward compatibility.
-impl From<NfsError> for std::io::Error {
-    fn from(e: NfsError) -> Self {
-        match e {
-            NfsError::Io(io) => io,
-            NfsError::Nfs3(code) => std::io::Error::new(std::io::ErrorKind::Other, code),
-            NfsError::Nfs4(code) => std::io::Error::new(std::io::ErrorKind::Other, code),
-            NfsError::Mount(code) => std::io::Error::new(std::io::ErrorKind::Other, code),
-            NfsError::Rpc(msg) => std::io::Error::new(std::io::ErrorKind::Other, msg),
-            NfsError::Xdr(msg) => std::io::Error::new(std::io::ErrorKind::Other, msg),
-            NfsError::Unsupported(msg) => std::io::Error::new(std::io::ErrorKind::Unsupported, msg),
-            NfsError::InvalidInput(msg) => std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
-            NfsError::RdattrError(code) => {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("rdattr_error: nfsstat4 {}", code))
-            }
-        }
     }
 }

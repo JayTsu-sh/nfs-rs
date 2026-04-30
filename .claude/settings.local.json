@@ -34,7 +34,12 @@
       "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/lib.rs\" \"C:/Jay/rust/nfs-rs/src/lib.rs\")",
       "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/mount.rs\" \"C:/Jay/rust/nfs-rs/src/mount.rs\")",
       "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/nfs3/mod.rs\" \"C:/Jay/rust/nfs-rs/src/nfs3/mod.rs\")",
-      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/nfs41/attrs.rs\" \"C:/Jay/rust/nfs-rs/src/nfs41/attrs.rs\")"
+      "Bash(cp \"C:/Jay/xxxx/nfs-rs/nfs-rs/src/nfs41/attrs.rs\" \"C:/Jay/rust/nfs-rs/src/nfs41/attrs.rs\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote:*)",
+      "Bash(awk:*)",
+      "Read(/tmp/**)"
     ]
   }
 }

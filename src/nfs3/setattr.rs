@@ -21,6 +21,7 @@ use super::{
 use bytes::Bytes;
 
 impl Mount {
+    #[allow(clippy::too_many_arguments)]
     pub async fn setattr_path(
         &self,
         path: &str,
@@ -44,6 +45,7 @@ impl Mount {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn setattr(
         &self,
         fh: Bytes,
@@ -58,10 +60,10 @@ impl Mount {
         let args = SETATTR3args {
             object: nfs_fh3 { data: fh },
             new_attributes: sattr3 {
-                mode: mode.map_or(set_mode3::default, |m| set_mode3::TRUE(m)),
-                uid: uid.map_or(set_uid3::default, |u| set_uid3::TRUE(u)),
-                gid: gid.map_or(set_gid3::default, |g| set_gid3::TRUE(g)),
-                size: size.map_or(set_size3::default, |s| set_size3::TRUE(s)),
+                mode: mode.map_or(set_mode3::default, set_mode3::TRUE),
+                uid: uid.map_or(set_uid3::default, set_uid3::TRUE),
+                gid: gid.map_or(set_gid3::default, set_gid3::TRUE),
+                size: size.map_or(set_size3::default, set_size3::TRUE),
                 atime: atime.map_or(set_atime::default, |a| {
                     set_atime::SET_TO_CLIENT_TIME(nfstime3_req {
                         seconds: a.seconds,

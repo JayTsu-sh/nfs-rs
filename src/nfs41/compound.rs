@@ -459,6 +459,7 @@ impl CompoundBuilder {
     /// LAYOUTGET: request a layout for parallel data access.
     /// layout_type: 1=LAYOUT4_NFSV4_1_FILES, 2=LAYOUT4_OSD2_OBJECTS, 3=LAYOUT4_BLOCK_VOLUME
     /// iomode: 1=LAYOUTIOMODE4_READ, 2=LAYOUTIOMODE4_RW
+    #[allow(clippy::too_many_arguments)]
     pub fn layoutget(
         mut self,
         signal_layout_avail: bool,
@@ -516,6 +517,7 @@ impl CompoundBuilder {
 
     /// LAYOUTRETURN: return a layout to the metadata server.
     /// return_type: 1=LAYOUTRETURN4_FILE, 2=LAYOUTRETURN4_FSID, 3=LAYOUTRETURN4_ALL
+    #[allow(clippy::too_many_arguments)]
     pub fn layoutreturn(
         mut self,
         reclaim: bool,
@@ -564,6 +566,7 @@ impl CompoundBuilder {
 
     /// LOCK: acquire a byte-range lock.
     /// lock_type: 1=READ_LT, 2=WRITE_LT, 3=READW_LT, 4=WRITEW_LT
+    #[allow(clippy::too_many_arguments)]
     pub fn lock(
         mut self,
         lock_type: u32,
@@ -920,11 +923,12 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
             skip_bitmap(buf)?;
         }
         // LOCK4denied: offset(8) + length(8) + locktype(4) + lock_owner4(clientid(8) + owner<>)
-        if opcode == OpNum::Lock as u32 && status == 10012 /* NFS4ERR_DENIED */ {
-            if buf.remaining() >= 28 {
-                buf.advance(28); // offset + length + locktype + clientid
-                skip_var_bytes(buf)?; // owner
-            }
+        if opcode == OpNum::Lock as u32
+            && status == 10012 /* NFS4ERR_DENIED */
+            && buf.remaining() >= 28
+        {
+            buf.advance(28); // offset + length + locktype + clientid
+            skip_var_bytes(buf)?; // owner
         }
         return Ok(());
     }

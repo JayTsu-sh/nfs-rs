@@ -417,28 +417,28 @@ impl XdrEncode for diropargs3 {
 }
 
 // sattr3 field types — match the old nfs3xdr.rs enums.
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum set_mode3 {
     TRUE(u32),
     default,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum set_uid3 {
     TRUE(u32),
     default,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum set_gid3 {
     TRUE(u32),
     default,
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum set_size3 {
     TRUE(u64),
@@ -546,7 +546,7 @@ impl XdrEncode for sattr3 {
     }
 }
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum sattrguard3 {
     TRUE(nfstime3_req),
@@ -581,7 +581,7 @@ impl XdrEncode for symlinkdata3 {
     }
 }
 
-#[allow(non_camel_case_types, dead_code)]
+#[allow(non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum createhow3 {
     UNCHECKED(sattr3),
