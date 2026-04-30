@@ -31,9 +31,35 @@ const DATA_TIMEOUT_BASE_SECS: u64 = 10;
 const MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 1_250_000;
 // Retry counts
 const NFS_RETRIES: usize = 10;
-// NFS4ERR_DELAY retry parameters
-pub(super) const DELAY_RETRY_MAX: usize = 5;
-pub(super) const DELAY_RETRY_BASE_MS: u64 = 100;
+// Equal-jitter exponential backoff for NFS4ERR_DELAY/GRACE retries.
+// Without jitter, concurrent workers (e.g. integrity-check parallel LOOKUPs)
+// resync to the same retry instant and sustain the thundering-herd that
+// triggered the error. Total expected DELAY wait across 17 attempts ≈ 46s
+// (max < 61s), covering observed 60+ s server-busy windows.
+pub(super) const DELAY_RETRY_MAX: usize = 16;
+const DELAY_RETRY_BASE_MS: u64 = 200;
+const DELAY_RETRY_CAP_MS: u64 = 5000;
+const GRACE_RETRY_BASE_MS: u64 = 1000;
+const GRACE_RETRY_CAP_MS: u64 = 8000;
+
+fn backoff_jitter_ms(attempt: usize, base_ms: u64, cap_ms: u64) -> u64 {
+    let base = base_ms
+        .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
+        .min(cap_ms);
+    let half = base / 2;
+    if half == 0 {
+        return base;
+    }
+    rand::random_range(half..base)
+}
+
+pub(super) fn delay_with_jitter_ms(attempt: usize) -> u64 {
+    backoff_jitter_ms(attempt, DELAY_RETRY_BASE_MS, DELAY_RETRY_CAP_MS)
+}
+
+pub(super) fn grace_with_jitter_ms(attempt: usize) -> u64 {
+    backoff_jitter_ms(attempt, GRACE_RETRY_BASE_MS, GRACE_RETRY_CAP_MS)
+}
 
 // SEQ4_STATUS flag constants (RFC 5661 §2.10.6.2)
 const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x0000_0001;
@@ -237,14 +263,14 @@ impl Mount41 {
             }
             match resp.check_status() {
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = DELAY_RETRY_BASE_MS * (1u64 << attempt);
-                    warn!(tag, attempt, delay_ms, "NFS4ERR_DELAY, retrying");
+                    let delay_ms = delay_with_jitter_ms(attempt);
+                    warn!(tag, attempt, delay_ms, "NFS4ERR_DELAY, retrying with jitter");
                     drop(slot);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = 1000 * (1u64 << attempt.min(3));
+                    let delay_ms = grace_with_jitter_ms(attempt);
                     warn!(tag, attempt, delay_ms, "NFS4ERR_GRACE, waiting for server grace period");
                     drop(slot);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1134,4 +1160,34 @@ pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {
     // skip_fattr4_inline, decode_entry_fattr4, encode_setattr) has been moved to
     // readdir.rs, setattr.rs, and state management helpers.
     // This replaces ~900 lines of inline implementations with ~90 lines of delegating code.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_lands_in_half_to_full_range() {
+        for _ in 0..200 {
+            let d = backoff_jitter_ms(0, 200, 5000);
+            assert!(d >= 100 && d < 200, "attempt=0 produced {} ms", d);
+        }
+    }
+
+    #[test]
+    fn jitter_caps_at_cap_ms() {
+        for _ in 0..200 {
+            let d = backoff_jitter_ms(20, 200, 5000);
+            assert!(d >= 2500 && d < 5000, "attempt=20 produced {} ms", d);
+        }
+    }
+
+    #[test]
+    fn jitter_does_not_panic_on_huge_attempt() {
+        // checked_shl + saturating_mul + min(cap) must absorb shifts past 63.
+        for attempt in [32usize, 63, 64, 100, usize::MAX] {
+            let d = backoff_jitter_ms(attempt, 200, 5000);
+            assert!(d > 0 && d < 5000, "attempt={} produced {}", attempt, d);
+        }
+    }
 }

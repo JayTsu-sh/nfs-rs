@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tracing::info;
 
 use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse};
-use super::mount::{DELAY_RETRY_BASE_MS, DELAY_RETRY_MAX};
+use super::mount::{delay_with_jitter_ms, grace_with_jitter_ms, DELAY_RETRY_MAX};
 use crate::error::{NfsError, Result};
 use crate::rpc;
 use crate::rpc::auth::Auth;
@@ -323,14 +323,14 @@ impl Session {
                         return Ok(session);
                     }
                     Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
-                        let delay_ms = DELAY_RETRY_BASE_MS * (1u64 << attempt);
-                        tracing::warn!(attempt, delay_ms, "RECLAIM_COMPLETE got NFS4ERR_DELAY, retrying");
+                        let delay_ms = delay_with_jitter_ms(attempt);
+                        tracing::warn!(attempt, delay_ms, "RECLAIM_COMPLETE got NFS4ERR_DELAY, retrying with jitter");
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
                     Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
                         // RFC 5661 §8.4.2.1: server is in grace period, wait and retry
-                        let delay_ms = 1000 * (1u64 << attempt.min(3));
+                        let delay_ms = grace_with_jitter_ms(attempt);
                         tracing::warn!(attempt, delay_ms, "RECLAIM_COMPLETE got NFS4ERR_GRACE, waiting for server grace period");
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
