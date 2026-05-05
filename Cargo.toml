@@ -28,6 +28,13 @@ socket2 = { version = "0.5", features = ["all"] }
 [build-dependencies]
 fastxdr = "=1.0.2"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "xdr_decode"
+harness = false
+
 [package.metadata.component]
 package = "component:nfs-rs"
 

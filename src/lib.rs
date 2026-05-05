@@ -207,6 +207,40 @@ pub use nfs41::Nfs4ErrorCode;
 #[cfg(target_os = "wasi")]
 pub use std::io::Error;
 
+// Decoder wrappers exposed solely for `benches/`. Not part of the stable API;
+// `#[doc(hidden)]` keeps it out of rustdoc. Internal XDR types stay private —
+// only `bytes::Bytes` and the public `NfsError` cross the boundary.
+#[doc(hidden)]
+pub mod __bench {
+    use crate::error::{NfsError, Result};
+    use crate::nfs3::fastxdr::{READ3resok, READDIRPLUS3resok, fattr3, post_op_attr};
+    use bytes::Bytes;
+
+    fn map_xdr_err<E: std::fmt::Display>(e: E) -> NfsError {
+        NfsError::Xdr(e.to_string())
+    }
+
+    /// Decode a single `fattr3` (84 wire bytes).
+    pub fn decode_fattr3(mut buf: Bytes) -> Result<()> {
+        fattr3::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+    }
+
+    /// Decode a `post_op_attr` (4-byte discriminant + optional `fattr3`).
+    pub fn decode_post_op_attr(mut buf: Bytes) -> Result<()> {
+        post_op_attr::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+    }
+
+    /// Decode a `READ3resok` (post_op_attr + count + eof + variable data slice).
+    pub fn decode_read3resok(mut buf: Bytes) -> Result<()> {
+        READ3resok::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+    }
+
+    /// Decode a `READDIRPLUS3resok` page (variable number of entries).
+    pub fn decode_readdirplus3resok(mut buf: Bytes) -> Result<()> {
+        READDIRPLUS3resok::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+    }
+}
+
 use rpc::auth::Auth;
 use tracing::{debug, info, trace, warn};
 use url::Url;
