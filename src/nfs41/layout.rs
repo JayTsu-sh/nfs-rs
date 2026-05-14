@@ -107,21 +107,28 @@ pub(crate) struct LayoutManager {
     data_servers: RwLock<HashMap<SocketAddr, rpc::Client>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], DeviceInfo>>,
+    /// Whether to use ephemeral (non-privileged) source ports for DS connections.
+    noresvport: bool,
 }
 
 impl LayoutManager {
-    pub fn new() -> Self {
+    pub fn new(noresvport: bool) -> Self {
         Self {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
+            noresvport,
         }
     }
 
     /// Store a layout for a file.
     pub async fn store_layout(&self, fh: &Bytes, layout: Layout) {
         let mut map = self.layouts.write().await;
-        debug!(fh_len = fh.len(), segments = layout.segments.len(), "layout stored");
+        debug!(
+            fh_len = fh.len(),
+            segments = layout.segments.len(),
+            "layout stored"
+        );
         map.insert(fh.clone(), layout);
     }
 
@@ -178,7 +185,7 @@ impl LayoutManager {
             }
         }
         // TCP connect OUTSIDE any lock — can be slow without stalling other I/O
-        let mux = rpc::StreamMux::connect(addr).await?;
+        let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
         let new_client = rpc::Client::new(mux, None);
         // Acquire write lock and re-check (another task may have connected concurrently)
         let mut servers = self.data_servers.write().await;
@@ -195,7 +202,9 @@ impl LayoutManager {
 /// Decode a LAYOUTGET response into a Layout.
 pub(crate) fn decode_layoutget_response(data: &mut Bytes) -> Result<Layout> {
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("LAYOUTGET return_on_close truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "LAYOUTGET return_on_close truncated".to_string(),
+        ));
     }
     let return_on_close = data.get_u32() != 0;
 
@@ -208,17 +217,24 @@ pub(crate) fn decode_layoutget_response(data: &mut Bytes) -> Result<Layout> {
 
     // layout4<>: array of layout segments
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("LAYOUTGET segments array truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "LAYOUTGET segments array truncated".to_string(),
+        ));
     }
     let num_segments = data.get_u32() as usize;
     if num_segments > 1024 {
-        return Err(NfsError::Xdr(format!("LAYOUTGET has {} segments, max 1024", num_segments)));
+        return Err(NfsError::Xdr(format!(
+            "LAYOUTGET has {} segments, max 1024",
+            num_segments
+        )));
     }
     let mut segments = Vec::with_capacity(num_segments);
 
     for _ in 0..num_segments {
         if data.remaining() < 24 {
-            return Err(NfsError::Xdr("layout4 segment header truncated".to_string()));
+            return Err(NfsError::Xdr(
+                "layout4 segment header truncated".to_string(),
+            ));
         }
         let offset = data.get_u64();
         let length = data.get_u64();
@@ -293,23 +309,32 @@ fn decode_files_layout(data: &mut Bytes) -> Result<LayoutContent> {
 
     // nfl_first_stripe_index: uint32
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("files_layout first_stripe_index truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "files_layout first_stripe_index truncated".to_string(),
+        ));
     }
     let first_stripe_index = data.get_u32();
 
     // nfl_pattern_offset: offset4 (uint64)
     if data.remaining() < 8 {
-        return Err(NfsError::Xdr("files_layout pattern_offset truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "files_layout pattern_offset truncated".to_string(),
+        ));
     }
     let pattern_offset = data.get_u64();
 
     // nfl_fh_list: nfs_fh4<>
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("files_layout fh_list length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "files_layout fh_list length truncated".to_string(),
+        ));
     }
     let num_fhs = data.get_u32() as usize;
     if num_fhs > 4096 {
-        return Err(NfsError::Xdr(format!("files_layout has {} FHs, max 4096", num_fhs)));
+        return Err(NfsError::Xdr(format!(
+            "files_layout has {} FHs, max 4096",
+            num_fhs
+        )));
     }
     let mut fh_list = Vec::with_capacity(num_fhs);
     for _ in 0..num_fhs {
@@ -499,7 +524,9 @@ fn read_xdr_string(data: &mut Bytes) -> Result<String> {
 pub(crate) fn decode_getdeviceinfo_response(data: &mut Bytes) -> Result<DeviceInfo> {
     // device_addr4: layout_type (uint32) + da_addr_body (opaque<>)
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("GETDEVICEINFO layout_type truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETDEVICEINFO layout_type truncated".to_string(),
+        ));
     }
     let layout_type = data.get_u32();
     if layout_type != 1 {
@@ -511,12 +538,16 @@ pub(crate) fn decode_getdeviceinfo_response(data: &mut Bytes) -> Result<DeviceIn
 
     // da_addr_body: opaque<>
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("GETDEVICEINFO da_addr_body length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETDEVICEINFO da_addr_body length truncated".to_string(),
+        ));
     }
     let body_len = data.get_u32() as usize;
     let padded = (body_len + 3) & !3;
     if data.remaining() < padded {
-        return Err(NfsError::Xdr("GETDEVICEINFO da_addr_body truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETDEVICEINFO da_addr_body truncated".to_string(),
+        ));
     }
     let mut body = data.split_to(body_len);
     let pad = padded - body_len;
@@ -527,7 +558,9 @@ pub(crate) fn decode_getdeviceinfo_response(data: &mut Bytes) -> Result<DeviceIn
     // nfsv4_1_file_layout_ds_addr4:
     // stripe_indices: uint32<>
     if body.remaining() < 4 {
-        return Err(NfsError::Xdr("GETDEVICEINFO stripe_indices length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETDEVICEINFO stripe_indices length truncated".to_string(),
+        ));
     }
     let num_indices = body.get_u32() as usize;
     if num_indices > 4096 {
@@ -537,7 +570,9 @@ pub(crate) fn decode_getdeviceinfo_response(data: &mut Bytes) -> Result<DeviceIn
         )));
     }
     if body.remaining() < num_indices * 4 {
-        return Err(NfsError::Xdr("GETDEVICEINFO stripe_indices data truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETDEVICEINFO stripe_indices data truncated".to_string(),
+        ));
     }
     let mut stripe_indices = Vec::with_capacity(num_indices);
     for _ in 0..num_indices {
@@ -583,19 +618,26 @@ pub(crate) fn decode_getdeviceinfo_response(data: &mut Bytes) -> Result<DeviceIn
         ds_addrs.push(addrs);
     }
 
-    Ok(DeviceInfo { stripe_indices, ds_addrs })
+    Ok(DeviceInfo {
+        stripe_indices,
+        ds_addrs,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn put_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_be_bytes()); }
-    fn put_u64(buf: &mut Vec<u8>, v: u64) { buf.extend_from_slice(&v.to_be_bytes()); }
+    fn put_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn put_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
 
     #[tokio::test]
     async fn layout_manager_store_and_get() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file1");
         let layout = Layout {
             stateid: [1u8; 16],
@@ -610,9 +652,17 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_remove() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file2");
-        mgr.store_layout(&fh, Layout { stateid: [2u8; 16], return_on_close: false, segments: vec![] }).await;
+        mgr.store_layout(
+            &fh,
+            Layout {
+                stateid: [2u8; 16],
+                return_on_close: false,
+                segments: vec![],
+            },
+        )
+        .await;
         let removed = mgr.remove_layout(&fh).await;
         assert!(removed.is_some());
         assert!(mgr.get_layout(&fh).await.is_none());
@@ -620,9 +670,25 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_clear() {
-        let mgr = LayoutManager::new();
-        mgr.store_layout(&Bytes::from_static(b"a"), Layout { stateid: [0u8; 16], return_on_close: false, segments: vec![] }).await;
-        mgr.store_layout(&Bytes::from_static(b"b"), Layout { stateid: [0u8; 16], return_on_close: false, segments: vec![] }).await;
+        let mgr = LayoutManager::new(false);
+        mgr.store_layout(
+            &Bytes::from_static(b"a"),
+            Layout {
+                stateid: [0u8; 16],
+                return_on_close: false,
+                segments: vec![],
+            },
+        )
+        .await;
+        mgr.store_layout(
+            &Bytes::from_static(b"b"),
+            Layout {
+                stateid: [0u8; 16],
+                return_on_close: false,
+                segments: vec![],
+            },
+        )
+        .await;
         mgr.clear().await;
         assert!(mgr.get_layout(&Bytes::from_static(b"a")).await.is_none());
         assert!(mgr.get_layout(&Bytes::from_static(b"b")).await.is_none());
@@ -648,12 +714,12 @@ mod tests {
         put_u32(&mut buf, 0); // return_on_close = false
         buf.extend_from_slice(&[7u8; 16]); // stateid
         put_u32(&mut buf, 1); // 1 segment
-        // segment: offset(8) + length(8) + iomode(4) + layout_type(4)
+                              // segment: offset(8) + length(8) + iomode(4) + layout_type(4)
         put_u64(&mut buf, 0); // offset
         put_u64(&mut buf, 0xFFFFFFFFFFFFFFFF); // length = whole file
         put_u32(&mut buf, 2); // iomode = RW
         put_u32(&mut buf, 2); // LayoutType::Osd2Objects → Opaque content
-        // layout_content: opaque (must be padded to 4-byte boundary)
+                              // layout_content: opaque (must be padded to 4-byte boundary)
         let content = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
         put_u32(&mut buf, content.len() as u32);
         buf.extend_from_slice(&content);
@@ -662,7 +728,10 @@ mod tests {
         let layout = decode_layoutget_response(&mut bytes).unwrap();
         assert_eq!(layout.segments.len(), 1);
         assert_eq!(layout.segments[0].iomode, IoMode::ReadWrite);
-        assert!(matches!(layout.segments[0].content, LayoutContent::Opaque(_)));
+        assert!(matches!(
+            layout.segments[0].content,
+            LayoutContent::Opaque(_)
+        ));
     }
 
     #[test]
@@ -673,7 +742,7 @@ mod tests {
         put_u32(&mut buf, 0); // first_stripe_index
         put_u64(&mut buf, 0); // pattern_offset
         put_u32(&mut buf, 2); // 2 file handles
-        // fh1: 4 bytes
+                              // fh1: 4 bytes
         put_u32(&mut buf, 4);
         buf.extend_from_slice(&[1, 2, 3, 4]);
         // fh2: 4 bytes
@@ -683,7 +752,14 @@ mod tests {
         let mut bytes = Bytes::from(buf);
         let content = decode_files_layout(&mut bytes).unwrap();
         match content {
-            LayoutContent::FilesLayout { device_id, stripe_unit, is_dense, first_stripe_index, pattern_offset, fh_list } => {
+            LayoutContent::FilesLayout {
+                device_id,
+                stripe_unit,
+                is_dense,
+                first_stripe_index,
+                pattern_offset,
+                fh_list,
+            } => {
                 assert_eq!(device_id, [0xAAu8; 16]);
                 assert_eq!(stripe_unit, 65536);
                 assert!(!is_dense);
@@ -721,7 +797,7 @@ mod tests {
     fn decode_files_layout_dense_flag() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0xBBu8; 16]); // device_id
-        // nfl_util with dense flag (bit 30) set + stripe_unit = 4096
+                                              // nfl_util with dense flag (bit 30) set + stripe_unit = 4096
         let nfl_util: u32 = 0x4000_0000 | 4096;
         put_u32(&mut buf, nfl_util);
         put_u32(&mut buf, 2); // first_stripe_index
@@ -733,7 +809,13 @@ mod tests {
         let mut bytes = Bytes::from(buf);
         let content = decode_files_layout(&mut bytes).unwrap();
         match content {
-            LayoutContent::FilesLayout { stripe_unit, is_dense, first_stripe_index, pattern_offset, .. } => {
+            LayoutContent::FilesLayout {
+                stripe_unit,
+                is_dense,
+                first_stripe_index,
+                pattern_offset,
+                ..
+            } => {
                 assert_eq!(stripe_unit, 4096);
                 assert!(is_dense);
                 assert_eq!(first_stripe_index, 2);
@@ -745,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cache_store_and_get() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let dev_id = [0xCCu8; 16];
         let info = DeviceInfo {
             stripe_indices: vec![0],
@@ -756,14 +838,24 @@ mod tests {
         assert!(got.is_some());
         let got = got.unwrap();
         assert_eq!(got.ds_addrs.len(), 1);
-        assert_eq!(got.ds_addrs[0][0], "10.0.0.1:2049".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            got.ds_addrs[0][0],
+            "10.0.0.1:2049".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn device_cache_cleared_on_clear() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let dev_id = [0xDDu8; 16];
-        mgr.store_device(dev_id, DeviceInfo { stripe_indices: vec![], ds_addrs: vec![] }).await;
+        mgr.store_device(
+            dev_id,
+            DeviceInfo {
+                stripe_indices: vec![],
+                ds_addrs: vec![],
+            },
+        )
+        .await;
         mgr.clear().await;
         assert!(mgr.get_device(&dev_id).await.is_none());
     }
@@ -774,14 +866,20 @@ mod tests {
     fn test_parse_netaddr4_basic() {
         // 192.168.1.1 port 2049: 2049 = 8*256 + 1
         let addr = parse_netaddr4("tcp", "192.168.1.1.8.1").unwrap();
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 2049));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 2049)
+        );
     }
 
     #[test]
     fn test_parse_netaddr4_high_port() {
         // 10.0.0.1 port 8080: 8080 = 31*256 + 144
         let addr = parse_netaddr4("tcp", "10.0.0.1.31.144").unwrap();
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080)
+        );
     }
 
     #[test]
@@ -979,7 +1077,7 @@ mod tests {
         put_u32(&mut body, 1);
         put_xdr_string(&mut body, "tcp");
         put_xdr_string(&mut body, "10.0.0.1.8.1"); // 10.0.0.1:2049
-        // DS 1: 2 addresses (multipath)
+                                                   // DS 1: 2 addresses (multipath)
         put_u32(&mut body, 2);
         put_xdr_string(&mut body, "tcp");
         put_xdr_string(&mut body, "10.0.0.2.8.1"); // 10.0.0.2:2049
@@ -998,8 +1096,14 @@ mod tests {
         assert_eq!(info.ds_addrs.len(), 2);
         assert_eq!(info.ds_addrs[0].len(), 1);
         assert_eq!(info.ds_addrs[1].len(), 2);
-        assert_eq!(info.ds_addrs[1][0], SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2049));
-        assert_eq!(info.ds_addrs[1][1], SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 2049));
+        assert_eq!(
+            info.ds_addrs[1][0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2049)
+        );
+        assert_eq!(
+            info.ds_addrs[1][1],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), 2049)
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ use tokio::net::{TcpStream, TcpSocket};
 #[cfg(target_os = "wasi")]
 use wasi_ext::{SocketAddr, TcpStream, ToSocketAddrs};
 
-pub(crate) async fn connect_to_target(addr: &SocketAddr) -> Result<TcpStream> {
+pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Result<TcpStream> {
     // Bind to a random privileged port (< 1024), required by some NFS servers.
     // Exclude well-known service ports to avoid conflicts.
     const WELL_KNOWN_PORTS: &[u16] = &[
@@ -109,15 +109,45 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr) -> Result<TcpStream> {
         993,  // imaps
         995,  // pop3s
     ];
-    // 预计算可用端口列表（1-1023 排除已知端口），约 960 个可用
-    let available_ports: Vec<u16> = (1..1024u16)
-        .filter(|p| !WELL_KNOWN_PORTS.contains(p))
-        .collect();
     let local_addr_base = if addr.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     } else {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     };
+    // noresvport=true: 让 OS 选临时端口（Windows ~49152-65535, Linux ~32768-60999）。
+    // 避开 ~960 个特权端口的耗尽问题，要求 server 端启用 insecure（NFSv3 export 选项）。
+    if noresvport {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        socket.bind(local_addr_base)?;
+        let stream = socket.connect(*addr).await?;
+        stream.set_nodelay(true)?;
+        const KEEPALIVE_TIME_SECS: u64 = 30;
+        const KEEPALIVE_INTERVAL_SECS: u64 = 5;
+        #[cfg(target_os = "linux")]
+        const KEEPALIVE_RETRIES: u32 = 3;
+        let sock_ref = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(KEEPALIVE_TIME_SECS))
+            .with_interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+        #[cfg(target_os = "linux")]
+        let keepalive = keepalive.with_retries(KEEPALIVE_RETRIES);
+        sock_ref.set_tcp_keepalive(&keepalive)?;
+        info!(
+            addr = %addr,
+            local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0),
+            "TCP connection established (ephemeral source port, noresvport)"
+        );
+        return Ok(stream);
+    }
+    // 预计算可用端口列表（1-1023 排除已知端口），约 960 个可用
+    let available_ports: Vec<u16> = (1..1024u16)
+        .filter(|p| !WELL_KNOWN_PORTS.contains(p))
+        .collect();
     // 外层循环：bind + connect 整体重试。
     // Windows 上 SO_REUSEADDR 允许 bind() 成功即使端口已被占用（TIME_WAIT 或其他
     // SO_REUSEADDR socket），冲突要到 connect() 时才以 WSAEADDRINUSE 暴露。
@@ -258,6 +288,7 @@ struct MountArgs {
     maxcount: u32,
     rsize: u32,
     wsize: u32,
+    noresvport: bool,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -387,6 +418,12 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         txsize_def,
         "specified URL contains bad max write size value",
     )?;
+    let noresvport = get_url_query_param(
+        &parsed_url,
+        "noresvport",
+        false,
+        "specified URL contains bad noresvport value",
+    )?;
     let host = parsed_url.host_str().unwrap_or_default().to_string();
     Ok(MountArgs {
         versions,
@@ -400,6 +437,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         maxcount,
         rsize,
         wsize,
+        noresvport,
     })
 }
 
@@ -850,6 +888,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -871,6 +910,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -892,6 +932,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1037,5 +1078,75 @@ mod tests {
         let (dir, name) = res.unwrap();
         assert_eq!(dir, "/first/place".to_string());
         assert_eq!(name, "1999.txt".to_string());
+    }
+
+    #[test]
+    fn parse_url_noresvport_true() {
+        let args = parse_url("nfs://127.0.0.1/some/export?noresvport=true").unwrap();
+        assert!(args.noresvport, "noresvport=true should parse to true");
+    }
+
+    #[test]
+    fn parse_url_noresvport_default_false() {
+        let args = parse_url("nfs://127.0.0.1/some/export").unwrap();
+        assert!(!args.noresvport, "default should be false (preserve legacy privileged-port behavior)");
+    }
+
+    #[test]
+    fn parse_url_noresvport_explicit_false() {
+        let args = parse_url("nfs://127.0.0.1/some/export?noresvport=false").unwrap();
+        assert!(!args.noresvport, "noresvport=false should parse to false");
+    }
+
+    #[test]
+    fn parse_url_with_bad_noresvport() {
+        let res = parse_url("nfs://127.0.0.1/some/export?noresvport=yes");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad noresvport value"));
+    }
+
+    #[tokio::test]
+    async fn connect_to_target_ephemeral_when_noresvport_true() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accept_handle = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            (stream, peer)
+        });
+        let stream = connect_to_target(&listen_addr, true).await.unwrap();
+        let local_port = stream.local_addr().unwrap().port();
+        assert!(
+            local_port >= 1024,
+            "with noresvport=true, source port {} must be ephemeral (>=1024)",
+            local_port
+        );
+        let _ = accept_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_to_target_privileged_when_noresvport_false() {
+        // 探测：本机是否允许绑特权端口（Unix root / Windows admin）。
+        // 没有权限时直接跳过，避免在无特权 CI 上误报 false negative。
+        let probe = if let Ok(s) = tokio::net::TcpSocket::new_v4() {
+            s.bind("127.0.0.1:1".parse().unwrap()).is_ok()
+        } else {
+            false
+        };
+        if !probe {
+            eprintln!("skipping: insufficient privilege to bind <1024");
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let accept_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = connect_to_target(&listen_addr, false).await.unwrap();
+        let local_port = stream.local_addr().unwrap().port();
+        assert!(
+            (1..1024).contains(&local_port),
+            "with noresvport=false, source port {} must be privileged (1-1023)",
+            local_port
+        );
+        let _ = accept_handle.await.unwrap();
     }
 }

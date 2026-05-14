@@ -60,6 +60,13 @@ Arguments supported are:
   bytes the server should use to retrieve the entry names and maxcount is the
   maximum size of the response buffer (including attributes).  If only one <count>
   is given it will be used for both.  Default is 8192 for both.
+* `noresvport=<true|false>`
+  * When `false` (default), source port is bound below 1024 (RFC 1813 secure-port
+  convention); the client retries up to 200 times to find a free port. When `true`,
+  the OS picks an ephemeral source port (~16K range), which avoids privileged-port
+  exhaustion under high-concurrency mounts. Equivalent to the Linux `mount.nfs`
+  `noresvport` option. The NFS server must accept non-privileged source ports (i.e.
+  be exported with the `insecure` option on Linux).
 
 ## Limitations
 
@@ -68,10 +75,11 @@ similar to [go-nfs-client](https://github.com/willscott/go-nfs-client) but with 
 NFSv3 procedures implemented ([go-nfs-client](https://github.com/willscott/go-nfs-client) 
 omits some procedures, probably due to them being rarely used features of NFS).
 
-One thing that [go-nfs-client](https://github.com/willscott/go-nfs-client) does, 
-but this rust implementation does not do, is to attempt connecting from a privileged 
-port (i.e. binding source port to a port that is lower than 1024). 
-This is due to rust's `std::net` crate not offering a way to do this.
+By default this rust implementation binds a privileged source port (1-1023) like
+[go-nfs-client](https://github.com/willscott/go-nfs-client). Set `?noresvport=true`
+in the URL to use an ephemeral source port instead — needed under high-concurrency
+mount workloads on platforms with small privileged-port pools (e.g., Windows where
+TIME_WAIT accumulation can exhaust the ~960 available privileged ports).
 
 ## License
 
