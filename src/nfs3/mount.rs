@@ -14,18 +14,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{MOUNT_RETRIES, METADATA_TIMEOUT};
+use super::{METADATA_TIMEOUT, MOUNT_RETRIES};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 
-use super::{encode_dirpath, export::decode_exports, mount_mountstat3, mountres3_ok, rpc_header, Mount, MountProc3, ObjRes, Time};
-use crate::{
-    nfs3, rpc, NFSVersion, SocketAddr, ToSocketAddrs,
+use super::{
+    encode_dirpath, export::decode_exports, mount_mountstat3, mountres3_ok, rpc_header, Mount,
+    MountProc3, ObjRes, Time,
 };
 use crate::error::{NfsError, Result};
+use crate::{nfs3, rpc, NFSVersion, SocketAddr, ToSocketAddrs};
 
 #[derive(Debug)]
 struct Mount3 {
@@ -199,7 +200,9 @@ impl crate::Mount for Mount3 {
         to_dir_fh: Bytes,
         to_filename: &str,
     ) -> Result<()> {
-        self.m.rename(from_dir_fh, from_filename, to_dir_fh, to_filename).await
+        self.m
+            .rename(from_dir_fh, from_filename, to_dir_fh, to_filename)
+            .await
     }
 
     async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
@@ -234,9 +237,7 @@ async fn ensure_port(
     rpc::portmap(addrs, prog, vers, auth, max_retries, noresvport).await
 }
 
-pub(crate) async fn mount(
-    args: &crate::MountArgs,
-) -> Result<Box<dyn crate::Mount>> {
+pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
     // start by resolving host address and assigning portmapper port to each resolved address
     let addrs: Vec<SocketAddr> = (args.host.as_str(), rpc::PORTMAP_PORT)
         .to_socket_addrs()?
@@ -245,8 +246,24 @@ pub(crate) async fn mount(
     let auth = crate::Auth::new_unix("nfs-rs", args.uid, args.gid);
     // Run both portmapper queries concurrently — they are independent TCP connections.
     let (nfsport, mountport) = tokio::try_join!(
-        ensure_port(&addrs, args.nfsport, rpc::NFS_PROG, rpc::NFS3_VERSION, &auth, MOUNT_RETRIES, args.noresvport),
-        ensure_port(&addrs, args.mountport, rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, &auth, MOUNT_RETRIES, args.noresvport),
+        ensure_port(
+            &addrs,
+            args.nfsport,
+            rpc::NFS_PROG,
+            rpc::NFS3_VERSION,
+            &auth,
+            MOUNT_RETRIES,
+            args.noresvport
+        ),
+        ensure_port(
+            &addrs,
+            args.mountport,
+            rpc::MOUNT_PROG,
+            rpc::MOUNT3_VERSION,
+            &auth,
+            MOUNT_RETRIES,
+            args.noresvport
+        ),
     )?;
     info!(nfsport, mountport, "ports resolved");
     for mut addr in addrs {
@@ -297,14 +314,13 @@ async fn mount_on_addr(
     encode_dirpath(&mut buf, dir.trim_end_matches('/'));
     // Mount phase: use small retry count for fast failure detection.
     let mut bytes = client.call(buf, MOUNT_RETRIES, METADATA_TIMEOUT).await?;
-    let status = mount_mountstat3::try_from(&mut bytes)
-        .map_err(|e| NfsError::Xdr(e.to_string()))?;
+    let status =
+        mount_mountstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
     match status {
         mount_mountstat3::MNT3_OK => {}
         e => return Err(NfsError::Mount(e)),
     }
-    let ok = mountres3_ok::try_from(&mut bytes)
-        .map_err(|e| NfsError::Xdr(e.to_string()))?;
+    let ok = mountres3_ok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
     let fh = ok.fhandle.0;
     info!(addr = %addr, dirpath = %args.dirpath, fh_len = fh.len(), "MOUNT MNT succeeded, got root file handle");
 
@@ -378,8 +394,13 @@ async fn query_exports_on_addr(
     let mux = rpc::StreamMux::connect(*addr, noresvport).await?;
     let client = rpc::Client::new(mux, None);
     let mut buf = Vec::with_capacity(128);
-    rpc_header(rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, MountProc3::Export as u32, auth)
-        .encode(&mut buf);
+    rpc_header(
+        rpc::MOUNT_PROG,
+        rpc::MOUNT3_VERSION,
+        MountProc3::Export as u32,
+        auth,
+    )
+    .encode(&mut buf);
     let mut bytes = client.call(buf, max_retries, METADATA_TIMEOUT).await?;
     decode_exports(&mut bytes)
 }

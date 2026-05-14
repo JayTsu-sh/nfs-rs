@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::delegation::DelegationManager;
-use super::layout::LayoutManager;
 use super::fastxdr::nfsstat4;
+use super::layout::LayoutManager;
 use super::lease::LeaseRenewal;
 use super::session::{ClientIdentity, Session, SessionHolder};
 use super::state::StateManager;
@@ -130,7 +130,10 @@ impl Mount41 {
         }
 
         if flags & SEQ4_STATUS_STATE_REVOKED != 0 {
-            warn!(flags, "server revoked state — clearing open/delegation state");
+            warn!(
+                flags,
+                "server revoked state — clearing open/delegation state"
+            );
             self.state.clear().await;
             let _ = self.delegations.return_all().await;
         }
@@ -198,7 +201,8 @@ impl Mount41 {
         tag: &str,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, METADATA_TIMEOUT, None, &build_ops).await
+        self.compound_inner(tag, METADATA_TIMEOUT, None, &build_ops)
+            .await
     }
 
     /// Send a COMPOUND with SEQUENCE (data-transfer timeout scaled by payload size).
@@ -208,7 +212,8 @@ impl Mount41 {
         data_size: usize,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, data_timeout(data_size), None, &build_ops).await
+        self.compound_inner(tag, data_timeout(data_size), None, &build_ops)
+            .await
     }
 
     /// Send a COMPOUND with SEQUENCE for writes, using zero-copy data transfer.
@@ -219,7 +224,8 @@ impl Mount41 {
         data: bytes::Bytes,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, data_timeout(data.len()), Some(data), &build_ops).await
+        self.compound_inner(tag, data_timeout(data.len()), Some(data), &build_ops)
+            .await
     }
 
     /// Unified COMPOUND execution with retry/recovery logic.
@@ -236,20 +242,21 @@ impl Mount41 {
             let slot = sess.acquire_slot().await?;
 
             let seq_id = slot.current_sequence_id();
-            let builder = CompoundBuilder::new(tag)
-                .sequence(
-                    sess.id(),
-                    seq_id,
-                    slot.slot_id,
-                    sess.highest_slot_id(),
-                    false,
-                );
+            let builder = CompoundBuilder::new(tag).sequence(
+                sess.id(),
+                seq_id,
+                slot.slot_id,
+                sess.highest_slot_id(),
+                false,
+            );
             let builder = build_ops(builder);
             let mut buf = Vec::new();
             builder.encode_with_header(&self.auth, &mut buf);
 
             let response_bytes = if let Some(ref data) = write_data {
-                self.rpc.call_with_data(buf, data.clone(), NFS_RETRIES, timeout).await?
+                self.rpc
+                    .call_with_data(buf, data.clone(), NFS_RETRIES, timeout)
+                    .await?
             } else {
                 self.rpc.call(buf, NFS_RETRIES, timeout).await?
             };
@@ -309,7 +316,9 @@ impl Mount41 {
             }
             return Ok(resp);
         }
-        Err(NfsError::Rpc("NFS4ERR_DELAY/GRACE retry exhausted".to_string()))
+        Err(NfsError::Rpc(
+            "NFS4ERR_DELAY/GRACE retry exhausted".to_string(),
+        ))
     }
 
     /// Send a COMPOUND to a pNFS data server without SEQUENCE.
@@ -345,7 +354,9 @@ impl Mount41 {
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data.len());
-        let response_bytes = ds_client.call_with_data(buf, data, NFS_RETRIES, timeout).await?;
+        let response_bytes = ds_client
+            .call_with_data(buf, data, NFS_RETRIES, timeout)
+            .await?;
         let resp = CompoundResponse::decode(response_bytes)?;
         resp.check_status()?;
         Ok(resp)
@@ -373,13 +384,17 @@ impl std::fmt::Debug for Mount41 {
 // ─── Mount entry point ──────────────────────────────────────────────────────
 
 pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
-    let nfsport = if args.nfsport != 0 { args.nfsport } else { NFS4_DEFAULT_PORT };
+    let nfsport = if args.nfsport != 0 {
+        args.nfsport
+    } else {
+        NFS4_DEFAULT_PORT
+    };
     // Use tokio async DNS to avoid blocking the worker thread (H8)
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(
-        format!("{}:{}", args.host, nfsport)
-    ).await
-        .map_err(NfsError::Io)?
-        .collect();
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host(format!("{}:{}", args.host, nfsport))
+            .await
+            .map_err(NfsError::Io)?
+            .collect();
     debug!(host = %args.host, port = nfsport, addr_count = addrs.len(), "resolved NFSv4.1 server addresses");
 
     let auth = Auth::new_unix("nfs-rs", args.uid, args.gid);
@@ -393,7 +408,9 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
             }
         }
     }
-    Err(NfsError::Rpc("NFSv4.1 mount failed on all addresses".to_string()))
+    Err(NfsError::Rpc(
+        "NFSv4.1 mount failed on all addresses".to_string(),
+    ))
 }
 
 async fn mount_on_addr(
@@ -416,13 +433,20 @@ async fn mount_on_addr(
 
     // 3. Navigate to export path: PUTROOTFH + LOOKUP*n + GETFH
     let root_fh = navigate_to_export(&client, &session, auth, &args.dirpath).await?;
-    info!(fh_len = root_fh.len(), "navigated to export, got root file handle");
+    info!(
+        fh_len = root_fh.len(),
+        "navigated to export, got root file handle"
+    );
 
     // 4. Get filesystem limits via GETATTR
-    let (rsize, wsize, renewal_interval) = get_fs_limits(
-        &client, &session, auth, &root_fh, args.rsize, args.wsize,
-    ).await?;
-    info!(rsize, wsize, renewal_secs = renewal_interval.as_secs(), "negotiated transfer sizes");
+    let (rsize, wsize, renewal_interval) =
+        get_fs_limits(&client, &session, auth, &root_fh, args.rsize, args.wsize).await?;
+    info!(
+        rsize,
+        wsize,
+        renewal_secs = renewal_interval.as_secs(),
+        "negotiated transfer sizes"
+    );
 
     let delegations = Arc::new(DelegationManager::new());
     let layout_manager = Arc::new(LayoutManager::new(args.noresvport));
@@ -439,7 +463,8 @@ async fn mount_on_addr(
             match client.call(bcts_buf, 1, METADATA_TIMEOUT).await {
                 Ok(resp_bytes) => {
                     if let Ok(resp) = CompoundResponse::decode(resp_bytes) {
-                        match resp.op_ok(0) { // op[0] = BIND_CONN_TO_SESSION
+                        match resp.op_ok(0) {
+                            // op[0] = BIND_CONN_TO_SESSION
                             Ok(op) => {
                                 // RFC 5661 §18.34.3: validate server echoes back our session ID.
                                 let mut d = op.data.clone();
@@ -449,14 +474,23 @@ async fn mount_on_addr(
                                     if &confirmed_sid != session.id() {
                                         warn!(cb_port = cb.port, "BIND_CONN_TO_SESSION: server returned mismatched session ID");
                                     } else {
-                                        info!(cb_port = cb.port, "backchannel bound via BIND_CONN_TO_SESSION");
+                                        info!(
+                                            cb_port = cb.port,
+                                            "backchannel bound via BIND_CONN_TO_SESSION"
+                                        );
                                     }
                                 } else {
-                                    info!(cb_port = cb.port, "backchannel bound via BIND_CONN_TO_SESSION");
+                                    info!(
+                                        cb_port = cb.port,
+                                        "backchannel bound via BIND_CONN_TO_SESSION"
+                                    );
                                 }
                             }
                             Err(_) => {
-                                warn!(cb_port = cb.port, "BIND_CONN_TO_SESSION succeeded but op result failed");
+                                warn!(
+                                    cb_port = cb.port,
+                                    "BIND_CONN_TO_SESSION succeeded but op result failed"
+                                );
                             }
                         }
                     }
@@ -481,7 +515,14 @@ async fn mount_on_addr(
         let auth_clone = auth.clone();
         let session_holder_clone = session_holder.clone();
         Some(tokio::spawn(async move {
-            handle_recalls(recall_rx, delegations_clone, rpc_clone, auth_clone, session_holder_clone).await;
+            handle_recalls(
+                recall_rx,
+                delegations_clone,
+                rpc_clone,
+                auth_clone,
+                session_holder_clone,
+            )
+            .await;
         }))
     } else {
         None
@@ -546,7 +587,10 @@ async fn handle_recalls(
                     match rpc.call(buf, 1, METADATA_TIMEOUT).await {
                         Ok(_) => {
                             slot.advance();
-                            debug!(fh_len = notification.fh.len(), "DELEGRETURN sent for recalled delegation");
+                            debug!(
+                                fh_len = notification.fh.len(),
+                                "DELEGRETURN sent for recalled delegation"
+                            );
                         }
                         Err(e) => {
                             warn!(error = %e, "DELEGRETURN failed");
@@ -581,9 +625,7 @@ async fn navigate_to_export(
         .putrootfh();
 
     // Split path into components and add LOOKUP for each
-    let components: Vec<&str> = dirpath.split('/')
-        .filter(|c| !c.is_empty())
-        .collect();
+    let components: Vec<&str> = dirpath.split('/').filter(|c| !c.is_empty()).collect();
     for component in &components {
         builder = builder.lookup(component);
     }
@@ -664,7 +706,10 @@ async fn get_fs_limits(
     }
     let bitmap_len = data.get_u32() as usize;
     if bitmap_len > 16 {
-        return Err(NfsError::Xdr(format!("GETATTR bitmap has {} words, max 16", bitmap_len)));
+        return Err(NfsError::Xdr(format!(
+            "GETATTR bitmap has {} words, max 16",
+            bitmap_len
+        )));
     }
     let mut resp_bitmap = vec![0u32; bitmap_len];
     for word in &mut resp_bitmap {
@@ -675,7 +720,9 @@ async fn get_fs_limits(
     }
     // attr_vals opaque
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("GETATTR attr_vals length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETATTR attr_vals length truncated".to_string(),
+        ));
     }
     let vals_len = data.get_u32() as usize;
     if data.remaining() < vals_len {
@@ -685,8 +732,8 @@ async fn get_fs_limits(
 
     // Check which attrs are in the response bitmap (NFSv4.1: 10=lease_time, 30=maxread, 31=maxwrite)
     let has_lease_time = bitmap_len > 0 && (resp_bitmap[0] & (1 << 10)) != 0;
-    let has_maxread    = bitmap_len > 0 && (resp_bitmap[0] & (1 << 30)) != 0;
-    let has_maxwrite   = bitmap_len > 0 && (resp_bitmap[0] & (1 << 31)) != 0;
+    let has_maxread = bitmap_len > 0 && (resp_bitmap[0] & (1 << 30)) != 0;
+    let has_maxwrite = bitmap_len > 0 && (resp_bitmap[0] & (1 << 31)) != 0;
 
     // Decode attr values in bitmap order (bit 10 < bit 29 < bit 30)
     let mut server_lease_secs: u32 = 90; // RFC 5661 §8.3: typical default
@@ -748,7 +795,8 @@ impl crate::Mount for Mount41Wrapper {
     async fn null(&self) -> Result<()> {
         // NFSv4 NULL is procedure 0 (same as v3), no COMPOUND needed
         let mut buf = Vec::new();
-        crate::nfs3::rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_NULL_PROC, &self.m.auth).encode(&mut buf);
+        crate::nfs3::rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_NULL_PROC, &self.m.auth)
+            .encode(&mut buf);
         self.m.rpc.call(buf, NFS_RETRIES, METADATA_TIMEOUT).await?;
         Ok(())
     }
@@ -759,20 +807,30 @@ impl crate::Mount for Mount41Wrapper {
 
     async fn delegreturn(&self, stateid: u64) -> Result<()> {
         let prefix: [u8; 8] = stateid.to_be_bytes();
-        let (fh, sid) = self.m.delegations
+        let (fh, sid) = self
+            .m
+            .delegations
             .find_fh_by_stateid_prefix(prefix)
             .await
-            .ok_or_else(|| NfsError::Rpc(format!("no delegation found for stateid prefix {:#x}", stateid)))?;
-        let resp = self.m.compound("delegreturn", |b| {
-            b.putfh(&fh).delegreturn(&sid)
-        }).await?;
+            .ok_or_else(|| {
+                NfsError::Rpc(format!(
+                    "no delegation found for stateid prefix {:#x}",
+                    stateid
+                ))
+            })?;
+        let resp = self
+            .m
+            .compound("delegreturn", |b| b.putfh(&fh).delegreturn(&sid))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // DELEGRETURN
         Ok(())
     }
 
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {
-        Err(NfsError::Unsupported("DELEGPURGE not supported".to_string()))
+        Err(NfsError::Unsupported(
+            "DELEGPURGE not supported".to_string(),
+        ))
     }
 
     async fn umount(&self) -> Result<()> {
@@ -789,16 +847,18 @@ impl crate::Mount for Mount41Wrapper {
         // Return all delegations via DELEGRETURN
         let delegs = self.m.delegations.return_all().await;
         for (fh, deleg) in &delegs {
-            let _ = self.m.compound("delegreturn", |b| {
-                b.putfh(fh).delegreturn(&deleg.stateid)
-            }).await;
+            let _ = self
+                .m
+                .compound("delegreturn", |b| b.putfh(fh).delegreturn(&deleg.stateid))
+                .await;
         }
         // CLOSE all open files before destroying session
         let open_files = self.m.state.drain().await;
         for (fh, sid) in &open_files {
-            let _ = self.m.compound("close", |b| {
-                b.putfh(fh).close(0, &sid.raw)
-            }).await;
+            let _ = self
+                .m
+                .compound("close", |b| b.putfh(fh).close(0, &sid.raw))
+                .await;
         }
         // Return all pNFS layouts to the server
         self.m.layoutreturn_all().await;
@@ -807,8 +867,8 @@ impl crate::Mount for Mount41Wrapper {
         let current_sess = self.m.session_holder.get().await;
         let client_id = current_sess.client_id();
         {
-            let builder = CompoundBuilder::new("destroy_session")
-                .destroy_session(current_sess.id());
+            let builder =
+                CompoundBuilder::new("destroy_session").destroy_session(current_sess.id());
             let mut buf = Vec::new();
             builder.encode_with_header(&self.m.auth, &mut buf);
             if let Err(e) = self.m.rpc.call(buf, 1, METADATA_TIMEOUT).await {
@@ -816,8 +876,7 @@ impl crate::Mount for Mount41Wrapper {
             }
         }
         // DESTROY_CLIENTID (no session needed)
-        let builder = CompoundBuilder::new("destroy_clientid")
-            .destroy_client_id(client_id);
+        let builder = CompoundBuilder::new("destroy_clientid").destroy_client_id(client_id);
         let mut buf = Vec::new();
         builder.encode_with_header(&self.m.auth, &mut buf);
         let _ = self.m.rpc.call(buf, 1, METADATA_TIMEOUT).await;
@@ -880,7 +939,12 @@ impl crate::Mount for Mount41Wrapper {
     async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
         self.m.open_path(path, access).await
     }
-    async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    async fn create(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
+    ) -> Result<mount::ObjRes> {
         self.m.create(dir_fh, filename, mode).await
     }
     async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
@@ -904,8 +968,16 @@ impl crate::Mount for Mount41Wrapper {
     async fn rmdir_path(&self, path: &str) -> Result<()> {
         self.m.rmdir_path(path).await
     }
-    async fn rename(&self, from_dir_fh: Bytes, from_name: &str, to_dir_fh: Bytes, to_name: &str) -> Result<()> {
-        self.m.rename(from_dir_fh, from_name, to_dir_fh, to_name).await
+    async fn rename(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: &str,
+        to_dir_fh: Bytes,
+        to_name: &str,
+    ) -> Result<()> {
+        self.m
+            .rename(from_dir_fh, from_name, to_dir_fh, to_name)
+            .await
     }
     async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
         self.m.rename_path(from_path, to_path).await
@@ -916,17 +988,46 @@ impl crate::Mount for Mount41Wrapper {
     async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
         self.m.link_path(src_path, dst_path).await
     }
-    async fn symlink(&self, target: &str, dst_dir_fh: Bytes, dst_name: &str) -> Result<mount::ObjRes> {
+    async fn symlink(
+        &self,
+        target: &str,
+        dst_dir_fh: Bytes,
+        dst_name: &str,
+    ) -> Result<mount::ObjRes> {
         self.m.symlink(target, dst_dir_fh, dst_name).await
     }
     async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
         self.m.symlink_path(target, dst_path).await
     }
-    async fn setattr(&self, fh: Bytes, guard_ctime: Option<crate::Time>, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<crate::Time>, mtime: Option<crate::Time>) -> Result<()> {
-        self.m.setattr(fh, guard_ctime, mode, uid, gid, size, atime, mtime).await
+    async fn setattr(
+        &self,
+        fh: Bytes,
+        guard_ctime: Option<crate::Time>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<()> {
+        self.m
+            .setattr(fh, guard_ctime, mode, uid, gid, size, atime, mtime)
+            .await
     }
-    async fn setattr_path(&self, path: &str, specify_guard: bool, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<crate::Time>, mtime: Option<crate::Time>) -> Result<()> {
-        self.m.setattr_path(path, specify_guard, mode, uid, gid, size, atime, mtime).await
+    async fn setattr_path(
+        &self,
+        path: &str,
+        specify_guard: bool,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<()> {
+        self.m
+            .setattr_path(path, specify_guard, mode, uid, gid, size, atime, mtime)
+            .await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.m.commit(fh, offset, count).await
@@ -937,8 +1038,17 @@ impl crate::Mount for Mount41Wrapper {
     async fn lock(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<Bytes> {
         self.m.lock(fh, lock_type, offset, length).await
     }
-    async fn locku(&self, fh: Bytes, lock_stateid: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
-        self.m.locku(fh, lock_stateid, lock_type, offset, length).await
+    async fn locku(
+        &self,
+        fh: Bytes,
+        lock_stateid: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        self.m
+            .locku(fh, lock_stateid, lock_type, offset, length)
+            .await
     }
     async fn getacl(&self, fh: Bytes) -> Result<mount::Acl> {
         self.m.getacl(fh).await
@@ -968,28 +1078,34 @@ impl crate::Mount for Mount41Wrapper {
         // Query filesystem attrs via GETATTR on root fh
         // NFSv4.1: maxfilesize(27), maxread(30), maxwrite(31)
         // word1: time_delta(#51 = bit 19)
-        let bitmap = [
-            (1u32 << 27) | (1 << 30) | (1 << 31),
-            1u32 << 19,
-        ];
-        let resp = self.m.compound("fsinfo", |b| {
-            b.putfh(&self.m.root_fh).getattr(&bitmap)
-        }).await?;
+        let bitmap = [(1u32 << 27) | (1 << 30) | (1 << 31), 1u32 << 19];
+        let resp = self
+            .m
+            .compound("fsinfo", |b| b.putfh(&self.m.root_fh).getattr(&bitmap))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let op = resp.op_ok(2)?; // GETATTR
         let mut data = op.data.clone();
 
         // Parse fattr4: bitmap + attr_vals
-        if data.remaining() < 4 { return Err(NfsError::Xdr("fsinfo bitmap truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("fsinfo bitmap truncated".to_string()));
+        }
         let bm_len = data.get_u32() as usize;
         let mut bm = vec![0u32; bm_len];
         for w in &mut bm {
-            if data.remaining() < 4 { return Err(NfsError::Xdr("fsinfo bitmap word truncated".to_string())); }
+            if data.remaining() < 4 {
+                return Err(NfsError::Xdr("fsinfo bitmap word truncated".to_string()));
+            }
             *w = data.get_u32();
         }
-        if data.remaining() < 4 { return Err(NfsError::Xdr("fsinfo vals length truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("fsinfo vals length truncated".to_string()));
+        }
         let vals_len = data.get_u32() as usize;
-        if data.remaining() < vals_len { return Err(NfsError::Xdr("fsinfo vals data truncated".to_string())); }
+        if data.remaining() < vals_len {
+            return Err(NfsError::Xdr("fsinfo vals data truncated".to_string()));
+        }
         let mut vals = data.split_to(vals_len);
 
         let bm_has = |attr: u32| -> bool {
@@ -1000,16 +1116,28 @@ impl crate::Mount for Mount41Wrapper {
         let mut maxfilesize = u64::MAX;
         let mut maxread = self.m.rsize as u64;
         let mut maxwrite = self.m.wsize as u64;
-        let mut time_delta = crate::Time { seconds: 0, nseconds: 1 };
+        let mut time_delta = crate::Time {
+            seconds: 0,
+            nseconds: 1,
+        };
 
         // Decode in attribute number order
-        if bm_has(27) && vals.remaining() >= 8 { maxfilesize = vals.get_u64(); }
-        if bm_has(30) && vals.remaining() >= 8 { maxread = vals.get_u64(); }
-        if bm_has(31) && vals.remaining() >= 8 { maxwrite = vals.get_u64(); }
+        if bm_has(27) && vals.remaining() >= 8 {
+            maxfilesize = vals.get_u64();
+        }
+        if bm_has(30) && vals.remaining() >= 8 {
+            maxread = vals.get_u64();
+        }
+        if bm_has(31) && vals.remaining() >= 8 {
+            maxwrite = vals.get_u64();
+        }
         if bm_has(51) && vals.remaining() >= 12 {
             let secs = vals.get_i64();
             let nsecs = vals.get_u32();
-            time_delta = crate::Time { seconds: secs as u32, nseconds: nsecs };
+            time_delta = crate::Time {
+                seconds: secs as u32,
+                nseconds: nsecs,
+            };
         }
 
         Ok(mount::FSInfo {
@@ -1031,38 +1159,71 @@ impl crate::Mount for Mount41Wrapper {
         //          space_avail(42), space_free(43), space_total(44)
         let bitmap = [
             (1u32 << 21) | (1 << 22) | (1 << 23),
-            (1u32 << (42-32)) | (1 << (43-32)) | (1 << (44-32)),
+            (1u32 << (42 - 32)) | (1 << (43 - 32)) | (1 << (44 - 32)),
         ];
-        let resp = self.m.compound("fsstat", |b| {
-            b.putfh(&self.m.root_fh).getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .m
+            .compound("fsstat", |b| b.putfh(&self.m.root_fh).getattr(&bitmap))
+            .await?;
         resp.op_ok(1)?;
         let op = resp.op_ok(2)?;
         let mut data = op.data.clone();
-        if data.remaining() < 4 { return Err(NfsError::Xdr("fsstat bitmap truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("fsstat bitmap truncated".to_string()));
+        }
         let bm_len = data.get_u32() as usize;
-        if bm_len > 16 { return Err(NfsError::Xdr(format!("fsstat bitmap has {} words, max 16", bm_len))); }
+        if bm_len > 16 {
+            return Err(NfsError::Xdr(format!(
+                "fsstat bitmap has {} words, max 16",
+                bm_len
+            )));
+        }
         let mut bm = vec![0u32; bm_len];
         for w in &mut bm {
-            if data.remaining() < 4 { return Err(NfsError::Xdr("fsstat bitmap word truncated".to_string())); }
+            if data.remaining() < 4 {
+                return Err(NfsError::Xdr("fsstat bitmap word truncated".to_string()));
+            }
             *w = data.get_u32();
         }
-        if data.remaining() < 4 { return Err(NfsError::Xdr("fsstat vals truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("fsstat vals truncated".to_string()));
+        }
         let vals_len = data.get_u32() as usize;
-        if data.remaining() < vals_len { return Err(NfsError::Xdr("fsstat vals data truncated".to_string())); }
+        if data.remaining() < vals_len {
+            return Err(NfsError::Xdr("fsstat vals data truncated".to_string()));
+        }
         let mut vals = data.split_to(vals_len);
         let mut stat = mount::FSStat::default();
-        let bm_has = |attr: u32| -> bool { let w = (attr / 32) as usize; w < bm.len() && (bm[w] & (1 << (attr % 32))) != 0 };
-        if bm_has(21) && vals.remaining() >= 8 { stat.afiles = vals.get_u64(); }
-        if bm_has(22) && vals.remaining() >= 8 { stat.ffiles = vals.get_u64(); }
-        if bm_has(23) && vals.remaining() >= 8 { stat.tfiles = vals.get_u64(); }
-        if bm_has(42) && vals.remaining() >= 8 { stat.abytes = vals.get_u64(); }
-        if bm_has(43) && vals.remaining() >= 8 { stat.fbytes = vals.get_u64(); }
-        if bm_has(44) && vals.remaining() >= 8 { stat.tbytes = vals.get_u64(); }
+        let bm_has = |attr: u32| -> bool {
+            let w = (attr / 32) as usize;
+            w < bm.len() && (bm[w] & (1 << (attr % 32))) != 0
+        };
+        if bm_has(21) && vals.remaining() >= 8 {
+            stat.afiles = vals.get_u64();
+        }
+        if bm_has(22) && vals.remaining() >= 8 {
+            stat.ffiles = vals.get_u64();
+        }
+        if bm_has(23) && vals.remaining() >= 8 {
+            stat.tfiles = vals.get_u64();
+        }
+        if bm_has(42) && vals.remaining() >= 8 {
+            stat.abytes = vals.get_u64();
+        }
+        if bm_has(43) && vals.remaining() >= 8 {
+            stat.fbytes = vals.get_u64();
+        }
+        if bm_has(44) && vals.remaining() >= 8 {
+            stat.tbytes = vals.get_u64();
+        }
         Ok(stat)
     }
     async fn pathconf(&self, fh: Bytes) -> Result<mount::Pathconf> {
-        let target_fh = if fh.is_empty() { self.m.root_fh.clone() } else { fh };
+        let target_fh = if fh.is_empty() {
+            self.m.root_fh.clone()
+        } else {
+            fh
+        };
         // NFSv4.1: case_insensitive(16), case_preserving(17), chown_restricted(18),
         //          maxlink(28), maxname(29)
         // word1: no_trunc(#34 = bit 2)
@@ -1070,23 +1231,32 @@ impl crate::Mount for Mount41Wrapper {
             (1u32 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
             1u32 << 2,
         ];
-        let resp = self.m.compound("pathconf", |b| {
-            b.putfh(&target_fh).getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .m
+            .compound("pathconf", |b| b.putfh(&target_fh).getattr(&bitmap))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let op = resp.op_ok(2)?; // GETATTR
         let mut data = op.data.clone();
 
-        if data.remaining() < 4 { return Err(NfsError::Xdr("pathconf bitmap truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("pathconf bitmap truncated".to_string()));
+        }
         let bm_len = data.get_u32() as usize;
         let mut bm = vec![0u32; bm_len];
         for w in &mut bm {
-            if data.remaining() < 4 { return Err(NfsError::Xdr("pathconf bitmap word truncated".to_string())); }
+            if data.remaining() < 4 {
+                return Err(NfsError::Xdr("pathconf bitmap word truncated".to_string()));
+            }
             *w = data.get_u32();
         }
-        if data.remaining() < 4 { return Err(NfsError::Xdr("pathconf vals truncated".to_string())); }
+        if data.remaining() < 4 {
+            return Err(NfsError::Xdr("pathconf vals truncated".to_string()));
+        }
         let vals_len = data.get_u32() as usize;
-        if data.remaining() < vals_len { return Err(NfsError::Xdr("pathconf vals truncated".to_string())); }
+        if data.remaining() < vals_len {
+            return Err(NfsError::Xdr("pathconf vals truncated".to_string()));
+        }
         let mut vals = data.split_to(vals_len);
 
         let bm_has = |attr: u32| -> bool {
@@ -1105,12 +1275,24 @@ impl crate::Mount for Mount41Wrapper {
         };
 
         // Decode in NFSv4.1 attr number order
-        if bm_has(16) && vals.remaining() >= 4 { pc.case_insensitive = vals.get_u32() != 0; }
-        if bm_has(17) && vals.remaining() >= 4 { pc.case_preserving = vals.get_u32() != 0; }
-        if bm_has(18) && vals.remaining() >= 4 { pc.chown_restricted = vals.get_u32() != 0; }
-        if bm_has(28) && vals.remaining() >= 4 { pc.linkmax = vals.get_u32(); }
-        if bm_has(29) && vals.remaining() >= 4 { pc.name_max = vals.get_u32(); }
-        if bm_has(34) && vals.remaining() >= 4 { pc.no_trunc = vals.get_u32() != 0; }
+        if bm_has(16) && vals.remaining() >= 4 {
+            pc.case_insensitive = vals.get_u32() != 0;
+        }
+        if bm_has(17) && vals.remaining() >= 4 {
+            pc.case_preserving = vals.get_u32() != 0;
+        }
+        if bm_has(18) && vals.remaining() >= 4 {
+            pc.chown_restricted = vals.get_u32() != 0;
+        }
+        if bm_has(28) && vals.remaining() >= 4 {
+            pc.linkmax = vals.get_u32();
+        }
+        if bm_has(29) && vals.remaining() >= 4 {
+            pc.name_max = vals.get_u32();
+        }
+        if bm_has(34) && vals.remaining() >= 4 {
+            pc.no_trunc = vals.get_u32() != 0;
+        }
 
         Ok(pc)
     }
@@ -1119,34 +1301,46 @@ impl crate::Mount for Mount41Wrapper {
         self.pathconf(obj.fh).await
     }
     async fn exports(&self) -> Result<Vec<mount::ExportEntry>> {
-        Err(NfsError::Unsupported("NFSv4.1 does not have a separate EXPORT procedure".to_string()))
+        Err(NfsError::Unsupported(
+            "NFSv4.1 does not have a separate EXPORT procedure".to_string(),
+        ))
     }
 }
 
 // ─── Decode helpers (used by sub-files) ──────────────────────────────────────
 
 pub(super) fn decode_fh(data: &mut Bytes) -> Result<Bytes> {
-    if data.remaining() < 4 { return Err(NfsError::Xdr("fh length truncated".to_string())); }
+    if data.remaining() < 4 {
+        return Err(NfsError::Xdr("fh length truncated".to_string()));
+    }
     let len = data.get_u32() as usize;
     let padded = (len + 3) & !3;
-    if data.remaining() < padded { return Err(NfsError::Xdr("fh data truncated".to_string())); }
+    if data.remaining() < padded {
+        return Err(NfsError::Xdr("fh data truncated".to_string()));
+    }
     let fh = data.slice(..len);
     data.advance(padded);
     Ok(fh)
 }
 
 pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<String> {
-    if data.remaining() < 4 { return Err(NfsError::Xdr("string length truncated".to_string())); }
+    if data.remaining() < 4 {
+        return Err(NfsError::Xdr("string length truncated".to_string()));
+    }
     let len = data.get_u32() as usize;
     let padded = (len + 3) & !3;
-    if data.remaining() < padded { return Err(NfsError::Xdr("string data truncated".to_string())); }
+    if data.remaining() < padded {
+        return Err(NfsError::Xdr("string data truncated".to_string()));
+    }
     let s = String::from_utf8_lossy(&data.slice(..len)).to_string();
     data.advance(padded);
     Ok(s)
 }
 
 pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {
-    if data.remaining() < 16 { return Err(NfsError::Xdr("stateid4 truncated".to_string())); }
+    if data.remaining() < 16 {
+        return Err(NfsError::Xdr("stateid4 truncated".to_string()));
+    }
     let mut sid = [0u8; 16];
     data.copy_to_slice(&mut sid);
     Ok(sid)

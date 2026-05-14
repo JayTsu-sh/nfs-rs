@@ -6,8 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
     let nfs_xdr = fs::read_to_string("src/nfs3/xdr/nfs.x")?;
-    let nfs_code = fastxdr::Generator::default()
-        .generate(&nfs_xdr)?;
+    let nfs_code = fastxdr::Generator::default().generate(&nfs_xdr)?;
     // fastxdr wraps generated code in `mod xdr { ... }` (private). Make it public
     // so it can be re-exported from the parent module.
     let nfs_code = nfs_code.replacen("mod xdr {", "pub mod xdr {", 1);
@@ -18,8 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(out_dir.join("nfs_xdr.rs"), nfs_code)?;
 
     let mount_xdr = fs::read_to_string("src/nfs3/xdr/mount.x")?;
-    let mount_code = fastxdr::Generator::default()
-        .generate(&mount_xdr)?;
+    let mount_code = fastxdr::Generator::default().generate(&mount_xdr)?;
     let mount_code = mount_code.replacen("mod xdr {", "pub mod xdr {", 1);
     // fastxdr generates `try_variable_array::<i32>` for auth_flavors, but i32 does not
     // implement TryFrom<Bytes>. Replace with manual per-element decoding.
@@ -31,8 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // NFSv4.1 XDR types (RFC 5661)
     let nfs4_xdr = fs::read_to_string("src/nfs41/xdr/nfs4.x")?;
-    let nfs4_code = fastxdr::Generator::default()
-        .generate(&nfs4_xdr)?;
+    let nfs4_code = fastxdr::Generator::default().generate(&nfs4_xdr)?;
     let nfs4_code = nfs4_code.replacen("mod xdr {", "pub mod xdr {", 1);
     // Add Copy+Clone to nfsstat4 enum (simple discriminant-only enum).
     let nfs4_code = nfs4_code.replace(

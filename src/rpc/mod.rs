@@ -18,11 +18,11 @@ pub mod auth;
 pub mod header;
 
 use crate::error::{NfsError, Result};
-use std::net::SocketAddr;
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -213,7 +213,10 @@ impl StreamMux {
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?.insert(xid, tx);
+        self.pending
+            .lock()
+            .map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?
+            .insert(xid, tx);
 
         // Write request under the writer lock — released before awaiting the response.
         // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
@@ -233,17 +236,27 @@ impl StreamMux {
         };
 
         if let Err(e) = write_result {
-            if let Ok(mut map) = self.pending.lock() { map.remove(&xid); }
+            if let Ok(mut map) = self.pending.lock() {
+                map.remove(&xid);
+            }
             return Err(e);
         }
 
         // Wait for response from the reader task with timeout.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reader task terminated"))),
+            Ok(Err(_)) => Err(NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "reader task terminated",
+            ))),
             Err(_) => {
-                if let Ok(mut map) = self.pending.lock() { map.remove(&xid); }
-                Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "RPC response timeout")))
+                if let Ok(mut map) = self.pending.lock() {
+                    map.remove(&xid);
+                }
+                Err(NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "RPC response timeout",
+                )))
             }
         }
     }
@@ -251,7 +264,10 @@ impl StreamMux {
     async fn reconnect(&self, failed_gen: u64) -> Result<()> {
         // 已关闭的连接不再重连
         if self.shutdown_flag.load(Ordering::Acquire) {
-            return Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::NotConnected, "mux is shut down")));
+            return Err(NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "mux is shut down",
+            )));
         }
         info!(addr = %self.addr, failed_gen, "initiating reconnection");
         // Fast path: another caller already reconnected (no lock needed).
@@ -275,7 +291,10 @@ impl StreamMux {
         }
         // 再次检查 shutdown，避免在等锁期间被 shutdown
         if self.shutdown_flag.load(Ordering::Acquire) {
-            return Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::NotConnected, "mux is shut down")));
+            return Err(NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "mux is shut down",
+            )));
         }
         // Abort old reader.
         if let Ok(mut guard) = self.reader_handle.lock() {
@@ -285,18 +304,27 @@ impl StreamMux {
         }
         // Fail all pending requests.
         {
-            let mut map = self.pending.lock().map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?;
+            let mut map = self
+                .pending
+                .lock()
+                .map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?;
             if !map.is_empty() {
                 debug!(addr = %self.addr, pending_count = map.len(), "failing pending requests due to reconnection");
             }
             for (_, tx) in map.drain() {
-                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reconnecting"))));
+                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reconnecting",
+                ))));
             }
         }
         // Install new connection.
         *writer = new_writer;
         {
-            let mut guard = self.reader_handle.lock().map_err(|_| NfsError::Rpc("reader_handle lock poisoned".to_string()))?;
+            let mut guard = self
+                .reader_handle
+                .lock()
+                .map_err(|_| NfsError::Rpc("reader_handle lock poisoned".to_string()))?;
             *guard = Some(tokio::spawn(reader_loop(reader, Arc::clone(&self.pending))));
         }
         self.generation.fetch_add(1, Ordering::Release);
@@ -316,7 +344,10 @@ impl StreamMux {
         let _ = writer.shutdown().await;
         if let Ok(mut map) = self.pending.lock() {
             for (_, tx) in map.drain() {
-                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shutdown"))));
+                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "shutdown",
+                ))));
             }
         }
     }
@@ -331,7 +362,10 @@ impl Drop for StreamMux {
         }
         if let Ok(mut map) = self.pending.lock() {
             for (_, tx) in map.drain() {
-                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "connection closed"))));
+                let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed",
+                ))));
             }
         }
     }
@@ -347,7 +381,10 @@ async fn reader_loop(mut reader: BufReader<OwnedReadHalf>, pending: PendingMap) 
                     if let Some(tx) = map.remove(&xid) {
                         let _ = tx.send(Ok(data));
                     } else {
-                        debug!(xid, "dropping response for unmatched XID (likely stale retry)");
+                        debug!(
+                            xid,
+                            "dropping response for unmatched XID (likely stale retry)"
+                        );
                     }
                 } else {
                     warn!("pending map lock poisoned in reader loop, terminating");
@@ -359,7 +396,10 @@ async fn reader_loop(mut reader: BufReader<OwnedReadHalf>, pending: PendingMap) 
                 // Connection broken: fail all pending requests.
                 if let Ok(mut map) = pending.lock() {
                     for (_, tx) in map.drain() {
-                        let _ = tx.send(Err(NfsError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))));
+                        let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        ))));
                     }
                 }
                 break;
@@ -379,7 +419,10 @@ async fn read_one_response(reader: &mut BufReader<OwnedReadHalf>) -> Result<(u32
     let last = (raw & 0x80000000) != 0;
     let sz = (raw & 0x7FFFFFFF) as usize;
     if sz > MAX_RPC_RESPONSE {
-        return Err(NfsError::Rpc(format!("RPC fragment size {} exceeds maximum {}", sz, MAX_RPC_RESPONSE)));
+        return Err(NfsError::Rpc(format!(
+            "RPC fragment size {} exceeds maximum {}",
+            sz, MAX_RPC_RESPONSE
+        )));
     }
 
     let mut buf = BytesMut::with_capacity(sz);
@@ -395,7 +438,10 @@ async fn read_one_response(reader: &mut BufReader<OwnedReadHalf>) -> Result<(u32
             let sz = (raw & 0x7FFFFFFF) as usize;
             let total = buf.len() + sz;
             if total > MAX_RPC_RESPONSE {
-                return Err(NfsError::Rpc(format!("RPC accumulated response size {} exceeds maximum {}", total, MAX_RPC_RESPONSE)));
+                return Err(NfsError::Rpc(format!(
+                    "RPC accumulated response size {} exceeds maximum {}",
+                    total, MAX_RPC_RESPONSE
+                )));
             }
             let offset = buf.len();
             buf.resize(total, 0);
@@ -429,17 +475,17 @@ impl std::fmt::Debug for StreamMux {
 
 impl Client {
     pub(crate) fn new(nfs_mux: Arc<StreamMux>, mount_mux: Option<Arc<StreamMux>>) -> Self {
-        Self {
-            nfs_mux,
-            mount_mux,
-        }
+        Self { nfs_mux, mount_mux }
     }
 
     fn get_mux(&self, program: u32) -> Result<&Arc<StreamMux>> {
         match program {
             MOUNT_PROG => Ok(self.mount_mux.as_ref().unwrap_or(&self.nfs_mux)),
             NFS_PROG | PORTMAP_PROG => Ok(&self.nfs_mux),
-            _ => Err(NfsError::InvalidInput(format!("unknown RPC program {}", program))),
+            _ => Err(NfsError::InvalidInput(format!(
+                "unknown RPC program {}",
+                program
+            ))),
         }
     }
 
@@ -501,7 +547,13 @@ impl Client {
             let xid = get_xid();
             BigEndian::write_u32(&mut msg_body[4..8], xid);
 
-            debug!(xid, attempt = num_retries + 1, max_retries, program, "sending RPC request");
+            debug!(
+                xid,
+                attempt = num_retries + 1,
+                max_retries,
+                program,
+                "sending RPC request"
+            );
             let gen = mux.generation();
             let res = mux
                 .send_and_receive(xid, &msg_body, &data, data_pad, timeout)
@@ -558,10 +610,15 @@ impl Client {
                         error!(xid, error = %e, "RPC call failed with non-retryable error");
                         return Err(NfsError::Rpc(e.to_string()));
                     }
-                },
+                }
             }
         }
-        error!(max_retries, elapsed_ms = start.elapsed().as_millis() as u64, program, "RPC retries exhausted, giving up");
+        error!(
+            max_retries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            program,
+            "RPC retries exhausted, giving up"
+        );
         Err(NfsError::Io(std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "unable to reconnect to NFS server",
@@ -579,10 +636,8 @@ impl Client {
     pub(crate) async fn new_dummy() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (stream_result, _accept_result) = tokio::join!(
-            tokio::net::TcpStream::connect(addr),
-            listener.accept()
-        );
+        let (stream_result, _accept_result) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let stream = stream_result.unwrap();
         stream.set_nodelay(true).unwrap();
         let (reader, writer) = stream.into_split();
@@ -624,13 +679,21 @@ fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
     let res_xid = BigEndian::read_u32(&res[0..4]);
     let res_msgtype = BigEndian::read_u32(&res[4..8]);
     if res_xid != xid {
-        error!(expected_xid = xid, actual_xid = res_xid, "RPC response XID mismatch");
+        error!(
+            expected_xid = xid,
+            actual_xid = res_xid,
+            "RPC response XID mismatch"
+        );
         return Err(NfsError::Rpc(
             "response id does not match expected one".to_string(),
         ));
     }
     if res_msgtype != MessageType::Response as u32 {
-        error!(xid, msgtype = res_msgtype, "RPC response has unexpected message type");
+        error!(
+            xid,
+            msgtype = res_msgtype,
+            "RPC response has unexpected message type"
+        );
         return Err(NfsError::Rpc(
             "response type does not match expected one".to_string(),
         ));
@@ -651,7 +714,11 @@ fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
     pos += 4;
     let verf_padded = verf_len + (4 - verf_len % 4) % 4;
     if pos + verf_padded > res.len() {
-        error!(xid, response_len = res.len(), "RPC response truncated (verifier)");
+        error!(
+            xid,
+            response_len = res.len(),
+            "RPC response truncated (verifier)"
+        );
         return Err(NfsError::Rpc("response truncated (verifier)".to_string()));
     }
     pos += verf_padded;
@@ -695,14 +762,17 @@ static XID: AtomicU32 = AtomicU32::new(0);
 fn get_xid() -> u32 {
     // Seed with wall-clock time on the very first call; a CAS ensures only one thread seeds.
     if XID.load(Ordering::Relaxed) == 0 {
-        XID.compare_exchange(0, get_current_time(), Ordering::Relaxed, Ordering::Relaxed).ok();
+        XID.compare_exchange(0, get_current_time(), Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
     }
     XID.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
 pub(crate) fn get_current_time() -> u32 {
     let now = std::time::SystemTime::now();
-    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let since_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     (since_epoch.as_secs() as u32).wrapping_mul(1000) + since_epoch.subsec_millis()
 }
 
@@ -744,7 +814,9 @@ mod tests {
         let err = res.expect_err("dead port should fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("127.0.0.1:1") || msg.to_lowercase().contains("refused") || msg.to_lowercase().contains("connect"),
+            msg.contains("127.0.0.1:1")
+                || msg.to_lowercase().contains("refused")
+                || msg.to_lowercase().contains("connect"),
             "portmap error should expose underlying detail, got: {}",
             msg
         );
