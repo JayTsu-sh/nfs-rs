@@ -258,6 +258,7 @@ struct MountArgs {
     maxcount: u32,
     rsize: u32,
     wsize: u32,
+    noresvport: bool,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -387,6 +388,12 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         txsize_def,
         "specified URL contains bad max write size value",
     )?;
+    let noresvport = get_url_query_param(
+        &parsed_url,
+        "noresvport",
+        false,
+        "specified URL contains bad noresvport value",
+    )?;
     let host = parsed_url.host_str().unwrap_or_default().to_string();
     Ok(MountArgs {
         versions,
@@ -400,6 +407,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         maxcount,
         rsize,
         wsize,
+        noresvport,
     })
 }
 
@@ -850,6 +858,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -871,6 +880,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -892,6 +902,7 @@ mod tests {
             maxcount: Default::default(),
             rsize: Default::default(),
             wsize: Default::default(),
+            noresvport: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1037,5 +1048,31 @@ mod tests {
         let (dir, name) = res.unwrap();
         assert_eq!(dir, "/first/place".to_string());
         assert_eq!(name, "1999.txt".to_string());
+    }
+
+    #[test]
+    fn parse_url_noresvport_true() {
+        let args = parse_url("nfs://127.0.0.1/some/export?noresvport=true").unwrap();
+        assert!(args.noresvport, "noresvport=true should parse to true");
+    }
+
+    #[test]
+    fn parse_url_noresvport_default_false() {
+        let args = parse_url("nfs://127.0.0.1/some/export").unwrap();
+        assert!(!args.noresvport, "default should be false (preserve legacy privileged-port behavior)");
+    }
+
+    #[test]
+    fn parse_url_noresvport_explicit_false() {
+        let args = parse_url("nfs://127.0.0.1/some/export?noresvport=false").unwrap();
+        assert!(!args.noresvport, "noresvport=false should parse to false");
+    }
+
+    #[test]
+    fn parse_url_with_bad_noresvport() {
+        let res = parse_url("nfs://127.0.0.1/some/export?noresvport=yes");
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad noresvport value"));
     }
 }
