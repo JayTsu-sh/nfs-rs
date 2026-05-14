@@ -107,14 +107,17 @@ pub(crate) struct LayoutManager {
     data_servers: RwLock<HashMap<SocketAddr, rpc::Client>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], DeviceInfo>>,
+    /// Whether to use ephemeral (non-privileged) source ports for DS connections.
+    noresvport: bool,
 }
 
 impl LayoutManager {
-    pub fn new() -> Self {
+    pub fn new(noresvport: bool) -> Self {
         Self {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
+            noresvport,
         }
     }
 
@@ -178,7 +181,7 @@ impl LayoutManager {
             }
         }
         // TCP connect OUTSIDE any lock — can be slow without stalling other I/O
-        let mux = rpc::StreamMux::connect(addr).await?;
+        let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
         let new_client = rpc::Client::new(mux, None);
         // Acquire write lock and re-check (another task may have connected concurrently)
         let mut servers = self.data_servers.write().await;
@@ -595,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_store_and_get() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file1");
         let layout = Layout {
             stateid: [1u8; 16],
@@ -610,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_remove() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file2");
         mgr.store_layout(&fh, Layout { stateid: [2u8; 16], return_on_close: false, segments: vec![] }).await;
         let removed = mgr.remove_layout(&fh).await;
@@ -620,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_clear() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         mgr.store_layout(&Bytes::from_static(b"a"), Layout { stateid: [0u8; 16], return_on_close: false, segments: vec![] }).await;
         mgr.store_layout(&Bytes::from_static(b"b"), Layout { stateid: [0u8; 16], return_on_close: false, segments: vec![] }).await;
         mgr.clear().await;
@@ -745,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cache_store_and_get() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let dev_id = [0xCCu8; 16];
         let info = DeviceInfo {
             stripe_indices: vec![0],
@@ -761,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cache_cleared_on_clear() {
-        let mgr = LayoutManager::new();
+        let mgr = LayoutManager::new(false);
         let dev_id = [0xDDu8; 16];
         mgr.store_device(dev_id, DeviceInfo { stripe_indices: vec![], ds_addrs: vec![] }).await;
         mgr.clear().await;

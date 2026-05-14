@@ -226,11 +226,12 @@ async fn ensure_port(
     vers: u32,
     auth: &crate::Auth,
     max_retries: usize,
+    noresvport: bool,
 ) -> Result<u16> {
     if port != 0 {
         return Ok(port);
     }
-    rpc::portmap(addrs, prog, vers, auth, max_retries).await
+    rpc::portmap(addrs, prog, vers, auth, max_retries, noresvport).await
 }
 
 pub(crate) async fn mount(
@@ -244,8 +245,8 @@ pub(crate) async fn mount(
     let auth = crate::Auth::new_unix("nfs-rs", args.uid, args.gid);
     // Run both portmapper queries concurrently — they are independent TCP connections.
     let (nfsport, mountport) = tokio::try_join!(
-        ensure_port(&addrs, args.nfsport, rpc::NFS_PROG, rpc::NFS3_VERSION, &auth, MOUNT_RETRIES),
-        ensure_port(&addrs, args.mountport, rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, &auth, MOUNT_RETRIES),
+        ensure_port(&addrs, args.nfsport, rpc::NFS_PROG, rpc::NFS3_VERSION, &auth, MOUNT_RETRIES, args.noresvport),
+        ensure_port(&addrs, args.mountport, rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, &auth, MOUNT_RETRIES, args.noresvport),
     )?;
     info!(nfsport, mountport, "ports resolved");
     for mut addr in addrs {
@@ -268,7 +269,7 @@ async fn mount_on_addr(
     mountport: u16,
 ) -> Result<Box<dyn crate::Mount>> {
     info!(addr = %addr, dirpath = %args.dirpath, "connecting to NFS server for mount");
-    let nfs_mux = rpc::StreamMux::connect(*addr).await?;
+    let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
     let dir: String = args.dirpath.to_owned();
     let (dircount, maxcount) = (args.dircount, args.maxcount);
     let (rsize, wsize) = (args.rsize, args.wsize);
@@ -277,7 +278,7 @@ async fn mount_on_addr(
     let mount_mux = if mountport != addr.port() {
         let mut mount_addr = *addr;
         mount_addr.set_port(mountport);
-        Some(rpc::StreamMux::connect(mount_addr).await?)
+        Some(rpc::StreamMux::connect(mount_addr, args.noresvport).await?)
     } else {
         None
     };
@@ -355,11 +356,12 @@ pub(crate) async fn query_exports(
         rpc::MOUNT3_VERSION,
         &auth,
         MOUNT_RETRIES,
+        args.noresvport,
     )
     .await?;
     for mut addr in addrs {
         addr.set_port(mountport);
-        let res = query_exports_on_addr(&addr, &auth, MOUNT_RETRIES).await;
+        let res = query_exports_on_addr(&addr, &auth, MOUNT_RETRIES, args.noresvport).await;
         if res.is_ok() {
             return res;
         }
@@ -371,8 +373,9 @@ async fn query_exports_on_addr(
     addr: &SocketAddr,
     auth: &crate::Auth,
     max_retries: usize,
+    noresvport: bool,
 ) -> Result<Vec<crate::mount::ExportEntry>> {
-    let mux = rpc::StreamMux::connect(*addr).await?;
+    let mux = rpc::StreamMux::connect(*addr, noresvport).await?;
     let client = rpc::Client::new(mux, None);
     let mut buf = Vec::with_capacity(128);
     rpc_header(rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, MountProc3::Export as u32, auth)

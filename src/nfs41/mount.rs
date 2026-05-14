@@ -404,7 +404,7 @@ async fn mount_on_addr(
     info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
 
     // 1. TCP connect
-    let nfs_mux = rpc::StreamMux::connect(*addr).await?;
+    let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
     let client = rpc::Client::new(nfs_mux, None); // no separate mount connection
 
     // 2. Establish session (EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE)
@@ -425,7 +425,7 @@ async fn mount_on_addr(
     info!(rsize, wsize, renewal_secs = renewal_interval.as_secs(), "negotiated transfer sizes");
 
     let delegations = Arc::new(DelegationManager::new());
-    let layout_manager = Arc::new(LayoutManager::new());
+    let layout_manager = Arc::new(LayoutManager::new(args.noresvport));
 
     // Start backchannel callback service for server→client delegation recalls
     let mut callback = match super::callback::CallbackService::start(*session.id()).await {

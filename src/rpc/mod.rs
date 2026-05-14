@@ -58,10 +58,11 @@ pub(crate) async fn portmap(
     vers: u32,
     auth: &Auth,
     max_retries: usize,
+    noresvport: bool,
 ) -> Result<u16> {
     for addr in addrs {
         debug!(addr = %addr, prog, vers, "attempting portmapper lookup");
-        let res = portmap_on_addr(addr, prog, vers, auth, max_retries).await;
+        let res = portmap_on_addr(addr, prog, vers, auth, max_retries, noresvport).await;
         match &res {
             Ok(port) => {
                 info!(addr = %addr, prog, vers, port, "portmapper resolved port");
@@ -83,8 +84,9 @@ async fn portmap_on_addr(
     vers: u32,
     auth: &Auth,
     max_retries: usize,
+    noresvport: bool,
 ) -> Result<u16> {
-    let mux = StreamMux::connect(*addr).await?;
+    let mux = StreamMux::connect(*addr, noresvport).await?;
     let client = Client::new(mux, None);
     let result = portmap_calls(&client, prog, vers, auth, max_retries).await;
     let _ = client.shutdown().await;
@@ -164,6 +166,7 @@ pub(crate) struct StreamMux {
     writer: TokioMutex<OwnedWriteHalf>,
     pending: PendingMap,
     addr: SocketAddr,
+    noresvport: bool,
     generation: AtomicU64,
     reader_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// 标记 shutdown 已调用，阻止后续 reconnect 尝试
@@ -171,8 +174,8 @@ pub(crate) struct StreamMux {
 }
 
 impl StreamMux {
-    pub(crate) async fn connect(addr: SocketAddr) -> Result<Arc<Self>> {
-        let stream = crate::connect_to_target(&addr).await?;
+    pub(crate) async fn connect(addr: SocketAddr, noresvport: bool) -> Result<Arc<Self>> {
+        let stream = crate::connect_to_target(&addr, noresvport).await?;
         let (reader, writer) = stream.into_split();
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let reader = BufReader::with_capacity(1_048_576, reader);
@@ -182,6 +185,7 @@ impl StreamMux {
             writer: TokioMutex::new(writer),
             pending,
             addr,
+            noresvport,
             generation: AtomicU64::new(0),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
@@ -252,7 +256,7 @@ impl StreamMux {
         }
         // Establish new TCP connection OUTSIDE the writer lock so that
         // concurrent send_and_receive() calls are not blocked during connect.
-        let stream = crate::connect_to_target(&self.addr).await?;
+        let stream = crate::connect_to_target(&self.addr, self.noresvport).await?;
         let (reader, new_writer) = stream.into_split();
         let reader = BufReader::with_capacity(1_048_576, reader);
 
@@ -583,6 +587,7 @@ impl Client {
             writer: TokioMutex::new(writer),
             pending,
             addr,
+            noresvport: false,
             generation: AtomicU64::new(0),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
