@@ -109,10 +109,6 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
         993,  // imaps
         995,  // pop3s
     ];
-    // 预计算可用端口列表（1-1023 排除已知端口），约 960 个可用
-    let available_ports: Vec<u16> = (1..1024u16)
-        .filter(|p| !WELL_KNOWN_PORTS.contains(p))
-        .collect();
     let local_addr_base = if addr.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
     } else {
@@ -148,6 +144,10 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
         );
         return Ok(stream);
     }
+    // 预计算可用端口列表（1-1023 排除已知端口），约 960 个可用
+    let available_ports: Vec<u16> = (1..1024u16)
+        .filter(|p| !WELL_KNOWN_PORTS.contains(p))
+        .collect();
     // 外层循环：bind + connect 整体重试。
     // Windows 上 SO_REUSEADDR 允许 bind() 成功即使端口已被占用（TIME_WAIT 或其他
     // SO_REUSEADDR socket），冲突要到 connect() 时才以 WSAEADDRINUSE 暴露。
@@ -1126,6 +1126,17 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_target_privileged_when_noresvport_false() {
+        // 探测：本机是否允许绑特权端口（Unix root / Windows admin）。
+        // 没有权限时直接跳过，避免在无特权 CI 上误报 false negative。
+        let probe = if let Ok(s) = tokio::net::TcpSocket::new_v4() {
+            s.bind("127.0.0.1:1".parse().unwrap()).is_ok()
+        } else {
+            false
+        };
+        if !probe {
+            eprintln!("skipping: insufficient privilege to bind <1024");
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
         let accept_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
