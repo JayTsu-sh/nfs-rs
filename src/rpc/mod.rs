@@ -60,22 +60,28 @@ pub(crate) async fn portmap(
     max_retries: usize,
     noresvport: bool,
 ) -> Result<u16> {
+    let mut last_err: Option<(SocketAddr, NfsError)> = None;
     for addr in addrs {
         debug!(addr = %addr, prog, vers, "attempting portmapper lookup");
-        let res = portmap_on_addr(addr, prog, vers, auth, max_retries, noresvport).await;
-        match &res {
+        match portmap_on_addr(addr, prog, vers, auth, max_retries, noresvport).await {
             Ok(port) => {
                 info!(addr = %addr, prog, vers, port, "portmapper resolved port");
-                return Ok(*port);
+                return Ok(port);
             }
             Err(e) => {
                 warn!(addr = %addr, prog, vers, error = %e, "portmapper lookup failed on address");
+                last_err = Some((*addr, e));
             }
         }
     }
-    Err(NfsError::Rpc(
-        "error obtaining ports from portmapper".to_string(),
-    ))
+    Err(NfsError::Rpc(format!(
+        "portmapper lookup failed for prog={} vers={}: {}",
+        prog,
+        vers,
+        last_err
+            .map(|(addr, e)| format!("{}: {}", addr, e))
+            .unwrap_or_else(|| "no addresses tried".to_string()),
+    )))
 }
 
 async fn portmap_on_addr(
@@ -727,5 +733,20 @@ mod tests {
     fn message_procedure() {
         let body = vec![0u8, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5];
         assert_eq!(BigEndian::read_u32(&body[12..16]), 5);
+    }
+
+    #[tokio::test]
+    async fn portmap_error_includes_underlying_detail() {
+        // Connect to a localhost port nobody listens on → ConnectionRefused
+        let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let auth = Auth::new_null();
+        let res = portmap(&vec![dead_addr], NFS_PROG, NFS3_VERSION, &auth, 2, false).await;
+        let err = res.expect_err("dead port should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1:1") || msg.to_lowercase().contains("refused") || msg.to_lowercase().contains("connect"),
+            "portmap error should expose underlying detail, got: {}",
+            msg
+        );
     }
 }
