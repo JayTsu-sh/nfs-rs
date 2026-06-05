@@ -495,6 +495,37 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes>;
 
+    /// Symbolic link creation with ownership / timestamps applied in the same
+    /// network round trip when the backend supports it.
+    ///
+    /// Behaves like [`Mount::symlink`] when all attribute arguments are `None`.
+    /// When any of `uid` / `gid` / `atime` / `mtime` is `Some`, implementations
+    /// SHOULD bundle a SETATTR into the same NFSv4 COMPOUND, saving one RPC
+    /// vs. the explicit CREATE-then-SETATTR pattern. The default implementation
+    /// preserves the old behavior (two RPCs) so backends that cannot merge
+    /// work without modification.
+    ///
+    /// On success, the symlink exists with the requested attributes applied.
+    /// If the server rejects in-compound SETATTR, the implementation is
+    /// expected to fall back to a separate SETATTR transparently.
+    #[allow(clippy::too_many_arguments)]
+    async fn symlink_with_attrs(
+        &self,
+        src_path: &str,
+        dst_dir_fh: Bytes,
+        dst_filename: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<Time>,
+        mtime: Option<Time>,
+    ) -> Result<ObjRes> {
+        let obj = self.symlink(src_path, dst_dir_fh, dst_filename).await?;
+        if uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            self.setattr(obj.fh.clone(), None, None, uid, gid, None, atime, mtime).await?;
+        }
+        Ok(obj)
+    }
+
     /// Procedure READLINK reads the data associated with a symbolic link.
     ///
     /// # Example

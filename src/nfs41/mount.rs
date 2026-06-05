@@ -999,6 +999,18 @@ impl crate::Mount for Mount41Wrapper {
     async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
         self.m.symlink_path(target, dst_path).await
     }
+    async fn symlink_with_attrs(
+        &self,
+        target: &str,
+        dst_dir_fh: Bytes,
+        dst_name: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<mount::ObjRes> {
+        self.m.symlink_with_attrs(target, dst_dir_fh, dst_name, uid, gid, atime, mtime).await
+    }
     async fn setattr(
         &self,
         fh: Bytes,

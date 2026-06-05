@@ -1,9 +1,10 @@
 use bytes::{Buf, Bytes};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::compound::OpResponse;
 use super::mount::{decode_fh, Mount41};
+use super::setattr::encode_setattr;
 use crate::error::Result;
 use crate::mount;
 
@@ -167,5 +168,65 @@ impl Mount41 {
         let (dst_dir, dst_name) = crate::split_path(dst_path)?;
         let dst_dir_obj = self.lookup_path(&dst_dir).await?;
         self.symlink(target, dst_dir_obj.fh, &dst_name).await
+    }
+
+    /// CREATE(NF4LNK) 与 SETATTR 合并到单个 COMPOUND 的实现。
+    ///
+    /// 当 uid/gid/atime/mtime 至少一个 `Some` 时，向 COMPOUND 追加 SETATTR
+    /// 与第二个 GETATTR，省一次 RPC 往返；全部为 `None` 时等价于 `symlink()`。
+    /// SETATTR 走 anonymous stateid（all-zero），适用于非 file 对象（RFC 5661 §8.2.3）。
+    /// 注意：mode 不参与 — symlink 的 POSIX mode 没有可移植语义，data-mover 调用方也不传。
+    /// SETATTR 写入 createattrs 会触发部分服务端的 NFS4ERR_ATTRNOTSUPP，
+    /// 因此沿用 mkdir/file create 的保守模式：CREATE 用空 attrs，SETATTR 紧随其后。
+    /// 若服务端连 in-compound 的 SETATTR 都拒绝，内部用独立 SETATTR + GETATTR 兜底。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn symlink_with_attrs(
+        &self,
+        target: &str,
+        dst_dir_fh: Bytes,
+        dst_filename: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<mount::ObjRes> {
+        let (setattr_mask, setattr_vals) = encode_setattr(None, uid, gid, None, atime, mtime);
+        if setattr_mask.is_empty() {
+            // 无属性要写：等价于旧 symlink，省去 SETATTR 这一 op
+            return self.symlink(target, dst_dir_fh, dst_filename).await;
+        }
+
+        let bitmap = standard_getattr_bitmap();
+        let stateid = [0u8; 16]; // anonymous stateid（RFC 5661 §8.2.3）
+        let resp = self.compound("symlink_with_attrs", |b| {
+            b.putfh(&dst_dir_fh)
+             .create_symlink(dst_filename, target, &[], &[])
+             .getfh()
+             .setattr(&stateid, &setattr_mask, &setattr_vals)
+             .getattr(&bitmap)
+        }).await?;
+
+        resp.op_ok(1)?; // PUTFH
+        resp.op_ok(2)?; // CREATE(NF4LNK) — 此点之后 symlink 已落地
+        let getfh = resp.op_ok(3)?;
+        let mut fh_data = getfh.data.clone();
+        let fh = decode_fh(&mut fh_data)?;
+
+        // SETATTR 失败时 GETATTR 不会执行；symlink 已存在但属性是默认值。
+        // 内部用独立 SETATTR + GETATTR 兜底，让上层看到的语义保持不变。
+        if let Err(e) = resp.op_ok(4) {
+            warn!(
+                error = ?e,
+                "symlink_with_attrs: in-compound SETATTR failed, falling back to separate SETATTR"
+            );
+            self.setattr(fh.clone(), None, None, uid, gid, None, atime, mtime).await?;
+            let attr = self.getattr(fh.clone()).await?;
+            return Ok(mount::ObjRes { fh, attr: Some(attr) });
+        }
+
+        let getattr = resp.op_ok(5)?;
+        let mut attr_data = getattr.data.clone();
+        let attr = decode_getattr_response(&mut attr_data)?;
+        Ok(mount::ObjRes { fh, attr: Some(attr) })
     }
 }
