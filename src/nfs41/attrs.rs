@@ -428,17 +428,23 @@ pub(super) fn decode_utf8str(buf: &mut Bytes) -> Result<String> {
         .map_err(|_| NfsError::Xdr("invalid UTF-8 in string attribute".to_string()))
 }
 
-/// Parse a numeric owner string (e.g., "1000" or "root") to uid/gid.
-/// NFSv4 encodes owners as strings like "user@domain" or numeric strings.
+/// Parse an owner string to uid/gid.
+/// NFSv4 encodes owners as "name@domain" or numeric strings (RFC 5661 §5.9).
+/// 数字形式直接解析；`root` 按 POSIX 惯例映射到 0；其余无法映射的名字 → nobody。
 fn parse_numeric_owner(s: &str) -> u32 {
     // Try parsing as plain number first
     if let Ok(n) = s.parse::<u32>() {
         return n;
     }
-    // Extract numeric part before '@'
+    // Extract the name part before '@'
     if let Some(name) = s.split('@').next() {
+        // Numeric-string form, e.g. "1000@domain"
         if let Ok(n) = name.parse::<u32>() {
             return n;
+        }
+        // Well-known: root is uid/gid 0 on all Unix systems (POSIX)
+        if name == "root" {
+            return 0;
         }
     }
     // Unknown owner → nobody
@@ -480,7 +486,8 @@ mod tests {
         assert_eq!(parse_numeric_owner("1000"), 1000);
         assert_eq!(parse_numeric_owner("0"), 0);
         assert_eq!(parse_numeric_owner("1000@example.com"), 1000);
-        assert_eq!(parse_numeric_owner("root"), 65534);
+        assert_eq!(parse_numeric_owner("root"), 0);
+        assert_eq!(parse_numeric_owner("root@netapp.com"), 0);
         assert_eq!(parse_numeric_owner("nobody@localdomain"), 65534);
     }
 
