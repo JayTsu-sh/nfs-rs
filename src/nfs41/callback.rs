@@ -1,28 +1,25 @@
-//! NFSv4.1 callback service — server→client backchannel (RFC 5661 §2.10.3).
+//! NFSv4.1 callback handling — server→client backchannel (RFC 8881 §2.10.3, §20).
 //!
-//! The server uses the backchannel to send CB_COMPOUND calls to the client,
-//! primarily for delegation recall (CB_RECALL) and session management (CB_SEQUENCE).
+//! In NFSv4.1 the backchannel rides the *fore-channel* TCP connection: the server
+//! sends CB_COMPOUND calls (CB_SEQUENCE, CB_RECALL) as ordinary RPC CALL messages
+//! back over the same connection the client opened. The RPC layer's reader loop
+//! detects those inbound CALLs and routes them to the handler built here via
+//! [`make_backchannel_handler`]; the reply is written back on the same connection.
 //!
-//! The callback service listens on a TCP port and handles incoming ONC-RPC
-//! requests with program number = cb_program (provided during CREATE_SESSION).
-//!
-//! NOTE: This module is currently unused because the NFSv4.1 backchannel
-//! (BIND_CONN_TO_SESSION) is not yet wired up. The code is retained for
-//! future backchannel support.
+//! There is deliberately no separate callback listener socket — that is the
+//! NFSv4.0 model (the server dials back to a client-advertised address) and is
+//! unnecessary and unused in NFSv4.1.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use bytes::{Buf, Bytes};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::error::Result;
+use crate::error::{NfsError, Result};
+use crate::rpc::BackchannelHandler;
 
-/// Maximum callback RPC message size (callbacks are small metadata ops).
-const MAX_CB_MESSAGE: usize = 65536;
 /// Maximum number of operations in a CB_COMPOUND.
 const MAX_CB_OPS: u32 = 64;
 /// Maximum referring_call_lists entries.
@@ -31,148 +28,66 @@ const MAX_REFERRING_LISTS: usize = 256;
 /// Callback program number (client-chosen, communicated in CREATE_SESSION).
 pub(crate) const CB_PROGRAM: u32 = 0x40000000;
 
+/// NFS4ERR_SEQ_MISORDERED error code (RFC 8881).
+const NFS4ERR_SEQ_MISORDERED: u32 = 10063;
+
 /// A delegation recall notification from the server.
 #[derive(Debug, Clone)]
 pub(crate) struct RecallNotification {
     /// The stateid of the delegation being recalled.
     pub stateid: [u8; 16],
     /// Whether to truncate the file (only for write delegations).
-    /// RFC 5661 §20.2.1 — not yet acted upon; retained for future use.
+    /// RFC 8881 §20.2.1 — not yet acted upon; retained for future use.
     #[allow(dead_code)]
     pub truncate: bool,
     /// The file handle of the file whose delegation is recalled.
     pub fh: Bytes,
 }
 
-/// Callback service that listens for server-initiated CB_COMPOUND calls.
-pub(crate) struct CallbackService {
-    /// The TCP port we are listening on.
-    pub port: u16,
-    /// Channel to receive recall notifications.
-    pub recall_rx: mpsc::Receiver<RecallNotification>,
-    /// Handle to the background listener task.
-    handle: JoinHandle<()>,
-}
-
-impl CallbackService {
-    /// Start the callback service on an ephemeral port.
-    /// Returns the service (with port number for CREATE_SESSION).
-    pub async fn start(session_id: [u8; 16]) -> Result<Self> {
-        let listener = TcpListener::bind("0.0.0.0:0").await
-            .map_err(crate::error::NfsError::Io)?;
-        let port = listener.local_addr()
-            .map_err(crate::error::NfsError::Io)?.port();
-        let (recall_tx, recall_rx) = mpsc::channel(32);
-
-        info!(port, "callback service started");
-
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        debug!(addr = %addr, "callback connection accepted");
-                        let tx = recall_tx.clone();
-                        let sid = session_id;
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_callback_connection(stream, sid, tx).await {
-                                warn!(error = %e, "callback connection error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "callback accept error");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Self { port, recall_rx, handle })
-    }
-
-    /// Take the recall notification receiver (can only be called once).
-    /// Subsequent calls return an empty receiver.
-    pub fn take_recall_rx(&mut self) -> mpsc::Receiver<RecallNotification> {
-        let (_, empty_rx) = mpsc::channel(1);
-        std::mem::replace(&mut self.recall_rx, empty_rx)
-    }
-
-    /// Stop the callback service.
-    pub fn stop(&self) {
-        self.handle.abort();
-    }
-}
-
-impl Drop for CallbackService {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Handle a single callback TCP connection from the server.
-async fn handle_callback_connection(
-    mut stream: tokio::net::TcpStream,
+/// Build the backchannel handler installed into the RPC layer for this session.
+///
+/// The returned closure is invoked by the reader loop for every inbound server
+/// CB_COMPOUND CALL. It owns the per-connection backchannel slot table used to
+/// validate CB_SEQUENCE sequencing (RFC 8881 §2.10.6.3).
+pub(crate) fn make_backchannel_handler(
     session_id: [u8; 16],
     recall_tx: mpsc::Sender<RecallNotification>,
-) -> Result<()> {
-    // RFC 5661 §2.10.6.3: client must track expected sequence ID per backchannel slot.
-    // slot_id → next expected sequence ID (server must use 1 for the first request).
-    let mut cb_slot_seqs: HashMap<u32, u32> = HashMap::new();
-
-    loop {
-        // Read RPC record mark (4 bytes: MSB=last_fragment, lower 31 bits=length)
-        let mut mark_buf = [0u8; 4];
-        match stream.read_exact(&mut mark_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        let mark = u32::from_be_bytes(mark_buf);
-        let len = (mark & 0x7FFFFFFF) as usize;
-
-        // H1: Bound callback message size to prevent OOM from malicious senders
-        if len > MAX_CB_MESSAGE {
-            return Err(crate::error::NfsError::Rpc(
-                format!("callback message size {} exceeds max {}", len, MAX_CB_MESSAGE)
-            ));
-        }
-
-        // Read the full RPC message
-        let mut msg = vec![0u8; len];
-        stream.read_exact(&mut msg).await?;
-        let mut buf = Bytes::from(msg);
-
-        // Parse RPC call header
-        let reply = match parse_and_handle_cb_compound(&mut buf, &session_id, &recall_tx, &mut cb_slot_seqs).await {
-            Ok(reply) => reply,
-            Err(e) => {
-                warn!(error = %e, "failed to handle CB_COMPOUND");
-                continue;
-            }
-        };
-
-        // Send RPC reply
-        let reply_len = reply.len() as u32 | 0x80000000; // last fragment
-        let mut out = BytesMut::with_capacity(4 + reply.len());
-        out.put_u32(reply_len);
-        out.extend_from_slice(&reply);
-        stream.write_all(&out).await?;
-    }
+) -> BackchannelHandler {
+    // slot_id → next expected sequence ID (server must use 1 on first use of a slot).
+    let slot_seqs: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    Arc::new(move |frame: Bytes| {
+        let mut buf = frame;
+        handle_cb_compound(&mut buf, &session_id, &recall_tx, &slot_seqs)
+    })
 }
 
-/// NFS4ERR_SEQ_MISORDERED error code (RFC 5661).
-const NFS4ERR_SEQ_MISORDERED: u32 = 10063;
-
-/// Parse a CB_COMPOUND RPC call and produce a reply.
-async fn parse_and_handle_cb_compound(
+/// Parse a CB_COMPOUND RPC CALL and produce the full RPC reply frame (starting at
+/// the xid, without the record mark). Returns `None` if the message cannot be
+/// parsed, in which case the reader loop drops it.
+fn handle_cb_compound(
     buf: &mut Bytes,
     session_id: &[u8; 16],
     recall_tx: &mpsc::Sender<RecallNotification>,
-    cb_slot_seqs: &mut HashMap<u32, u32>,
+    slot_seqs: &Mutex<HashMap<u32, u32>>,
+) -> Option<Vec<u8>> {
+    match parse_cb_compound(buf, session_id, recall_tx, slot_seqs) {
+        Ok(reply) => Some(reply),
+        Err(e) => {
+            warn!(error = %e, "failed to handle CB_COMPOUND");
+            None
+        }
+    }
+}
+
+fn parse_cb_compound(
+    buf: &mut Bytes,
+    session_id: &[u8; 16],
+    recall_tx: &mpsc::Sender<RecallNotification>,
+    slot_seqs: &Mutex<HashMap<u32, u32>>,
 ) -> Result<Vec<u8>> {
     // RPC call header: xid(4) + msg_type(4) + rpc_version(4) + program(4) + version(4) + procedure(4)
     if buf.remaining() < 24 {
-        return Err(crate::error::NfsError::Xdr("CB RPC header too short".to_string()));
+        return Err(NfsError::Xdr("CB RPC header too short".to_string()));
     }
     let xid = buf.get_u32();
     let _msg_type = buf.get_u32(); // 0 = CALL
@@ -194,20 +109,21 @@ async fn parse_and_handle_cb_compound(
     // Parse CB_COMPOUND4args: tag + minorversion + callback_ident + ops
     let _tag = skip_opaque(buf)?;
     if buf.remaining() < 8 {
-        return Err(crate::error::NfsError::Xdr("CB_COMPOUND args truncated".to_string()));
+        return Err(NfsError::Xdr("CB_COMPOUND args truncated".to_string()));
     }
     let _minor_version = buf.get_u32();
     let _callback_ident = buf.get_u32();
 
     if buf.remaining() < 4 {
-        return Err(crate::error::NfsError::Xdr("CB_COMPOUND ops count truncated".to_string()));
+        return Err(NfsError::Xdr("CB_COMPOUND ops count truncated".to_string()));
     }
     let num_ops = buf.get_u32();
-    // H2: Bound num_ops to prevent CPU exhaustion
+    // Bound num_ops to prevent CPU exhaustion
     if num_ops > MAX_CB_OPS {
-        return Err(crate::error::NfsError::Xdr(
-            format!("CB_COMPOUND has {} ops, max {}", num_ops, MAX_CB_OPS)
-        ));
+        return Err(NfsError::Xdr(format!(
+            "CB_COMPOUND has {} ops, max {}",
+            num_ops, MAX_CB_OPS
+        )));
     }
 
     let mut reply_ops = Vec::new();
@@ -236,52 +152,54 @@ async fn parse_and_handle_cb_compound(
                 if buf.remaining() >= 4 {
                     let n = buf.get_u32() as usize;
                     if n > MAX_REFERRING_LISTS {
-                        return Err(crate::error::NfsError::Xdr(
-                            format!("too many referring_call_lists: {}", n)
-                        ));
+                        return Err(NfsError::Xdr(format!(
+                            "too many referring_call_lists: {}",
+                            n
+                        )));
                     }
                     for _ in 0..n {
                         if buf.remaining() < 16 {
-                            return Err(crate::error::NfsError::Xdr(
-                                "referring_call sessionid truncated".to_string()
+                            return Err(NfsError::Xdr(
+                                "referring_call sessionid truncated".to_string(),
                             ));
                         }
                         buf.advance(16);
                         if buf.remaining() < 4 {
-                            return Err(crate::error::NfsError::Xdr(
-                                "referring_call count truncated".to_string()
+                            return Err(NfsError::Xdr(
+                                "referring_call count truncated".to_string(),
                             ));
                         }
                         let m = buf.get_u32() as usize;
                         let needed = m.checked_mul(8).ok_or_else(|| {
-                            crate::error::NfsError::Xdr("referring_call overflow".to_string())
+                            NfsError::Xdr("referring_call overflow".to_string())
                         })?;
                         if buf.remaining() < needed {
-                            return Err(crate::error::NfsError::Xdr(
-                                "referring_call data truncated".to_string()
+                            return Err(NfsError::Xdr(
+                                "referring_call data truncated".to_string(),
                             ));
                         }
                         buf.advance(needed);
                     }
                 }
 
-                // H1: Validate session ID matches expected session
+                // Validate session ID matches our session
                 if cb_session_id != *session_id {
                     warn!("CB_SEQUENCE session ID mismatch, ignoring");
-                    return Err(crate::error::NfsError::Xdr(
-                        "CB_SEQUENCE session ID mismatch".to_string()
-                    ));
+                    return Err(NfsError::Xdr("CB_SEQUENCE session ID mismatch".to_string()));
                 }
 
-                // RFC 5661 §2.10.6.3: validate sequence ID against our slot table.
+                // RFC 8881 §2.10.6.3: validate sequence ID against our slot table.
                 // Server MUST use sequenceid=1 on first use of a slot.
-                let expected_seq = cb_slot_seqs.get(&cb_slotid).copied().unwrap_or(1);
+                let expected_seq = {
+                    let map = slot_seqs
+                        .lock()
+                        .map_err(|_| NfsError::Rpc("cb slot table lock poisoned".to_string()))?;
+                    map.get(&cb_slotid).copied().unwrap_or(1)
+                };
                 if cb_sequenceid != expected_seq {
                     warn!(
                         cb_slotid,
-                        cb_sequenceid,
-                        expected_seq,
-                        "CB_SEQUENCE misordered — rejecting"
+                        cb_sequenceid, expected_seq, "CB_SEQUENCE misordered — rejecting"
                     );
                     let mut op_reply = Vec::new();
                     op_reply.extend_from_slice(&opcode.to_be_bytes());
@@ -289,7 +207,12 @@ async fn parse_and_handle_cb_compound(
                     reply_ops.push(op_reply);
                     break; // RFC: stop processing after first error
                 }
-                cb_slot_seqs.insert(cb_slotid, cb_sequenceid.wrapping_add(1));
+                {
+                    let mut map = slot_seqs
+                        .lock()
+                        .map_err(|_| NfsError::Rpc("cb slot table lock poisoned".to_string()))?;
+                    map.insert(cb_slotid, cb_sequenceid.wrapping_add(1));
+                }
 
                 // Reply: CB_SEQUENCE4resok
                 let mut op_reply = Vec::new();
@@ -357,29 +280,29 @@ async fn parse_and_handle_cb_compound(
     Ok(build_rpc_reply(xid, &compound_res))
 }
 
-/// Build a minimal RPC reply message.
+/// Build a minimal RPC reply message (starting at the xid; no record mark).
 fn build_rpc_reply(xid: u32, body: &[u8]) -> Vec<u8> {
     let mut reply = Vec::with_capacity(24 + body.len());
-    reply.extend_from_slice(&xid.to_be_bytes());       // xid
-    reply.extend_from_slice(&1u32.to_be_bytes());       // msg_type = REPLY
-    reply.extend_from_slice(&0u32.to_be_bytes());       // reply_stat = MSG_ACCEPTED
-    // Verf: AUTH_NONE
-    reply.extend_from_slice(&0u32.to_be_bytes());       // flavor = AUTH_NONE
-    reply.extend_from_slice(&0u32.to_be_bytes());       // body length = 0
-    reply.extend_from_slice(&0u32.to_be_bytes());       // accept_stat = SUCCESS
+    reply.extend_from_slice(&xid.to_be_bytes()); // xid
+    reply.extend_from_slice(&1u32.to_be_bytes()); // msg_type = REPLY
+    reply.extend_from_slice(&0u32.to_be_bytes()); // reply_stat = MSG_ACCEPTED
+                                                  // Verf: AUTH_NONE
+    reply.extend_from_slice(&0u32.to_be_bytes()); // flavor = AUTH_NONE
+    reply.extend_from_slice(&0u32.to_be_bytes()); // body length = 0
+    reply.extend_from_slice(&0u32.to_be_bytes()); // accept_stat = SUCCESS
     reply.extend_from_slice(body);
     reply
 }
 
 fn skip_rpc_auth(buf: &mut Bytes) -> Result<()> {
     if buf.remaining() < 8 {
-        return Err(crate::error::NfsError::Xdr("RPC auth truncated".to_string()));
+        return Err(NfsError::Xdr("RPC auth truncated".to_string()));
     }
     let _flavor = buf.get_u32();
     let len = buf.get_u32() as usize;
     let padded = (len + 3) & !3;
     if buf.remaining() < padded {
-        return Err(crate::error::NfsError::Xdr("RPC auth body truncated".to_string()));
+        return Err(NfsError::Xdr("RPC auth body truncated".to_string()));
     }
     buf.advance(padded);
     Ok(())
@@ -387,12 +310,12 @@ fn skip_rpc_auth(buf: &mut Bytes) -> Result<()> {
 
 fn skip_opaque(buf: &mut Bytes) -> Result<usize> {
     if buf.remaining() < 4 {
-        return Err(crate::error::NfsError::Xdr("opaque length truncated".to_string()));
+        return Err(NfsError::Xdr("opaque length truncated".to_string()));
     }
     let len = buf.get_u32() as usize;
     let padded = (len + 3) & !3;
     if buf.remaining() < padded {
-        return Err(crate::error::NfsError::Xdr("opaque data truncated".to_string()));
+        return Err(NfsError::Xdr("opaque data truncated".to_string()));
     }
     buf.advance(padded);
     Ok(len)
@@ -400,14 +323,137 @@ fn skip_opaque(buf: &mut Bytes) -> Result<usize> {
 
 fn read_opaque(buf: &mut Bytes) -> Result<Bytes> {
     if buf.remaining() < 4 {
-        return Err(crate::error::NfsError::Xdr("opaque length truncated".to_string()));
+        return Err(NfsError::Xdr("opaque length truncated".to_string()));
     }
     let len = buf.get_u32() as usize;
     let padded = (len + 3) & !3;
     if buf.remaining() < padded {
-        return Err(crate::error::NfsError::Xdr("opaque data truncated".to_string()));
+        return Err(NfsError::Xdr("opaque data truncated".to_string()));
     }
     let data = buf.slice(..len);
     buf.advance(padded);
     Ok(data)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    fn u32_at(b: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+
+    /// Build a CB_COMPOUND RPC CALL carrying a single CB_SEQUENCE op.
+    fn cb_sequence_frame(xid: u32, session_id: &[u8; 16], slotid: u32, seqid: u32) -> Bytes {
+        let mut f = Vec::new();
+        f.extend_from_slice(&be(xid)); // xid
+        f.extend_from_slice(&be(0)); // msg_type = CALL
+        f.extend_from_slice(&be(2)); // rpc_version
+        f.extend_from_slice(&be(CB_PROGRAM)); // program
+        f.extend_from_slice(&be(1)); // version
+        f.extend_from_slice(&be(1)); // procedure = CB_COMPOUND
+        f.extend_from_slice(&be(0)); // cred flavor = AUTH_NONE
+        f.extend_from_slice(&be(0)); // cred len = 0
+        f.extend_from_slice(&be(0)); // verf flavor = AUTH_NONE
+        f.extend_from_slice(&be(0)); // verf len = 0
+        f.extend_from_slice(&be(0)); // tag len = 0
+        f.extend_from_slice(&be(1)); // minorversion
+        f.extend_from_slice(&be(0)); // callback_ident
+        f.extend_from_slice(&be(1)); // num_ops
+        f.extend_from_slice(&be(11)); // opcode = CB_SEQUENCE
+        f.extend_from_slice(session_id); // sessionid
+        f.extend_from_slice(&be(seqid)); // sequenceid
+        f.extend_from_slice(&be(slotid)); // slotid
+        f.extend_from_slice(&be(slotid)); // highest_slotid
+        f.extend_from_slice(&be(0)); // cachethis
+        f.extend_from_slice(&be(0)); // referring_call_lists count
+        Bytes::from(f)
+    }
+
+    /// Build a CB_COMPOUND RPC CALL carrying a single CB_RECALL op.
+    fn cb_recall_frame(xid: u32, stateid: &[u8; 16], truncate: bool, fh: &[u8]) -> Bytes {
+        let mut f = Vec::new();
+        f.extend_from_slice(&be(xid));
+        f.extend_from_slice(&be(0)); // CALL
+        f.extend_from_slice(&be(2));
+        f.extend_from_slice(&be(CB_PROGRAM));
+        f.extend_from_slice(&be(1));
+        f.extend_from_slice(&be(1)); // CB_COMPOUND
+        f.extend_from_slice(&be(0)); // cred
+        f.extend_from_slice(&be(0));
+        f.extend_from_slice(&be(0)); // verf
+        f.extend_from_slice(&be(0));
+        f.extend_from_slice(&be(0)); // tag
+        f.extend_from_slice(&be(1)); // minorversion
+        f.extend_from_slice(&be(0)); // callback_ident
+        f.extend_from_slice(&be(1)); // num_ops
+        f.extend_from_slice(&be(4)); // opcode = CB_RECALL
+        f.extend_from_slice(stateid); // stateid(16)
+        f.extend_from_slice(&be(if truncate { 1 } else { 0 })); // truncate
+        f.extend_from_slice(&be(fh.len() as u32)); // fh opaque len
+        f.extend_from_slice(fh);
+        let pad = (4 - fh.len() % 4) % 4;
+        f.extend_from_slice(&[0u8; 4][..pad]);
+        Bytes::from(f)
+    }
+
+    #[test]
+    fn cb_sequence_ok_then_misordered() {
+        let session_id = [7u8; 16];
+        let (tx, _rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+
+        // First CB_SEQUENCE on slot 0 with seqid 1 → accepted.
+        let mut frame = cb_sequence_frame(0xAABBCCDD, &session_id, 0, 1);
+        let reply = handle_cb_compound(&mut frame, &session_id, &tx, &slots).unwrap();
+        // Reply layout: xid + msg_type(=1) + reply_stat + verf(flavor+len) + accept_stat
+        //   + compound{status + tag_len + resarray_len} + op{opcode + op_status + ...}
+        assert_eq!(u32_at(&reply, 0), 0xAABBCCDD); // xid echoed
+        assert_eq!(u32_at(&reply, 4), 1); // msg_type = REPLY
+        assert_eq!(u32_at(&reply, 24), 0); // CB_COMPOUND status = NFS4_OK
+        assert_eq!(u32_at(&reply, 32), 1); // resarray len = 1
+        assert_eq!(u32_at(&reply, 36), 11); // opcode = CB_SEQUENCE
+        assert_eq!(u32_at(&reply, 40), 0); // op status = NFS4_OK
+
+        // Replaying seqid 1 on slot 0 is misordered (expected is now 2).
+        let mut frame2 = cb_sequence_frame(0xAABBCCDE, &session_id, 0, 1);
+        let reply2 = handle_cb_compound(&mut frame2, &session_id, &tx, &slots).unwrap();
+        assert_eq!(u32_at(&reply2, 36), 11); // opcode
+        assert_eq!(u32_at(&reply2, 40), NFS4ERR_SEQ_MISORDERED); // misordered
+    }
+
+    #[test]
+    fn cb_sequence_session_mismatch_dropped() {
+        let session_id = [1u8; 16];
+        let wrong = [2u8; 16];
+        let (tx, _rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+        // Frame carries `wrong` session id; handler must reject → None.
+        let mut frame = cb_sequence_frame(1, &wrong, 0, 1);
+        assert!(handle_cb_compound(&mut frame, &session_id, &tx, &slots).is_none());
+    }
+
+    #[test]
+    fn cb_recall_forwards_notification() {
+        let session_id = [9u8; 16];
+        let stateid = [0xEE; 16];
+        let fh = b"file-handle-xyz"; // 15 bytes → exercises XDR padding
+        let (tx, mut rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+
+        let mut frame = cb_recall_frame(0x11223344, &stateid, true, fh);
+        let reply = handle_cb_compound(&mut frame, &session_id, &tx, &slots).unwrap();
+        assert_eq!(u32_at(&reply, 36), 4); // opcode = CB_RECALL
+        assert_eq!(u32_at(&reply, 40), 0); // NFS4_OK
+
+        let n = rx.try_recv().expect("recall notification forwarded");
+        assert_eq!(n.stateid, stateid);
+        assert!(n.truncate);
+        assert_eq!(&n.fh[..], &fh[..]);
+    }
 }

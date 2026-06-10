@@ -102,7 +102,6 @@ pub(crate) struct Mount41 {
     pub(crate) delegations: Arc<DelegationManager>,
     pub(crate) lease_renewal: LeaseRenewal,
     pub(crate) layout_manager: Arc<LayoutManager>,
-    pub(crate) callback: Option<super::callback::CallbackService>,
     /// Handle to the recall handler task; aborted on umount.
     pub(crate) recall_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) rsize: u32,
@@ -142,7 +141,18 @@ impl Mount41 {
             self.layout_manager.clear().await;
         }
         if flags & SEQ4_STATUS_CB_FLAGS != 0 {
-            warn!(flags, "backchannel issue reported by server");
+            // RFC 8881 §18.46.3. CB_PATH_DOWN / CB_PATH_DOWN_SESSION mean the
+            // backchannel path is down (recover by re-binding a connection);
+            // BACKCHANNEL_FAULT means the server hit an unrecoverable backchannel
+            // fault (slot/seq desync) and mandates destroying & rebuilding the
+            // session. With the in-connection backchannel now serviced, these
+            // should not normally fire; full re-bind / DESTROY_SESSION recovery is
+            // a follow-up. For now surface the specific condition.
+            if flags & SEQ4_STATUS_BACKCHANNEL_FAULT != 0 {
+                warn!(flags, "server reports BACKCHANNEL_FAULT (slot/seq desync); session should be rebuilt");
+            } else {
+                warn!(flags, "server reports backchannel path down (CB_PATH_DOWN)");
+            }
         }
         if flags & SEQ4_STATUS_LEASE_MOVED != 0 {
             warn!("server reports LEASE_MOVED");
@@ -451,82 +461,71 @@ async fn mount_on_addr(
     let delegations = Arc::new(DelegationManager::new());
     let layout_manager = Arc::new(LayoutManager::new(args.noresvport));
 
-    // Start backchannel callback service for server→client delegation recalls
-    let mut callback = match super::callback::CallbackService::start(*session.id()).await {
-        Ok(cb) => {
-            // Tell server this fore-channel connection also accepts callbacks
-            // BIND_CONN_TO_SESSION must be the sole op in COMPOUND (RFC 5661 §18.34.3)
-            let mut bcts_buf = Vec::new();
-            CompoundBuilder::new("bind_conn")
-                .bind_conn_to_session(session.id(), 3, false) // CDFC4_FORE_OR_BOTH
-                .encode_with_header(auth, &mut bcts_buf);
-            match client.call(bcts_buf, 1, METADATA_TIMEOUT).await {
-                Ok(resp_bytes) => {
-                    if let Ok(resp) = CompoundResponse::decode(resp_bytes) {
-                        match resp.op_ok(0) {
-                            // op[0] = BIND_CONN_TO_SESSION
-                            Ok(op) => {
-                                // RFC 5661 §18.34.3: validate server echoes back our session ID.
-                                let mut d = op.data.clone();
-                                if d.remaining() >= 16 {
-                                    let mut confirmed_sid = [0u8; 16];
-                                    d.copy_to_slice(&mut confirmed_sid);
-                                    if &confirmed_sid != session.id() {
-                                        warn!(cb_port = cb.port, "BIND_CONN_TO_SESSION: server returned mismatched session ID");
-                                    } else {
-                                        info!(
-                                            cb_port = cb.port,
-                                            "backchannel bound via BIND_CONN_TO_SESSION"
-                                        );
-                                    }
-                                } else {
-                                    info!(
-                                        cb_port = cb.port,
-                                        "backchannel bound via BIND_CONN_TO_SESSION"
-                                    );
-                                }
-                            }
-                            Err(_) => {
-                                warn!(
-                                    cb_port = cb.port,
-                                    "BIND_CONN_TO_SESSION succeeded but op result failed"
-                                );
-                            }
+    // Set up the NFSv4.1 backchannel on this fore-channel connection. In v4.1 the
+    // server sends CB_COMPOUND callbacks back over the *same* connection, so we
+    // register a handler with the RPC layer rather than opening a separate
+    // listener (the v4.0 model). RFC 8881 §2.10.3.1, §18.34.
+    let (recall_tx, recall_rx) = tokio::sync::mpsc::channel(32);
+    client.enable_backchannel(super::callback::make_backchannel_handler(
+        *session.id(),
+        recall_tx,
+    ));
+
+    // Tell the server this connection also carries the backchannel.
+    // BIND_CONN_TO_SESSION must be the sole op in COMPOUND (RFC 8881 §18.34.3).
+    let mut bcts_buf = Vec::new();
+    CompoundBuilder::new("bind_conn")
+        .bind_conn_to_session(session.id(), 3, false) // CDFC4_FORE_OR_BOTH
+        .encode_with_header(auth, &mut bcts_buf);
+    match client.call(bcts_buf, 1, METADATA_TIMEOUT).await {
+        Ok(resp_bytes) => match CompoundResponse::decode(resp_bytes) {
+            // BIND_CONN_TO_SESSION4resok: sessionid(16) + dir(4)
+            Ok(resp) => match resp.op_ok(0) {
+                Ok(op) => {
+                    let mut d = op.data.clone();
+                    if d.remaining() >= 20 {
+                        let mut confirmed_sid = [0u8; 16];
+                        d.copy_to_slice(&mut confirmed_sid);
+                        let dir = d.get_u32();
+                        // RFC 8881 §18.34.3: validate the echoed session ID and the
+                        // granted direction. CDFS4_BACK=2, CDFS4_BOTH=3 → the
+                        // backchannel is granted iff bit 1 is set.
+                        if &confirmed_sid != session.id() {
+                            warn!("BIND_CONN_TO_SESSION: server returned mismatched session ID");
+                        } else if dir & 2 == 0 {
+                            warn!(
+                                dir,
+                                "BIND_CONN_TO_SESSION: server did not grant the backchannel direction"
+                            );
+                        } else {
+                            info!(dir, "backchannel bound via BIND_CONN_TO_SESSION");
                         }
+                    } else {
+                        warn!("BIND_CONN_TO_SESSION result truncated; cannot confirm backchannel");
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "BIND_CONN_TO_SESSION failed, backchannel may not work");
+                    warn!(error = %e, "BIND_CONN_TO_SESSION op result failed; backchannel may not work");
                 }
+            },
+            Err(e) => {
+                warn!(error = %e, "failed to decode BIND_CONN_TO_SESSION response");
             }
-            Some(cb)
-        }
+        },
         Err(e) => {
-            warn!(error = %e, "callback service failed to start, delegations disabled");
-            None
+            warn!(error = %e, "BIND_CONN_TO_SESSION failed, backchannel may not work");
         }
-    };
+    }
 
-    // Spawn recall handler if backchannel is available
-    let recall_handle = if let Some(ref mut cb) = callback {
-        let recall_rx = cb.take_recall_rx();
-        let delegations_clone = delegations.clone();
-        let rpc_clone = client.clone();
-        let auth_clone = auth.clone();
-        let session_holder_clone = session_holder.clone();
-        Some(tokio::spawn(async move {
-            handle_recalls(
-                recall_rx,
-                delegations_clone,
-                rpc_clone,
-                auth_clone,
-                session_holder_clone,
-            )
-            .await;
-        }))
-    } else {
-        None
-    };
+    // Always run the recall handler: it drains delegation recalls forwarded by the
+    // backchannel handler and issues DELEGRETURN.
+    let recall_handle = Some(tokio::spawn(handle_recalls(
+        recall_rx,
+        delegations.clone(),
+        client.clone(),
+        auth.clone(),
+        session_holder.clone(),
+    )));
 
     // Start background lease renewal using COMPOUND(SEQUENCE) (interval = server lease_time / 2)
     let lease_renewal = LeaseRenewal::start(
@@ -546,7 +545,6 @@ async fn mount_on_addr(
         delegations,
         layout_manager,
         lease_renewal,
-        callback,
         recall_handle,
         rsize,
         wsize,
@@ -834,13 +832,10 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     async fn umount(&self) -> Result<()> {
-        // Stop recall handler before stopping callback service
+        // Stop recall handler (the backchannel handler itself lives in the RPC
+        // layer and is torn down when the connection closes).
         if let Some(ref handle) = self.m.recall_handle {
             handle.abort();
-        }
-        // Stop callback service
-        if let Some(ref cb) = self.m.callback {
-            cb.stop();
         }
         // Stop lease renewal
         self.m.lease_renewal.stop();

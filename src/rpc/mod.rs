@@ -168,9 +168,26 @@ impl GETPORT2args {
 
 type PendingMap = Arc<std::sync::Mutex<HashMap<u32, oneshot::Sender<Result<Bytes>>>>>;
 
+/// Handler for inbound NFSv4.1 backchannel CALLs (server→client CB_COMPOUND).
+///
+/// Input: the full RPC CALL frame, starting at the xid (record mark already stripped).
+/// Output: the full RPC reply frame (also starting at the xid, without record mark),
+/// or `None` to drop the message silently (e.g. on a parse error).
+///
+/// The handler is synchronous — CB processing is pure parsing plus a non-blocking
+/// `try_send` to the recall channel, so it never needs to await.
+pub(crate) type BackchannelHandler = Arc<dyn Fn(Bytes) -> Option<Vec<u8>> + Send + Sync>;
+
+/// Shared slot for the optional backchannel handler. Installed after the session
+/// is established (see `enable_backchannel`); read by the reader loop on each CALL.
+type BackchannelSlot = Arc<std::sync::Mutex<Option<BackchannelHandler>>>;
+
 pub(crate) struct StreamMux {
-    writer: TokioMutex<OwnedWriteHalf>,
+    /// Wrapped in an `Arc` so the reader loop can also write backchannel replies
+    /// onto the same connection (NFSv4.1 backchannel rides the fore-channel TCP).
+    writer: Arc<TokioMutex<OwnedWriteHalf>>,
     pending: PendingMap,
+    backchannel: BackchannelSlot,
     addr: SocketAddr,
     noresvport: bool,
     generation: AtomicU64,
@@ -184,12 +201,20 @@ impl StreamMux {
         let stream = crate::connect_to_target(&addr, noresvport).await?;
         let (reader, writer) = stream.into_split();
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let writer = Arc::new(TokioMutex::new(writer));
+        let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
         let reader = BufReader::with_capacity(1_048_576, reader);
-        let reader_handle = tokio::spawn(reader_loop(reader, Arc::clone(&pending)));
+        let reader_handle = tokio::spawn(reader_loop(
+            reader,
+            Arc::clone(&pending),
+            Arc::clone(&writer),
+            Arc::clone(&backchannel),
+        ));
         info!(addr = %addr, "RPC stream mux connected");
         Ok(Arc::new(Self {
-            writer: TokioMutex::new(writer),
+            writer,
             pending,
+            backchannel,
             addr,
             noresvport,
             generation: AtomicU64::new(0),
@@ -200,6 +225,15 @@ impl StreamMux {
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Install the backchannel handler so the reader loop dispatches inbound
+    /// server CB_COMPOUND CALLs. Called once after the session is established.
+    fn enable_backchannel(&self, handler: BackchannelHandler) {
+        match self.backchannel.lock() {
+            Ok(mut slot) => *slot = Some(handler),
+            Err(_) => warn!("backchannel slot lock poisoned; cannot enable backchannel"),
+        }
     }
 
     /// `header` is the pre-assembled RPC frame header + msg_body (prefix already prepended).
@@ -325,7 +359,12 @@ impl StreamMux {
                 .reader_handle
                 .lock()
                 .map_err(|_| NfsError::Rpc("reader_handle lock poisoned".to_string()))?;
-            *guard = Some(tokio::spawn(reader_loop(reader, Arc::clone(&self.pending))));
+            *guard = Some(tokio::spawn(reader_loop(
+                reader,
+                Arc::clone(&self.pending),
+                Arc::clone(&self.writer),
+                Arc::clone(&self.backchannel),
+            )));
         }
         self.generation.fetch_add(1, Ordering::Release);
         info!(addr = %self.addr, generation = self.generation.load(Ordering::Acquire), "reconnection successful");
@@ -371,12 +410,32 @@ impl Drop for StreamMux {
     }
 }
 
-/// Background task: reads RPC responses from the TCP stream and dispatches them
-/// to the appropriate caller via the PendingMap.
-async fn reader_loop(mut reader: BufReader<OwnedReadHalf>, pending: PendingMap) {
+/// Background task: reads RPC messages from the TCP stream. Server REPLY messages
+/// are dispatched to the waiting caller via the PendingMap; server CALL messages
+/// (NFSv4.1 backchannel CB_COMPOUND, which ride the fore-channel connection) are
+/// handed to the registered backchannel handler and the reply is written back on
+/// the same connection.
+async fn reader_loop(
+    mut reader: BufReader<OwnedReadHalf>,
+    pending: PendingMap,
+    writer: Arc<TokioMutex<OwnedWriteHalf>>,
+    backchannel: BackchannelSlot,
+) {
     loop {
         match read_one_response(&mut reader).await {
             Ok((xid, data)) => {
+                // RPC msg_type lives at bytes [4..8]: 0 = CALL, 1 = REPLY.
+                // A CALL here is a server-initiated backchannel request, not a
+                // response to one of our outstanding calls.
+                let msg_type = if data.len() >= 8 {
+                    BigEndian::read_u32(&data[4..8])
+                } else {
+                    MessageType::Response as u32
+                };
+                if msg_type == MessageType::Request as u32 {
+                    dispatch_backchannel_call(xid, data, &writer, &backchannel).await;
+                    continue;
+                }
                 if let Ok(mut map) = pending.lock() {
                     if let Some(tx) = map.remove(&xid) {
                         let _ = tx.send(Ok(data));
@@ -405,6 +464,43 @@ async fn reader_loop(mut reader: BufReader<OwnedReadHalf>, pending: PendingMap) 
                 break;
             }
         }
+    }
+}
+
+/// Handle a server-initiated backchannel CALL (CB_COMPOUND) received on the
+/// fore-channel connection: dispatch it to the registered handler and write the
+/// reply back on the same connection. If no handler is registered, the CALL is
+/// dropped (the server will observe this via SEQ4_STATUS on the fore channel).
+async fn dispatch_backchannel_call(
+    xid: u32,
+    data: Bytes,
+    writer: &Arc<TokioMutex<OwnedWriteHalf>>,
+    backchannel: &BackchannelSlot,
+) {
+    let handler = match backchannel.lock() {
+        Ok(slot) => slot.clone(),
+        Err(_) => {
+            warn!("backchannel slot lock poisoned, dropping backchannel CALL");
+            return;
+        }
+    };
+    let Some(handler) = handler else {
+        debug!(xid, "backchannel CALL received but no handler registered, dropping");
+        return;
+    };
+    let Some(reply) = handler(data) else {
+        debug!(xid, "backchannel handler dropped CALL (parse error)");
+        return;
+    };
+    // Frame with the RPC record mark (MSB = last fragment) and write on the
+    // shared writer; this serializes against concurrent fore-channel requests.
+    let mark = (reply.len() as u32) | 0x80000000;
+    let mut out = Vec::with_capacity(4 + reply.len());
+    out.extend_from_slice(&mark.to_be_bytes());
+    out.extend_from_slice(&reply);
+    let mut w = writer.lock().await;
+    if let Err(e) = w.write_all(&out).await {
+        warn!(xid, error = %e, "failed to write backchannel reply");
     }
 }
 
@@ -476,6 +572,12 @@ impl std::fmt::Debug for StreamMux {
 impl Client {
     pub(crate) fn new(nfs_mux: Arc<StreamMux>, mount_mux: Option<Arc<StreamMux>>) -> Self {
         Self { nfs_mux, mount_mux }
+    }
+
+    /// Install the NFSv4.1 backchannel handler on the NFS connection so the
+    /// reader loop dispatches inbound server CB_COMPOUND CALLs.
+    pub(crate) fn enable_backchannel(&self, handler: BackchannelHandler) {
+        self.nfs_mux.enable_backchannel(handler);
     }
 
     fn get_mux(&self, program: u32) -> Result<&Arc<StreamMux>> {
@@ -642,11 +744,19 @@ impl Client {
         stream.set_nodelay(true).unwrap();
         let (reader, writer) = stream.into_split();
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let writer = Arc::new(TokioMutex::new(writer));
+        let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
         let reader = BufReader::with_capacity(1_048_576, reader);
-        let reader_handle = tokio::spawn(reader_loop(reader, Arc::clone(&pending)));
+        let reader_handle = tokio::spawn(reader_loop(
+            reader,
+            Arc::clone(&pending),
+            Arc::clone(&writer),
+            Arc::clone(&backchannel),
+        ));
         let mux = Arc::new(StreamMux {
-            writer: TokioMutex::new(writer),
+            writer,
             pending,
+            backchannel,
             addr,
             noresvport: false,
             generation: AtomicU64::new(0),
