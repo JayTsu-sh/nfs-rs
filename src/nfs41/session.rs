@@ -27,6 +27,9 @@ static PROCESS_VERIFIER: LazyLock<[u8; 8]> = LazyLock::new(rand::random);
 /// USE_NON_PNFS 和 USE_PNFS_MDS 互斥，只能选一个。
 pub(crate) const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
 
+/// RFC 8881 §13.1：客户端与 pNFS 数据服务器建立 client-id 时声明 DS 用途。
+pub(crate) const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
+
 /// 客户端身份标识，在一个 mount 实例的生命周期内保持不变。
 ///
 /// RFC 5661 §18.35.4：co_ownerid + verifier 唯一标识一个客户端实例。
@@ -223,87 +226,22 @@ impl Session {
         client_identity: &ClientIdentity,
     ) -> Result<Self> {
         // ─── Step 1: EXCHANGE_ID ─────────────────────────────────────────
-        let verifier = &client_identity.verifier;
-        let owner_id = client_identity.owner_id.as_bytes();
-
-        let builder = CompoundBuilder::new("exchange_id").exchange_id(
-            verifier,
-            owner_id,
-            EXCHGID4_FLAG_USE_PNFS_MDS,
-            "nfs-rs",
-            "nfs-rs NFSv4.1 client",
-        );
-
-        let resp = send_compound_no_session(rpc, auth, builder).await?;
-        resp.check_status()?;
-        let op = resp.op_ok(0)?;
-        let mut data = op.data.clone();
-
-        // Decode EXCHANGE_ID4resok
-        if data.remaining() < 16 {
-            return Err(NfsError::Xdr("EXCHANGE_ID result too short".to_string()));
-        }
-        let client_id = data.get_u64();
-        let create_seq_id = data.get_u32();
-        let flags = data.get_u32();
+        let (client_id, create_seq_id, eir_flags) =
+            exchange_id_step(rpc, auth, client_identity, EXCHGID4_FLAG_USE_PNFS_MDS).await?;
         // RFC 5661 §18.35.3：服务端通过 eir_flags 表明 pNFS 角色；
         // 无 USE_PNFS_MDS 即整个 mount 禁用 pNFS（与 Linux 客户端一致）
-        let pnfs_mds = flags & EXCHGID4_FLAG_USE_PNFS_MDS != 0;
+        let pnfs_mds = eir_flags & EXCHGID4_FLAG_USE_PNFS_MDS != 0;
         info!(client_id, create_seq_id, pnfs_mds, "EXCHANGE_ID successful");
 
         // ─── Step 2: CREATE_SESSION ──────────────────────────────────────
-        let fore_attrs = ChannelAttrsArgs {
-            headerpadsize: 0,
-            maxrequestsize: 1048576, // 1 MiB
-            maxresponsesize: 1048576,
-            maxresponsesize_cached: 4096,
-            maxoperations: 16,
-            maxrequests: 64, // match Linux client default (NFS4_DEF_SLOT_TABLE_SIZE)
-        };
-        let back_attrs = ChannelAttrsArgs {
-            headerpadsize: 0,
-            maxrequestsize: 4096,
-            maxresponsesize: 4096,
-            maxresponsesize_cached: 4096,
-            maxoperations: 2,
-            maxrequests: 1,
-        };
-
-        let builder = CompoundBuilder::new("create_session").create_session(
+        let (session_id, num_slots) = create_session_step(
+            rpc,
+            auth,
             client_id,
             create_seq_id,
             0x00000002, // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
-            &fore_attrs,
-            &back_attrs,
-            super::callback::CB_PROGRAM,
-        );
-
-        let resp = send_compound_no_session(rpc, auth, builder).await?;
-        resp.check_status()?;
-        let op = resp.op_ok(0)?;
-        let mut data = op.data.clone();
-
-        // Decode CREATE_SESSION4resok
-        if data.remaining() < 24 {
-            return Err(NfsError::Xdr("CREATE_SESSION result too short".to_string()));
-        }
-        let mut session_id = [0u8; 16];
-        data.copy_to_slice(&mut session_id);
-        let _csr_sequence = data.get_u32();
-        let _csr_flags = data.get_u32();
-        // Decode fore channel attrs
-        let fore_channel = decode_channel_attrs(&mut data)?;
-        // Skip back channel attrs
-        let _back_channel = decode_channel_attrs(&mut data)?;
-
-        let num_slots = fore_channel.max_requests;
-        info!(
-            session_id = hex::encode(session_id),
-            num_slots,
-            max_ops = fore_channel.max_ops,
-            max_req_size = fore_channel.max_request_size,
-            "CREATE_SESSION successful"
-        );
+        )
+        .await?;
 
         let session = Session {
             session_id,
@@ -375,6 +313,132 @@ impl Session {
             ))
         }
     }
+
+    /// 与 pNFS 数据服务器建立 session（RFC 8881 §13.1）。
+    ///
+    /// 与 [`Session::establish`] 的差异：
+    /// - EXCHANGE_ID 声明 `USE_PNFS_DS`（而非 MDS）
+    /// - CREATE_SESSION 不请求 backchannel（DS 不发 layout/delegation 召回）
+    /// - 跳过 RECLAIM_COMPLETE（DS 上无可 reclaim 的状态，Linux 客户端同样跳过）
+    pub async fn establish_ds(
+        rpc: &rpc::Client,
+        auth: &Auth,
+        client_identity: &ClientIdentity,
+    ) -> Result<Self> {
+        let (client_id, create_seq_id, eir_flags) =
+            exchange_id_step(rpc, auth, client_identity, EXCHGID4_FLAG_USE_PNFS_DS).await?;
+        info!(
+            client_id,
+            create_seq_id, eir_flags, "DS EXCHANGE_ID successful"
+        );
+
+        let (session_id, num_slots) =
+            create_session_step(rpc, auth, client_id, create_seq_id, 0).await?;
+
+        Ok(Session {
+            session_id,
+            client_id,
+            slot_table: SlotTable::new(num_slots),
+            // DS session 不参与 layout 获取，此标志仅对 MDS session 有意义
+            pnfs_mds: false,
+        })
+    }
+}
+
+/// EXCHANGE_ID：返回 (client_id, create_seq_id, eir_flags)。
+async fn exchange_id_step(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    client_identity: &ClientIdentity,
+    flags: u32,
+) -> Result<(u64, u32, u32)> {
+    let verifier = &client_identity.verifier;
+    let owner_id = client_identity.owner_id.as_bytes();
+
+    let builder = CompoundBuilder::new("exchange_id").exchange_id(
+        verifier,
+        owner_id,
+        flags,
+        "nfs-rs",
+        "nfs-rs NFSv4.1 client",
+    );
+
+    let resp = send_compound_no_session(rpc, auth, builder).await?;
+    resp.check_status()?;
+    let op = resp.op_ok(0)?;
+    let mut data = op.data.clone();
+
+    // Decode EXCHANGE_ID4resok
+    if data.remaining() < 16 {
+        return Err(NfsError::Xdr("EXCHANGE_ID result too short".to_string()));
+    }
+    let client_id = data.get_u64();
+    let create_seq_id = data.get_u32();
+    let eir_flags = data.get_u32();
+    Ok((client_id, create_seq_id, eir_flags))
+}
+
+/// CREATE_SESSION：返回 (session_id, 协商出的 slot 数)。
+async fn create_session_step(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    client_id: u64,
+    create_seq_id: u32,
+    csa_flags: u32,
+) -> Result<([u8; 16], u32)> {
+    let fore_attrs = ChannelAttrsArgs {
+        headerpadsize: 0,
+        maxrequestsize: 1048576, // 1 MiB
+        maxresponsesize: 1048576,
+        maxresponsesize_cached: 4096,
+        maxoperations: 16,
+        maxrequests: 64, // match Linux client default (NFS4_DEF_SLOT_TABLE_SIZE)
+    };
+    let back_attrs = ChannelAttrsArgs {
+        headerpadsize: 0,
+        maxrequestsize: 4096,
+        maxresponsesize: 4096,
+        maxresponsesize_cached: 4096,
+        maxoperations: 2,
+        maxrequests: 1,
+    };
+
+    let builder = CompoundBuilder::new("create_session").create_session(
+        client_id,
+        create_seq_id,
+        csa_flags,
+        &fore_attrs,
+        &back_attrs,
+        super::callback::CB_PROGRAM,
+    );
+
+    let resp = send_compound_no_session(rpc, auth, builder).await?;
+    resp.check_status()?;
+    let op = resp.op_ok(0)?;
+    let mut data = op.data.clone();
+
+    // Decode CREATE_SESSION4resok
+    if data.remaining() < 24 {
+        return Err(NfsError::Xdr("CREATE_SESSION result too short".to_string()));
+    }
+    let mut session_id = [0u8; 16];
+    data.copy_to_slice(&mut session_id);
+    let _csr_sequence = data.get_u32();
+    let _csr_flags = data.get_u32();
+    // Decode fore channel attrs
+    let fore_channel = decode_channel_attrs(&mut data)?;
+    // Skip back channel attrs
+    let _back_channel = decode_channel_attrs(&mut data)?;
+
+    let num_slots = fore_channel.max_requests;
+    info!(
+        session_id = hex::encode(session_id),
+        num_slots,
+        max_ops = fore_channel.max_ops,
+        max_req_size = fore_channel.max_request_size,
+        "CREATE_SESSION successful"
+    );
+    Ok((session_id, num_slots))
 }
 
 /// Send a COMPOUND without session SEQUENCE (used during session establishment).

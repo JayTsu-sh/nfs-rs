@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use super::callback::RecallNotification;
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::fastxdr::nfsstat4;
-use super::layout::LayoutManager;
+use super::layout::{DsConnection, LayoutManager};
 use super::lease::LeaseRenewal;
 use super::session::{ClientIdentity, Session, SessionHolder};
 use super::state::StateManager;
@@ -101,6 +101,8 @@ pub(crate) struct Mount41 {
     pub(crate) state: StateManager,
     pub(crate) lease_renewal: LeaseRenewal,
     pub(crate) layout_manager: Arc<LayoutManager>,
+    /// 解析后的 MDS 地址；pNFS 路径用于判定 DS 是否就是 MDS（复用主 session）。
+    pub(crate) server_addr: std::net::SocketAddr,
     /// Handle to the recall handler task; aborted on umount.
     pub(crate) recall_handle: Option<tokio::task::JoinHandle<()>>,
     pub(crate) rsize: u32,
@@ -328,43 +330,65 @@ impl Mount41 {
         ))
     }
 
-    /// Send a COMPOUND to a pNFS data server without SEQUENCE.
-    /// DS operations per RFC 5661 §13.1 do not require sessions.
+    /// Send a COMPOUND to a pNFS data server with SEQUENCE on the DS's own
+    /// session (RFC 8881 §13.1: DS 上的 READ/WRITE 同样要求 session)。
     pub(crate) async fn compound_ds(
-        ds_client: &rpc::Client,
+        ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data_size: usize,
         build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
     ) -> Result<CompoundResponse> {
-        let builder = CompoundBuilder::new(tag);
+        let slot = ds.session.acquire_slot().await?;
+        let builder = CompoundBuilder::new(tag).sequence(
+            ds.session.id(),
+            slot.current_sequence_id(),
+            slot.slot_id,
+            ds.session.highest_slot_id(),
+            false,
+        );
         let builder = build_ops(builder);
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data_size);
-        let response_bytes = ds_client.call(buf, NFS_RETRIES, timeout).await?;
+        let response_bytes = ds.client.call(buf, NFS_RETRIES, timeout).await?;
         let resp = CompoundResponse::decode(response_bytes)?;
+        // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
+        if resp.op_ok(0).is_ok() {
+            slot.advance();
+        }
         resp.check_status()?;
         Ok(resp)
     }
 
-    /// Send a COMPOUND to a DS with zero-copy write data (no SEQUENCE).
+    /// Send a COMPOUND to a DS with zero-copy write data (SEQUENCE on DS session).
     pub(crate) async fn compound_ds_write(
-        ds_client: &rpc::Client,
+        ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data: Bytes,
         build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
     ) -> Result<CompoundResponse> {
-        let builder = CompoundBuilder::new(tag);
+        let slot = ds.session.acquire_slot().await?;
+        let builder = CompoundBuilder::new(tag).sequence(
+            ds.session.id(),
+            slot.current_sequence_id(),
+            slot.slot_id,
+            ds.session.highest_slot_id(),
+            false,
+        );
         let builder = build_ops(builder);
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data.len());
-        let response_bytes = ds_client
+        let response_bytes = ds
+            .client
             .call_with_data(buf, data, NFS_RETRIES, timeout)
             .await?;
         let resp = CompoundResponse::decode(response_bytes)?;
+        if resp.op_ok(0).is_ok() {
+            slot.advance();
+        }
         resp.check_status()?;
         Ok(resp)
     }
@@ -540,6 +564,7 @@ async fn mount_on_addr(
         client_identity,
         state: StateManager::new(),
         layout_manager,
+        server_addr: *addr,
         lease_renewal,
         recall_handle,
         rsize,
@@ -896,6 +921,11 @@ impl crate::Mount for Mount41Wrapper {
         }
         // Return all pNFS layouts to the server
         self.m.layoutreturn_all().await;
+        // Tear down DS connections: destroy each DS session/client-id (best-effort)
+        for (addr, ds) in self.m.layout_manager.drain_data_servers().await {
+            debug!(addr = %addr, "destroying DS session");
+            ds.destroy(&self.m.auth).await;
+        }
         // DESTROY_SESSION — send without SEQUENCE (H3: cannot use session to
         // destroy itself). Use a bare COMPOUND with only DESTROY_SESSION.
         let current_sess = self.m.session_holder.get().await;

@@ -5,10 +5,13 @@
 //! parallel. If pNFS is unavailable or fails, callers fall back to MDS I/O.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tracing::debug;
 
+use super::compound::CompoundResponse;
+use super::fastxdr::nfsstat4;
 use super::layout::{Layout, LayoutContent, LayoutSegment};
 use super::mount::Mount41;
 use super::state::{AccessMode, StateId};
@@ -119,6 +122,96 @@ impl Mount41 {
         }
     }
 
+    // ─── DS chunk I/O ───────────────────────────────────────────────────────
+
+    /// 对单个 stripe chunk 发 DS READ（COMPOUND: SEQUENCE, PUTFH, READ）。
+    /// MDS 即 DS 时复用主 session（避免对同一 server 重复建 client-id）；
+    /// 否则走 DS 自己的 session，NFS4ERR_BADSESSION/DEADSESSION 时重建一次。
+    async fn ds_read_chunk(
+        &self,
+        ds_addr: SocketAddr,
+        ds_fh: &Bytes,
+        stateid: &[u8; 16],
+        offset: u64,
+        count: u32,
+    ) -> Result<CompoundResponse> {
+        if ds_addr == self.server_addr {
+            return self
+                .compound_data("ds-read-mds", count as usize, |b| {
+                    b.putfh(ds_fh).read(stateid, offset, count)
+                })
+                .await;
+        }
+        let ds = self
+            .layout_manager
+            .get_data_server(ds_addr, &self.auth, &self.client_identity)
+            .await?;
+        let result = Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
+            b.putfh(ds_fh).read(stateid, offset, count)
+        })
+        .await;
+        match result {
+            Err(NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION | nfsstat4::NFS4ERR_DEADSESSION)) => {
+                // DS session 失效（如长时间空闲后过期）：重建一次再试
+                self.layout_manager.remove_data_server(ds_addr).await;
+                let ds = self
+                    .layout_manager
+                    .get_data_server(ds_addr, &self.auth, &self.client_identity)
+                    .await?;
+                Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
+                    b.putfh(ds_fh).read(stateid, offset, count)
+                })
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// 对单个 stripe chunk 发 DS WRITE（COMPOUND: SEQUENCE, PUTFH, WRITE），
+    /// 路由与 session 失效处理同 [`Self::ds_read_chunk`]。
+    async fn ds_write_chunk(
+        &self,
+        ds_addr: SocketAddr,
+        ds_fh: &Bytes,
+        stateid: &[u8; 16],
+        ds_off: u64,
+        data: Bytes,
+    ) -> Result<CompoundResponse> {
+        let len = data.len() as u32;
+        if ds_addr == self.server_addr {
+            return self
+                .compound_write("ds-write-mds", data, |b| {
+                    b.putfh(ds_fh)
+                        .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+                })
+                .await;
+        }
+        let ds = self
+            .layout_manager
+            .get_data_server(ds_addr, &self.auth, &self.client_identity)
+            .await?;
+        let result = Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data.clone(), |b| {
+            b.putfh(ds_fh)
+                .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+        })
+        .await;
+        match result {
+            Err(NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION | nfsstat4::NFS4ERR_DEADSESSION)) => {
+                self.layout_manager.remove_data_server(ds_addr).await;
+                let ds = self
+                    .layout_manager
+                    .get_data_server(ds_addr, &self.auth, &self.client_identity)
+                    .await?;
+                Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data, |b| {
+                    b.putfh(ds_fh)
+                        .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+                })
+                .await
+            }
+            other => other,
+        }
+    }
+
     // ─── pNFS Read ──────────────────────────────────────────────────────────
 
     /// Attempt a pNFS parallel read.
@@ -197,27 +290,18 @@ impl Mount41 {
                     .copied()
                     .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
                 let layout_stateid = layout.stateid;
-                let auth = self.auth.clone();
-                let lm = self.layout_manager.clone();
                 let chunk_len = chunk.length;
                 let chunk_ds_offset = chunk.ds_offset;
                 async move {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
-                    let ds_client = lm.get_data_server(ds_addr).await?;
-                    let resp = Mount41::compound_ds(
-                        &ds_client,
-                        &auth,
-                        "ds-read",
-                        chunk_len as usize,
-                        |b| {
-                            b.putfh(&ds_fh)
-                                .read(&layout_stateid, chunk_ds_offset, chunk_len)
-                        },
-                    )
-                    .await?;
-                    resp.op_ok(0)?; // PUTFH (no SEQUENCE on DS)
-                    let read_op = resp.op_ok(1)?; // READ
+                    let resp = self
+                        .ds_read_chunk(ds_addr, &ds_fh, &layout_stateid, chunk_ds_offset, chunk_len)
+                        .await?;
+                    // 主 session 复用与独立 DS session 两条路径的 op 布局一致：
+                    // SEQUENCE=0, PUTFH=1, READ=2
+                    resp.op_ok(1)?; // PUTFH
+                    let read_op = resp.op_ok(2)?; // READ
                     let mut data = read_op.data.clone();
                     // READ4resok: eof(4) + data<>
                     if data.remaining() < 4 {
@@ -336,34 +420,19 @@ impl Mount41 {
                     .copied()
                     .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
                 let layout_stateid = layout.stateid;
-                let auth = self.auth.clone();
-                let lm = self.layout_manager.clone();
                 // Zero-copy slice of the write data for this stripe chunk
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
-                let chunk_len = chunk.length;
                 let ds_off = chunk.ds_offset;
                 async move {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
-                    let ds_client = lm.get_data_server(ds_addr).await?;
-                    let resp = Mount41::compound_ds_write(
-                        &ds_client,
-                        &auth,
-                        "ds-write",
-                        chunk_data,
-                        |b| {
-                            b.putfh(&ds_fh).write_header(
-                                &layout_stateid,
-                                ds_off,
-                                2, /* FILE_SYNC4 */
-                                chunk_len,
-                            )
-                        },
-                    )
-                    .await?;
-                    resp.op_ok(0)?; // PUTFH
-                    let write_op = resp.op_ok(1)?; // WRITE
+                    let resp = self
+                        .ds_write_chunk(ds_addr, &ds_fh, &layout_stateid, ds_off, chunk_data)
+                        .await?;
+                    // SEQUENCE=0, PUTFH=1, WRITE=2（两条路径布局一致）
+                    resp.op_ok(1)?; // PUTFH
+                    let write_op = resp.op_ok(2)?; // WRITE
                     let mut d = write_op.data.clone();
                     if d.remaining() < 16 {
                         return Err(NfsError::Xdr("DS WRITE result too short".to_string()));

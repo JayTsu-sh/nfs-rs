@@ -11,13 +11,20 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use super::compound::CompoundBuilder;
+use super::session::{ClientIdentity, Session};
 use crate::error::{NfsError, Result};
 use crate::rpc;
+use crate::rpc::auth::Auth;
+
+/// DS 控制操作（DESTROY_SESSION/DESTROY_CLIENTID）的超时。
+const DS_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// pNFS layout types.
 #[repr(u32)]
@@ -99,12 +106,38 @@ pub(crate) struct StripeChunk {
     pub length: u32,
 }
 
+/// A connection to a pNFS data server with its own NFSv4.1 session
+/// (RFC 8881 §13.1：DS 上的 READ/WRITE 同样要求 SEQUENCE)。
+#[derive(Clone)]
+pub(crate) struct DsConnection {
+    pub client: rpc::Client,
+    pub session: Arc<Session>,
+}
+
+impl DsConnection {
+    /// Best-effort 销毁 DS 的 session 与 client-id（umount 或竞态重复连接时）。
+    /// DESTROY_SESSION/DESTROY_CLIENTID 都不带 SEQUENCE，失败仅记日志。
+    pub async fn destroy(&self, auth: &Auth) {
+        let builder = CompoundBuilder::new("ds_destroy_session").destroy_session(self.session.id());
+        let mut buf = Vec::new();
+        builder.encode_with_header(auth, &mut buf);
+        if let Err(e) = self.client.call(buf, 1, DS_TEARDOWN_TIMEOUT).await {
+            debug!(error = %e, "DS DESTROY_SESSION failed (may already be destroyed)");
+        }
+        let builder =
+            CompoundBuilder::new("ds_destroy_clientid").destroy_client_id(self.session.client_id());
+        let mut buf = Vec::new();
+        builder.encode_with_header(auth, &mut buf);
+        let _ = self.client.call(buf, 1, DS_TEARDOWN_TIMEOUT).await;
+    }
+}
+
 /// Manages active layouts and data server connections.
 pub(crate) struct LayoutManager {
     /// Layouts indexed by file handle.
     layouts: RwLock<HashMap<Bytes, Layout>>,
-    /// Cached connections to data servers.
-    data_servers: RwLock<HashMap<SocketAddr, rpc::Client>>,
+    /// Cached connections to data servers (each with its own session).
+    data_servers: RwLock<HashMap<SocketAddr, DsConnection>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], DeviceInfo>>,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
@@ -175,27 +208,56 @@ impl LayoutManager {
         cache.get(device_id).cloned()
     }
 
-    /// Get or create a connection to a data server.
-    pub async fn get_data_server(&self, addr: SocketAddr) -> Result<rpc::Client> {
+    /// Get or create a connection (with session) to a data server.
+    pub async fn get_data_server(
+        &self,
+        addr: SocketAddr,
+        auth: &Auth,
+        client_identity: &ClientIdentity,
+    ) -> Result<DsConnection> {
         // Fast path: read lock only
         {
             let servers = self.data_servers.read().await;
-            if let Some(client) = servers.get(&addr) {
-                return Ok(client.clone());
+            if let Some(conn) = servers.get(&addr) {
+                return Ok(conn.clone());
             }
         }
-        // TCP connect OUTSIDE any lock — can be slow without stalling other I/O
+        // TCP connect + session establishment OUTSIDE any lock —
+        // can be slow without stalling other I/O
         let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
         let new_client = rpc::Client::new(mux, None);
+        // RFC 8881 §13.1：DS 需要自己的 client-id + session（EXCHANGE_ID USE_PNFS_DS）
+        let session = Session::establish_ds(&new_client, auth, client_identity).await?;
+        let conn = DsConnection {
+            client: new_client,
+            session: Arc::new(session),
+        };
         // Acquire write lock and re-check (another task may have connected concurrently)
         let mut servers = self.data_servers.write().await;
         if let Some(existing) = servers.get(&addr) {
-            // Race: another task already connected; use existing connection
-            return Ok(existing.clone());
+            // Race: another task already connected; destroy the duplicate
+            // session best-effort and use the existing connection
+            let existing = existing.clone();
+            drop(servers);
+            let auth = auth.clone();
+            tokio::spawn(async move { conn.destroy(&auth).await });
+            return Ok(existing);
         }
-        servers.insert(addr, new_client.clone());
-        info!(addr = %addr, "connected to pNFS data server");
-        Ok(new_client)
+        servers.insert(addr, conn.clone());
+        info!(addr = %addr, "connected to pNFS data server (session established)");
+        Ok(conn)
+    }
+
+    /// Remove a cached DS connection (e.g. after NFS4ERR_BADSESSION from the DS).
+    pub async fn remove_data_server(&self, addr: SocketAddr) -> Option<DsConnection> {
+        let mut servers = self.data_servers.write().await;
+        servers.remove(&addr)
+    }
+
+    /// Drain all DS connections for teardown (umount).
+    pub async fn drain_data_servers(&self) -> Vec<(SocketAddr, DsConnection)> {
+        let mut servers = self.data_servers.write().await;
+        servers.drain().collect()
     }
 }
 
