@@ -9,7 +9,6 @@ mod acl_ops;
 pub(crate) mod attrs;
 pub(crate) mod callback;
 pub(crate) mod compound;
-pub(crate) mod delegation;
 mod dir_ops;
 pub(crate) mod fastxdr;
 mod getattr;

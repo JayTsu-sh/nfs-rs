@@ -720,6 +720,11 @@ impl ChannelAttrsArgs {
     }
 }
 
+/// OPEN4_SHARE_ACCESS_WANT_NO_DELEG (RFC 8881 §18.16)：告知服务器不要授予 delegation。
+/// 本客户端面向迁移/批量传输负载（每个文件只写一遍），delegation 没有缓存收益，
+/// 只会引入 CB_RECALL / NFS4ERR_DELAY 停顿，因此所有 OPEN 一律拒绝。
+const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0100;
+
 /// OPEN arguments.
 pub(crate) struct OpenArgs {
     pub seqid: u32,
@@ -736,7 +741,8 @@ pub(crate) struct OpenArgs {
 impl OpenArgs {
     fn encode(&self, buf: &mut Vec<u8>) {
         xdr_u32(buf, self.seqid);
-        xdr_u32(buf, self.share_access);
+        // 统一附加 WANT_NO_DELEG：合规服务器（knfsd/ONTAP）将不再授予 delegation
+        xdr_u32(buf, self.share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG);
         xdr_u32(buf, self.share_deny);
         // open_owner4
         xdr_u64(buf, self.client_id);

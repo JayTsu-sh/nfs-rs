@@ -83,9 +83,6 @@ impl Mount41 {
         let mut open_data = open_op.data.clone();
         let stateid = extract_stateid(&mut open_data)?;
 
-        // Parse delegation from OPEN4resok remainder (after stateid)
-        let deleg_info = parse_open_delegation(&mut open_data);
-
         let getfh = resp.op_ok(3)?; // GETFH
         let mut fh_data = getfh.data.clone();
         let fh = decode_fh(&mut fh_data)?;
@@ -99,12 +96,6 @@ impl Mount41 {
             StateId::from_bytes(&stateid),
             access_mode,
         ).await;
-
-        // Register delegation if the server granted one
-        if let Some((deleg_stateid, deleg_type)) = deleg_info {
-            debug!(fh_len = fh.len(), deleg_type, "delegation granted by server");
-            self.delegations.register(&fh, deleg_stateid).await;
-        }
 
         Ok(mount::ObjRes { fh, attr: Some(attr) })
     }
@@ -228,44 +219,3 @@ impl Mount41 {
     }
 }
 
-/// Parse open_delegation4 from OPEN4resok remainder (after stateid).
-/// The remaining fields are: cinfo + rflags + attrset + delegation.
-/// Returns `Some((stateid, deleg_type))` if a delegation was granted,
-/// where `deleg_type` is 1 (READ) or 2 (WRITE).
-fn parse_open_delegation(data: &mut Bytes) -> Option<([u8; 16], u32)> {
-    // Skip cinfo: atomic(4) + before(8) + after(8) = 20 bytes
-    if data.remaining() < 20 {
-        return None;
-    }
-    data.advance(20);
-    // Skip rflags (4 bytes)
-    if data.remaining() < 4 {
-        return None;
-    }
-    data.advance(4);
-    // Skip attrset bitmap: count(4) + count*4 bytes
-    if data.remaining() < 4 {
-        return None;
-    }
-    let bitmap_count = data.get_u32() as usize;
-    let skip = bitmap_count.checked_mul(4)?;
-    if data.remaining() < skip {
-        return None;
-    }
-    data.advance(skip);
-    // Parse delegation_type: 0=NONE, 1=READ, 2=WRITE
-    if data.remaining() < 4 {
-        return None;
-    }
-    let deleg_type = data.get_u32();
-    if deleg_type != 1 && deleg_type != 2 {
-        return None; // OPEN_DELEGATE_NONE or unknown
-    }
-    // stateid4: seqid(4) + other(12) = 16 bytes
-    if data.remaining() < 16 {
-        return None;
-    }
-    let mut sid = [0u8; 16];
-    data.copy_to_slice(&mut sid);
-    Some((sid, deleg_type))
-}

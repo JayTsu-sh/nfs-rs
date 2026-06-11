@@ -12,7 +12,6 @@ use bytes::{Buf, Bytes};
 use tracing::{debug, info, warn};
 
 use super::compound::{CompoundBuilder, CompoundResponse};
-use super::delegation::DelegationManager;
 use super::fastxdr::nfsstat4;
 use super::layout::LayoutManager;
 use super::lease::LeaseRenewal;
@@ -99,7 +98,6 @@ pub(crate) struct Mount41 {
     /// 客户端身份标识，re-establishment 时复用，避免 EXCHANGE_ID 互相销毁 session。
     pub(crate) client_identity: ClientIdentity,
     pub(crate) state: StateManager,
-    pub(crate) delegations: Arc<DelegationManager>,
     pub(crate) lease_renewal: LeaseRenewal,
     pub(crate) layout_manager: Arc<LayoutManager>,
     /// Handle to the recall handler task; aborted on umount.
@@ -129,12 +127,8 @@ impl Mount41 {
         }
 
         if flags & SEQ4_STATUS_STATE_REVOKED != 0 {
-            warn!(
-                flags,
-                "server revoked state — clearing open/delegation state"
-            );
+            warn!(flags, "server revoked state — clearing open state");
             self.state.clear().await;
-            let _ = self.delegations.return_all().await;
         }
         if flags & (SEQ4_STATUS_DEVID_CHANGED | SEQ4_STATUS_DEVID_DELETED) != 0 {
             warn!(flags, "pNFS device changed/deleted — evicting layout cache");
@@ -165,7 +159,6 @@ impl Mount41 {
             // background to avoid slot contention with the caller's in-flight slot.
             warn!("server reports RESTART_RECLAIM_NEEDED — clearing all state, sending RECLAIM_COMPLETE");
             self.state.clear().await;
-            let _ = self.delegations.return_all().await;
             self.layout_manager.clear().await;
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
@@ -458,7 +451,6 @@ async fn mount_on_addr(
         "negotiated transfer sizes"
     );
 
-    let delegations = Arc::new(DelegationManager::new());
     let layout_manager = Arc::new(LayoutManager::new(args.noresvport));
 
     // Set up the NFSv4.1 backchannel on this fore-channel connection. In v4.1 the
@@ -517,11 +509,11 @@ async fn mount_on_addr(
         }
     }
 
-    // Always run the recall handler: it drains delegation recalls forwarded by the
-    // backchannel handler and issues DELEGRETURN.
+    // Always run the recall handler: OPEN 一律带 WANT_NO_DELEG，正常情况下服务器
+    // 不会授予 delegation；若不合规服务器仍强塞并 CB_RECALL，则用 recall 报文里
+    // 自带的 (fh, stateid) 无状态地直接 DELEGRETURN，无需本地跟踪。
     let recall_handle = Some(tokio::spawn(handle_recalls(
         recall_rx,
-        delegations.clone(),
         client.clone(),
         auth.clone(),
         session_holder.clone(),
@@ -542,7 +534,6 @@ async fn mount_on_addr(
         session_holder,
         client_identity,
         state: StateManager::new(),
-        delegations,
         layout_manager,
         lease_renewal,
         recall_handle,
@@ -554,52 +545,55 @@ async fn mount_on_addr(
 }
 
 /// Background task that processes delegation recall notifications and sends DELEGRETURN.
+///
+/// 客户端从不主动持有 delegation（OPEN 带 WANT_NO_DELEG），因此无本地跟踪；
+/// CB_RECALL 报文自带 (fh, stateid)，直接原样归还即可。
 async fn handle_recalls(
     mut recall_rx: tokio::sync::mpsc::Receiver<super::callback::RecallNotification>,
-    delegations: Arc<DelegationManager>,
     rpc: rpc::Client,
     auth: Auth,
     session_holder: Arc<SessionHolder>,
 ) {
     while let Some(notification) = recall_rx.recv().await {
-        // Find and remove the delegation
-        if let Some(deleg) = delegations.handle_recall(&notification).await {
-            // Always get the latest session from the holder so that post-recovery
-            // DELEGRETURN uses the current session ID rather than a stale one.
-            let session = session_holder.get().await;
-            // Send DELEGRETURN
-            match session.acquire_slot().await {
-                Ok(slot) => {
-                    let builder = CompoundBuilder::new("delegreturn")
-                        .sequence(
-                            session.id(),
-                            slot.sequence_id,
-                            slot.slot_id,
-                            session.highest_slot_id(),
-                            false,
-                        )
-                        .putfh(&notification.fh)
-                        .delegreturn(&deleg.stateid);
-                    let mut buf = Vec::new();
-                    builder.encode_with_header(&auth, &mut buf);
-                    match rpc.call(buf, 1, METADATA_TIMEOUT).await {
-                        Ok(_) => {
-                            slot.advance();
-                            debug!(
-                                fh_len = notification.fh.len(),
-                                "DELEGRETURN sent for recalled delegation"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "DELEGRETURN failed");
-                        }
+        warn!(
+            fh_len = notification.fh.len(),
+            "server granted a delegation despite WANT_NO_DELEG; returning it"
+        );
+        // Always get the latest session from the holder so that post-recovery
+        // DELEGRETURN uses the current session ID rather than a stale one.
+        let session = session_holder.get().await;
+        // Send DELEGRETURN
+        match session.acquire_slot().await {
+            Ok(slot) => {
+                let builder = CompoundBuilder::new("delegreturn")
+                    .sequence(
+                        session.id(),
+                        slot.sequence_id,
+                        slot.slot_id,
+                        session.highest_slot_id(),
+                        false,
+                    )
+                    .putfh(&notification.fh)
+                    .delegreturn(&notification.stateid);
+                let mut buf = Vec::new();
+                builder.encode_with_header(&auth, &mut buf);
+                match rpc.call(buf, 1, METADATA_TIMEOUT).await {
+                    Ok(_) => {
+                        slot.advance();
+                        debug!(
+                            fh_len = notification.fh.len(),
+                            "DELEGRETURN sent for recalled delegation"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "DELEGRETURN failed");
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "failed to acquire slot for DELEGRETURN");
-                }
-            };
-        }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to acquire slot for DELEGRETURN");
+            }
+        };
     }
     debug!("recall handler exiting");
 }
@@ -804,25 +798,11 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     async fn delegreturn(&self, stateid: u64) -> Result<()> {
-        let prefix: [u8; 8] = stateid.to_be_bytes();
-        let (fh, sid) = self
-            .m
-            .delegations
-            .find_fh_by_stateid_prefix(prefix)
-            .await
-            .ok_or_else(|| {
-                NfsError::Rpc(format!(
-                    "no delegation found for stateid prefix {:#x}",
-                    stateid
-                ))
-            })?;
-        let resp = self
-            .m
-            .compound("delegreturn", |b| b.putfh(&fh).delegreturn(&sid))
-            .await?;
-        resp.op_ok(1)?; // PUTFH
-        resp.op_ok(2)?; // DELEGRETURN
-        Ok(())
+        // 客户端 OPEN 一律带 WANT_NO_DELEG，从不持有 delegation，无可归还。
+        Err(NfsError::Rpc(format!(
+            "no delegation held (client opens with WANT_NO_DELEG); stateid prefix {:#x}",
+            stateid
+        )))
     }
 
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {
@@ -839,14 +819,6 @@ impl crate::Mount for Mount41Wrapper {
         }
         // Stop lease renewal
         self.m.lease_renewal.stop();
-        // Return all delegations via DELEGRETURN
-        let delegs = self.m.delegations.return_all().await;
-        for (fh, deleg) in &delegs {
-            let _ = self
-                .m
-                .compound("delegreturn", |b| b.putfh(fh).delegreturn(&deleg.stateid))
-                .await;
-        }
         // CLOSE all open files before destroying session
         let open_files = self.m.state.drain().await;
         for (fh, sid) in &open_files {
