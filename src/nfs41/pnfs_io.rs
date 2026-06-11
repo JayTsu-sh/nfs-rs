@@ -255,6 +255,15 @@ impl Mount41 {
             return None;
         }
 
+        // RFC 8881 §13.9.1：DS 上的 READ 使用 open/delegation stateid，
+        // 而非 layout stateid（layout stateid 仅用于 LAYOUTCOMMIT/LAYOUTRETURN）
+        let io_stateid = self
+            .state
+            .has_open(fh, AccessMode::Read)
+            .await
+            .unwrap_or_else(StateId::anonymous)
+            .raw;
+
         let num_ds = fh_list.len() as u32;
         let chunks = super::layout::split_into_stripes(
             offset,
@@ -289,14 +298,13 @@ impl Mount41 {
                     .and_then(|a| a.first())
                     .copied()
                     .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
-                let layout_stateid = layout.stateid;
                 let chunk_len = chunk.length;
                 let chunk_ds_offset = chunk.ds_offset;
                 async move {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
                     let resp = self
-                        .ds_read_chunk(ds_addr, &ds_fh, &layout_stateid, chunk_ds_offset, chunk_len)
+                        .ds_read_chunk(ds_addr, &ds_fh, &io_stateid, chunk_ds_offset, chunk_len)
                         .await?;
                     // 主 session 复用与独立 DS session 两条路径的 op 布局一致：
                     // SEQUENCE=0, PUTFH=1, READ=2
@@ -384,6 +392,15 @@ impl Mount41 {
             return None;
         }
 
+        // RFC 8881 §13.9.1：DS 上的 WRITE 使用 open/delegation stateid，
+        // 而非 layout stateid（layout stateid 仅用于 LAYOUTCOMMIT/LAYOUTRETURN）
+        let io_stateid = self
+            .state
+            .has_open(fh, AccessMode::Write)
+            .await
+            .unwrap_or_else(StateId::anonymous)
+            .raw;
+
         let num_ds = fh_list.len() as u32;
         let data_len = data.len();
         let chunks = super::layout::split_into_stripes(
@@ -419,7 +436,6 @@ impl Mount41 {
                     .and_then(|a| a.first())
                     .copied()
                     .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
-                let layout_stateid = layout.stateid;
                 // Zero-copy slice of the write data for this stripe chunk
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
@@ -428,7 +444,7 @@ impl Mount41 {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
                     let resp = self
-                        .ds_write_chunk(ds_addr, &ds_fh, &layout_stateid, ds_off, chunk_data)
+                        .ds_write_chunk(ds_addr, &ds_fh, &io_stateid, ds_off, chunk_data)
                         .await?;
                     // SEQUENCE=0, PUTFH=1, WRITE=2（两条路径布局一致）
                     resp.op_ok(1)?; // PUTFH
