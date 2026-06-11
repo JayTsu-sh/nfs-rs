@@ -6,8 +6,8 @@
 //! and provides exactly-once semantics.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use bytes::{Buf, Bytes};
 use tokio::sync::Semaphore;
@@ -22,6 +22,10 @@ use crate::rpc::auth::Auth;
 /// 进程级 verifier，RFC 5661 §18.35.4 要求 verifier 在客户端重启时变化。
 /// 同一进程内所有 mount 实例共享同一 verifier，仅在进程重启时改变。
 static PROCESS_VERIFIER: LazyLock<[u8; 8]> = LazyLock::new(rand::random);
+
+/// RFC 5661 §18.35.3：客户端声明 / 服务端确认其为 pNFS 元数据服务器。
+/// USE_NON_PNFS 和 USE_PNFS_MDS 互斥，只能选一个。
+pub(crate) const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
 
 /// 客户端身份标识，在一个 mount 实例的生命周期内保持不变。
 ///
@@ -57,6 +61,9 @@ pub(crate) struct Session {
     client_id: u64,
     /// Slot table for concurrent request management.
     slot_table: SlotTable,
+    /// 服务端在 EXCHANGE_ID eir_flags 中确认自己是 pNFS MDS（RFC 5661 §18.35.3）。
+    /// 为 false 时整个 mount 禁用 pNFS（与 Linux 客户端行为一致），跳过所有 LAYOUTGET。
+    pnfs_mds: bool,
 }
 
 /// Negotiated channel attributes from CREATE_SESSION (used for logging).
@@ -116,11 +123,16 @@ impl SlotTable {
     /// Acquire the next available slot. Blocks if all slots are in use.
     async fn acquire(&self) -> Result<AcquiredSlot<'_>> {
         // Semaphore ensures we don't exceed the slot count.
-        let _permit = self.semaphore.acquire().await
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
             .map_err(|_| NfsError::Rpc("session slot table closed".to_string()))?;
         // Pop a free slot index — guaranteed to succeed because the semaphore guards it.
         let slot_id = {
-            let mut pool = self.free_pool.lock()
+            let mut pool = self
+                .free_pool
+                .lock()
                 .map_err(|_| NfsError::Rpc("slot pool mutex poisoned".to_string()))?;
             pool.pop_front()
                 .ok_or_else(|| NfsError::Rpc("slot pool empty (should not happen)".to_string()))?
@@ -181,6 +193,11 @@ impl Session {
         self.client_id
     }
 
+    /// 服务端是否为 pNFS MDS（EXCHANGE_ID eir_flags 含 USE_PNFS_MDS）。
+    pub fn pnfs_mds(&self) -> bool {
+        self.pnfs_mds
+    }
+
     /// Acquire a slot for a COMPOUND call.
     pub async fn acquire_slot(&self) -> Result<AcquiredSlot<'_>> {
         self.slot_table.acquire().await
@@ -209,14 +226,13 @@ impl Session {
         let verifier = &client_identity.verifier;
         let owner_id = client_identity.owner_id.as_bytes();
 
-        let builder = CompoundBuilder::new("exchange_id")
-            .exchange_id(
-                verifier,
-                owner_id,
-                0x00020000, // EXCHGID4_FLAG_USE_PNFS_MDS — RFC 5661 §18.35.3: USE_NON_PNFS 和 USE_PNFS_MDS 互斥，只能选一个
-                "nfs-rs",
-                "nfs-rs NFSv4.1 client",
-            );
+        let builder = CompoundBuilder::new("exchange_id").exchange_id(
+            verifier,
+            owner_id,
+            EXCHGID4_FLAG_USE_PNFS_MDS,
+            "nfs-rs",
+            "nfs-rs NFSv4.1 client",
+        );
 
         let resp = send_compound_no_session(rpc, auth, builder).await?;
         resp.check_status()?;
@@ -229,13 +245,16 @@ impl Session {
         }
         let client_id = data.get_u64();
         let create_seq_id = data.get_u32();
-        let _flags = data.get_u32();
-        info!(client_id, create_seq_id, "EXCHANGE_ID successful");
+        let flags = data.get_u32();
+        // RFC 5661 §18.35.3：服务端通过 eir_flags 表明 pNFS 角色；
+        // 无 USE_PNFS_MDS 即整个 mount 禁用 pNFS（与 Linux 客户端一致）
+        let pnfs_mds = flags & EXCHGID4_FLAG_USE_PNFS_MDS != 0;
+        info!(client_id, create_seq_id, pnfs_mds, "EXCHANGE_ID successful");
 
         // ─── Step 2: CREATE_SESSION ──────────────────────────────────────
         let fore_attrs = ChannelAttrsArgs {
             headerpadsize: 0,
-            maxrequestsize: 1048576,  // 1 MiB
+            maxrequestsize: 1048576, // 1 MiB
             maxresponsesize: 1048576,
             maxresponsesize_cached: 4096,
             maxoperations: 16,
@@ -250,15 +269,14 @@ impl Session {
             maxrequests: 1,
         };
 
-        let builder = CompoundBuilder::new("create_session")
-            .create_session(
-                client_id,
-                create_seq_id,
-                0x00000002, // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
-                &fore_attrs,
-                &back_attrs,
-                super::callback::CB_PROGRAM,
-            );
+        let builder = CompoundBuilder::new("create_session").create_session(
+            client_id,
+            create_seq_id,
+            0x00000002, // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
+            &fore_attrs,
+            &back_attrs,
+            super::callback::CB_PROGRAM,
+        );
 
         let resp = send_compound_no_session(rpc, auth, builder).await?;
         resp.check_status()?;
@@ -291,6 +309,7 @@ impl Session {
             session_id,
             client_id,
             slot_table: SlotTable::new(num_slots),
+            pnfs_mds,
         };
 
         // ─── Step 3: RECLAIM_COMPLETE ────────────────────────────────────
@@ -322,16 +341,28 @@ impl Session {
                         info!("RECLAIM_COMPLETE successful, session ready");
                         return Ok(session);
                     }
-                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
+                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_DELAY))
+                        if attempt < DELAY_RETRY_MAX =>
+                    {
                         let delay_ms = delay_with_jitter_ms(attempt);
-                        tracing::warn!(attempt, delay_ms, "RECLAIM_COMPLETE got NFS4ERR_DELAY, retrying with jitter");
+                        tracing::warn!(
+                            attempt,
+                            delay_ms,
+                            "RECLAIM_COMPLETE got NFS4ERR_DELAY, retrying with jitter"
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
+                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_GRACE))
+                        if attempt < DELAY_RETRY_MAX =>
+                    {
                         // RFC 5661 §8.4.2.1: server is in grace period, wait and retry
                         let delay_ms = grace_with_jitter_ms(attempt);
-                        tracing::warn!(attempt, delay_ms, "RECLAIM_COMPLETE got NFS4ERR_GRACE, waiting for server grace period");
+                        tracing::warn!(
+                            attempt,
+                            delay_ms,
+                            "RECLAIM_COMPLETE got NFS4ERR_GRACE, waiting for server grace period"
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
@@ -339,7 +370,9 @@ impl Session {
                 }
             }
             drop(slot);
-            Err(NfsError::Rpc("RECLAIM_COMPLETE NFS4ERR_DELAY/GRACE retry exhausted".to_string()))
+            Err(NfsError::Rpc(
+                "RECLAIM_COMPLETE NFS4ERR_DELAY/GRACE retry exhausted".to_string(),
+            ))
         }
     }
 }
@@ -511,13 +544,13 @@ mod tests {
     #[test]
     fn decode_channel_attrs_basic() {
         let mut buf = bytes::BytesMut::new();
-        buf.extend_from_slice(&0u32.to_be_bytes());       // headerpadsize
-        buf.extend_from_slice(&1048576u32.to_be_bytes());  // maxrequestsize
-        buf.extend_from_slice(&1048576u32.to_be_bytes());  // maxresponsesize
-        buf.extend_from_slice(&4096u32.to_be_bytes());     // maxresponsesize_cached
-        buf.extend_from_slice(&16u32.to_be_bytes());       // maxoperations
-        buf.extend_from_slice(&4u32.to_be_bytes());        // maxrequests
-        buf.extend_from_slice(&0u32.to_be_bytes());        // ca_rdma_ird count = 0
+        buf.extend_from_slice(&0u32.to_be_bytes()); // headerpadsize
+        buf.extend_from_slice(&1048576u32.to_be_bytes()); // maxrequestsize
+        buf.extend_from_slice(&1048576u32.to_be_bytes()); // maxresponsesize
+        buf.extend_from_slice(&4096u32.to_be_bytes()); // maxresponsesize_cached
+        buf.extend_from_slice(&16u32.to_be_bytes()); // maxoperations
+        buf.extend_from_slice(&4u32.to_be_bytes()); // maxrequests
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ca_rdma_ird count = 0
         let mut bytes = buf.freeze();
         let attrs = decode_channel_attrs(&mut bytes).unwrap();
         assert_eq!(attrs.max_request_size, 1048576);

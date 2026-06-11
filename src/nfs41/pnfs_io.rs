@@ -25,11 +25,13 @@ fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment>
 impl Mount41 {
     /// Get layout for a file, fetching from MDS if not cached.
     /// Returns None if pNFS layouts are unavailable (caller should fall back to MDS I/O).
-    pub(crate) async fn get_or_fetch_layout(
-        &self,
-        fh: &Bytes,
-        iomode: u32,
-    ) -> Option<Layout> {
+    pub(crate) async fn get_or_fetch_layout(&self, fh: &Bytes, iomode: u32) -> Option<Layout> {
+        // RFC 5661 §18.35.3：server 未在 EXCHANGE_ID 中声明 USE_PNFS_MDS，
+        // 整个 mount 禁用 pNFS，跳过 LAYOUTGET（省每文件一次注定失败的 RTT）
+        if !self.session_holder.get().await.pnfs_mds() {
+            return None;
+        }
+
         // 1. Check cache
         if let Some(layout) = self.layout_manager.get_layout(fh).await {
             return Some(layout);
@@ -37,20 +39,27 @@ impl Mount41 {
 
         // 2. LAYOUTGET to MDS: COMPOUND(SEQUENCE, PUTFH, LAYOUTGET)
         // iomode 1=READ, 2=RW — use matching access mode to avoid NFS4ERR_OPENMODE.
-        let access = if iomode == 1 { AccessMode::Read } else { AccessMode::Write };
-        let sid = self.state.has_open(fh, access).await
+        let access = if iomode == 1 {
+            AccessMode::Read
+        } else {
+            AccessMode::Write
+        };
+        let sid = self
+            .state
+            .has_open(fh, access)
+            .await
             .unwrap_or_else(StateId::anonymous);
         let result = self
             .compound("layoutget", |b| {
                 b.putfh(fh).layoutget(
-                    false,                      // signal_layout_avail
-                    1,                          // LAYOUT4_NFSV4_1_FILES
-                    iomode,                     // 1=READ, 2=RW
-                    0,                          // offset = whole file
-                    0xFFFF_FFFF_FFFF_FFFF,      // length = whole file
-                    0,                          // min_length
+                    false,                 // signal_layout_avail
+                    1,                     // LAYOUT4_NFSV4_1_FILES
+                    iomode,                // 1=READ, 2=RW
+                    0,                     // offset = whole file
+                    0xFFFF_FFFF_FFFF_FFFF, // length = whole file
+                    0,                     // min_length
                     &sid.raw,
-                    1024 * 1024,                // max_count (1 MiB)
+                    1024 * 1024, // max_count (1 MiB)
                 )
             })
             .await;
@@ -60,8 +69,7 @@ impl Mount41 {
                 // LAYOUTGET result is after SEQUENCE=0, PUTFH=1 → index 2
                 let op = resp.op_ok(2).ok()?;
                 let mut data = op.data.clone();
-                let layout =
-                    super::layout::decode_layoutget_response(&mut data).ok()?;
+                let layout = super::layout::decode_layoutget_response(&mut data).ok()?;
                 // Fetch device info for layout segments
                 self.fetch_devices_for_layout(&layout).await;
                 self.layout_manager.store_layout(fh, layout.clone()).await;
@@ -88,8 +96,7 @@ impl Mount41 {
                 // GETDEVICEINFO: COMPOUND(SEQUENCE, PUTROOTFH, GETDEVICEINFO)
                 match self
                     .compound("getdeviceinfo", |b| {
-                        b.putrootfh()
-                            .getdeviceinfo(device_id, 1, 1024 * 1024)
+                        b.putrootfh().getdeviceinfo(device_id, 1, 1024 * 1024)
                     })
                     .await
                 {
@@ -100,9 +107,7 @@ impl Mount41 {
                             if let Ok(info) =
                                 super::layout::decode_getdeviceinfo_response(&mut data)
                             {
-                                self.layout_manager
-                                    .store_device(*device_id, info)
-                                    .await;
+                                self.layout_manager.store_device(*device_id, info).await;
                             }
                         }
                     }
@@ -138,7 +143,14 @@ impl Mount41 {
                     pattern_offset,
                     fh_list,
                     ..
-                } => (*device_id, *stripe_unit, *is_dense, *first_stripe_index, *pattern_offset, fh_list),
+                } => (
+                    *device_id,
+                    *stripe_unit,
+                    *is_dense,
+                    *first_stripe_index,
+                    *pattern_offset,
+                    fh_list,
+                ),
                 _ => return None,
             };
 
@@ -170,8 +182,11 @@ impl Mount41 {
                 let ds_fh_res = fh_list
                     .get(chunk.ds_index as usize)
                     .cloned()
-                    .ok_or_else(|| NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index)));
-                let ds_phys_idx = device.stripe_indices
+                    .ok_or_else(|| {
+                        NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index))
+                    });
+                let ds_phys_idx = device
+                    .stripe_indices
                     .get(chunk.ds_index as usize)
                     .copied()
                     .unwrap_or(chunk.ds_index) as usize;
@@ -195,7 +210,10 @@ impl Mount41 {
                         &auth,
                         "ds-read",
                         chunk_len as usize,
-                        |b| b.putfh(&ds_fh).read(&layout_stateid, chunk_ds_offset, chunk_len),
+                        |b| {
+                            b.putfh(&ds_fh)
+                                .read(&layout_stateid, chunk_ds_offset, chunk_len)
+                        },
                     )
                     .await?;
                     resp.op_ok(0)?; // PUTFH (no SEQUENCE on DS)
@@ -203,21 +221,15 @@ impl Mount41 {
                     let mut data = read_op.data.clone();
                     // READ4resok: eof(4) + data<>
                     if data.remaining() < 4 {
-                        return Err(NfsError::Xdr(
-                            "DS READ result too short".to_string(),
-                        ));
+                        return Err(NfsError::Xdr("DS READ result too short".to_string()));
                     }
                     let _eof = data.get_u32();
                     if data.remaining() < 4 {
-                        return Err(NfsError::Xdr(
-                            "DS READ data length missing".to_string(),
-                        ));
+                        return Err(NfsError::Xdr("DS READ data length missing".to_string()));
                     }
                     let data_len = data.get_u32() as usize;
                     if data.remaining() < data_len {
-                        return Err(NfsError::Xdr(
-                            "DS READ data truncated".to_string(),
-                        ));
+                        return Err(NfsError::Xdr("DS READ data truncated".to_string()));
                     }
                     Ok::<Bytes, NfsError>(data.slice(..data_len))
                 }
@@ -227,10 +239,7 @@ impl Mount41 {
         match futures::future::try_join_all(futures).await {
             Ok(results) => {
                 if results.len() == 1 {
-                    Some(Ok(results
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default()))
+                    Some(Ok(results.into_iter().next().unwrap_or_default()))
                 } else {
                     // Concatenate stripe results in order
                     let total_len: usize = results.iter().map(|b| b.len()).sum();
@@ -272,7 +281,14 @@ impl Mount41 {
                     pattern_offset,
                     fh_list,
                     ..
-                } => (*device_id, *stripe_unit, *is_dense, *first_stripe_index, *pattern_offset, fh_list),
+                } => (
+                    *device_id,
+                    *stripe_unit,
+                    *is_dense,
+                    *first_stripe_index,
+                    *pattern_offset,
+                    fh_list,
+                ),
                 _ => return None,
             };
 
@@ -305,8 +321,11 @@ impl Mount41 {
                 let ds_fh_res = fh_list
                     .get(chunk.ds_index as usize)
                     .cloned()
-                    .ok_or_else(|| NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index)));
-                let ds_phys_idx = device.stripe_indices
+                    .ok_or_else(|| {
+                        NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index))
+                    });
+                let ds_phys_idx = device
+                    .stripe_indices
                     .get(chunk.ds_index as usize)
                     .copied()
                     .unwrap_or(chunk.ds_index) as usize;
@@ -334,8 +353,12 @@ impl Mount41 {
                         "ds-write",
                         chunk_data,
                         |b| {
-                            b.putfh(&ds_fh)
-                                .write_header(&layout_stateid, ds_off, 2 /* FILE_SYNC4 */, chunk_len)
+                            b.putfh(&ds_fh).write_header(
+                                &layout_stateid,
+                                ds_off,
+                                2, /* FILE_SYNC4 */
+                                chunk_len,
+                            )
                         },
                     )
                     .await?;
@@ -343,9 +366,7 @@ impl Mount41 {
                     let write_op = resp.op_ok(1)?; // WRITE
                     let mut d = write_op.data.clone();
                     if d.remaining() < 16 {
-                        return Err(NfsError::Xdr(
-                            "DS WRITE result too short".to_string(),
-                        ));
+                        return Err(NfsError::Xdr("DS WRITE result too short".to_string()));
                     }
                     let written = d.get_u32();
                     let committed = d.get_u32();
@@ -408,12 +429,12 @@ impl Mount41 {
         let result = self
             .compound("layoutreturn", |b| {
                 b.putfh(fh).layoutreturn(
-                    false,                          // reclaim
-                    1,                              // LAYOUT4_NFSV4_1_FILES
+                    false, // reclaim
+                    1,     // LAYOUT4_NFSV4_1_FILES
                     iomode,
-                    1,                              // LAYOUTRETURN4_FILE
-                    0,                              // offset = whole file
-                    0xFFFF_FFFF_FFFF_FFFF,          // length = whole file
+                    1,                     // LAYOUTRETURN4_FILE
+                    0,                     // offset = whole file
+                    0xFFFF_FFFF_FFFF_FFFF, // length = whole file
                     &layout.stateid,
                 )
             })
@@ -460,9 +481,7 @@ impl Mount41 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nfs41::layout::{
-        IoMode, Layout, LayoutContent, LayoutSegment, LayoutType,
-    };
+    use crate::nfs41::layout::{IoMode, Layout, LayoutContent, LayoutSegment, LayoutType};
 
     #[test]
     fn find_covering_segment_whole_file() {
