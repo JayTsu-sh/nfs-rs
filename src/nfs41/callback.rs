@@ -31,17 +31,31 @@ pub(crate) const CB_PROGRAM: u32 = 0x40000000;
 /// NFS4ERR_SEQ_MISORDERED error code (RFC 8881).
 const NFS4ERR_SEQ_MISORDERED: u32 = 10063;
 
-/// A delegation recall notification from the server.
+/// A recall notification from the server (delegation or pNFS layout).
 #[derive(Debug, Clone)]
-pub(crate) struct RecallNotification {
-    /// The stateid of the delegation being recalled.
-    pub stateid: [u8; 16],
-    /// Whether to truncate the file (only for write delegations).
-    /// RFC 8881 §20.2.1 — not yet acted upon; retained for future use.
-    #[allow(dead_code)]
-    pub truncate: bool,
-    /// The file handle of the file whose delegation is recalled.
-    pub fh: Bytes,
+pub(crate) enum RecallNotification {
+    /// CB_RECALL：delegation 召回（RFC 8881 §20.2）。
+    Delegation {
+        /// The stateid of the delegation being recalled.
+        stateid: [u8; 16],
+        /// Whether to truncate the file (only for write delegations).
+        /// RFC 8881 §20.2.1 — not yet acted upon; retained for future use.
+        #[allow(dead_code)]
+        truncate: bool,
+        /// The file handle of the file whose delegation is recalled.
+        fh: Bytes,
+    },
+    /// CB_LAYOUTRECALL4_FILE：单文件 layout 召回（RFC 8881 §20.3）。
+    LayoutFile {
+        /// 召回报文携带的 layout stateid，LAYOUTRETURN 时原样使用。
+        stateid: [u8; 16],
+        fh: Bytes,
+        offset: u64,
+        length: u64,
+        iomode: u32,
+    },
+    /// CB_LAYOUTRECALL4_FSID / _ALL：召回客户端持有的全部 layout。
+    LayoutAll,
 }
 
 /// Build the backchannel handler installed into the RPC layer for this session.
@@ -170,13 +184,11 @@ fn parse_cb_compound(
                             ));
                         }
                         let m = buf.get_u32() as usize;
-                        let needed = m.checked_mul(8).ok_or_else(|| {
-                            NfsError::Xdr("referring_call overflow".to_string())
-                        })?;
+                        let needed = m
+                            .checked_mul(8)
+                            .ok_or_else(|| NfsError::Xdr("referring_call overflow".to_string()))?;
                         if buf.remaining() < needed {
-                            return Err(NfsError::Xdr(
-                                "referring_call data truncated".to_string(),
-                            ));
+                            return Err(NfsError::Xdr("referring_call data truncated".to_string()));
                         }
                         buf.advance(needed);
                     }
@@ -225,7 +237,11 @@ fn parse_cb_compound(
                 op_reply.extend_from_slice(&cb_highest_slotid.to_be_bytes()); // target_highest_slotid
                 reply_ops.push(op_reply);
 
-                debug!(slotid = cb_slotid, seqid = cb_sequenceid, "CB_SEQUENCE handled");
+                debug!(
+                    slotid = cb_slotid,
+                    seqid = cb_sequenceid,
+                    "CB_SEQUENCE handled"
+                );
             }
 
             // CB_RECALL
@@ -242,7 +258,7 @@ fn parse_cb_compound(
                 debug!(fh_len = fh.len(), truncate, "CB_RECALL received");
 
                 // Notify the delegation manager
-                if let Err(e) = recall_tx.try_send(RecallNotification {
+                if let Err(e) = recall_tx.try_send(RecallNotification::Delegation {
                     stateid,
                     truncate,
                     fh,
@@ -255,6 +271,79 @@ fn parse_cb_compound(
                 op_reply.extend_from_slice(&opcode.to_be_bytes());
                 op_reply.extend_from_slice(&0u32.to_be_bytes()); // NFS4_OK
                 reply_ops.push(op_reply);
+            }
+
+            // CB_LAYOUTRECALL (RFC 8881 §20.3)
+            5 => {
+                // CB_LAYOUTRECALL4args: clora_type(4) + clora_iomode(4) + clora_changed(4)
+                //                       + lor_recalltype(4) + union body
+                if buf.remaining() < 16 {
+                    break;
+                }
+                let _layout_type = buf.get_u32();
+                let iomode = buf.get_u32();
+                let _changed = buf.get_u32();
+                let recalltype = buf.get_u32();
+
+                let notification = match recalltype {
+                    // LAYOUTRECALL4_FILE: fh<> + offset(8) + length(8) + stateid(16)
+                    1 => {
+                        let fh = read_opaque(buf)?;
+                        if buf.remaining() < 32 {
+                            return Err(NfsError::Xdr(
+                                "CB_LAYOUTRECALL file args truncated".to_string(),
+                            ));
+                        }
+                        let offset = buf.get_u64();
+                        let length = buf.get_u64();
+                        let mut stateid = [0u8; 16];
+                        buf.copy_to_slice(&mut stateid);
+                        Some(RecallNotification::LayoutFile {
+                            stateid,
+                            fh,
+                            offset,
+                            length,
+                            iomode,
+                        })
+                    }
+                    // LAYOUTRECALL4_FSID: fsid4 = major(8) + minor(8)。
+                    // 客户端不跟踪 fsid 与 layout 的映射，保守地全量归还。
+                    2 => {
+                        if buf.remaining() < 16 {
+                            return Err(NfsError::Xdr(
+                                "CB_LAYOUTRECALL fsid truncated".to_string(),
+                            ));
+                        }
+                        buf.advance(16);
+                        Some(RecallNotification::LayoutAll)
+                    }
+                    // LAYOUTRECALL4_ALL: no body
+                    3 => Some(RecallNotification::LayoutAll),
+                    _ => None,
+                };
+
+                match notification {
+                    Some(n) => {
+                        debug!(recalltype, iomode, "CB_LAYOUTRECALL received");
+                        if let Err(e) = recall_tx.try_send(n) {
+                            warn!("CB_LAYOUTRECALL notification channel full or closed: {}", e);
+                        }
+                        // 先回 NFS4_OK，由 recall handler 异步驱逐缓存并 LAYOUTRETURN
+                        // （RFC 8881 §12.5.5.1：OK 表示客户端承诺随后归还）
+                        let mut op_reply = Vec::new();
+                        op_reply.extend_from_slice(&opcode.to_be_bytes());
+                        op_reply.extend_from_slice(&0u32.to_be_bytes()); // NFS4_OK
+                        reply_ops.push(op_reply);
+                    }
+                    None => {
+                        let mut op_reply = Vec::new();
+                        op_reply.extend_from_slice(&opcode.to_be_bytes());
+                        op_reply.extend_from_slice(&10022u32.to_be_bytes()); // NFS4ERR_INVAL
+                        reply_ops.push(op_reply);
+                        debug!(recalltype, "CB_LAYOUTRECALL unknown recalltype");
+                        break; // RFC: stop processing after first error
+                    }
+                }
             }
 
             // Unknown callback op — return NFS4ERR_OP_ILLEGAL
@@ -451,9 +540,131 @@ mod tests {
         assert_eq!(u32_at(&reply, 36), 4); // opcode = CB_RECALL
         assert_eq!(u32_at(&reply, 40), 0); // NFS4_OK
 
-        let n = rx.try_recv().expect("recall notification forwarded");
-        assert_eq!(n.stateid, stateid);
-        assert!(n.truncate);
-        assert_eq!(&n.fh[..], &fh[..]);
+        match rx.try_recv().expect("recall notification forwarded") {
+            RecallNotification::Delegation {
+                stateid: sid,
+                truncate,
+                fh: nfh,
+            } => {
+                assert_eq!(sid, stateid);
+                assert!(truncate);
+                assert_eq!(&nfh[..], &fh[..]);
+            }
+            other => panic!("expected Delegation, got {other:?}"),
+        }
+    }
+
+    /// Build a CB_COMPOUND RPC CALL carrying a single CB_LAYOUTRECALL op.
+    /// `file_body`: Some((fh, offset, length, stateid)) for FILE; None for FSID/ALL.
+    fn cb_layoutrecall_frame(
+        xid: u32,
+        iomode: u32,
+        recalltype: u32,
+        file_body: Option<(&[u8], u64, u64, &[u8; 16])>,
+    ) -> Bytes {
+        let mut f = Vec::new();
+        f.extend_from_slice(&be(xid));
+        f.extend_from_slice(&be(0)); // CALL
+        f.extend_from_slice(&be(2));
+        f.extend_from_slice(&be(CB_PROGRAM));
+        f.extend_from_slice(&be(1));
+        f.extend_from_slice(&be(1)); // CB_COMPOUND
+        f.extend_from_slice(&be(0)); // cred
+        f.extend_from_slice(&be(0));
+        f.extend_from_slice(&be(0)); // verf
+        f.extend_from_slice(&be(0));
+        f.extend_from_slice(&be(0)); // tag
+        f.extend_from_slice(&be(1)); // minorversion
+        f.extend_from_slice(&be(0)); // callback_ident
+        f.extend_from_slice(&be(1)); // num_ops
+        f.extend_from_slice(&be(5)); // opcode = CB_LAYOUTRECALL
+        f.extend_from_slice(&be(1)); // clora_type = LAYOUT4_NFSV4_1_FILES
+        f.extend_from_slice(&be(iomode)); // clora_iomode
+        f.extend_from_slice(&be(0)); // clora_changed = false
+        f.extend_from_slice(&be(recalltype));
+        match recalltype {
+            1 => {
+                let (fh, offset, length, stateid) = file_body.expect("FILE recall needs body");
+                f.extend_from_slice(&be(fh.len() as u32));
+                f.extend_from_slice(fh);
+                let pad = (4 - fh.len() % 4) % 4;
+                f.extend_from_slice(&[0u8; 4][..pad]);
+                f.extend_from_slice(&offset.to_be_bytes());
+                f.extend_from_slice(&length.to_be_bytes());
+                f.extend_from_slice(stateid);
+            }
+            2 => {
+                f.extend_from_slice(&[0u8; 16]); // fsid4: major(8) + minor(8)
+            }
+            _ => {}
+        }
+        Bytes::from(f)
+    }
+
+    #[test]
+    fn cb_layoutrecall_file_forwards_notification() {
+        let session_id = [3u8; 16];
+        let stateid = [0xAB; 16];
+        let fh = b"layout-fh-123"; // 13 bytes → exercises XDR padding
+        let (tx, mut rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+
+        let mut frame = cb_layoutrecall_frame(
+            0x55667788,
+            2, // LAYOUTIOMODE4_RW
+            1, // LAYOUTRECALL4_FILE
+            Some((fh, 0, u64::MAX, &stateid)),
+        );
+        let reply = handle_cb_compound(&mut frame, &session_id, &tx, &slots).unwrap();
+        assert_eq!(u32_at(&reply, 36), 5); // opcode = CB_LAYOUTRECALL
+        assert_eq!(u32_at(&reply, 40), 0); // NFS4_OK
+
+        match rx.try_recv().expect("layout recall forwarded") {
+            RecallNotification::LayoutFile {
+                stateid: sid,
+                fh: nfh,
+                offset,
+                length,
+                iomode,
+            } => {
+                assert_eq!(sid, stateid);
+                assert_eq!(&nfh[..], &fh[..]);
+                assert_eq!(offset, 0);
+                assert_eq!(length, u64::MAX);
+                assert_eq!(iomode, 2);
+            }
+            other => panic!("expected LayoutFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cb_layoutrecall_all_forwards_notification() {
+        let session_id = [3u8; 16];
+        let (tx, mut rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+
+        for recalltype in [2u32, 3u32] {
+            let mut frame = cb_layoutrecall_frame(1, 3, recalltype, None);
+            let reply = handle_cb_compound(&mut frame, &session_id, &tx, &slots).unwrap();
+            assert_eq!(u32_at(&reply, 40), 0); // NFS4_OK
+            match rx.try_recv().expect("layout recall forwarded") {
+                RecallNotification::LayoutAll => {}
+                other => panic!("expected LayoutAll, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cb_layoutrecall_truncated_no_panic() {
+        let session_id = [3u8; 16];
+        let (tx, mut rx) = mpsc::channel(4);
+        let slots = Mutex::new(HashMap::new());
+
+        // FILE recall 但 fh 之后的 offset/length/stateid 被截断
+        let full = cb_layoutrecall_frame(1, 2, 1, Some((b"fh", 7, 9, &[1u8; 16])));
+        let mut truncated = full.slice(..full.len() - 20);
+        // 截断帧按错误路径丢弃（None），不 panic，也不发通知
+        assert!(handle_cb_compound(&mut truncated, &session_id, &tx, &slots).is_none());
+        assert!(rx.try_recv().is_err());
     }
 }

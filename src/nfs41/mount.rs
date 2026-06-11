@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use tracing::{debug, info, warn};
 
+use super::callback::RecallNotification;
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::fastxdr::nfsstat4;
 use super::layout::LayoutManager;
@@ -143,7 +144,10 @@ impl Mount41 {
             // should not normally fire; full re-bind / DESTROY_SESSION recovery is
             // a follow-up. For now surface the specific condition.
             if flags & SEQ4_STATUS_BACKCHANNEL_FAULT != 0 {
-                warn!(flags, "server reports BACKCHANNEL_FAULT (slot/seq desync); session should be rebuilt");
+                warn!(
+                    flags,
+                    "server reports BACKCHANNEL_FAULT (slot/seq desync); session should be rebuilt"
+                );
             } else {
                 warn!(flags, "server reports backchannel path down (CB_PATH_DOWN)");
             }
@@ -517,6 +521,7 @@ async fn mount_on_addr(
         client.clone(),
         auth.clone(),
         session_holder.clone(),
+        layout_manager.clone(),
     )));
 
     // Start background lease renewal using COMPOUND(SEQUENCE) (interval = server lease_time / 2)
@@ -544,58 +549,120 @@ async fn mount_on_addr(
     Ok(Box::new(Mount41Wrapper { m }))
 }
 
-/// Background task that processes delegation recall notifications and sends DELEGRETURN.
+/// Background task that processes recall notifications (delegation + pNFS layout).
 ///
-/// 客户端从不主动持有 delegation（OPEN 带 WANT_NO_DELEG），因此无本地跟踪；
-/// CB_RECALL 报文自带 (fh, stateid)，直接原样归还即可。
+/// 两类召回都走"无状态归还"模式：
+/// - CB_RECALL：客户端从不主动持有 delegation（OPEN 带 WANT_NO_DELEG），
+///   报文自带 (fh, stateid)，直接原样 DELEGRETURN。
+/// - CB_LAYOUTRECALL：callback 已回 NFS4_OK（承诺归还），此处驱逐本地
+///   layout 缓存并用报文里的 stateid 发 LAYOUTRETURN（RFC 8881 §12.5.5.1）。
 async fn handle_recalls(
-    mut recall_rx: tokio::sync::mpsc::Receiver<super::callback::RecallNotification>,
+    mut recall_rx: tokio::sync::mpsc::Receiver<RecallNotification>,
     rpc: rpc::Client,
     auth: Auth,
     session_holder: Arc<SessionHolder>,
+    layout_manager: Arc<LayoutManager>,
 ) {
     while let Some(notification) = recall_rx.recv().await {
-        warn!(
-            fh_len = notification.fh.len(),
-            "server granted a delegation despite WANT_NO_DELEG; returning it"
-        );
-        // Always get the latest session from the holder so that post-recovery
-        // DELEGRETURN uses the current session ID rather than a stale one.
-        let session = session_holder.get().await;
-        // Send DELEGRETURN
-        match session.acquire_slot().await {
-            Ok(slot) => {
-                let builder = CompoundBuilder::new("delegreturn")
-                    .sequence(
-                        session.id(),
-                        slot.sequence_id,
-                        slot.slot_id,
-                        session.highest_slot_id(),
-                        false,
+        match notification {
+            RecallNotification::Delegation { stateid, fh, .. } => {
+                warn!(
+                    fh_len = fh.len(),
+                    "server granted a delegation despite WANT_NO_DELEG; returning it"
+                );
+                send_recall_return(&rpc, &auth, &session_holder, |b| {
+                    b.putfh(&fh).delegreturn(&stateid)
+                })
+                .await;
+            }
+            RecallNotification::LayoutFile {
+                stateid,
+                fh,
+                offset,
+                length,
+                iomode,
+            } => {
+                debug!(
+                    fh_len = fh.len(),
+                    offset, length, "returning recalled layout"
+                );
+                layout_manager.remove_layout(&fh).await;
+                send_recall_return(&rpc, &auth, &session_holder, |b| {
+                    b.putfh(&fh).layoutreturn(
+                        false, // reclaim
+                        1,     // LAYOUT4_NFSV4_1_FILES
+                        iomode, 1, // LAYOUTRETURN4_FILE
+                        offset, length, &stateid,
                     )
-                    .putfh(&notification.fh)
-                    .delegreturn(&notification.stateid);
-                let mut buf = Vec::new();
-                builder.encode_with_header(&auth, &mut buf);
-                match rpc.call(buf, 1, METADATA_TIMEOUT).await {
-                    Ok(_) => {
-                        slot.advance();
-                        debug!(
-                            fh_len = notification.fh.len(),
-                            "DELEGRETURN sent for recalled delegation"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "DELEGRETURN failed");
-                    }
+                })
+                .await;
+            }
+            RecallNotification::LayoutAll => {
+                // FSID/ALL 召回：客户端不跟踪 fsid 映射，保守地逐个归还全部缓存 layout
+                let layouts = layout_manager.drain_layouts().await;
+                debug!(count = layouts.len(), "returning all layouts on recall");
+                for (fh, layout) in &layouts {
+                    let iomode = if layout.segments.len() == 1 {
+                        layout.segments[0].iomode as u32
+                    } else {
+                        3 // LAYOUTIOMODE4_ANY
+                    };
+                    send_recall_return(&rpc, &auth, &session_holder, |b| {
+                        b.putfh(fh).layoutreturn(
+                            false,
+                            1, // LAYOUT4_NFSV4_1_FILES
+                            iomode,
+                            1, // LAYOUTRETURN4_FILE
+                            0,
+                            0xFFFF_FFFF_FFFF_FFFF,
+                            &layout.stateid,
+                        )
+                    })
+                    .await;
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "failed to acquire slot for DELEGRETURN");
-            }
-        };
+        }
     }
     debug!("recall handler exiting");
+}
+
+/// 在 recall handler 中发送一个 SEQUENCE + 归还类 op 的 COMPOUND（best-effort）。
+/// 失败仅记日志：归还是尽力而为，server 侧有超时兜底。
+async fn send_recall_return(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    session_holder: &Arc<SessionHolder>,
+    build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+) {
+    // Always get the latest session from the holder so that post-recovery
+    // returns use the current session ID rather than a stale one.
+    let session = session_holder.get().await;
+    match session.acquire_slot().await {
+        Ok(slot) => {
+            let builder = CompoundBuilder::new("recall_return").sequence(
+                session.id(),
+                slot.sequence_id,
+                slot.slot_id,
+                session.highest_slot_id(),
+                false,
+            );
+            let builder = build_ops(builder);
+            let mut buf = Vec::new();
+            builder.encode_with_header(auth, &mut buf);
+            match rpc.call(buf, 1, METADATA_TIMEOUT).await {
+                Ok(_) => {
+                    slot.advance();
+                    debug!("recall return sent");
+                }
+                Err(e) => {
+                    warn!(error = %e, "recall return failed");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to acquire slot for recall return");
+        }
+    };
 }
 
 /// Navigate to the export path using PUTROOTFH + LOOKUP chain + GETFH.
@@ -976,7 +1043,9 @@ impl crate::Mount for Mount41Wrapper {
         atime: Option<crate::Time>,
         mtime: Option<crate::Time>,
     ) -> Result<mount::ObjRes> {
-        self.m.symlink_with_attrs(target, dst_dir_fh, dst_name, uid, gid, atime, mtime).await
+        self.m
+            .symlink_with_attrs(target, dst_dir_fh, dst_name, uid, gid, atime, mtime)
+            .await
     }
     async fn setattr(
         &self,
