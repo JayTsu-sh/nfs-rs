@@ -591,7 +591,10 @@ async fn handle_recalls(
     while let Some(notification) = recall_rx.recv().await {
         match notification {
             RecallNotification::Delegation { stateid, fh, .. } => {
-                warn!(
+                // 部分 server（如 ONTAP）无视 WANT_NO_DELEG 仍授予 delegation，
+                // 之后逐个 recall——多文件负载下每文件一条，属已知常态行为而非
+                // 异常，降为 debug 避免刷屏
+                debug!(
                     fh_len = fh.len(),
                     "server granted a delegation despite WANT_NO_DELEG; returning it"
                 );
