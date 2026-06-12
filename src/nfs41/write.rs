@@ -118,6 +118,8 @@ impl Mount41 {
     }
 
     pub(crate) async fn close_file(&self, fh: Bytes) -> Result<()> {
+        // CLOSE 前提交累积的 layout 写入范围（size/mtime 对 MDS 可见）
+        self.flush_layoutcommit(&fh).await;
         // Return pNFS layout before CLOSE if server requested return_on_close
         if let Some(layout) = self.layout_manager.get_layout(&fh).await {
             if layout.return_on_close {

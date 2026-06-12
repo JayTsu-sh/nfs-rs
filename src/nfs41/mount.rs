@@ -611,6 +611,20 @@ async fn handle_recalls(
                     fh_len = fh.len(),
                     offset, length, "returning recalled layout"
                 );
+                // RFC 5661 §18.42.3：先 LAYOUTCOMMIT 累积的写入范围再 LAYOUTRETURN
+                if let Some((start, end)) = layout_manager.take_dirty(&fh).await {
+                    send_recall_return(&rpc, &auth, &session_holder, |b| {
+                        b.putfh(&fh).layoutcommit(
+                            start,
+                            end - start,
+                            false,
+                            &stateid,
+                            Some(end - 1),
+                            1, // LAYOUT4_NFSV4_1_FILES
+                        )
+                    })
+                    .await;
+                }
                 layout_manager.remove_layout(&fh).await;
                 send_recall_return(&rpc, &auth, &session_holder, |b| {
                     b.putfh(&fh).layoutreturn(
@@ -627,6 +641,20 @@ async fn handle_recalls(
                 let layouts = layout_manager.drain_layouts().await;
                 debug!(count = layouts.len(), "returning all layouts on recall");
                 for (fh, layout) in &layouts {
+                    // 先提交该 layout 累积的写入范围再归还
+                    if let Some((start, end)) = layout_manager.take_dirty(fh).await {
+                        send_recall_return(&rpc, &auth, &session_holder, |b| {
+                            b.putfh(fh).layoutcommit(
+                                start,
+                                end - start,
+                                false,
+                                &layout.stateid,
+                                Some(end - 1),
+                                1, // LAYOUT4_NFSV4_1_FILES
+                            )
+                        })
+                        .await;
+                    }
                     let iomode = if layout.segments.len() == 1 {
                         layout.segments[0].iomode as u32
                     } else {

@@ -467,19 +467,15 @@ impl Mount41 {
             Ok(results) => {
                 let total: u32 = results.iter().map(|(n, _)| n).sum();
                 let needs_commit = results.iter().any(|(_, c)| *c);
-                // LAYOUTCOMMIT to MDS: inform MDS that data was written via layout
-                let _ = self
-                    .compound("layoutcommit", |b| {
-                        b.putfh(fh).layoutcommit(
-                            offset,
-                            data_len as u64,
-                            false,
-                            &layout.stateid,
-                            Some(offset + data_len as u64 - 1),
-                            1, // LAYOUT4_NFSV4_1_FILES
-                        )
-                    })
-                    .await;
+                // RFC 5661 §18.42.3：LAYOUTCOMMIT 不必每次 WRITE 后发，只需在
+                // LAYOUTRETURN/CLOSE 前提交。这里仅累积 dirty 范围，由
+                // flush_layoutcommit 在 close/layoutreturn 时一次性发送，
+                // 避免每个 wsize 块一次串行 MDS RTT。
+                if data_len > 0 {
+                    self.layout_manager
+                        .mark_dirty(fh, offset, offset + data_len as u64)
+                        .await;
+                }
                 // RFC 5661 §18.32.3: if any DS downgraded write stability, COMMIT to MDS.
                 if needs_commit {
                     let _ = self.commit(fh.clone(), offset, total).await;
@@ -487,10 +483,41 @@ impl Mount41 {
                 Some(Ok(total))
             }
             Err(e) => {
+                // 驱逐 layout 前先提交此前成功写入的范围
+                self.flush_layoutcommit(fh).await;
                 self.layout_manager.remove_layout(fh).await;
                 debug!(error = %e, "pNFS write failed, falling back to MDS");
                 None
             }
+        }
+    }
+
+    // ─── pNFS Layout Commit ──────────────────────────────────────────────
+
+    /// 将累积的 dirty 范围通过一次 LAYOUTCOMMIT 提交给 MDS（best-effort）。
+    /// 在 CLOSE / LAYOUTRETURN 前调用；无 dirty 范围或 layout 已不在缓存时为 no-op。
+    pub(crate) async fn flush_layoutcommit(&self, fh: &Bytes) {
+        let Some((start, end)) = self.layout_manager.take_dirty(fh).await else {
+            return;
+        };
+        let Some(layout) = self.layout_manager.get_layout(fh).await else {
+            // layout 已被驱逐（recall 等）：无法 LAYOUTCOMMIT，丢弃 dirty 记录
+            return;
+        };
+        let result = self
+            .compound("layoutcommit", |b| {
+                b.putfh(fh).layoutcommit(
+                    start,
+                    end - start,
+                    false,
+                    &layout.stateid,
+                    Some(end - 1),
+                    1, // LAYOUT4_NFSV4_1_FILES
+                )
+            })
+            .await;
+        if let Err(e) = result {
+            debug!(error = %e, "LAYOUTCOMMIT flush failed");
         }
     }
 
@@ -500,6 +527,8 @@ impl Mount41 {
     /// Removes the layout from the local cache and notifies the server.
     /// Errors are logged but not propagated — layout return is best-effort.
     pub(crate) async fn layoutreturn_file(&self, fh: &Bytes) {
+        // RFC 5661 §18.42.3：LAYOUTCOMMIT 必须在 LAYOUTRETURN 之前
+        self.flush_layoutcommit(fh).await;
         let layout = match self.layout_manager.remove_layout(fh).await {
             Some(l) => l,
             None => return,
@@ -540,6 +569,21 @@ impl Mount41 {
     pub(crate) async fn layoutreturn_all(&self) {
         let layouts = self.layout_manager.drain_layouts().await;
         for (fh, layout) in &layouts {
+            // layout 已从缓存 drain，用 drain 出的 stateid 提交 dirty 范围
+            if let Some((start, end)) = self.layout_manager.take_dirty(fh).await {
+                let _ = self
+                    .compound("layoutcommit", |b| {
+                        b.putfh(fh).layoutcommit(
+                            start,
+                            end - start,
+                            false,
+                            &layout.stateid,
+                            Some(end - 1),
+                            1, // LAYOUT4_NFSV4_1_FILES
+                        )
+                    })
+                    .await;
+            }
             let iomode = if layout.segments.len() == 1 {
                 layout.segments[0].iomode as u32
             } else {

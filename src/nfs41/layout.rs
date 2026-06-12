@@ -140,6 +140,9 @@ pub(crate) struct LayoutManager {
     data_servers: RwLock<HashMap<SocketAddr, DsConnection>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], DeviceInfo>>,
+    /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
+    /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
+    dirty: RwLock<HashMap<Bytes, (u64, u64)>>,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
 }
@@ -150,6 +153,7 @@ impl LayoutManager {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
+            dirty: RwLock::new(HashMap::new()),
             noresvport,
         }
     }
@@ -187,12 +191,32 @@ impl LayoutManager {
     ///
     /// Both locks are acquired before clearing to prevent a window where one map
     /// is empty but the other still has stale entries.
-    /// Lock order: layouts -> device_cache (consistent with all other callers to prevent deadlock).
+    /// Lock order: layouts -> device_cache -> dirty (consistent with all other callers to prevent deadlock).
     pub async fn clear(&self) {
         let mut map = self.layouts.write().await;
         let mut devices = self.device_cache.write().await;
+        let mut dirty = self.dirty.write().await;
         map.clear();
         devices.clear();
+        dirty.clear();
+    }
+
+    /// 记录一段已通过 layout 写入、待 LAYOUTCOMMIT 的范围；与已有范围 merge（min/max）。
+    pub async fn mark_dirty(&self, fh: &Bytes, start: u64, end: u64) {
+        let mut dirty = self.dirty.write().await;
+        dirty
+            .entry(fh.clone())
+            .and_modify(|(s, e)| {
+                *s = (*s).min(start);
+                *e = (*e).max(end);
+            })
+            .or_insert((start, end));
+    }
+
+    /// 取出并清除一个文件的待提交范围。
+    pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
+        let mut dirty = self.dirty.write().await;
+        dirty.remove(fh)
     }
 
     /// Store a device info entry in the cache.
@@ -728,6 +752,34 @@ mod tests {
         let removed = mgr.remove_layout(&fh).await;
         assert!(removed.is_some());
         assert!(mgr.get_layout(&fh).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dirty_range_merge() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty1");
+        mgr.mark_dirty(&fh, 4096, 8192).await;
+        mgr.mark_dirty(&fh, 0, 4096).await;
+        mgr.mark_dirty(&fh, 16384, 20480).await;
+        assert_eq!(mgr.take_dirty(&fh).await, Some((0, 20480)));
+    }
+
+    #[tokio::test]
+    async fn dirty_take_removes() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty2");
+        mgr.mark_dirty(&fh, 100, 200).await;
+        assert_eq!(mgr.take_dirty(&fh).await, Some((100, 200)));
+        assert_eq!(mgr.take_dirty(&fh).await, None);
+    }
+
+    #[tokio::test]
+    async fn dirty_cleared_on_clear() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty3");
+        mgr.mark_dirty(&fh, 0, 1).await;
+        mgr.clear().await;
+        assert_eq!(mgr.take_dirty(&fh).await, None);
     }
 
     #[tokio::test]
