@@ -9,14 +9,14 @@
 //! - LAYOUT4_OSD2_OBJECTS (2): object storage (not implemented)
 //! - LAYOUT4_BLOCK_VOLUME (3): block devices (not implemented)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::compound::CompoundBuilder;
 use super::session::{ClientIdentity, Session};
@@ -26,6 +26,9 @@ use crate::rpc::auth::Auth;
 
 /// DS 控制操作（DESTROY_SESSION/DESTROY_CLIENTID）的超时。
 const DS_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// DS 连接 + 会话建立的整体超时（不可达地址快速失败并拉黑）。
+const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// pNFS layout types.
 #[repr(u32)]
@@ -146,6 +149,10 @@ pub(crate) struct LayoutManager {
     dirty: RwLock<HashMap<Bytes, (u64, u64)>>,
     /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
     degenerate_logged: AtomicBool,
+    /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
+    /// server 可能下发客户端不可达网段的 DS LIF（如 ONTAP 多网段拓扑），
+    /// 不拉黑会导致每次 I/O 都重复付一次连接超时。
+    unreachable_ds: RwLock<HashSet<SocketAddr>>,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
 }
@@ -158,8 +165,23 @@ impl LayoutManager {
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
+            unreachable_ds: RwLock::new(HashSet::new()),
             noresvport,
         }
+    }
+
+    /// 把一个连接失败的 DS 地址记入负缓存（mount 生命周期内不再尝试）。
+    pub async fn mark_ds_unreachable(&self, addr: SocketAddr) {
+        let mut set = self.unreachable_ds.write().await;
+        if set.insert(addr) {
+            warn!(addr = %addr, "marking pNFS data server unreachable, affected files fall back to MDS I/O");
+        }
+    }
+
+    /// DS 地址是否已被标记为不可达。
+    pub async fn is_ds_unreachable(&self, addr: &SocketAddr) -> bool {
+        let set = self.unreachable_ds.read().await;
+        set.contains(addr)
     }
 
     /// 首次调用返回 true（用于退化拓扑只打一次 info 日志），之后返回 false。
@@ -244,6 +266,9 @@ impl LayoutManager {
     }
 
     /// Get or create a connection (with session) to a data server.
+    ///
+    /// 连接或建会话失败（含超时）时将地址记入不可达负缓存，调用方
+    /// 回退 MDS I/O；mount 生命周期内不再尝试该地址。
     pub async fn get_data_server(
         &self,
         addr: SocketAddr,
@@ -257,15 +282,37 @@ impl LayoutManager {
                 return Ok(conn.clone());
             }
         }
+        if self.is_ds_unreachable(&addr).await {
+            return Err(NfsError::Rpc(format!(
+                "pNFS data server {addr} marked unreachable"
+            )));
+        }
         // TCP connect + session establishment OUTSIDE any lock —
-        // can be slow without stalling other I/O
-        let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
-        let new_client = rpc::Client::new(mux, None);
-        // RFC 8881 §13.1：DS 需要自己的 client-id + session（EXCHANGE_ID USE_PNFS_DS）
-        let session = Session::establish_ds(&new_client, auth, client_identity).await?;
-        let conn = DsConnection {
-            client: new_client,
-            session: Arc::new(session),
+        // can be slow without stalling other I/O.
+        // 整体包超时：server 可能下发不可达网段的 DS 地址（SYN 黑洞时
+        // 系统级 connect 超时可达 20s+），失败后拉黑避免每次 I/O 重付。
+        let connect_and_establish = async {
+            let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
+            let new_client = rpc::Client::new(mux, None);
+            // RFC 8881 §13.1：DS 需要自己的 client-id + session（EXCHANGE_ID USE_PNFS_DS）
+            let session = Session::establish_ds(&new_client, auth, client_identity).await?;
+            Ok::<DsConnection, NfsError>(DsConnection {
+                client: new_client,
+                session: Arc::new(session),
+            })
+        };
+        let conn = match tokio::time::timeout(DS_CONNECT_TIMEOUT, connect_and_establish).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                self.mark_ds_unreachable(addr).await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.mark_ds_unreachable(addr).await;
+                return Err(NfsError::Rpc(format!(
+                    "pNFS data server {addr} connect timed out"
+                )));
+            }
         };
         // Acquire write lock and re-check (another task may have connected concurrently)
         let mut servers = self.data_servers.write().await;
@@ -894,6 +941,18 @@ mod tests {
         };
         sort_multipath_by_affinity(&mut info, &mds);
         assert_eq!(info.ds_addrs[0][0], v4);
+    }
+
+    #[tokio::test]
+    async fn unreachable_ds_mark_and_check() {
+        let mgr = LayoutManager::new(false);
+        let addr: SocketAddr = "192.168.13.131:2049".parse().unwrap();
+        assert!(!mgr.is_ds_unreachable(&addr).await);
+        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.is_ds_unreachable(&addr).await);
+        // 重复标记幂等
+        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.is_ds_unreachable(&addr).await);
     }
 
     #[tokio::test]

@@ -101,6 +101,19 @@ impl Mount41 {
         degenerate
     }
 
+    /// 该设备引用的任一非 MDS 的 DS 首选地址已被标记不可达时返回 true，
+    /// 调用方直接回退 MDS I/O（layout 保留缓存，避免反复 LAYOUTGET）。
+    async fn device_ds_unreachable(&self, device: &super::layout::DeviceInfo) -> bool {
+        for paths in &device.ds_addrs {
+            if let Some(addr) = paths.first() {
+                if *addr != self.server_addr && self.layout_manager.is_ds_unreachable(addr).await {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Fetch GETDEVICEINFO for each unique device_id referenced by a layout.
     async fn fetch_devices_for_layout(&self, layout: &Layout) {
         let mut seen = HashSet::new();
@@ -280,6 +293,10 @@ impl Mount41 {
         if self.device_degenerate(&device) {
             return None;
         }
+        // DS 已知不可达：回退 MDS I/O（layout 保留，不再反复尝试）
+        if self.device_ds_unreachable(&device).await {
+            return None;
+        }
 
         // RFC 8881 §13.9.1：DS 上的 READ 使用 open/delegation stateid，
         // 而非 layout stateid（layout stateid 仅用于 LAYOUTCOMMIT/LAYOUTRETURN）
@@ -419,6 +436,10 @@ impl Mount41 {
         }
         // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
         if self.device_degenerate(&device) {
+            return None;
+        }
+        // DS 已知不可达：回退 MDS I/O（layout 保留，不再反复尝试）
+        if self.device_ds_unreachable(&device).await {
             return None;
         }
 
