@@ -123,9 +123,15 @@ impl Mount41 {
                         // GETDEVICEINFO is after SEQUENCE=0, PUTROOTFH=1 → index 2
                         if let Ok(op) = resp.op_ok(2) {
                             let mut data = op.data.clone();
-                            if let Ok(info) =
+                            if let Ok(mut info) =
                                 super::layout::decode_getdeviceinfo_response(&mut data)
                             {
+                                // multipath 地址按与 MDS 的网络接近度排序后再缓存，
+                                // 避免 DS I/O 选到客户端不可达网段的 LIF
+                                super::layout::sort_multipath_by_affinity(
+                                    &mut info,
+                                    &self.server_addr,
+                                );
                                 self.layout_manager.store_device(*device_id, info).await;
                             }
                         }

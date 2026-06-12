@@ -307,6 +307,35 @@ pub(crate) fn is_degenerate_device(device: &DeviceInfo, server_addr: &SocketAddr
             .all(|paths| paths.first() == Some(server_addr))
 }
 
+/// IP 地址与 MDS 地址的公共前缀位数（不同地址家族视为 0）。
+fn addr_prefix_len(a: &SocketAddr, b: &SocketAddr) -> u32 {
+    match (a.ip(), b.ip()) {
+        (IpAddr::V4(x), IpAddr::V4(y)) => (u32::from(x) ^ u32::from(y)).leading_zeros(),
+        (IpAddr::V6(x), IpAddr::V6(y)) => (u128::from(x) ^ u128::from(y)).leading_zeros(),
+        _ => 0,
+    }
+}
+
+/// 按与 MDS 地址的网络接近度对每个 DS 的 multipath 地址排序（降序）：
+/// 与 MDS 完全相同的地址最优（复用主 session），其次按 IP 公共前缀
+/// 长度排序——server 可能在 multipath 里返回客户端不可达网段的 LIF
+/// （如 ONTAP 把同节点上该 SVM 的所有 LIF 都放进列表），盲取第一个
+/// 会把 DS I/O 指向不可达地址。
+pub(crate) fn sort_multipath_by_affinity(info: &mut DeviceInfo, server_addr: &SocketAddr) {
+    for paths in &mut info.ds_addrs {
+        paths.sort_by_key(|addr| {
+            let exact = *addr == *server_addr;
+            let same_family = addr.is_ipv4() == server_addr.is_ipv4();
+            // sort_by_key 升序：取反让 (exact, 同家族, 前缀长) 大者排前
+            (
+                !exact,
+                !same_family,
+                u32::MAX - addr_prefix_len(addr, server_addr),
+            )
+        });
+    }
+}
+
 /// Decode a LAYOUTGET response into a Layout.
 pub(crate) fn decode_layoutget_response(data: &mut Bytes) -> Result<Layout> {
     if data.remaining() < 4 {
@@ -819,6 +848,52 @@ mod tests {
             ds_addrs: vec![vec![same_ip_other_port]],
         };
         assert!(!is_degenerate_device(&device, &mds));
+    }
+
+    #[test]
+    fn multipath_sort_exact_match_first() {
+        // 复现 ONTAP FlexGroup 场景：multipath = [不可达网段 LIF, MDS 本身]
+        let mds: SocketAddr = "10.128.61.201:2049".parse().unwrap();
+        let mut info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![
+                "192.168.13.132:2049".parse().unwrap(),
+                "10.128.61.201:2049".parse().unwrap(),
+            ]],
+        };
+        sort_multipath_by_affinity(&mut info, &mds);
+        assert_eq!(info.ds_addrs[0][0], mds);
+        // 排序后退化判定应命中
+        assert!(is_degenerate_device(&info, &mds));
+    }
+
+    #[test]
+    fn multipath_sort_prefix_affinity() {
+        // 非退化 DS：选与 MDS 同网段的地址而非异网段地址
+        let mds: SocketAddr = "10.128.61.201:2049".parse().unwrap();
+        let near: SocketAddr = "10.128.61.200:2049".parse().unwrap();
+        let far: SocketAddr = "192.168.13.131:2049".parse().unwrap();
+        let mut info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![far, near]],
+        };
+        sort_multipath_by_affinity(&mut info, &mds);
+        assert_eq!(info.ds_addrs[0][0], near);
+        assert!(!is_degenerate_device(&info, &mds));
+    }
+
+    #[test]
+    fn multipath_sort_keeps_v4_over_v6_mismatch() {
+        // 不同地址家族视为 0 前缀，排在同家族地址之后
+        let mds: SocketAddr = "10.128.61.201:2049".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:2049".parse().unwrap();
+        let v4: SocketAddr = "172.16.0.1:2049".parse().unwrap();
+        let mut info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![v6, v4]],
+        };
+        sort_multipath_by_affinity(&mut info, &mds);
+        assert_eq!(info.ds_addrs[0][0], v4);
     }
 
     #[tokio::test]
