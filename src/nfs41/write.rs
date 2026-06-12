@@ -2,8 +2,9 @@ use bytes::{Buf, Bytes};
 use tracing::{debug, warn};
 
 use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
+use super::callback::RecallNotification;
 use super::compound::OpenArgs;
-use super::mount::{decode_fh, extract_stateid, Mount41};
+use super::mount::{decode_fh, extract_open_delegation, extract_stateid, Mount41};
 use super::setattr::encode_setattr;
 use super::state::{AccessMode, StateId};
 use crate::error::{NfsError, Result};
@@ -92,6 +93,7 @@ impl Mount41 {
         let open_op = resp.op_ok(2)?; // OPEN
         let mut open_data = open_op.data.clone();
         let stateid = extract_stateid(&mut open_data)?;
+        let delegation = extract_open_delegation(&mut open_data);
 
         let getfh = resp.op_ok(3)?; // GETFH
         let mut fh_data = getfh.data.clone();
@@ -99,6 +101,8 @@ impl Mount41 {
         let getattr = resp.op_ok(4)?; // GETATTR
         let mut attr_data = getattr.data.clone();
         let attr = decode_getattr_response(&mut attr_data)?;
+
+        self.return_unsolicited_delegation(delegation, &fh);
 
         // Register in StateManager for READ/WRITE to use
         self.state
@@ -109,6 +113,24 @@ impl Mount41 {
             fh,
             attr: Some(attr),
         })
+    }
+
+    /// server 无视 WANT_NO_DELEG 仍授予 delegation 时，立即入队异步
+    /// DELEGRETURN（复用 recall handler 路径）。不等 server 后续
+    /// CB_RECALL——多 client（如多 worker）并发访问同一文件时，recall
+    /// 期间 server 会阻塞冲突请求，主动归还消除该阻塞窗口。
+    fn return_unsolicited_delegation(&self, delegation: Option<[u8; 16]>, fh: &Bytes) {
+        if let Some(deleg_sid) = delegation {
+            let notification = RecallNotification::Delegation {
+                stateid: deleg_sid,
+                truncate: false,
+                fh: fh.clone(),
+            };
+            // best-effort：队列满时放弃，server 稍后 CB_RECALL 仍能兜底归还
+            if let Err(e) = self.recall_tx.try_send(notification) {
+                debug!(error = %e, "proactive DELEGRETURN enqueue failed, deferring to CB_RECALL");
+            }
+        }
     }
 
     pub(crate) async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
@@ -164,9 +186,11 @@ impl Mount41 {
                                       // Extract stateid from OPEN result for CLOSE
         let mut open_data = open_op.data.clone();
         let stateid = extract_stateid(&mut open_data)?;
+        let delegation = extract_open_delegation(&mut open_data);
         let getfh = resp.op_ok(3)?;
         let mut fh_data = getfh.data.clone();
         let fh = decode_fh(&mut fh_data)?;
+        self.return_unsolicited_delegation(delegation, &fh);
         let getattr = resp.op_ok(4)?;
         let mut attr_data = getattr.data.clone();
         let mut attr = decode_getattr_response(&mut attr_data)?;

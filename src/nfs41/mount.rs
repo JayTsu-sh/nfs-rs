@@ -105,6 +105,10 @@ pub(crate) struct Mount41 {
     pub(crate) server_addr: std::net::SocketAddr,
     /// Handle to the recall handler task; aborted on umount.
     pub(crate) recall_handle: Option<tokio::task::JoinHandle<()>>,
+    /// 归还通道发送端：OPEN 收到不请自来的 delegation 时主动入队
+    /// DELEGRETURN（复用 recall handler），避免 server 后续 CB_RECALL
+    /// 时阻塞其它 client 对同一文件的访问。
+    pub(crate) recall_tx: tokio::sync::mpsc::Sender<RecallNotification>,
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
 }
@@ -488,7 +492,7 @@ async fn mount_on_addr(
     let (recall_tx, recall_rx) = tokio::sync::mpsc::channel(32);
     client.enable_backchannel(super::callback::make_backchannel_handler(
         *session.id(),
-        recall_tx,
+        recall_tx.clone(),
     ));
 
     // Tell the server this connection also carries the backchannel.
@@ -567,6 +571,7 @@ async fn mount_on_addr(
         server_addr: *addr,
         lease_renewal,
         recall_handle,
+        recall_tx,
         rsize,
         wsize,
     };
@@ -1453,6 +1458,37 @@ pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {
     let mut sid = [0u8; 16];
     data.copy_to_slice(&mut sid);
     Ok(sid)
+}
+
+/// 在 `extract_stateid` 之后继续解析 OPEN4resok 剩余部分，提取 server
+/// 授予的 delegation stateid（RFC 8881 §18.16.3）。
+///
+/// 布局：change_info4(20) + rflags(4) + attrmask(bitmap4) + open_delegation4。
+/// OPEN_DELEGATE_READ(1)/WRITE(2) 返回 Some(deleg stateid)；NONE(0)、
+/// NONE_EXT(3) 或任何截断都返回 None（best-effort，解析失败不影响 OPEN）。
+pub(super) fn extract_open_delegation(data: &mut Bytes) -> Option<[u8; 16]> {
+    // change_info4: atomic(4) + before(8) + after(8)
+    if data.remaining() < 20 + 4 + 4 {
+        return None;
+    }
+    data.advance(20);
+    let _rflags = data.get_u32();
+    // attrmask: bitmap4 = count + count 个 u32
+    let bitmap_len = data.get_u32() as usize;
+    if bitmap_len > 16 || data.remaining() < bitmap_len * 4 + 4 {
+        return None;
+    }
+    data.advance(bitmap_len * 4);
+    let delegation_type = data.get_u32();
+    match delegation_type {
+        // OPEN_DELEGATE_READ / OPEN_DELEGATE_WRITE：紧接 stateid4
+        1 | 2 if data.remaining() >= 16 => {
+            let mut sid = [0u8; 16];
+            data.copy_to_slice(&mut sid);
+            Some(sid)
+        }
+        _ => None,
+    }
     // NOTE: the rest of the old file content (readdir helpers, ensure_open, maybe_close,
     // skip_fattr4_inline, decode_entry_fattr4, encode_setattr) has been moved to
     // readdir.rs, setattr.rs, and state management helpers.
@@ -1486,5 +1522,43 @@ mod tests {
             let d = backoff_jitter_ms(attempt, 200, 5000);
             assert!(d > 0 && d < 5000, "attempt={} produced {}", attempt, d);
         }
+    }
+
+    /// 构造 extract_stateid 之后的 OPEN4resok 剩余字节。
+    fn open_resok_tail(delegation_type: u32, deleg_sid: Option<[u8; 16]>) -> Bytes {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; 20]); // change_info4
+        buf.extend_from_slice(&0u32.to_be_bytes()); // rflags
+        buf.extend_from_slice(&2u32.to_be_bytes()); // attrmask: 2 words
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&delegation_type.to_be_bytes());
+        if let Some(sid) = deleg_sid {
+            buf.extend_from_slice(&sid);
+        }
+        Bytes::from(buf)
+    }
+
+    #[test]
+    fn open_delegation_none() {
+        let mut data = open_resok_tail(0, None);
+        assert_eq!(extract_open_delegation(&mut data), None);
+    }
+
+    #[test]
+    fn open_delegation_read_and_write() {
+        for dtype in [1u32, 2] {
+            let mut data = open_resok_tail(dtype, Some([7u8; 16]));
+            assert_eq!(extract_open_delegation(&mut data), Some([7u8; 16]));
+        }
+    }
+
+    #[test]
+    fn open_delegation_truncated() {
+        // delegation_type=2 但缺 stateid
+        let mut data = open_resok_tail(2, None);
+        assert_eq!(extract_open_delegation(&mut data), None);
+        // 整体截断
+        let mut short = Bytes::from_static(&[0u8; 10]);
+        assert_eq!(extract_open_delegation(&mut short), None);
     }
 }
