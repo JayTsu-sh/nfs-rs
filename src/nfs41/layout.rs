@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
@@ -143,6 +144,8 @@ pub(crate) struct LayoutManager {
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
     dirty: RwLock<HashMap<Bytes, (u64, u64)>>,
+    /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
+    degenerate_logged: AtomicBool,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
 }
@@ -154,8 +157,16 @@ impl LayoutManager {
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
+            degenerate_logged: AtomicBool::new(false),
             noresvport,
         }
+    }
+
+    /// 首次调用返回 true（用于退化拓扑只打一次 info 日志），之后返回 false。
+    pub fn should_log_degenerate(&self) -> bool {
+        self.degenerate_logged
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Store a layout for a file.
@@ -283,6 +294,17 @@ impl LayoutManager {
         let mut servers = self.data_servers.write().await;
         servers.drain().collect()
     }
+}
+
+/// 判定设备是否为退化 pNFS 拓扑：所有 DS 的首选地址（与 DS I/O 的
+/// 选址逻辑一致，取 multipath list 第一个）都等于 MDS 地址。
+/// 空 ds_addrs 保守返回 false。
+pub(crate) fn is_degenerate_device(device: &DeviceInfo, server_addr: &SocketAddr) -> bool {
+    !device.ds_addrs.is_empty()
+        && device
+            .ds_addrs
+            .iter()
+            .all(|paths| paths.first() == Some(server_addr))
 }
 
 /// Decode a LAYOUTGET response into a Layout.
@@ -752,6 +774,58 @@ mod tests {
         let removed = mgr.remove_layout(&fh).await;
         assert!(removed.is_some());
         assert!(mgr.get_layout(&fh).await.is_none());
+    }
+
+    #[test]
+    fn degenerate_device_single_ds_is_mds() {
+        let mds: SocketAddr = "10.0.0.1:2049".parse().unwrap();
+        let device = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![mds]],
+        };
+        assert!(is_degenerate_device(&device, &mds));
+    }
+
+    #[test]
+    fn degenerate_device_other_ds() {
+        let mds: SocketAddr = "10.0.0.1:2049".parse().unwrap();
+        let other: SocketAddr = "10.0.0.2:2049".parse().unwrap();
+        // 任一 DS ≠ MDS → 非退化
+        let device = DeviceInfo {
+            stripe_indices: vec![0, 1],
+            ds_addrs: vec![vec![mds], vec![other]],
+        };
+        assert!(!is_degenerate_device(&device, &mds));
+    }
+
+    #[test]
+    fn degenerate_device_empty_ds_list() {
+        let mds: SocketAddr = "10.0.0.1:2049".parse().unwrap();
+        let device = DeviceInfo {
+            stripe_indices: vec![],
+            ds_addrs: vec![],
+        };
+        // 空 ds_addrs 保守不判退化
+        assert!(!is_degenerate_device(&device, &mds));
+    }
+
+    #[test]
+    fn degenerate_device_port_mismatch() {
+        // 端口不同视为不同端点（与 ds_write_chunk 的完整 SocketAddr 比较一致）
+        let mds: SocketAddr = "10.0.0.1:2049".parse().unwrap();
+        let same_ip_other_port: SocketAddr = "10.0.0.1:20490".parse().unwrap();
+        let device = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![same_ip_other_port]],
+        };
+        assert!(!is_degenerate_device(&device, &mds));
+    }
+
+    #[tokio::test]
+    async fn degenerate_log_only_once() {
+        let mgr = LayoutManager::new(false);
+        assert!(mgr.should_log_degenerate());
+        assert!(!mgr.should_log_degenerate());
     }
 
     #[tokio::test]

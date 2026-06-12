@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use bytes::{Buf, Bytes, BytesMut};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::compound::CompoundResponse;
 use super::fastxdr::nfsstat4;
@@ -83,6 +83,22 @@ impl Mount41 {
                 None
             }
         }
+    }
+
+    /// 该文件的 pNFS 设备是否退化（所有 DS 地址都等于 MDS）。
+    ///
+    /// 退化时 DS I/O 与 MDS I/O 网络路径完全等价，走 pNFS 只多付
+    /// LAYOUTCOMMIT 等管理开销，I/O 路径应回退 MDS。判定按 device
+    /// 而非 mount 级——FlexGroup 等多 device 拓扑下，不同文件可能
+    /// 落在不同节点，其中部分 device 退化、部分不退化。
+    fn device_degenerate(&self, device: &super::layout::DeviceInfo) -> bool {
+        let degenerate = super::layout::is_degenerate_device(device, &self.server_addr);
+        if degenerate && self.layout_manager.should_log_degenerate() {
+            info!(
+                "pNFS degenerate device: data servers resolve to the MDS, using MDS I/O for affected files"
+            );
+        }
+        degenerate
     }
 
     /// Fetch GETDEVICEINFO for each unique device_id referenced by a layout.
@@ -254,6 +270,10 @@ impl Mount41 {
         if device.ds_addrs.len() < fh_list.len() {
             return None;
         }
+        // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
+        if self.device_degenerate(&device) {
+            return None;
+        }
 
         // RFC 8881 §13.9.1：DS 上的 READ 使用 open/delegation stateid，
         // 而非 layout stateid（layout stateid 仅用于 LAYOUTCOMMIT/LAYOUTRETURN）
@@ -389,6 +409,10 @@ impl Mount41 {
         }
         let device = self.layout_manager.get_device(&device_id).await?;
         if device.ds_addrs.len() < fh_list.len() {
+            return None;
+        }
+        // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
+        if self.device_degenerate(&device) {
             return None;
         }
 
