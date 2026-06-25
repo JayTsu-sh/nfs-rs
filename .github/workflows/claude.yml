@@ -1,0 +1,32 @@
+name: Claude (实现者)
+
+# 实现者/提交者角色：在 issue / PR 里 @claude 描述需求，Claude 改代码、提交、开 PR。
+# 人在回路、按需触发。认证走 Claude 订阅 OAuth token。
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    # 只在评论/正文包含 @claude 时触发，避免无谓跑 Action
+    if: contains(github.event.comment.body, '@claude') || contains(github.event.issue.body, '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 提交代码
+      pull-requests: write   # 开 PR / 评论
+      issues: write          # 回应 issue
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # CLAUDE.md 已被 Action 自动加载；此处再强调"提交者"职责与项目硬规则
+          claude_args: |
+            --append-system-prompt "你是本仓库（nfs-rs，纯 Rust NFS 客户端库）的实现者。严格遵守 CLAUDE.md：禁止 unwrap/expect（测试除外）；use 语句集中文件顶部、表达式内路径≤三层；错误用 thiserror 结构化定义，不得 Box<dyn Error>/String；重构只改结构不改语义；数据传输用 Bytes 零拷贝、禁 Vec<u8> clone；共享计数用 Atomic、禁 Mutex<u64>；async 禁同步 IO、禁 unbounded channel。涉及 NFS 协议行为/字段/错误码必须对照 RFC（NFSv3=RFC 1813、NFSv4.1=RFC 5661 等），不得凭经验推断。改完代码先 cargo fmt && cargo check（XDR 生成文件 nfs3xdr.rs/mount3xdr.rs 不得手改），再开 PR。commit 用 conventional commits + 中文描述，禁止 Co-Authored-By。"
