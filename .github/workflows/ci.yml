@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+      # Existing main references a cfg(wasi) module that is not present in the
+      # repository, so cargo fmt cannot resolve the module tree. Keep clippy
+      # non-denying until the existing warning baseline is recorded.
+      - run: cargo clippy --all-targets
+      - run: cargo test --all-targets --no-fail-fast
