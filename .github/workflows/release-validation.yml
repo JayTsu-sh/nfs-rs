@@ -30,7 +30,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
-      - run: cargo test --all-targets --locked --no-fail-fast
+      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
       - run: cargo build --release --locked
       - name: Checksums
         run: find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum | tee release-sha256.txt
