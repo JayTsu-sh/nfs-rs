@@ -42,7 +42,7 @@ impl Mount {
     pub async fn readdirplus_path(
         &self,
         dir_path: &str,
-    ) -> Result<impl Stream<Item = Result<ReaddirplusEntry>> + '_> {
+    ) -> Result<impl Stream<Item = Result<ReaddirplusEntry>> + '_ + use<'_>> {
         let fh = self.lookup_path(dir_path).await?.fh;
         Ok(self.readdirplus(fh).await)
     }

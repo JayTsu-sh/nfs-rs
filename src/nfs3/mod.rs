@@ -85,7 +85,7 @@ pub(crate) use fastxdr::{
 /// The linked list is walked twice per page: once (read-only) to find the last
 /// cookie and entry count, then once (destructive) via `from_fn` to yield entries.
 macro_rules! paged_dir_stream {
-    ($self:expr, $dir_fh:expr, $fetch_page:ident, $convert:expr, $label:literal) => {{
+    ($self:expr_2021, $dir_fh:expr_2021, $fetch_page:ident, $convert:expr_2021, $label:literal) => {{
         use futures::stream::TryStreamExt as _;
         let this = $self;
         futures::stream::try_unfold(

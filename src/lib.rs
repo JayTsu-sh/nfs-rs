@@ -1098,11 +1098,11 @@ mod tests {
     async fn connect_to_target_privileged_when_noresvport_false() {
         // 探测：本机是否允许绑特权端口（Unix root / Windows admin）。
         // 没有权限时直接跳过，避免在无特权 CI 上误报 false negative。
-        let probe = if let Ok(s) = tokio::net::TcpSocket::new_v4() {
+        let probe = match tokio::net::TcpSocket::new_v4() { Ok(s) => {
             s.bind("127.0.0.1:1".parse().unwrap()).is_ok()
-        } else {
+        } _ => {
             false
-        };
+        }};
         if !probe {
             eprintln!("skipping: insufficient privilege to bind <1024");
             return;

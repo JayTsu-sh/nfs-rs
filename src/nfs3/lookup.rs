@@ -25,13 +25,14 @@ impl Mount {
             attr: None,
         });
         for n in &path_clean::clean(path) {
-            if let Ok(ref r) = res {
-                if !n.is_empty() && n != "/" && n != "." && n != "\\" {
-                    tracing::trace!(component = %n.to_string_lossy(), "resolving path component");
-                    res = self
-                        .lookup(r.fh.clone(), &n.to_string_lossy())
-                        .await;
-                }
+            if let Ok(ref r) = res
+                && !n.is_empty()
+                && n != "/"
+                && n != "."
+                && n != "\\"
+            {
+                tracing::trace!(component = %n.to_string_lossy(), "resolving path component");
+                res = self.lookup(r.fh.clone(), &n.to_string_lossy()).await;
             }
         }
         res

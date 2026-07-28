@@ -331,10 +331,10 @@ impl StreamMux {
             )));
         }
         // Abort old reader.
-        if let Ok(mut guard) = self.reader_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        if let Ok(mut guard) = self.reader_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
         }
         // Fail all pending requests.
         {
@@ -374,10 +374,10 @@ impl StreamMux {
     async fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
         debug!(addr = %self.addr, "shutting down StreamMux");
-        if let Ok(mut guard) = self.reader_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        if let Ok(mut guard) = self.reader_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
         }
         let mut writer = self.writer.lock().await;
         let _ = writer.shutdown().await;
@@ -394,10 +394,10 @@ impl StreamMux {
 
 impl Drop for StreamMux {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.reader_handle.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        if let Ok(mut guard) = self.reader_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
         }
         if let Ok(mut map) = self.pending.lock() {
             for (_, tx) in map.drain() {
@@ -436,19 +436,19 @@ async fn reader_loop(
                     dispatch_backchannel_call(xid, data, &writer, &backchannel).await;
                     continue;
                 }
-                if let Ok(mut map) = pending.lock() {
-                    if let Some(tx) = map.remove(&xid) {
+                match pending.lock() { Ok(mut map) => {
+                    match map.remove(&xid) { Some(tx) => {
                         let _ = tx.send(Ok(data));
-                    } else {
+                    } _ => {
                         debug!(
                             xid,
                             "dropping response for unmatched XID (likely stale retry)"
                         );
-                    }
-                } else {
+                    }}
+                } _ => {
                     warn!("pending map lock poisoned in reader loop, terminating");
                     break;
-                }
+                }}
             }
             Err(e) => {
                 warn!(error = %e, "reader loop terminated due to connection error");
@@ -656,7 +656,7 @@ impl Client {
                 program,
                 "sending RPC request"
             );
-            let gen = mux.generation();
+            let r#gen = mux.generation();
             let res = mux
                 .send_and_receive(xid, &msg_body, &data, data_pad, timeout)
                 .await;
@@ -668,7 +668,7 @@ impl Client {
                 }
                 Err(ref e) => {
                     let (is_conn_error, is_timeout) = match e {
-                        NfsError::Io(ref io_err) => (
+                        NfsError::Io(io_err) => (
                             matches!(
                                 io_err.kind(),
                                 std::io::ErrorKind::BrokenPipe
@@ -691,7 +691,7 @@ impl Client {
                         let jitter = rand::random_range(0..50u64);
                         let backoff = std::cmp::min(100u64 << num_retries, 2000) + jitter;
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
-                        if let Err(reconn_err) = mux.reconnect(gen).await {
+                        if let Err(reconn_err) = mux.reconnect(r#gen).await {
                             warn!(error = %reconn_err, "reconnect failed, will retry");
                         }
                         num_retries += 1;

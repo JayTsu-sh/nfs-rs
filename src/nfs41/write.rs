@@ -143,10 +143,10 @@ impl Mount41 {
         // CLOSE 前提交累积的 layout 写入范围（size/mtime 对 MDS 可见）
         self.flush_layoutcommit(&fh).await;
         // Return pNFS layout before CLOSE if server requested return_on_close
-        if let Some(layout) = self.layout_manager.get_layout(&fh).await {
-            if layout.return_on_close {
-                self.layoutreturn_file(&fh).await;
-            }
+        if let Some(layout) = self.layout_manager.get_layout(&fh).await
+            && layout.return_on_close
+        {
+            self.layoutreturn_file(&fh).await;
         }
         // Release ref in StateManager; if ref_count hits 0, send CLOSE to server
         if let Some(sid) = self.state.release(&fh).await {
@@ -198,16 +198,16 @@ impl Mount41 {
         // 使用 open stateid 避免与 delegation 冲突，且保证原子性。
         if let Some(m) = mode {
             let (attrmask, attr_vals) = encode_setattr(Some(m), None, None, None, None, None);
-            if let Err(e) = self
+            match self
                 .compound("setattr", |b| {
                     b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
                 })
                 .await
-            {
+            { Err(e) => {
                 warn!(error = %e, mode = m, "create: SETATTR mode failed after file creation");
-            } else {
+            } _ => {
                 attr.file_mode = m;
-            }
+            }}
         }
         // 保持文件 open 并注册 stateid，由调用方 close_file() 时发 CLOSE 释放
         // （umount 时 drain 兜底）。后续 WRITE 因此持有真实 open stateid——

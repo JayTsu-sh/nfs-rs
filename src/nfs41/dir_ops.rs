@@ -28,10 +28,10 @@ impl Mount41 {
         }).await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // REMOVE
-        if let Some(remove_op) = resp.results.get(2) {
-            if let Some((atomic, before, after)) = parse_change_info(remove_op) {
-                debug!(atomic, before, after, name = filename, "REMOVE change_info");
-            }
+        if let Some(remove_op) = resp.results.get(2)
+            && let Some((atomic, before, after)) = parse_change_info(remove_op)
+        {
+            debug!(atomic, before, after, name = filename, "REMOVE change_info");
         }
         Ok(())
     }
@@ -117,10 +117,10 @@ impl Mount41 {
         resp.op_ok(2)?; // SAVEFH
         resp.op_ok(3)?; // PUTFH(dst_dir)
         resp.op_ok(4)?; // LINK
-        if let Some(link_op) = resp.results.get(4) {
-            if let Some((atomic, before, after)) = parse_change_info(link_op) {
-                debug!(atomic, before, after, name = dst_filename, "LINK change_info");
-            }
+        if let Some(link_op) = resp.results.get(4)
+            && let Some((atomic, before, after)) = parse_change_info(link_op)
+        {
+            debug!(atomic, before, after, name = dst_filename, "LINK change_info");
         }
         resp.op_ok(5)?; // PUTFH(src) again for getattr
         let getattr = resp.op_ok(6)?;

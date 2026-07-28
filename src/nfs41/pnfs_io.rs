@@ -105,10 +105,11 @@ impl Mount41 {
     /// 调用方直接回退 MDS I/O（layout 保留缓存，避免反复 LAYOUTGET）。
     async fn device_ds_unreachable(&self, device: &super::layout::DeviceInfo) -> bool {
         for paths in &device.ds_addrs {
-            if let Some(addr) = paths.first() {
-                if *addr != self.server_addr && self.layout_manager.is_ds_unreachable(addr).await {
-                    return true;
-                }
+            if let Some(addr) = paths.first()
+                && *addr != self.server_addr
+                && self.layout_manager.is_ds_unreachable(addr).await
+            {
+                return true;
             }
         }
         false
