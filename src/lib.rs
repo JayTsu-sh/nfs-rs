@@ -14,35 +14,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(target_os = "wasi")]
-#[allow(static_mut_refs, unused)]
-mod bindings;
-#[cfg(target_os = "wasi")]
-mod component;
-#[cfg(target_os = "wasi")]
-#[allow(unused)]
-mod wasi_ext;
-
-#[cfg(target_os = "wasi")]
-struct Component;
-
-#[cfg(target_os = "wasi")]
-pub struct NfsMount {
-    id: u32,
-}
-
-#[cfg(target_os = "wasi")]
-bindings::export!(Component with_types_in bindings);
-
-#[cfg(target_os = "wasi")]
-use component::{add_resource, get_resource, remove_resource};
-
-#[cfg(not(target_os = "wasi"))]
-use std::net::{SocketAddr, ToSocketAddrs,IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(not(target_os = "wasi"))]
-use tokio::net::{TcpStream, TcpSocket};
-#[cfg(target_os = "wasi")]
-use wasi_ext::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use tokio::net::{TcpSocket, TcpStream};
 
 pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Result<TcpStream> {
     // Bind to a random privileged port (< 1024), required by some NFS servers.
@@ -234,9 +207,6 @@ pub use error::{NfsError, Result};
 pub use nfs3::ErrorCode as Nfs3ErrorCode;
 pub use nfs3::MountErrorCode as Nfs3MountErrorCode;
 pub use nfs41::Nfs4ErrorCode;
-#[cfg(target_os = "wasi")]
-pub use std::io::Error;
-
 // Decoder wrappers exposed solely for `benches/`. Not part of the stable API;
 // `#[doc(hidden)]` keeps it out of rustdoc. Internal XDR types stay private —
 // only `bytes::Bytes` and the public `NfsError` cross the boundary.

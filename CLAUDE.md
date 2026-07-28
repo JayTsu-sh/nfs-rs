@@ -33,13 +33,11 @@ cargo test
 # Run a single test by name
 cargo test <test_name>
 
-# Build WASI component (requires cargo-component tool)
-cargo component build
 ```
 
 ## Architecture
 
-Pure Rust NFSv3 client library (NetApp). Compiles to both `rlib` and `cdylib` (WASI component). Only NFSv3 is implemented; NFSv4/4.1/4.2 version strings are accepted in URLs but return `Unsupported`.
+Pure Rust NFS client library (NetApp), built as a native Rust library.
 
 ### Entry Point
 
@@ -93,14 +91,6 @@ Each NFSv3 procedure (access, read, write, lookup, etc.) has its own file in `sr
 ### Known Limitations
 
 **Stale file handles after server reboot**: TCP reconnection (`StreamMux::reconnect`) restores the network connection but does **not** re-mount. If the NFS server reboots, all previously obtained file handles become stale (`NFS3ERR_STALE`). The `_path` methods will also fail because intermediate lookup handles are stale. Callers should catch `NfsError::Nfs3` with `NFS3ERR_STALE` and re-mount (`parse_url_and_mount`) to obtain fresh handles. This is consistent with how libnfs and other NFS client libraries handle this scenario.
-
-### WASI Component (`src/bindings.rs`, `src/component.rs`)
-
-`src/bindings.rs` — **auto-generated** by `wit-bindgen` from `wit/`. Do not edit.
-
-`src/component.rs` — hand-written bridge between WIT types and Rust types. Maps WIT types (prefixed `Wit*`) to/from native types using `From` impls.
-
-All WASI-specific code is gated with `#[cfg(target_os = "wasi")]`. The WASI build uses a separate `MOUNTS` global HashMap (keyed by `u32`) to store active mounts as resources. The `wit/` directory contains the WASI Interface Types spec and WASI dependency stubs.
 
 ### Code Style
 
