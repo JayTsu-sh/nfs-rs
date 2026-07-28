@@ -12,7 +12,7 @@
 use bytes::{Buf, Bytes};
 
 use super::compound::OpenArgs;
-use super::mount::{decode_fh, Mount41};
+use super::mount::{Mount41, decode_fh};
 use crate::error::{NfsError, Result};
 
 /// Maximum xattr value size we'll read in one request (1 MiB).
@@ -22,9 +22,9 @@ impl Mount41 {
     /// Get the file handle for the named attribute directory of a file.
     /// Returns the attr dir fh, or an error if the file has no named attributes.
     async fn open_attr_dir(&self, fh: &Bytes, create: bool) -> Result<Bytes> {
-        let resp = self.compound("openattr", |b| {
-            b.putfh(fh).openattr(create).getfh()
-        }).await?;
+        let resp = self
+            .compound("openattr", |b| b.putfh(fh).openattr(create).getfh())
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // OPENATTR
         let getfh = resp.op_ok(3)?;
@@ -34,9 +34,11 @@ impl Mount41 {
 
     pub(crate) async fn getxattr(&self, fh: Bytes, name: &str) -> Result<Bytes> {
         // Step 1: open attr dir + lookup the named attribute → get its fh
-        let resp = self.compound("getxattr-lookup", |b| {
-            b.putfh(&fh).openattr(false).lookup(name).getfh()
-        }).await?;
+        let resp = self
+            .compound("getxattr-lookup", |b| {
+                b.putfh(&fh).openattr(false).lookup(name).getfh()
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // OPENATTR
         resp.op_ok(3)?; // LOOKUP
@@ -46,9 +48,11 @@ impl Mount41 {
 
         // Step 2: read the xattr value using anonymous stateid
         let stateid = [0u8; 16];
-        let resp = self.compound_data("getxattr-read", MAX_XATTR_SIZE as usize, |b| {
-            b.putfh(&attr_fh).read(&stateid, 0, MAX_XATTR_SIZE)
-        }).await?;
+        let resp = self
+            .compound_data("getxattr-read", MAX_XATTR_SIZE as usize, |b| {
+                b.putfh(&attr_fh).read(&stateid, 0, MAX_XATTR_SIZE)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let read_op = resp.op_ok(2)?;
         let mut rdata = read_op.data.clone();
@@ -79,9 +83,11 @@ impl Mount41 {
             create_attrs_vals: vec![],
             claim_file: name.to_string(),
         };
-        let resp = self.compound("setxattr-open", |b| {
-            b.putfh(&fh).openattr(true).open(&open_args).getfh()
-        }).await?;
+        let resp = self
+            .compound("setxattr-open", |b| {
+                b.putfh(&fh).openattr(true).open(&open_args).getfh()
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // OPENATTR
         let open_op = resp.op_ok(3)?; // OPEN
@@ -93,15 +99,17 @@ impl Mount41 {
 
         // Step 2: write the value + close
         let data_len = value.len() as u32;
-        let write_result = self.compound_write("setxattr-write", value, |b| {
-            b.putfh(&attr_fh)
-                .write_header(&stateid, 0, 2 /* FILE_SYNC4 */, data_len)
-        }).await;
+        let write_result = self
+            .compound_write("setxattr-write", value, |b| {
+                b.putfh(&attr_fh)
+                    .write_header(&stateid, 0, 2 /* FILE_SYNC4 */, data_len)
+            })
+            .await;
 
         // Step 3: always close, regardless of write result
-        let _ = self.compound("setxattr-close", |b| {
-            b.putfh(&attr_fh).close(0, &stateid)
-        }).await;
+        let _ = self
+            .compound("setxattr-close", |b| b.putfh(&attr_fh).close(0, &stateid))
+            .await;
 
         write_result?;
         Ok(())
@@ -127,17 +135,21 @@ impl Mount41 {
         let bitmap: [u32; 0] = [];
 
         loop {
-            let resp = self.compound("listxattr-readdir", |b| {
-                b.putfh(&attr_dir_fh)
-                    .readdir(cookie, &cookieverf, 4096, 32768, &bitmap)
-            }).await?;
+            let resp = self
+                .compound("listxattr-readdir", |b| {
+                    b.putfh(&attr_dir_fh)
+                        .readdir(cookie, &cookieverf, 4096, 32768, &bitmap)
+                })
+                .await?;
             resp.op_ok(1)?; // PUTFH
             let readdir_op = resp.op_ok(2)?;
             let mut data = readdir_op.data.clone();
 
             // READDIR4resok: cookieverf(8) + dirlist4(entries + eof)
             if data.remaining() < 8 {
-                return Err(NfsError::Xdr("xattr READDIR cookieverf truncated".to_string()));
+                return Err(NfsError::Xdr(
+                    "xattr READDIR cookieverf truncated".to_string(),
+                ));
             }
             data.advance(8); // cookieverf
 
@@ -145,10 +157,14 @@ impl Mount41 {
             let mut last_cookie = cookie;
             loop {
                 if data.remaining() < 4 {
-                    return Err(NfsError::Xdr("xattr READDIR entry flag truncated".to_string()));
+                    return Err(NfsError::Xdr(
+                        "xattr READDIR entry flag truncated".to_string(),
+                    ));
                 }
                 let has_entry = data.get_u32();
-                if has_entry == 0 { break; }
+                if has_entry == 0 {
+                    break;
+                }
 
                 // entry4: cookie(8) + name(utf8str) + attrs(fattr4)
                 if data.remaining() < 8 {
@@ -179,9 +195,9 @@ impl Mount41 {
     }
 
     pub(crate) async fn removexattr(&self, fh: Bytes, name: &str) -> Result<()> {
-        let resp = self.compound("removexattr", |b| {
-            b.putfh(&fh).openattr(false).remove(name)
-        }).await?;
+        let resp = self
+            .compound("removexattr", |b| b.putfh(&fh).openattr(false).remove(name))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // OPENATTR
         resp.op_ok(3)?; // REMOVE
@@ -196,7 +212,8 @@ fn skip_fattr4(buf: &mut Bytes) -> Result<()> {
         return Err(NfsError::Xdr("fattr4 bitmap length truncated".to_string()));
     }
     let bitmap_len = buf.get_u32() as usize;
-    let bitmap_bytes = bitmap_len.checked_mul(4)
+    let bitmap_bytes = bitmap_len
+        .checked_mul(4)
         .ok_or_else(|| NfsError::Xdr("fattr4 bitmap overflow".to_string()))?;
     if buf.remaining() < bitmap_bytes {
         return Err(NfsError::Xdr("fattr4 bitmap truncated".to_string()));
@@ -204,7 +221,9 @@ fn skip_fattr4(buf: &mut Bytes) -> Result<()> {
     buf.advance(bitmap_bytes);
     // attr_vals opaque
     if buf.remaining() < 4 {
-        return Err(NfsError::Xdr("fattr4 attr_vals length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "fattr4 attr_vals length truncated".to_string(),
+        ));
     }
     let vals_len = buf.get_u32() as usize;
     let padded = (vals_len + 3) & !3;

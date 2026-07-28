@@ -167,7 +167,9 @@ impl Mount41 {
             // existing open files (no VFS layer), so they will get stale-stateid
             // errors; callers should re-open. RECLAIM_COMPLETE is spawned in the
             // background to avoid slot contention with the caller's in-flight slot.
-            warn!("server reports RESTART_RECLAIM_NEEDED — clearing all state, sending RECLAIM_COMPLETE");
+            warn!(
+                "server reports RESTART_RECLAIM_NEEDED — clearing all state, sending RECLAIM_COMPLETE"
+            );
             self.state.clear().await;
             self.layout_manager.clear().await;
             let rpc = self.rpc.clone();

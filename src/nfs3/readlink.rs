@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bytes_to_string, nfs_fh3, Mount, READLINK3args, Result};
+use super::{Mount, READLINK3args, Result, bytes_to_string, nfs_fh3};
 use bytes::Bytes;
 
 #[allow(unused)]

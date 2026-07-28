@@ -41,7 +41,12 @@ pub(crate) fn decode_nfsace4(buf: &mut Bytes) -> Result<NfsAce> {
     let flags = AceFlags(buf.get_u32());
     let access_mask = AceMask(buf.get_u32());
     let who = decode_utf8str(buf)?;
-    Ok(NfsAce { ace_type, flags, access_mask, who })
+    Ok(NfsAce {
+        ace_type,
+        flags,
+        access_mask,
+        who,
+    })
 }
 
 /// Decode a variable-length array of nfsace4.
@@ -52,7 +57,10 @@ pub(crate) fn decode_acl(buf: &mut Bytes) -> Result<Acl> {
     }
     let count = buf.get_u32() as usize;
     if count > MAX_ACES {
-        return Err(NfsError::Xdr(format!("ACL has {} entries, max {}", count, MAX_ACES)));
+        return Err(NfsError::Xdr(format!(
+            "ACL has {} entries, max {}",
+            count, MAX_ACES
+        )));
     }
     let mut aces = Vec::with_capacity(count);
     for _ in 0..count {
@@ -70,7 +78,10 @@ pub(super) fn skip_acl(buf: &mut Bytes) -> Result<()> {
     }
     let count = buf.get_u32() as usize;
     if count > MAX_ACES {
-        return Err(NfsError::Xdr(format!("ACL has {} entries, max {}", count, MAX_ACES)));
+        return Err(NfsError::Xdr(format!(
+            "ACL has {} entries, max {}",
+            count, MAX_ACES
+        )));
     }
     for _ in 0..count {
         // nfsace4: type(4) + flag(4) + access_mask(4) + who(var)
@@ -133,12 +144,16 @@ pub(super) fn decode_getattr_acl(data: &mut Bytes) -> Result<Acl> {
     let (bitmap, mut vals) = decode_getattr_envelope(data)?;
     let word0 = bitmap.first().copied().unwrap_or(0);
     if word0 & (1 << 12) == 0 {
-        return Err(NfsError::Xdr("server did not return FATTR4_ACL".to_string()));
+        return Err(NfsError::Xdr(
+            "server did not return FATTR4_ACL".to_string(),
+        ));
     }
     // Guard: attributes are encoded in bit-number order. If any bits below 12 are set,
     // their values precede the ACL data in attr_vals and would cause a misparse.
     if word0 & ((1 << 12) - 1) != 0 {
-        return Err(NfsError::Xdr("server returned unexpected attributes before FATTR4_ACL".to_string()));
+        return Err(NfsError::Xdr(
+            "server returned unexpected attributes before FATTR4_ACL".to_string(),
+        ));
     }
     decode_acl(&mut vals)
 }
@@ -148,11 +163,15 @@ pub(super) fn decode_getattr_aclsupport(data: &mut Bytes) -> Result<AclSupport> 
     let (bitmap, mut vals) = decode_getattr_envelope(data)?;
     let word0 = bitmap.first().copied().unwrap_or(0);
     if word0 & (1 << 13) == 0 {
-        return Err(NfsError::Xdr("server did not return FATTR4_ACLSUPPORT".to_string()));
+        return Err(NfsError::Xdr(
+            "server did not return FATTR4_ACLSUPPORT".to_string(),
+        ));
     }
     // Guard: if any bits below 13 are set, their values precede ACLSUPPORT data.
     if word0 & ((1 << 13) - 1) != 0 {
-        return Err(NfsError::Xdr("server returned unexpected attributes before FATTR4_ACLSUPPORT".to_string()));
+        return Err(NfsError::Xdr(
+            "server returned unexpected attributes before FATTR4_ACLSUPPORT".to_string(),
+        ));
     }
     if vals.remaining() < 4 {
         return Err(NfsError::Xdr("ACLSUPPORT value truncated".to_string()));
@@ -230,8 +249,18 @@ mod tests {
     fn roundtrip_acl_multiple() {
         let acl = Acl {
             aces: vec![
-                make_ace(AceType::AccessAllowed, 0, AceMask::READ_DATA | AceMask::EXECUTE, "OWNER@"),
-                make_ace(AceType::AccessAllowed, AceFlags::IDENTIFIER_GROUP, AceMask::READ_DATA, "GROUP@"),
+                make_ace(
+                    AceType::AccessAllowed,
+                    0,
+                    AceMask::READ_DATA | AceMask::EXECUTE,
+                    "OWNER@",
+                ),
+                make_ace(
+                    AceType::AccessAllowed,
+                    AceFlags::IDENTIFIER_GROUP,
+                    AceMask::READ_DATA,
+                    "GROUP@",
+                ),
                 make_ace(AceType::AccessDenied, 0, AceMask::WRITE_DATA, "EVERYONE@"),
             ],
         };
@@ -292,7 +321,17 @@ mod tests {
 
     #[test]
     fn special_who_strings() {
-        for who in &["OWNER@", "GROUP@", "EVERYONE@", "INTERACTIVE@", "NETWORK@", "BATCH@", "ANONYMOUS@", "AUTHENTICATED@", "SERVICE@"] {
+        for who in &[
+            "OWNER@",
+            "GROUP@",
+            "EVERYONE@",
+            "INTERACTIVE@",
+            "NETWORK@",
+            "BATCH@",
+            "ANONYMOUS@",
+            "AUTHENTICATED@",
+            "SERVICE@",
+        ] {
             let ace = make_ace(AceType::AccessAllowed, 0, AceMask::READ_DATA, who);
             let encoded = encode_one_ace(&ace);
             let mut bytes = Bytes::from(encoded);
@@ -339,7 +378,12 @@ mod tests {
     #[test]
     fn decode_getattr_acl_response() {
         let acl = Acl {
-            aces: vec![make_ace(AceType::AccessAllowed, 0, AceMask::READ_DATA, "OWNER@")],
+            aces: vec![make_ace(
+                AceType::AccessAllowed,
+                0,
+                AceMask::READ_DATA,
+                "OWNER@",
+            )],
         };
         // Build a GETATTR response with bit 12 set
         let mut resp = Vec::new();

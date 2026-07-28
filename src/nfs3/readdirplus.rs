@@ -14,7 +14,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bytes_to_string, entryplus3, nfs_fh3, post_op_fh3, paged_dir_stream, Mount, READDIRPLUS3args, READDIRPLUS3resok, Result};
+use super::{
+    Mount, READDIRPLUS3args, READDIRPLUS3resok, Result, bytes_to_string, entryplus3, nfs_fh3,
+    paged_dir_stream, post_op_fh3,
+};
 use bytes::Bytes;
 use futures::stream::Stream;
 
@@ -47,16 +50,25 @@ impl Mount {
         Ok(self.readdirplus(fh).await)
     }
 
-    pub async fn readdirplus(&self, dir_fh: Bytes) -> impl Stream<Item = Result<ReaddirplusEntry>> + '_ {
-        paged_dir_stream!(self, dir_fh, readdirplus_at, |entry: Box<entryplus3>| ReaddirplusEntry {
-            fileid: entry.fileid.0,
-            file_name: bytes_to_string(entry.name.0),
-            attr: entry.name_attributes.into(),
-            handle: match entry.name_handle {
-                post_op_fh3::TRUE(h) => h.0,
-                _ => Bytes::new(),
+    pub async fn readdirplus(
+        &self,
+        dir_fh: Bytes,
+    ) -> impl Stream<Item = Result<ReaddirplusEntry>> + '_ {
+        paged_dir_stream!(
+            self,
+            dir_fh,
+            readdirplus_at,
+            |entry: Box<entryplus3>| ReaddirplusEntry {
+                fileid: entry.fileid.0,
+                file_name: bytes_to_string(entry.name.0),
+                attr: entry.name_attributes.into(),
+                handle: match entry.name_handle {
+                    post_op_fh3::TRUE(h) => h.0,
+                    _ => Bytes::new(),
+                },
             },
-        }, "readdirplus page received")
+            "readdirplus page received"
+        )
     }
 
     pub async fn readdirplus_at(
@@ -74,5 +86,4 @@ impl Mount {
         };
         self._readdirplus(args).await
     }
-
 }

@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes};
 use futures::stream::TryStreamExt as _;
 
 use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
-use super::mount::{decode_string_from_bytes, Mount41};
+use super::mount::{Mount41, decode_string_from_bytes};
 use crate::error::{NfsError, Result};
 use crate::mount;
 
@@ -10,23 +10,24 @@ impl Mount41 {
     pub(crate) async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         let this = self;
         Box::pin(
-            futures::stream::try_unfold(
-                Some((dir_fh, 0u64, [0u8; 8])),
-                move |state| async move {
-                    let Some((fh, cookie, verf)) = state else {
-                        return Ok::<_, NfsError>(None);
-                    };
-                    let (entries, last_cookie, new_verf, eof) =
-                        this.readdir_page(&fh, cookie, &verf).await?;
-                    // H7: detect no-progress to avoid infinite loop
-                    if entries.is_empty() && !eof && last_cookie == cookie {
-                        return Ok(None);
-                    }
-                    let next = if eof { None } else { Some((fh, last_cookie, new_verf)) };
-                    let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
-                    Ok(Some((page, next)))
-                },
-            )
+            futures::stream::try_unfold(Some((dir_fh, 0u64, [0u8; 8])), move |state| async move {
+                let Some((fh, cookie, verf)) = state else {
+                    return Ok::<_, NfsError>(None);
+                };
+                let (entries, last_cookie, new_verf, eof) =
+                    this.readdir_page(&fh, cookie, &verf).await?;
+                // H7: detect no-progress to avoid infinite loop
+                if entries.is_empty() && !eof && last_cookie == cookie {
+                    return Ok(None);
+                }
+                let next = if eof {
+                    None
+                } else {
+                    Some((fh, last_cookie, new_verf))
+                };
+                let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
+                Ok(Some((page, next)))
+            })
             .try_flatten(),
         )
     }
@@ -39,28 +40,32 @@ impl Mount41 {
     pub(crate) async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
         let this = self;
         Box::pin(
-            futures::stream::try_unfold(
-                Some((dir_fh, 0u64, [0u8; 8])),
-                move |state| async move {
-                    let Some((fh, cookie, verf)) = state else {
-                        return Ok::<_, NfsError>(None);
-                    };
-                    let (entries, last_cookie, new_verf, eof) =
-                        this.readdirplus_page(&fh, cookie, &verf).await?;
-                    // H7: detect no-progress to avoid infinite loop
-                    if entries.is_empty() && !eof && last_cookie == cookie {
-                        return Ok(None);
-                    }
-                    let next = if eof { None } else { Some((fh, last_cookie, new_verf)) };
-                    let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
-                    Ok(Some((page, next)))
-                },
-            )
+            futures::stream::try_unfold(Some((dir_fh, 0u64, [0u8; 8])), move |state| async move {
+                let Some((fh, cookie, verf)) = state else {
+                    return Ok::<_, NfsError>(None);
+                };
+                let (entries, last_cookie, new_verf, eof) =
+                    this.readdirplus_page(&fh, cookie, &verf).await?;
+                // H7: detect no-progress to avoid infinite loop
+                if entries.is_empty() && !eof && last_cookie == cookie {
+                    return Ok(None);
+                }
+                let next = if eof {
+                    None
+                } else {
+                    Some((fh, last_cookie, new_verf))
+                };
+                let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
+                Ok(Some((page, next)))
+            })
             .try_flatten(),
         )
     }
 
-    pub(crate) async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
+    pub(crate) async fn readdirplus_path(
+        &self,
+        dir_path: &str,
+    ) -> Result<mount::ReaddirplusStream<'_>> {
         let obj = self.lookup_path(dir_path).await?;
         Ok(self.readdirplus(obj.fh).await)
     }
@@ -74,9 +79,12 @@ impl Mount41 {
         // Request fileid attribute for each entry (NFSv4.1: attr #20 = word 0, bit 20)
         let attr_request = [1u32 << 20];
 
-        let resp = self.compound("readdir", |b| {
-            b.putfh(fh).readdir(cookie, cookieverf, 8192, 32768, &attr_request)
-        }).await?;
+        let resp = self
+            .compound("readdir", |b| {
+                b.putfh(fh)
+                    .readdir(cookie, cookieverf, 8192, 32768, &attr_request)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let readdir_op = resp.op_ok(2)?;
         let mut data = readdir_op.data.clone();
@@ -93,7 +101,9 @@ impl Mount41 {
         let mut last_cookie = cookie;
         loop {
             if data.remaining() < 4 {
-                return Err(NfsError::Xdr("dirlist4 value_follows truncated".to_string()));
+                return Err(NfsError::Xdr(
+                    "dirlist4 value_follows truncated".to_string(),
+                ));
             }
             let has_entry = data.get_u32();
             if has_entry == 0 {
@@ -133,9 +143,12 @@ impl Mount41 {
     ) -> Result<(Vec<mount::ReaddirplusEntry>, u64, [u8; 8], bool)> {
         let attr_request = standard_getattr_bitmap();
 
-        let resp = self.compound("readdirplus", |b| {
-            b.putfh(fh).readdir(cookie, cookieverf, 8192, 32768, &attr_request)
-        }).await?;
+        let resp = self
+            .compound("readdirplus", |b| {
+                b.putfh(fh)
+                    .readdir(cookie, cookieverf, 8192, 32768, &attr_request)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let readdir_op = resp.op_ok(2)?;
         let mut data = readdir_op.data.clone();
@@ -150,7 +163,9 @@ impl Mount41 {
         let mut last_cookie = cookie;
         loop {
             if data.remaining() < 4 {
-                return Err(NfsError::Xdr("dirlist4 value_follows truncated".to_string()));
+                return Err(NfsError::Xdr(
+                    "dirlist4 value_follows truncated".to_string(),
+                ));
             }
             let has_entry = data.get_u32();
             if has_entry == 0 {
@@ -165,14 +180,19 @@ impl Mount41 {
             let attr = match decode_entry_fattr4(&mut data) {
                 Ok(a) => Some(a),
                 Err(e) => {
-                    tracing::warn!("readdirplus: failed to decode attrs for entry '{}': {}", name, e);
+                    tracing::warn!(
+                        "readdirplus: failed to decode attrs for entry '{}': {}",
+                        name,
+                        e
+                    );
                     None
                 }
             };
             let fileid = attr.as_ref().map(|a| a.fileid).unwrap_or(entry_cookie);
             // NFSv4.1 FATTR4_FILEHANDLE (attr 19) provides per-entry file handles
             // when requested in the READDIR attr bitmap.
-            let handle = attr.as_ref()
+            let handle = attr
+                .as_ref()
                 .map(|a| a.filehandle.clone())
                 .unwrap_or_default();
             entries.push(mount::ReaddirplusEntry {

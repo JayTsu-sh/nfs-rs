@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{diropargs3, filename3, nfs_fh3, LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result};
+use super::{LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result, diropargs3, filename3, nfs_fh3};
 use bytes::Bytes;
 
 impl Mount {
@@ -41,9 +41,7 @@ impl Mount {
     pub async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
         let args = LOOKUP3args {
             what: diropargs3 {
-                dir: nfs_fh3 {
-                    data: dir_fh,
-                },
+                dir: nfs_fh3 { data: dir_fh },
                 name: filename3(filename.to_string()),
             },
         };

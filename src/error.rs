@@ -109,7 +109,9 @@ impl From<NfsError> for std::io::Error {
             NfsError::Rpc(msg) => std::io::Error::other(msg),
             NfsError::Xdr(msg) => std::io::Error::other(msg),
             NfsError::Unsupported(msg) => std::io::Error::new(std::io::ErrorKind::Unsupported, msg),
-            NfsError::InvalidInput(msg) => std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
+            NfsError::InvalidInput(msg) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+            }
             NfsError::RdattrError(code) => {
                 std::io::Error::other(format!("rdattr_error: nfsstat4 {}", code))
             }

@@ -22,11 +22,11 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -436,19 +436,23 @@ async fn reader_loop(
                     dispatch_backchannel_call(xid, data, &writer, &backchannel).await;
                     continue;
                 }
-                match pending.lock() { Ok(mut map) => {
-                    match map.remove(&xid) { Some(tx) => {
-                        let _ = tx.send(Ok(data));
-                    } _ => {
-                        debug!(
-                            xid,
-                            "dropping response for unmatched XID (likely stale retry)"
-                        );
-                    }}
-                } _ => {
-                    warn!("pending map lock poisoned in reader loop, terminating");
-                    break;
-                }}
+                match pending.lock() {
+                    Ok(mut map) => match map.remove(&xid) {
+                        Some(tx) => {
+                            let _ = tx.send(Ok(data));
+                        }
+                        _ => {
+                            debug!(
+                                xid,
+                                "dropping response for unmatched XID (likely stale retry)"
+                            );
+                        }
+                    },
+                    _ => {
+                        warn!("pending map lock poisoned in reader loop, terminating");
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "reader loop terminated due to connection error");
@@ -485,7 +489,10 @@ async fn dispatch_backchannel_call(
         }
     };
     let Some(handler) = handler else {
-        debug!(xid, "backchannel CALL received but no handler registered, dropping");
+        debug!(
+            xid,
+            "backchannel CALL received but no handler registered, dropping"
+        );
         return;
     };
     let Some(reply) = handler(data) else {

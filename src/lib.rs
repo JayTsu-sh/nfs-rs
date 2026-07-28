@@ -21,66 +21,66 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     // Bind to a random privileged port (< 1024), required by some NFS servers.
     // Exclude well-known service ports to avoid conflicts.
     const WELL_KNOWN_PORTS: &[u16] = &[
-        1,    // tcpmux
-        7,    // echo
-        9,    // discard
-        11,   // systat
-        13,   // daytime
-        15,   // netstat
-        20,   // ftp-data
-        21,   // ftp
-        22,   // ssh
-        23,   // telnet
-        25,   // smtp
-        37,   // time
-        42,   // nameserver
-        43,   // whois
-        49,   // tacacs
-        53,   // dns
-        67,   // dhcp server
-        68,   // dhcp client
-        69,   // tftp
-        70,   // gopher
-        79,   // finger
-        80,   // http
-        88,   // kerberos
-        102,  // iso-tsap
-        110,  // pop3
-        111,  // rpcbind/portmapper
-        119,  // nntp
-        123,  // ntp
-        135,  // msrpc
-        137,  // netbios-ns
-        138,  // netbios-dgm
-        139,  // netbios-ssn
-        143,  // imap
-        161,  // snmp
-        162,  // snmp-trap
-        179,  // bgp
-        389,  // ldap
-        427,  // svrloc
-        443,  // https
-        445,  // microsoft-ds
-        464,  // kpasswd
-        465,  // smtps
-        514,  // syslog
-        515,  // printer
-        520,  // rip
-        530,  // rpc
-        543,  // klogin
-        544,  // kshell
-        546,  // dhcpv6-client
-        547,  // dhcpv6-server
-        548,  // afp
-        554,  // rtsp
-        587,  // submission
-        593,  // http-rpc-epmap
-        631,  // ipp
-        636,  // ldaps
-        873,  // rsync
-        990,  // ftps
-        993,  // imaps
-        995,  // pop3s
+        1,   // tcpmux
+        7,   // echo
+        9,   // discard
+        11,  // systat
+        13,  // daytime
+        15,  // netstat
+        20,  // ftp-data
+        21,  // ftp
+        22,  // ssh
+        23,  // telnet
+        25,  // smtp
+        37,  // time
+        42,  // nameserver
+        43,  // whois
+        49,  // tacacs
+        53,  // dns
+        67,  // dhcp server
+        68,  // dhcp client
+        69,  // tftp
+        70,  // gopher
+        79,  // finger
+        80,  // http
+        88,  // kerberos
+        102, // iso-tsap
+        110, // pop3
+        111, // rpcbind/portmapper
+        119, // nntp
+        123, // ntp
+        135, // msrpc
+        137, // netbios-ns
+        138, // netbios-dgm
+        139, // netbios-ssn
+        143, // imap
+        161, // snmp
+        162, // snmp-trap
+        179, // bgp
+        389, // ldap
+        427, // svrloc
+        443, // https
+        445, // microsoft-ds
+        464, // kpasswd
+        465, // smtps
+        514, // syslog
+        515, // printer
+        520, // rip
+        530, // rpc
+        543, // klogin
+        544, // kshell
+        546, // dhcpv6-client
+        547, // dhcpv6-server
+        548, // afp
+        554, // rtsp
+        587, // submission
+        593, // http-rpc-epmap
+        631, // ipp
+        636, // ldaps
+        873, // rsync
+        990, // ftps
+        993, // imaps
+        995, // pop3s
     ];
     let local_addr_base = if addr.is_ipv4() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -141,7 +141,10 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
         match socket.bind(local_addr) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                trace!(local_port, "source port bind failed (AddrInUse), trying another");
+                trace!(
+                    local_port,
+                    "source port bind failed (AddrInUse), trying another"
+                );
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -184,7 +187,9 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     warn!(addr = %addr, "exhausted all connect attempts ({MAX_CONNECT_ATTEMPTS}), all privileged source ports failed");
     Err(NfsError::Io(std::io::Error::new(
         std::io::ErrorKind::AddrInUse,
-        format!("all privileged source ports (1-1023) failed to connect to {addr} after {MAX_CONNECT_ATTEMPTS} attempts"),
+        format!(
+            "all privileged source ports (1-1023) failed to connect to {addr} after {MAX_CONNECT_ATTEMPTS} attempts"
+        ),
     )))
 }
 
@@ -195,14 +200,13 @@ mod nfs41;
 mod rpc;
 mod shared;
 
+pub use error::{NfsError, Result};
 pub use mount::{
-    Acl, AceFlags, AceMask, AceType, AclSupport, NfsAce,
-    Attr, ExportEntry, FSInfo, FSStat, Mount, NFSVersion, ObjRes, Pathconf, ReaddirEntry,
+    AceFlags, AceMask, AceType, Acl, AclSupport, Attr, ExportEntry, FSInfo, FSStat, Mount,
+    NFSVersion, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes, Pathconf, ReaddirEntry,
     ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
-    OPEN_READ, OPEN_WRITE, OPEN_BOTH,
 };
 pub use shared::Time;
-pub use error::{NfsError, Result};
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
 pub use nfs3::ErrorCode as Nfs3ErrorCode;
 pub use nfs3::MountErrorCode as Nfs3MountErrorCode;
@@ -227,17 +231,23 @@ pub mod __bench {
 
     /// Decode a `post_op_attr` (4-byte discriminant + optional `fattr3`).
     pub fn decode_post_op_attr(mut buf: Bytes) -> Result<()> {
-        post_op_attr::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+        post_op_attr::try_from(&mut buf)
+            .map(|_| ())
+            .map_err(map_xdr_err)
     }
 
     /// Decode a `READ3resok` (post_op_attr + count + eof + variable data slice).
     pub fn decode_read3resok(mut buf: Bytes) -> Result<()> {
-        READ3resok::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+        READ3resok::try_from(&mut buf)
+            .map(|_| ())
+            .map_err(map_xdr_err)
     }
 
     /// Decode a `READDIRPLUS3resok` page (variable number of entries).
     pub fn decode_readdirplus3resok(mut buf: Bytes) -> Result<()> {
-        READDIRPLUS3resok::try_from(&mut buf).map(|_| ()).map_err(map_xdr_err)
+        READDIRPLUS3resok::try_from(&mut buf)
+            .map(|_| ())
+            .map_err(map_xdr_err)
     }
 }
 
@@ -319,8 +329,9 @@ fn get_uid_gid() -> (u32, u32) {
 }
 
 fn parse_url(url: &str) -> Result<MountArgs> {
-    let mut parsed_url = Url::parse_with_params(url, &[("version", "3"), ("readdir-buffer", "8192,8192")])
-        .map_err(|e| NfsError::InvalidInput(e.to_string()))?;
+    let mut parsed_url =
+        Url::parse_with_params(url, &[("version", "3"), ("readdir-buffer", "8192,8192")])
+            .map_err(|e| NfsError::InvalidInput(e.to_string()))?;
     if parsed_url.scheme() != "nfs" {
         return Err(NfsError::InvalidInput(
             "specified URL does not have scheme nfs".to_string(),
@@ -332,7 +343,9 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         ));
     }
     let addr_port = parsed_url.port();
-    parsed_url.set_port(None).map_err(|_| NfsError::InvalidInput("cannot clear port on URL".to_string()))?;
+    parsed_url
+        .set_port(None)
+        .map_err(|_| NfsError::InvalidInput("cannot clear port on URL".to_string()))?;
     let version_str = parsed_url
         .query_pairs()
         .find(|(name, _)| name == "version")
@@ -345,7 +358,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
             NFSVersion::Unknown => {
                 return Err(NfsError::InvalidInput(
                     "specified URL contains bad NFS version".to_string(),
-                ))
+                ));
             }
             _ => versions.push(version),
         }
@@ -355,8 +368,18 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         versions.push(NFSVersion::NFSv3);
     }
     let (uid_def, gid_def) = get_uid_gid();
-    let uid = get_url_query_param(&parsed_url, "uid", uid_def, "specified URL contains bad UID")?;
-    let gid = get_url_query_param(&parsed_url, "gid", gid_def, "specified URL contains bad GID")?;
+    let uid = get_url_query_param(
+        &parsed_url,
+        "uid",
+        uid_def,
+        "specified URL contains bad UID",
+    )?;
+    let gid = get_url_query_param(
+        &parsed_url,
+        "gid",
+        gid_def,
+        "specified URL contains bad GID",
+    )?;
     let readdir_buffer_str = parsed_url
         .query_pairs()
         .find(|(name, _)| name == "readdir-buffer")
@@ -428,21 +451,15 @@ fn get_url_query_param<T: std::str::FromStr>(
 fn parse_readdir_buffer_query_param(param: &str) -> Result<(u32, u32)> {
     if let Some((dircount_str, maxcount_str)) = param.split_once(',') {
         let dircount: u32 = dircount_str.parse().map_err(|_| {
-            NfsError::InvalidInput(
-                "specified URL contains bad readdir-buffer value".to_string(),
-            )
+            NfsError::InvalidInput("specified URL contains bad readdir-buffer value".to_string())
         })?;
         let maxcount: u32 = maxcount_str.parse().map_err(|_| {
-            NfsError::InvalidInput(
-                "specified URL contains bad readdir-buffer value".to_string(),
-            )
+            NfsError::InvalidInput("specified URL contains bad readdir-buffer value".to_string())
         })?;
         Ok((dircount, maxcount))
     } else {
         let count: u32 = param.parse().map_err(|_| {
-            NfsError::InvalidInput(
-                "specified URL contains bad readdir-buffer value".to_string(),
-            )
+            NfsError::InvalidInput("specified URL contains bad readdir-buffer value".to_string())
         })?;
         Ok((count, count))
     }
@@ -455,7 +472,9 @@ async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
         let res: Result<Box<dyn Mount>> = match version {
             NFSVersion::NFSv3 => nfs3::mount(&args).await,
             NFSVersion::NFSv4p1 => nfs41::mount::mount(&args).await,
-            NFSVersion::NFSv4 => Err(NfsError::Unsupported("NFSv4.0 is not supported".to_string())),
+            NFSVersion::NFSv4 => Err(NfsError::Unsupported(
+                "NFSv4.0 is not supported".to_string(),
+            )),
             NFSVersion::NFSv4p2 => Err(NfsError::Unsupported(
                 "NFSv4.2 is not supported".to_string(),
             )),
@@ -479,7 +498,10 @@ fn nfs_error_msg(err: &NfsError) -> String {
         NfsError::Nfs3(c) => c.to_string(),
         NfsError::Nfs4(c) => c.to_string(),
         NfsError::Mount(c) => c.to_string(),
-        NfsError::Rpc(s) | NfsError::Xdr(s) | NfsError::Unsupported(s) | NfsError::InvalidInput(s) => s.clone(),
+        NfsError::Rpc(s)
+        | NfsError::Xdr(s)
+        | NfsError::Unsupported(s)
+        | NfsError::InvalidInput(s) => s.clone(),
         NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
     }
 }
@@ -518,9 +540,7 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
 fn split_path(path: &str) -> Result<(String, String)> {
     let cleaned = path_clean::clean(format!("/=/{}", path));
     if !cleaned.starts_with("/=/") {
-        return Err(NfsError::InvalidInput(
-            "invalid path specified".to_string(),
-        ));
+        return Err(NfsError::InvalidInput("invalid path specified".to_string()));
     }
     if cleaned.eq(std::path::Path::new("/=/")) {
         return Ok(("/".to_string(), "".to_string()));
@@ -561,7 +581,9 @@ mod tests {
             let res = parse_url(&format!("{}://localhost/some/export/path", scheme));
             assert!(res.is_err());
             let err = res.unwrap_err();
-            assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not have scheme nfs"));
+            assert!(
+                matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not have scheme nfs")
+            );
         }
     }
 
@@ -570,7 +592,9 @@ mod tests {
         let res = parse_url("nfs:///some/export/path");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not contain a host"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not contain a host")
+        );
     }
 
     #[test]
@@ -578,7 +602,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?version=5");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS version"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS version")
+        );
     }
 
     #[test]
@@ -586,7 +612,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?uid=nobody");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad UID"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad UID")
+        );
     }
 
     #[test]
@@ -594,7 +622,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?gid=wheel");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad GID"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad GID")
+        );
     }
 
     #[test]
@@ -602,7 +632,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?nfsport=default");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS port"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS port")
+        );
     }
 
     #[test]
@@ -610,7 +642,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?mountport=nfsport");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad mount port"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad mount port")
+        );
     }
 
     #[test]
@@ -618,7 +652,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=unlimited");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value")
+        );
     }
 
     #[test]
@@ -626,7 +662,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=unlimited,4096");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value")
+        );
     }
 
     #[test]
@@ -634,7 +672,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=4096,unlimited");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value")
+        );
     }
 
     #[test]
@@ -642,7 +682,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?readdir-buffer=2048,4096,8192");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad readdir-buffer value")
+        );
     }
 
     #[test]
@@ -650,7 +692,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?rsize=sizable");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max read size value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max read size value")
+        );
     }
 
     #[test]
@@ -658,7 +702,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export/path?wsize=4mib");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max write size value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max write size value")
+        );
     }
 
     #[test]
@@ -907,7 +953,9 @@ mod tests {
         let res = mount(args).await;
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported"));
+        assert!(
+            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported")
+        );
     }
 
     #[test]
@@ -925,7 +973,9 @@ mod tests {
             NfsError::InvalidInput("some final error".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - some final error"));
+        assert!(
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - some final error")
+        );
     }
 
     #[test]
@@ -945,7 +995,9 @@ mod tests {
             NfsError::Unsupported("NFSv4 is not supported".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported"));
+        assert!(
+            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported")
+        );
     }
 
     #[test]
@@ -955,7 +1007,9 @@ mod tests {
             NfsError::Rpc("some error".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4.2 is not supported"));
+        assert!(
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4.2 is not supported")
+        );
     }
 
     #[test]
@@ -966,7 +1020,9 @@ mod tests {
             NfsError::Unsupported("NFSv4 is not supported".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4 and NFSv4.2 are not supported"));
+        assert!(
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4 and NFSv4.2 are not supported")
+        );
     }
 
     #[test]
@@ -977,7 +1033,9 @@ mod tests {
             NfsError::InvalidInput("some other error".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 is not supported"));
+        assert!(
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 is not supported")
+        );
     }
 
     #[test]
@@ -989,7 +1047,9 @@ mod tests {
             NfsError::Unsupported("NFSv4.2 is not supported".to_string()),
         ];
         let err = squash_mount_errors(errs);
-        assert!(matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 and NFSv4.2 are not supported"));
+        assert!(
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 and NFSv4.2 are not supported")
+        );
     }
 
     #[test]
@@ -1059,7 +1119,10 @@ mod tests {
     #[test]
     fn parse_url_noresvport_default_false() {
         let args = parse_url("nfs://127.0.0.1/some/export").unwrap();
-        assert!(!args.noresvport, "default should be false (preserve legacy privileged-port behavior)");
+        assert!(
+            !args.noresvport,
+            "default should be false (preserve legacy privileged-port behavior)"
+        );
     }
 
     #[test]
@@ -1073,7 +1136,9 @@ mod tests {
         let res = parse_url("nfs://127.0.0.1/some/export?noresvport=yes");
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad noresvport value"));
+        assert!(
+            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad noresvport value")
+        );
     }
 
     #[tokio::test]
@@ -1098,11 +1163,10 @@ mod tests {
     async fn connect_to_target_privileged_when_noresvport_false() {
         // 探测：本机是否允许绑特权端口（Unix root / Windows admin）。
         // 没有权限时直接跳过，避免在无特权 CI 上误报 false negative。
-        let probe = match tokio::net::TcpSocket::new_v4() { Ok(s) => {
-            s.bind("127.0.0.1:1".parse().unwrap()).is_ok()
-        } _ => {
-            false
-        }};
+        let probe = match tokio::net::TcpSocket::new_v4() {
+            Ok(s) => s.bind("127.0.0.1:1".parse().unwrap()).is_ok(),
+            _ => false,
+        };
         if !probe {
             eprintln!("skipping: insufficient privilege to bind <1024");
             return;

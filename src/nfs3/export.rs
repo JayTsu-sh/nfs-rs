@@ -16,20 +16,24 @@
 
 use bytes::{Buf, Bytes};
 
-use super::{rpc_header, Mount, MountProc3};
-use crate::mount::ExportEntry;
+use super::{Mount, MountProc3, rpc_header};
 use crate::error::{NfsError, Result};
+use crate::mount::ExportEntry;
 use crate::rpc;
 
 /// Decode one XDR variable-length string from `bytes`, consuming the data and its 4-byte padding.
 fn decode_xdr_string(bytes: &mut Bytes) -> Result<String> {
     if bytes.remaining() < 4 {
-        return Err(NfsError::Xdr("response truncated (string length)".to_string()));
+        return Err(NfsError::Xdr(
+            "response truncated (string length)".to_string(),
+        ));
     }
     let len = bytes.get_u32() as usize; // big-endian, advances by 4
     let pad = (4 - len % 4) % 4;
     if bytes.remaining() < len + pad {
-        return Err(NfsError::Xdr("response truncated (string data)".to_string()));
+        return Err(NfsError::Xdr(
+            "response truncated (string data)".to_string(),
+        ));
     }
     let s = std::str::from_utf8(&bytes[..len])
         .map_err(|e| NfsError::Xdr(e.to_string()))?
@@ -77,9 +81,17 @@ pub(crate) fn decode_exports(bytes: &mut Bytes) -> Result<Vec<ExportEntry>> {
 impl Mount {
     pub(crate) async fn _export(&self) -> Result<Vec<ExportEntry>> {
         let mut buf = Vec::with_capacity(128);
-        rpc_header(rpc::MOUNT_PROG, rpc::MOUNT3_VERSION, MountProc3::Export as u32, &self.auth)
-            .encode(&mut buf);
-        let mut bytes = self.rpc.call(buf, super::NFS_RETRIES, super::METADATA_TIMEOUT).await?;
+        rpc_header(
+            rpc::MOUNT_PROG,
+            rpc::MOUNT3_VERSION,
+            MountProc3::Export as u32,
+            &self.auth,
+        )
+        .encode(&mut buf);
+        let mut bytes = self
+            .rpc
+            .call(buf, super::NFS_RETRIES, super::METADATA_TIMEOUT)
+            .await?;
         decode_exports(&mut bytes)
     }
 

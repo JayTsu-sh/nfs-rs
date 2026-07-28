@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tracing::info;
 
 use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse};
-use super::mount::{delay_with_jitter_ms, grace_with_jitter_ms, DELAY_RETRY_MAX};
+use super::mount::{DELAY_RETRY_MAX, delay_with_jitter_ms, grace_with_jitter_ms};
 use crate::error::{NfsError, Result};
 use crate::rpc;
 use crate::rpc::auth::Auth;

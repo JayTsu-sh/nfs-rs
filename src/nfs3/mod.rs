@@ -41,8 +41,8 @@ mod write;
 
 pub(crate) use mount::{mount, query_exports};
 
-use crate::{rpc, Auth, ObjRes, Time};
 use crate::error::{NfsError, Result};
+use crate::{Auth, ObjRes, Time, rpc};
 use bytes::Bytes;
 
 /// Convert NFS byte-string to Rust String. Tries UTF-8 first;
@@ -59,8 +59,16 @@ pub(crate) fn bytes_to_string(raw: Bytes) -> String {
 
 fn hex_preview(bytes: &[u8]) -> String {
     let limit = bytes.len().min(32);
-    let hex: String = bytes[..limit].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-    if bytes.len() > 32 { format!("{}...", hex) } else { hex }
+    let hex: String = bytes[..limit]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if bytes.len() > 32 {
+        format!("{}...", hex)
+    } else {
+        hex
+    }
 }
 
 pub(crate) mod fastxdr;
@@ -69,11 +77,11 @@ pub(crate) mod fastxdr;
 // Note: filename3 and nfspath3 are NOT re-exported here because we have local
 // request-encoding structs with those names. Callers use the local encoding types.
 pub(crate) use fastxdr::{
-    entry3, entryplus3, fattr3, mount_mountstat3, mountres3_ok, nfsstat3, nfstime3, post_op_attr,
-    post_op_fh3, ACCESS3resok, COMMIT3resok, CREATE3resok, FSINFO3resok, FSSTAT3resok,
-    GETATTR3resok, LINK3resok, LOOKUP3resok, MKDIR3resok, PATHCONF3resok, READ3resok,
-    READDIR3resok, READDIRPLUS3resok, READLINK3resok, REMOVE3resok, RENAME3resok, RMDIR3resok,
-    SETATTR3resok, SYMLINK3resok, WRITE3resok, stable_how,
+    ACCESS3resok, COMMIT3resok, CREATE3resok, FSINFO3resok, FSSTAT3resok, GETATTR3resok,
+    LINK3resok, LOOKUP3resok, MKDIR3resok, PATHCONF3resok, READ3resok, READDIR3resok,
+    READDIRPLUS3resok, READLINK3resok, REMOVE3resok, RENAME3resok, RMDIR3resok, SETATTR3resok,
+    SYMLINK3resok, WRITE3resok, entry3, entryplus3, fattr3, mount_mountstat3, mountres3_ok,
+    nfsstat3, nfstime3, post_op_attr, post_op_fh3, stable_how,
 };
 
 /// Shared paging logic for `readdir` and `readdirplus` streams.
@@ -88,53 +96,49 @@ macro_rules! paged_dir_stream {
     ($self:expr_2021, $dir_fh:expr_2021, $fetch_page:ident, $convert:expr_2021, $label:literal) => {{
         use futures::stream::TryStreamExt as _;
         let this = $self;
-        futures::stream::try_unfold(
-            Some(($dir_fh, 0u64, [0u8; 8])),
-            move |state| async move {
-                let Some((fh, cookie, verifier)) = state else {
-                    return Ok::<_, crate::error::NfsError>(None);
-                };
-                let res = this.$fetch_page(fh.clone(), cookie, verifier).await?;
-                let new_verifier: [u8; 8] =
-                    res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
-                let eof = res.reply.eof;
-                // Walk linked list (read-only) for last cookie and count.
-                let (new_cookie, entry_count, entries_head) = match res.reply.entries {
-                    Some(entry) => {
-                        let mut count = 0usize;
-                        let mut last_cookie = cookie;
-                        let mut e = &*entry;
-                        loop {
-                            count += 1;
-                            last_cookie = e.cookie.0;
-                            match &e.nextentry {
-                                Some(next) => e = next,
-                                None => break,
-                            }
+        futures::stream::try_unfold(Some(($dir_fh, 0u64, [0u8; 8])), move |state| async move {
+            let Some((fh, cookie, verifier)) = state else {
+                return Ok::<_, crate::error::NfsError>(None);
+            };
+            let res = this.$fetch_page(fh.clone(), cookie, verifier).await?;
+            let new_verifier: [u8; 8] = res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
+            let eof = res.reply.eof;
+            // Walk linked list (read-only) for last cookie and count.
+            let (new_cookie, entry_count, entries_head) = match res.reply.entries {
+                Some(entry) => {
+                    let mut count = 0usize;
+                    let mut last_cookie = cookie;
+                    let mut e = &*entry;
+                    loop {
+                        count += 1;
+                        last_cookie = e.cookie.0;
+                        match &e.nextentry {
+                            Some(next) => e = next,
+                            None => break,
                         }
-                        (last_cookie, count, Some(entry))
                     }
-                    None => (cookie, 0, None),
-                };
-                tracing::debug!(cookie = new_cookie, eof, entry_count, $label);
-                let next = if eof || entry_count == 0 {
-                    None
-                } else {
-                    Some((fh, new_cookie, new_verifier))
-                };
-                // Yield entries directly from the linked list — no intermediate Vec.
-                let convert = $convert;
-                let entry_iter = {
-                    let mut current = entries_head;
-                    std::iter::from_fn(move || {
-                        let mut node = current.take()?;
-                        current = node.nextentry.take();
-                        Some(Ok(convert(node)))
-                    })
-                };
-                Ok(Some((futures::stream::iter(entry_iter), next)))
-            },
-        )
+                    (last_cookie, count, Some(entry))
+                }
+                None => (cookie, 0, None),
+            };
+            tracing::debug!(cookie = new_cookie, eof, entry_count, $label);
+            let next = if eof || entry_count == 0 {
+                None
+            } else {
+                Some((fh, new_cookie, new_verifier))
+            };
+            // Yield entries directly from the linked list — no intermediate Vec.
+            let convert = $convert;
+            let entry_iter = {
+                let mut current = entries_head;
+                std::iter::from_fn(move || {
+                    let mut node = current.take()?;
+                    current = node.nextentry.take();
+                    Some(Ok(convert(node)))
+                })
+            };
+            Ok(Some((futures::stream::iter(entry_iter), next)))
+        })
         .try_flatten()
     }};
 }
@@ -314,13 +318,11 @@ impl Mount {
         self.pack_nfs3(NFSProc3::Read, &args, &mut buf);
         tracing::debug!(proc = "Read", "NFS3 call");
         let mut bytes = self.rpc.call(buf, NFS_RETRIES, timeout).await?;
-        let status = nfsstat3::try_from(&mut bytes)
-            .map_err(|e| NfsError::Xdr(e.to_string()))?;
+        let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
         match status {
             nfsstat3::NFS3_OK => {
                 tracing::trace!(proc = "Read", "NFS3 call succeeded");
-                READ3resok::try_from(&mut bytes)
-                    .map_err(|e| NfsError::Xdr(e.to_string()))
+                READ3resok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))
             }
             e => {
                 tracing::warn!(proc = "Read", status = ?e, "NFS3 call returned error status");
@@ -329,7 +331,12 @@ impl Mount {
         }
     }
     nfs3_call!(_readdir, Readdir, READDIR3args, READDIR3resok);
-    nfs3_call!(_readdirplus, Readdirplus, READDIRPLUS3args, READDIRPLUS3resok);
+    nfs3_call!(
+        _readdirplus,
+        Readdirplus,
+        READDIRPLUS3args,
+        READDIRPLUS3resok
+    );
     nfs3_call!(_readlink, Readlink, READLINK3args, READLINK3resok);
     nfs3_call!(_remove, Remove, REMOVE3args, REMOVE3resok);
     nfs3_call!(_rename, Rename, RENAME3args, RENAME3resok);
@@ -345,14 +352,15 @@ impl Mount {
         let mut buf = Vec::<u8>::new();
         self.pack_nfs3(NFSProc3::Write, &args, &mut buf);
         tracing::debug!(proc = "Write", data_len = data.len(), "NFS3 call");
-        let mut bytes = self.rpc.call_with_data(buf, data, NFS_RETRIES, timeout).await?;
-        let status = nfsstat3::try_from(&mut bytes)
-            .map_err(|e| NfsError::Xdr(e.to_string()))?;
+        let mut bytes = self
+            .rpc
+            .call_with_data(buf, data, NFS_RETRIES, timeout)
+            .await?;
+        let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
         match status {
             nfsstat3::NFS3_OK => {
                 tracing::trace!(proc = "Write", "NFS3 call succeeded");
-                WRITE3resok::try_from(&mut bytes)
-                    .map_err(|e| NfsError::Xdr(e.to_string()))
+                WRITE3resok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))
             }
             e => {
                 tracing::warn!(proc = "Write", status = ?e, "NFS3 call returned error status");
@@ -565,7 +573,6 @@ impl XdrEncode for sattrguard3 {
         }
     }
 }
-
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
@@ -1086,8 +1093,7 @@ mod tests {
     fn rpc_header_util() {
         let auth = crate::Auth::new_unix("machinist", 123, 987);
         let header = rpc_header(9, 8, 7, &auth);
-        let expected =
-            rpc::Header::new(rpc::RPC_VERSION, 9, 8, 7, &auth, &crate::Auth::new_null());
+        let expected = rpc::Header::new(rpc::RPC_VERSION, 9, 8, 7, &auth, &crate::Auth::new_null());
         assert_eq!(header, expected);
     }
 

@@ -375,7 +375,7 @@ fn build_rpc_reply(xid: u32, body: &[u8]) -> Vec<u8> {
     reply.extend_from_slice(&xid.to_be_bytes()); // xid
     reply.extend_from_slice(&1u32.to_be_bytes()); // msg_type = REPLY
     reply.extend_from_slice(&0u32.to_be_bytes()); // reply_stat = MSG_ACCEPTED
-                                                  // Verf: AUTH_NONE
+    // Verf: AUTH_NONE
     reply.extend_from_slice(&0u32.to_be_bytes()); // flavor = AUTH_NONE
     reply.extend_from_slice(&0u32.to_be_bytes()); // body length = 0
     reply.extend_from_slice(&0u32.to_be_bytes()); // accept_stat = SUCCESS

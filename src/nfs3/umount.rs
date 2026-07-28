@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{encode_dirpath, rpc_header, Mount, MountProc3, Result};
+use super::{Mount, MountProc3, Result, encode_dirpath, rpc_header};
 use crate::rpc;
 
 #[allow(unused)]
@@ -34,7 +34,10 @@ impl Mount {
         // blocking the caller when the server is unreachable.
         // 注意：不调用 self.rpc.shutdown()，连接由 Arc<StreamMux>::Drop 自然清理。
         // 在共享 Client 场景下，提前 shutdown 会摧毁其他持有者正在使用的连接。
-        let result = self.rpc.call(buf, super::MOUNT_RETRIES, super::METADATA_TIMEOUT).await;
+        let result = self
+            .rpc
+            .call(buf, super::MOUNT_RETRIES, super::METADATA_TIMEOUT)
+            .await;
         result.map(|_| ())
     }
 }

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::mount::{extract_stateid, Mount41};
+use super::mount::{Mount41, extract_stateid};
 use super::state::StateId;
 use crate::error::{NfsError, Result};
 
@@ -20,12 +20,16 @@ impl Mount41 {
         // Build fattr4 bitmap + attr_vals for the requested attributes
         let (attrmask, attr_vals) = encode_setattr(mode, uid, gid, size, atime, mtime);
         let stateid = [0u8; 16]; // anonymous stateid
-        let resp = self.compound("setattr", |b| {
-            b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
-        }).await?;
+        let resp = self
+            .compound("setattr", |b| {
+                b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         // SETATTR4res has status + bitmap (not a union with void default)
-        let setattr_op = resp.results.get(2)
+        let setattr_op = resp
+            .results
+            .get(2)
             .ok_or_else(|| NfsError::Xdr("SETATTR response missing op at index 2".to_string()))?;
         if !matches!(setattr_op.status, super::fastxdr::nfsstat4::NFS4_OK) {
             return Err(NfsError::Nfs4(setattr_op.status));
@@ -52,7 +56,8 @@ impl Mount41 {
         } else {
             None
         };
-        self.setattr(obj.fh, guard, mode, uid, gid, size, atime, mtime).await
+        self.setattr(obj.fh, guard, mode, uid, gid, size, atime, mtime)
+            .await
     }
 
     pub(crate) async fn lock(
@@ -72,20 +77,22 @@ impl Mount41 {
         let open_stateid = sid.raw;
         let client_id = self.session_holder.get().await.client_id();
 
-        let resp = self.compound("lock", |b| {
-            b.putfh(&fh).lock(
-                lock_type,
-                false, // reclaim
-                offset,
-                length,
-                true,  // new_lock_owner
-                &open_stateid,
-                0,     // lock_seqid
-                0,     // open_seqid
-                b"nfs-rs-lock",
-                client_id,
-            )
-        }).await?;
+        let resp = self
+            .compound("lock", |b| {
+                b.putfh(&fh).lock(
+                    lock_type,
+                    false, // reclaim
+                    offset,
+                    length,
+                    true, // new_lock_owner
+                    &open_stateid,
+                    0, // lock_seqid
+                    0, // open_seqid
+                    b"nfs-rs-lock",
+                    client_id,
+                )
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let lock_op = resp.op_ok(2)?;
         let mut data = lock_op.data.clone();
@@ -103,23 +110,27 @@ impl Mount41 {
         length: u64,
     ) -> Result<()> {
         if lock_stateid.len() < 16 {
-            return Err(NfsError::InvalidInput("lock_stateid must be 16 bytes".to_string()));
+            return Err(NfsError::InvalidInput(
+                "lock_stateid must be 16 bytes".to_string(),
+            ));
         }
         let mut sid = [0u8; 16];
         sid.copy_from_slice(&lock_stateid[..16]);
 
-        let resp = self.compound("locku", |b| {
-            b.putfh(&fh).locku(lock_type, 0, &sid, offset, length)
-        }).await?;
+        let resp = self
+            .compound("locku", |b| {
+                b.putfh(&fh).locku(lock_type, 0, &sid, offset, length)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // LOCKU
         Ok(())
     }
 
     pub(crate) async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
-        let resp = self.compound("commit", |b| {
-            b.putfh(&fh).commit(offset, count)
-        }).await?;
+        let resp = self
+            .compound("commit", |b| b.putfh(&fh).commit(offset, count))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // COMMIT
         Ok(())
@@ -192,6 +203,12 @@ pub(super) fn encode_setattr(
         vals.extend_from_slice(&t.nseconds.to_be_bytes());
     }
 
-    let attrmask = if word1 != 0 { vec![word0, word1] } else if word0 != 0 { vec![word0] } else { vec![] };
+    let attrmask = if word1 != 0 {
+        vec![word0, word1]
+    } else if word0 != 0 {
+        vec![word0]
+    } else {
+        vec![]
+    };
     (attrmask, vals)
 }

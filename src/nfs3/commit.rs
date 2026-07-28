@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{nfs_fh3, COMMIT3args, Mount, Result};
+use super::{COMMIT3args, Mount, Result, nfs_fh3};
 use bytes::Bytes;
 
 impl Mount {

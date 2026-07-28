@@ -4,7 +4,7 @@
 // All fixtures are hand-built XDR byte buffers — no network, no NFS server.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use nfs_rs::__bench::{
     decode_fattr3, decode_post_op_attr, decode_read3resok, decode_readdirplus3resok,
 };

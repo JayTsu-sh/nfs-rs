@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Buf, Bytes};
 use tokio::sync::RwLock;
@@ -1036,12 +1036,12 @@ mod tests {
         put_u32(&mut buf, 0); // return_on_close = false
         buf.extend_from_slice(&[7u8; 16]); // stateid
         put_u32(&mut buf, 1); // 1 segment
-                              // segment: offset(8) + length(8) + iomode(4) + layout_type(4)
+        // segment: offset(8) + length(8) + iomode(4) + layout_type(4)
         put_u64(&mut buf, 0); // offset
         put_u64(&mut buf, 0xFFFFFFFFFFFFFFFF); // length = whole file
         put_u32(&mut buf, 2); // iomode = RW
         put_u32(&mut buf, 2); // LayoutType::Osd2Objects → Opaque content
-                              // layout_content: opaque (must be padded to 4-byte boundary)
+        // layout_content: opaque (must be padded to 4-byte boundary)
         let content = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
         put_u32(&mut buf, content.len() as u32);
         buf.extend_from_slice(&content);
@@ -1064,7 +1064,7 @@ mod tests {
         put_u32(&mut buf, 0); // first_stripe_index
         put_u64(&mut buf, 0); // pattern_offset
         put_u32(&mut buf, 2); // 2 file handles
-                              // fh1: 4 bytes
+        // fh1: 4 bytes
         put_u32(&mut buf, 4);
         buf.extend_from_slice(&[1, 2, 3, 4]);
         // fh2: 4 bytes
@@ -1119,7 +1119,7 @@ mod tests {
     fn decode_files_layout_dense_flag() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0xBBu8; 16]); // device_id
-                                              // nfl_util with dense flag (bit 30) set + stripe_unit = 4096
+        // nfl_util with dense flag (bit 30) set + stripe_unit = 4096
         let nfl_util: u32 = 0x4000_0000 | 4096;
         put_u32(&mut buf, nfl_util);
         put_u32(&mut buf, 2); // first_stripe_index
@@ -1399,7 +1399,7 @@ mod tests {
         put_u32(&mut body, 1);
         put_xdr_string(&mut body, "tcp");
         put_xdr_string(&mut body, "10.0.0.1.8.1"); // 10.0.0.1:2049
-                                                   // DS 1: 2 addresses (multipath)
+        // DS 1: 2 addresses (multipath)
         put_u32(&mut body, 2);
         put_xdr_string(&mut body, "tcp");
         put_xdr_string(&mut body, "10.0.0.2.8.1"); // 10.0.0.2:2049

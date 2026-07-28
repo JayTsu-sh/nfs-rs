@@ -15,8 +15,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    diropargs3, filename3, from_post_op_fh3, nfs_fh3, nfspath3, sattr3, symlinkdata3,
-    Mount, ObjRes, Result, SYMLINK3args, SYMLINK3resok,
+    Mount, ObjRes, Result, SYMLINK3args, SYMLINK3resok, diropargs3, filename3, from_post_op_fh3,
+    nfs_fh3, nfspath3, sattr3, symlinkdata3,
 };
 use crate::split_path;
 use bytes::Bytes;
@@ -36,9 +36,7 @@ impl Mount {
     ) -> Result<ObjRes> {
         let args = SYMLINK3args {
             where_: diropargs3 {
-                dir: nfs_fh3 {
-                    data: dst_dir_fh,
-                },
+                dir: nfs_fh3 { data: dst_dir_fh },
                 name: filename3(dst_filename.to_string()),
             },
             symlink: symlinkdata3 {

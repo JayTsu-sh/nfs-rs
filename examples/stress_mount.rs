@@ -7,8 +7,8 @@
 //   cargo run --release --example stress_mount -- nfs://10.131.9.13/export/nfs 32
 
 use std::env;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinSet;

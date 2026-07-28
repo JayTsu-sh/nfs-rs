@@ -14,9 +14,9 @@ pub(crate) mod fastxdr;
 mod getattr;
 pub(crate) mod layout;
 pub(crate) mod lease;
-mod pnfs_io;
 mod lookup;
 pub(crate) mod mount;
+mod pnfs_io;
 mod read;
 mod readdir;
 pub(crate) mod session;
@@ -105,7 +105,9 @@ impl std::fmt::Display for Nfs4ErrorCode {
             Nfs4ErrorCode::NFS4ERR_BADSESSION => write!(f, "bad session"),
             Nfs4ErrorCode::NFS4ERR_BADSLOT => write!(f, "bad slot"),
             Nfs4ErrorCode::NFS4ERR_COMPLETE_ALREADY => write!(f, "reclaim complete already"),
-            Nfs4ErrorCode::NFS4ERR_CONN_NOT_BOUND_TO_SESSION => write!(f, "connection not bound to session"),
+            Nfs4ErrorCode::NFS4ERR_CONN_NOT_BOUND_TO_SESSION => {
+                write!(f, "connection not bound to session")
+            }
             Nfs4ErrorCode::NFS4ERR_DELEG_ALREADY_WANTED => write!(f, "delegation already wanted"),
             Nfs4ErrorCode::NFS4ERR_BACK_CHAN_BUSY => write!(f, "backchannel busy"),
             Nfs4ErrorCode::NFS4ERR_LAYOUTTRYLATER => write!(f, "layout try later"),
@@ -133,7 +135,9 @@ impl std::fmt::Display for Nfs4ErrorCode {
             Nfs4ErrorCode::NFS4ERR_NOT_ONLY_OP => write!(f, "not the only operation"),
             Nfs4ErrorCode::NFS4ERR_WRONG_CRED => write!(f, "wrong credentials"),
             Nfs4ErrorCode::NFS4ERR_WRONG_TYPE => write!(f, "wrong type"),
-            Nfs4ErrorCode::NFS4ERR_DIRDELEG_UNAVAIL => write!(f, "directory delegation unavailable"),
+            Nfs4ErrorCode::NFS4ERR_DIRDELEG_UNAVAIL => {
+                write!(f, "directory delegation unavailable")
+            }
             Nfs4ErrorCode::NFS4ERR_REJECT_DELEG => write!(f, "delegation rejected"),
             Nfs4ErrorCode::NFS4ERR_RETURNCONFLICT => write!(f, "return conflict"),
             Nfs4ErrorCode::NFS4ERR_DELEG_REVOKED => write!(f, "delegation revoked"),
@@ -160,41 +164,80 @@ mod tests {
 
     #[test]
     fn nfs4_ok_display() {
-        assert_eq!(Nfs4ErrorCode::NFS4_OK.to_string(), "call completed successfully");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4_OK.to_string(),
+            "call completed successfully"
+        );
     }
 
     #[test]
     fn nfs4_common_errors_display() {
         assert_eq!(Nfs4ErrorCode::NFS4ERR_PERM.to_string(), "permission denied");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_NOENT.to_string(), "no such file or directory");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_NOENT.to_string(),
+            "no such file or directory"
+        );
         assert_eq!(Nfs4ErrorCode::NFS4ERR_ACCESS.to_string(), "access denied");
         assert_eq!(Nfs4ErrorCode::NFS4ERR_EXIST.to_string(), "file exists");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_STALE.to_string(), "stale file handle");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_NOSPC.to_string(), "no space left on device");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_ROFS.to_string(), "read-only file system");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_STALE.to_string(),
+            "stale file handle"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_NOSPC.to_string(),
+            "no space left on device"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_ROFS.to_string(),
+            "read-only file system"
+        );
     }
 
     #[test]
     fn nfs4_session_errors_display() {
         assert_eq!(Nfs4ErrorCode::NFS4ERR_BADSESSION.to_string(), "bad session");
         assert_eq!(Nfs4ErrorCode::NFS4ERR_BADSLOT.to_string(), "bad slot");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_SEQ_MISORDERED.to_string(), "sequence misordered");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_DEADSESSION.to_string(), "dead session");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_SEQ_MISORDERED.to_string(),
+            "sequence misordered"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_DEADSESSION.to_string(),
+            "dead session"
+        );
     }
 
     #[test]
     fn nfs4_state_errors_display() {
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_BAD_STATEID.to_string(), "bad state ID");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_EXPIRED.to_string(), "lock/stateid expired");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_GRACE.to_string(), "server in grace period");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_BAD_STATEID.to_string(),
+            "bad state ID"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_EXPIRED.to_string(),
+            "lock/stateid expired"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_GRACE.to_string(),
+            "server in grace period"
+        );
         assert_eq!(Nfs4ErrorCode::NFS4ERR_LOCKED.to_string(), "file locked");
     }
 
     #[test]
     fn nfs4_pnfs_errors_display() {
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_LAYOUTTRYLATER.to_string(), "layout try later");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_LAYOUTUNAVAILABLE.to_string(), "layout unavailable");
-        assert_eq!(Nfs4ErrorCode::NFS4ERR_NOMATCHING_LAYOUT.to_string(), "no matching layout");
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_LAYOUTTRYLATER.to_string(),
+            "layout try later"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_LAYOUTUNAVAILABLE.to_string(),
+            "layout unavailable"
+        );
+        assert_eq!(
+            Nfs4ErrorCode::NFS4ERR_NOMATCHING_LAYOUT.to_string(),
+            "no matching layout"
+        );
     }
 
     #[test]

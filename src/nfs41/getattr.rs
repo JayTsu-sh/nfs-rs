@@ -8,9 +8,9 @@ use crate::mount;
 impl Mount41 {
     pub(crate) async fn getattr(&self, fh: Bytes) -> Result<mount::Attr> {
         let bitmap = standard_getattr_bitmap();
-        let resp = self.compound("getattr", |b| {
-            b.putfh(&fh).getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .compound("getattr", |b| b.putfh(&fh).getattr(&bitmap))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let getattr = resp.op_ok(2)?;
         let mut data = getattr.data.clone();

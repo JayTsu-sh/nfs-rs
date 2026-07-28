@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{diropargs3, filename3, nfs_fh3, LINK3args, Mount};
+use super::{LINK3args, Mount, diropargs3, filename3, nfs_fh3};
 use crate::error::{NfsError, Result};
 use crate::split_path;
 use bytes::Bytes;
@@ -34,13 +34,9 @@ impl Mount {
         dst_filename: &str,
     ) -> Result<crate::mount::Attr> {
         let args = LINK3args {
-            file: nfs_fh3 {
-                data: src_fh,
-            },
+            file: nfs_fh3 { data: src_fh },
             link: diropargs3 {
-                dir: nfs_fh3 {
-                    data: dst_dir_fh,
-                },
+                dir: nfs_fh3 { data: dst_dir_fh },
                 name: filename3(dst_filename.to_string()),
             },
         };

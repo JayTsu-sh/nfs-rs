@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::callback::RecallNotification;
 use super::compound::OpenArgs;
-use super::mount::{decode_fh, extract_open_delegation, extract_stateid, Mount41};
+use super::mount::{Mount41, decode_fh, extract_open_delegation, extract_stateid};
 use super::setattr::encode_setattr;
 use super::state::{AccessMode, StateId};
 use crate::error::{NfsError, Result};
@@ -45,8 +45,8 @@ impl Mount41 {
         let count = d.get_u32();
         let committed = d.get_u32();
         d.advance(8); // writeverf — used in COMMIT response, not here
-                      // RFC 5661 §18.32.3: if stability was downgraded (committed != FILE_SYNC4),
-                      // COMMIT to make the data durable before returning success to the caller.
+        // RFC 5661 §18.32.3: if stability was downgraded (committed != FILE_SYNC4),
+        // COMMIT to make the data durable before returning success to the caller.
         if committed != 2
         /* FILE_SYNC4 */
         {
@@ -183,7 +183,7 @@ impl Mount41 {
             .await?;
         resp.op_ok(1)?; // PUTFH
         let open_op = resp.op_ok(2)?; // OPEN
-                                      // Extract stateid from OPEN result for CLOSE
+        // Extract stateid from OPEN result for CLOSE
         let mut open_data = open_op.data.clone();
         let stateid = extract_stateid(&mut open_data)?;
         let delegation = extract_open_delegation(&mut open_data);
@@ -203,11 +203,14 @@ impl Mount41 {
                     b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
                 })
                 .await
-            { Err(e) => {
-                warn!(error = %e, mode = m, "create: SETATTR mode failed after file creation");
-            } _ => {
-                attr.file_mode = m;
-            }}
+            {
+                Err(e) => {
+                    warn!(error = %e, mode = m, "create: SETATTR mode failed after file creation");
+                }
+                _ => {
+                    attr.file_mode = m;
+                }
+            }
         }
         // 保持文件 open 并注册 stateid，由调用方 close_file() 时发 CLOSE 释放
         // （umount 时 drain 兜底）。后续 WRITE 因此持有真实 open stateid——
@@ -246,7 +249,7 @@ impl Mount41 {
             .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // CREATE
-                        // Log CREATE change_info
+        // Log CREATE change_info
         if let Some(create_op) = resp.results.get(2) {
             let mut cdata = create_op.data.clone();
             if cdata.remaining() >= 20 {

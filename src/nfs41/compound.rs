@@ -17,7 +17,7 @@
 use bytes::{Buf, Bytes};
 
 use super::fastxdr::*;
-use super::{NFS41_MINOR_VERSION, NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION};
+use super::{NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION, NFS41_MINOR_VERSION};
 use crate::error::{NfsError, Result};
 use crate::nfs3::rpc_header;
 use crate::rpc::auth::Auth;
@@ -33,45 +33,45 @@ const MAX_LAYOUT_SEGMENTS: usize = 1024;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum OpNum {
-    Access          = 3,
-    Close           = 4,
-    Commit          = 5,
-    Create          = 6,
-    GetAttr         = 9,
-    GetFh           = 10,
-    Link            = 11,
-    Lookup          = 15,
-    Lookupp         = 16,
-    Open            = 18,
-    PutFh           = 22,
-    PutRootFh       = 24,
-    Read            = 25,
-    ReadDir         = 26,
-    ReadLink        = 27,
-    Remove          = 28,
-    Rename          = 29,
-    RestoreFh       = 31,
-    SaveFh          = 32,
-    SetAttr         = 34,
-    Write           = 38,
-    OpenAttr        = 20,
-    Lock            = 12,
-    Lockt           = 13,
-    Locku           = 14,
-    LayoutGet       = 50,
-    LayoutCommit    = 49,
-    LayoutReturn    = 51,
-    GetDeviceInfo   = 47,
-    ExchangeId      = 42,
-    CreateSession   = 43,
-    DestroySession  = 44,
+    Access = 3,
+    Close = 4,
+    Commit = 5,
+    Create = 6,
+    GetAttr = 9,
+    GetFh = 10,
+    Link = 11,
+    Lookup = 15,
+    Lookupp = 16,
+    Open = 18,
+    PutFh = 22,
+    PutRootFh = 24,
+    Read = 25,
+    ReadDir = 26,
+    ReadLink = 27,
+    Remove = 28,
+    Rename = 29,
+    RestoreFh = 31,
+    SaveFh = 32,
+    SetAttr = 34,
+    Write = 38,
+    OpenAttr = 20,
+    Lock = 12,
+    Lockt = 13,
+    Locku = 14,
+    LayoutGet = 50,
+    LayoutCommit = 49,
+    LayoutReturn = 51,
+    GetDeviceInfo = 47,
+    ExchangeId = 42,
+    CreateSession = 43,
+    DestroySession = 44,
     BindConnToSession = 41,
-    Sequence        = 53,
+    Sequence = 53,
     ReclaimComplete = 58,
     DestroyClientId = 57,
-    DelegReturn     = 8,
-    TestStateId     = 55,
-    FreeStateId     = 56,
+    DelegReturn = 8,
+    TestStateId = 55,
+    FreeStateId = 56,
 }
 
 // ─── XDR encoding helpers (same pattern as nfs3) ─────────────────────────────
@@ -163,7 +163,10 @@ impl CompoundBuilder {
         xdr_u32(&mut args, slot_id);
         xdr_u32(&mut args, highest_slot_id);
         xdr_bool(&mut args, cachethis);
-        self.ops.push(EncodedOp { opcode: OpNum::Sequence, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Sequence,
+            args,
+        });
         self
     }
 
@@ -190,7 +193,10 @@ impl CompoundBuilder {
         // nfstime4 date (0, 0)
         xdr_i64(&mut args, 0);
         xdr_u32(&mut args, 0);
-        self.ops.push(EncodedOp { opcode: OpNum::ExchangeId, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ExchangeId,
+            args,
+        });
         self
     }
 
@@ -213,68 +219,103 @@ impl CompoundBuilder {
         // callback_sec_parms4: array of 1 AUTH_NONE entry
         xdr_u32(&mut args, 1); // array length
         xdr_u32(&mut args, 0); // AUTH_NONE flavor
-        self.ops.push(EncodedOp { opcode: OpNum::CreateSession, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::CreateSession,
+            args,
+        });
         self
     }
 
     pub fn destroy_session(mut self, session_id: &[u8; 16]) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(session_id);
-        self.ops.push(EncodedOp { opcode: OpNum::DestroySession, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::DestroySession,
+            args,
+        });
         self
     }
 
     /// BIND_CONN_TO_SESSION (RFC 5661 §18.34)
     /// dir: CDFC4_FORE=1, CDFC4_BACK=2, CDFC4_FORE_OR_BOTH=3
-    pub fn bind_conn_to_session(mut self, session_id: &[u8; 16], dir: u32, use_conn_in_rdma_mode: bool) -> Self {
+    pub fn bind_conn_to_session(
+        mut self,
+        session_id: &[u8; 16],
+        dir: u32,
+        use_conn_in_rdma_mode: bool,
+    ) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(session_id);
         xdr_u32(&mut args, dir); // channel direction
         xdr_bool(&mut args, use_conn_in_rdma_mode);
-        self.ops.push(EncodedOp { opcode: OpNum::BindConnToSession, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::BindConnToSession,
+            args,
+        });
         self
     }
 
     pub fn reclaim_complete(mut self, one_fs: bool) -> Self {
         let mut args = Vec::new();
         xdr_bool(&mut args, one_fs);
-        self.ops.push(EncodedOp { opcode: OpNum::ReclaimComplete, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ReclaimComplete,
+            args,
+        });
         self
     }
 
     pub fn destroy_client_id(mut self, client_id: u64) -> Self {
         let mut args = Vec::new();
         xdr_u64(&mut args, client_id);
-        self.ops.push(EncodedOp { opcode: OpNum::DestroyClientId, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::DestroyClientId,
+            args,
+        });
         self
     }
 
     // ─── File handle ops ─────────────────────────────────────────────────
 
     pub fn putrootfh(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::PutRootFh, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::PutRootFh,
+            args: Vec::new(),
+        });
         self
     }
 
     pub fn putfh(mut self, fh: &[u8]) -> Self {
         let mut args = Vec::new();
         xdr_var_bytes(&mut args, fh);
-        self.ops.push(EncodedOp { opcode: OpNum::PutFh, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::PutFh,
+            args,
+        });
         self
     }
 
     pub fn getfh(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::GetFh, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::GetFh,
+            args: Vec::new(),
+        });
         self
     }
 
     pub fn savefh(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::SaveFh, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::SaveFh,
+            args: Vec::new(),
+        });
         self
     }
 
     pub fn restorefh(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::RestoreFh, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::RestoreFh,
+            args: Vec::new(),
+        });
         self
     }
 
@@ -283,7 +324,10 @@ impl CompoundBuilder {
     pub fn openattr(mut self, create_dir: bool) -> Self {
         let mut args = Vec::new();
         xdr_bool(&mut args, create_dir);
-        self.ops.push(EncodedOp { opcode: OpNum::OpenAttr, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::OpenAttr,
+            args,
+        });
         self
     }
 
@@ -292,19 +336,28 @@ impl CompoundBuilder {
     pub fn lookup(mut self, name: &str) -> Self {
         let mut args = Vec::new();
         xdr_string(&mut args, name);
-        self.ops.push(EncodedOp { opcode: OpNum::Lookup, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Lookup,
+            args,
+        });
         self
     }
 
     pub fn lookupp(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::Lookupp, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Lookupp,
+            args: Vec::new(),
+        });
         self
     }
 
     pub fn getattr(mut self, bitmap: &[u32]) -> Self {
         let mut args = Vec::new();
         xdr_bitmap(&mut args, bitmap);
-        self.ops.push(EncodedOp { opcode: OpNum::GetAttr, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::GetAttr,
+            args,
+        });
         self
     }
 
@@ -315,14 +368,20 @@ impl CompoundBuilder {
         // fattr4: bitmap + opaque attr_vals
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
-        self.ops.push(EncodedOp { opcode: OpNum::SetAttr, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::SetAttr,
+            args,
+        });
         self
     }
 
     pub fn access(mut self, access_mask: u32) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, access_mask);
-        self.ops.push(EncodedOp { opcode: OpNum::Access, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Access,
+            args,
+        });
         self
     }
 
@@ -331,7 +390,10 @@ impl CompoundBuilder {
         args.extend_from_slice(stateid);
         xdr_u64(&mut args, offset);
         xdr_u32(&mut args, count);
-        self.ops.push(EncodedOp { opcode: OpNum::Read, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Read,
+            args,
+        });
         self
     }
 
@@ -341,21 +403,33 @@ impl CompoundBuilder {
         xdr_u64(&mut args, offset);
         xdr_u32(&mut args, stable); // stable_how4
         xdr_var_bytes(&mut args, data);
-        self.ops.push(EncodedOp { opcode: OpNum::Write, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Write,
+            args,
+        });
         self
     }
 
     /// Encode WRITE header only (stateid, offset, stable, data_length) without the
     /// actual data bytes. The caller must send the data separately via
     /// `rpc::Client::call_with_data()` for zero-copy writes.
-    pub fn write_header(mut self, stateid: &[u8; 16], offset: u64, stable: u32, data_len: u32) -> Self {
+    pub fn write_header(
+        mut self,
+        stateid: &[u8; 16],
+        offset: u64,
+        stable: u32,
+        data_len: u32,
+    ) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(stateid);
         xdr_u64(&mut args, offset);
         xdr_u32(&mut args, stable); // stable_how4
         // XDR opaque length prefix only — actual data sent out-of-band
         xdr_u32(&mut args, data_len);
-        self.ops.push(EncodedOp { opcode: OpNum::Write, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Write,
+            args,
+        });
         self
     }
 
@@ -363,7 +437,10 @@ impl CompoundBuilder {
         let mut args = Vec::new();
         xdr_u64(&mut args, offset);
         xdr_u32(&mut args, count);
-        self.ops.push(EncodedOp { opcode: OpNum::Commit, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Commit,
+            args,
+        });
         self
     }
 
@@ -381,19 +458,28 @@ impl CompoundBuilder {
         xdr_u32(&mut args, dircount);
         xdr_u32(&mut args, maxcount);
         xdr_bitmap(&mut args, attr_request);
-        self.ops.push(EncodedOp { opcode: OpNum::ReadDir, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ReadDir,
+            args,
+        });
         self
     }
 
     pub fn readlink(mut self) -> Self {
-        self.ops.push(EncodedOp { opcode: OpNum::ReadLink, args: Vec::new() });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ReadLink,
+            args: Vec::new(),
+        });
         self
     }
 
     pub fn open(mut self, open_args: &OpenArgs) -> Self {
         let mut args = Vec::new();
         open_args.encode(&mut args);
-        self.ops.push(EncodedOp { opcode: OpNum::Open, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Open,
+            args,
+        });
         self
     }
 
@@ -401,7 +487,10 @@ impl CompoundBuilder {
         let mut args = Vec::new();
         xdr_u32(&mut args, seqid);
         args.extend_from_slice(stateid);
-        self.ops.push(EncodedOp { opcode: OpNum::Close, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Close,
+            args,
+        });
         self
     }
 
@@ -415,12 +504,21 @@ impl CompoundBuilder {
         xdr_string(&mut args, name);
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
-        self.ops.push(EncodedOp { opcode: OpNum::Create, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Create,
+            args,
+        });
         self
     }
 
     /// CREATE for symlinks (NF4LNK): requires the link target path.
-    pub fn create_symlink(mut self, name: &str, link_target: &str, attrmask: &[u32], attr_vals: &[u8]) -> Self {
+    pub fn create_symlink(
+        mut self,
+        name: &str,
+        link_target: &str,
+        attrmask: &[u32],
+        attr_vals: &[u8],
+    ) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK = 5
         // For NF4LNK, linkdata (utf8str) comes before objname
@@ -428,14 +526,20 @@ impl CompoundBuilder {
         xdr_string(&mut args, name);
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
-        self.ops.push(EncodedOp { opcode: OpNum::Create, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Create,
+            args,
+        });
         self
     }
 
     pub fn remove(mut self, name: &str) -> Self {
         let mut args = Vec::new();
         xdr_string(&mut args, name);
-        self.ops.push(EncodedOp { opcode: OpNum::Remove, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Remove,
+            args,
+        });
         self
     }
 
@@ -443,14 +547,20 @@ impl CompoundBuilder {
         let mut args = Vec::new();
         xdr_string(&mut args, oldname);
         xdr_string(&mut args, newname);
-        self.ops.push(EncodedOp { opcode: OpNum::Rename, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Rename,
+            args,
+        });
         self
     }
 
     pub fn link(mut self, newname: &str) -> Self {
         let mut args = Vec::new();
         xdr_string(&mut args, newname);
-        self.ops.push(EncodedOp { opcode: OpNum::Link, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Link,
+            args,
+        });
         self
     }
 
@@ -480,7 +590,10 @@ impl CompoundBuilder {
         xdr_u64(&mut args, min_length);
         args.extend_from_slice(stateid);
         xdr_u32(&mut args, max_count);
-        self.ops.push(EncodedOp { opcode: OpNum::LayoutGet, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::LayoutGet,
+            args,
+        });
         self
     }
 
@@ -511,7 +624,10 @@ impl CompoundBuilder {
         xdr_u32(&mut args, layout_type);
         // layoutupdate4: opaque body (empty for files layout)
         xdr_u32(&mut args, 0);
-        self.ops.push(EncodedOp { opcode: OpNum::LayoutCommit, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::LayoutCommit,
+            args,
+        });
         self
     }
 
@@ -541,24 +657,25 @@ impl CompoundBuilder {
             // lrf_body (opaque, empty for files layout)
             xdr_u32(&mut args, 0);
         }
-        self.ops.push(EncodedOp { opcode: OpNum::LayoutReturn, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::LayoutReturn,
+            args,
+        });
         self
     }
 
     /// GETDEVICEINFO: get info about a data server device.
-    pub fn getdeviceinfo(
-        mut self,
-        device_id: &[u8; 16],
-        layout_type: u32,
-        max_count: u32,
-    ) -> Self {
+    pub fn getdeviceinfo(mut self, device_id: &[u8; 16], layout_type: u32, max_count: u32) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(device_id); // deviceid4 = 16 bytes
         xdr_u32(&mut args, layout_type);
         xdr_u32(&mut args, max_count);
         // notify_types bitmap (empty)
         xdr_u32(&mut args, 0);
-        self.ops.push(EncodedOp { opcode: OpNum::GetDeviceInfo, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::GetDeviceInfo,
+            args,
+        });
         self
     }
 
@@ -600,7 +717,10 @@ impl CompoundBuilder {
             args.extend_from_slice(open_stateid); // lock_stateid4
             xdr_u32(&mut args, lock_seqid);
         }
-        self.ops.push(EncodedOp { opcode: OpNum::Lock, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Lock,
+            args,
+        });
         self
     }
 
@@ -620,7 +740,10 @@ impl CompoundBuilder {
         // lock_owner4
         xdr_u64(&mut args, client_id);
         xdr_var_bytes(&mut args, lock_owner);
-        self.ops.push(EncodedOp { opcode: OpNum::Lockt, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Lockt,
+            args,
+        });
         self
     }
 
@@ -639,7 +762,10 @@ impl CompoundBuilder {
         args.extend_from_slice(lock_stateid);
         xdr_u64(&mut args, offset);
         xdr_u64(&mut args, length);
-        self.ops.push(EncodedOp { opcode: OpNum::Locku, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Locku,
+            args,
+        });
         self
     }
 
@@ -650,7 +776,10 @@ impl CompoundBuilder {
         for sid in stateids {
             args.extend_from_slice(sid);
         }
-        self.ops.push(EncodedOp { opcode: OpNum::TestStateId, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::TestStateId,
+            args,
+        });
         self
     }
 
@@ -658,7 +787,10 @@ impl CompoundBuilder {
     pub fn delegreturn(mut self, stateid: &[u8; 16]) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(stateid); // stateid4 = 16 bytes
-        self.ops.push(EncodedOp { opcode: OpNum::DelegReturn, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::DelegReturn,
+            args,
+        });
         self
     }
 
@@ -666,7 +798,10 @@ impl CompoundBuilder {
     pub fn free_stateid(mut self, stateid: &[u8; 16]) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(stateid);
-        self.ops.push(EncodedOp { opcode: OpNum::FreeStateId, args });
+        self.ops.push(EncodedOp {
+            opcode: OpNum::FreeStateId,
+            args,
+        });
         self
     }
 
@@ -795,16 +930,23 @@ impl CompoundResponse {
         let tag = decode_string(&mut buf)?;
         // resarray length
         if buf.remaining() < 4 {
-            return Err(NfsError::Xdr("COMPOUND response missing resarray length".to_string()));
+            return Err(NfsError::Xdr(
+                "COMPOUND response missing resarray length".to_string(),
+            ));
         }
         let num_results = buf.get_u32() as usize;
         if num_results > MAX_COMPOUND_OPS {
-            return Err(NfsError::Xdr(format!("COMPOUND response has {} ops, max {}", num_results, MAX_COMPOUND_OPS)));
+            return Err(NfsError::Xdr(format!(
+                "COMPOUND response has {} ops, max {}",
+                num_results, MAX_COMPOUND_OPS
+            )));
         }
         let mut results = Vec::with_capacity(num_results);
         for _ in 0..num_results {
             if buf.remaining() < 8 {
-                return Err(NfsError::Xdr("COMPOUND response truncated at op header".to_string()));
+                return Err(NfsError::Xdr(
+                    "COMPOUND response truncated at op header".to_string(),
+                ));
             }
             let opcode = buf.get_u32();
             let op_status_val = buf.get_u32();
@@ -820,7 +962,11 @@ impl CompoundResponse {
             // Skip past the op-specific data by trying to decode it
             skip_op_result(opcode, op_status_val, &mut buf)?;
         }
-        Ok(CompoundResponse { tag, status, results })
+        Ok(CompoundResponse {
+            tag,
+            status,
+            results,
+        })
     }
 
     /// Check overall COMPOUND status and return error if not OK.
@@ -834,8 +980,9 @@ impl CompoundResponse {
 
     /// Get the result for the nth operation (0-based), checking its status.
     pub fn op_ok(&self, index: usize) -> Result<&OpResponse> {
-        let op = self.results.get(index)
-            .ok_or_else(|| NfsError::Xdr(format!("COMPOUND response missing op at index {}", index)))?;
+        let op = self.results.get(index).ok_or_else(|| {
+            NfsError::Xdr(format!("COMPOUND response missing op at index {}", index))
+        })?;
         if !matches!(op.status, nfsstat4::NFS4_OK) {
             return Err(NfsError::Nfs4(op.status));
         }
@@ -885,7 +1032,10 @@ fn skip_bitmap(buf: &mut Bytes) -> Result<()> {
     }
     let n = buf.get_u32() as usize;
     if n > MAX_BITMAP_WORDS {
-        return Err(NfsError::Xdr(format!("bitmap has {} words, max {}", n, MAX_BITMAP_WORDS)));
+        return Err(NfsError::Xdr(format!(
+            "bitmap has {} words, max {}",
+            n, MAX_BITMAP_WORDS
+        )));
     }
     let bytes_needed = n * 4;
     if buf.remaining() < bytes_needed {
@@ -954,7 +1104,9 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
 
         // SEQUENCE4resok: sessionid(16) + sequenceid(4) + slotid(4) + highest_slotid(4) + target_highest_slotid(4) + status_flags(4) = 36
         op if op == OpNum::Sequence as u32 => {
-            if buf.remaining() < 36 { return Err(NfsError::Xdr("SEQUENCE result truncated".to_string())); }
+            if buf.remaining() < 36 {
+                return Err(NfsError::Xdr("SEQUENCE result truncated".to_string()));
+            }
             buf.advance(36);
         }
 
@@ -975,32 +1127,42 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
 
         // ACCESS4resok: supported(4) + access(4) = 8
         op if op == OpNum::Access as u32 => {
-            if buf.remaining() < 8 { return Err(NfsError::Xdr("ACCESS result truncated".to_string())); }
+            if buf.remaining() < 8 {
+                return Err(NfsError::Xdr("ACCESS result truncated".to_string()));
+            }
             buf.advance(8);
         }
 
         // READ4resok: eof(4) + data<> (variable)
         op if op == OpNum::Read as u32 => {
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("READ result truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("READ result truncated".to_string()));
+            }
             buf.advance(4); // eof
             skip_var_bytes(buf)?; // data
         }
 
         // WRITE4resok: count(4) + committed(4) + writeverf(8) = 16
         op if op == OpNum::Write as u32 => {
-            if buf.remaining() < 16 { return Err(NfsError::Xdr("WRITE result truncated".to_string())); }
+            if buf.remaining() < 16 {
+                return Err(NfsError::Xdr("WRITE result truncated".to_string()));
+            }
             buf.advance(16);
         }
 
         // COMMIT4resok: writeverf(8)
         op if op == OpNum::Commit as u32 => {
-            if buf.remaining() < 8 { return Err(NfsError::Xdr("COMMIT result truncated".to_string())); }
+            if buf.remaining() < 8 {
+                return Err(NfsError::Xdr("COMMIT result truncated".to_string()));
+            }
             buf.advance(8);
         }
 
         // READDIR4resok: cookieverf(8) + dirlist4 (entries + eof)
         op if op == OpNum::ReadDir as u32 => {
-            if buf.remaining() < 8 { return Err(NfsError::Xdr("READDIR result truncated".to_string())); }
+            if buf.remaining() < 8 {
+                return Err(NfsError::Xdr("READDIR result truncated".to_string()));
+            }
             buf.advance(8); // cookieverf
             // dirlist4: linked list of entry4 followed by eof bool
             skip_entry4_list(buf)?;
@@ -1018,7 +1180,9 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
         op if op == OpNum::Open as u32 => {
             skip_stateid4(buf)?;
             skip_change_info(buf)?;
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("OPEN rflags truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("OPEN rflags truncated".to_string()));
+            }
             buf.advance(4); // rflags
             skip_bitmap(buf)?; // attrset
             skip_open_delegation(buf)?;
@@ -1044,11 +1208,16 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
 
         // TEST_STATEID4resok: array of status codes
         op if op == OpNum::TestStateId as u32 => {
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("TEST_STATEID result truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("TEST_STATEID result truncated".to_string()));
+            }
             let n = buf.get_u32() as usize;
-            let bytes_needed = n.checked_mul(4)
+            let bytes_needed = n
+                .checked_mul(4)
                 .ok_or_else(|| NfsError::Xdr("TEST_STATEID count overflow".to_string()))?;
-            if buf.remaining() < bytes_needed { return Err(NfsError::Xdr("TEST_STATEID statuses truncated".to_string())); }
+            if buf.remaining() < bytes_needed {
+                return Err(NfsError::Xdr("TEST_STATEID statuses truncated".to_string()));
+            }
             buf.advance(bytes_needed);
         }
 
@@ -1089,16 +1258,29 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
 
         // LAYOUTGET4resok: complex — return_on_close(4) + stateid(16) + layout_content array
         op if op == OpNum::LayoutGet as u32 => {
-            if buf.remaining() < 20 { return Err(NfsError::Xdr("LAYOUTGET result truncated".to_string())); }
+            if buf.remaining() < 20 {
+                return Err(NfsError::Xdr("LAYOUTGET result truncated".to_string()));
+            }
             buf.advance(4); // return_on_close
             skip_stateid4(buf)?; // stateid
             // layout4<>: array of layout segments
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("LAYOUTGET segments len truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr(
+                    "LAYOUTGET segments len truncated".to_string(),
+                ));
+            }
             let n = buf.get_u32() as usize;
-            if n > MAX_LAYOUT_SEGMENTS { return Err(NfsError::Xdr(format!("LAYOUTGET has {} segments, max {}", n, MAX_LAYOUT_SEGMENTS))); }
+            if n > MAX_LAYOUT_SEGMENTS {
+                return Err(NfsError::Xdr(format!(
+                    "LAYOUTGET has {} segments, max {}",
+                    n, MAX_LAYOUT_SEGMENTS
+                )));
+            }
             for _ in 0..n {
                 // layout4: offset(8) + length(8) + iomode(4) + layout_type(4) + layout_content(var)
-                if buf.remaining() < 24 { return Err(NfsError::Xdr("layout4 segment truncated".to_string())); }
+                if buf.remaining() < 24 {
+                    return Err(NfsError::Xdr("layout4 segment truncated".to_string()));
+                }
                 buf.advance(24);
                 skip_var_bytes(buf)?; // layout_content opaque
             }
@@ -1106,7 +1288,9 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
 
         // LAYOUTCOMMIT4resok: newsize4 (bool + optional uint64)
         op if op == OpNum::LayoutCommit as u32 => {
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("LAYOUTCOMMIT result truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("LAYOUTCOMMIT result truncated".to_string()));
+            }
             let has_newsize = buf.get_u32();
             if has_newsize != 0 && buf.remaining() >= 8 {
                 buf.advance(8);
@@ -1116,7 +1300,9 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
         // LAYOUTRETURN4res: depends on return_type
         op if op == OpNum::LayoutReturn as u32 => {
             // layoutreturn_stateid: bool + optional stateid
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("LAYOUTRETURN result truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("LAYOUTRETURN result truncated".to_string()));
+            }
             let has_stateid = buf.get_u32();
             if has_stateid != 0 {
                 skip_stateid4(buf)?;
@@ -1126,7 +1312,11 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
         // GETDEVICEINFO4resok: device_addr + notification bitmap
         op if op == OpNum::GetDeviceInfo as u32 => {
             // device_addr4: layout_type(4) + da_addr_body(var)
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("GETDEVICEINFO layout_type truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr(
+                    "GETDEVICEINFO layout_type truncated".to_string(),
+                ));
+            }
             buf.advance(4);
             skip_var_bytes(buf)?; // da_addr_body
             skip_bitmap(buf)?; // notification bitmap
@@ -1135,14 +1325,19 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
         // BIND_CONN_TO_SESSION4resok: sessionid(16) + dir(4) + use_conn_in_rdma_mode(4) = 24 bytes
         op if op == OpNum::BindConnToSession as u32 => {
             if buf.remaining() < 24 {
-                return Err(NfsError::Xdr("BIND_CONN_TO_SESSION result truncated".to_string()));
+                return Err(NfsError::Xdr(
+                    "BIND_CONN_TO_SESSION result truncated".to_string(),
+                ));
             }
             buf.advance(24);
         }
 
         // Unknown op: we can't skip it safely
         _ => {
-            return Err(NfsError::Xdr(format!("unknown op {} in COMPOUND response, cannot skip", opcode)));
+            return Err(NfsError::Xdr(format!(
+                "unknown op {} in COMPOUND response, cannot skip",
+                opcode
+            )));
         }
     }
     Ok(())
@@ -1165,7 +1360,10 @@ fn skip_entry4_list(buf: &mut Bytes) -> Result<()> {
         }
         count += 1;
         if count > MAX_ENTRY4_PER_PAGE {
-            return Err(NfsError::Xdr(format!("entry4 list exceeds max {}", MAX_ENTRY4_PER_PAGE)));
+            return Err(NfsError::Xdr(format!(
+                "entry4 list exceeds max {}",
+                MAX_ENTRY4_PER_PAGE
+            )));
         }
         // entry4: cookie(8) + name(var) + attrs(fattr4) + nextentry (pointer, handled by loop)
         if buf.remaining() < 8 {
@@ -1187,32 +1385,45 @@ fn skip_open_delegation(buf: &mut Bytes) -> Result<()> {
         1 => {
             // OPEN_DELEGATE_READ: stateid(16) + recall(4) + nfsace4(variable)
             skip_stateid4(buf)?;
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("delegation recall truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("delegation recall truncated".to_string()));
+            }
             buf.advance(4); // recall
             let _ace = super::acl::decode_nfsace4(buf)?;
         }
         2 => {
             // OPEN_DELEGATE_WRITE: stateid(16) + recall(4) + space_limit(12) + nfsace4
             skip_stateid4(buf)?;
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("delegation recall truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("delegation recall truncated".to_string()));
+            }
             buf.advance(4); // recall
             skip_space_limit(buf)?;
             let _ace = super::acl::decode_nfsace4(buf)?;
         }
         3 => {
             // OPEN_DELEGATE_NONE_EXT: why_no_delegation4 union
-            if buf.remaining() < 4 { return Err(NfsError::Xdr("why_no_deleg truncated".to_string())); }
+            if buf.remaining() < 4 {
+                return Err(NfsError::Xdr("why_no_deleg truncated".to_string()));
+            }
             let why = buf.get_u32();
             match why {
                 1 | 2 => {
                     // WND4_CONTENTION or WND4_RESOURCE: bool
-                    if buf.remaining() < 4 { return Err(NfsError::Xdr("why_no_deleg bool truncated".to_string())); }
+                    if buf.remaining() < 4 {
+                        return Err(NfsError::Xdr("why_no_deleg bool truncated".to_string()));
+                    }
                     buf.advance(4);
                 }
                 _ => {} // other cases are void
             }
         }
-        _ => return Err(NfsError::Xdr(format!("unknown delegation type {}", deleg_type))),
+        _ => {
+            return Err(NfsError::Xdr(format!(
+                "unknown delegation type {}",
+                deleg_type
+            )));
+        }
     }
     Ok(())
 }
@@ -1226,12 +1437,16 @@ fn skip_space_limit(buf: &mut Bytes) -> Result<()> {
     match limit_by {
         1 => {
             // NFS_LIMIT_SIZE: filesize (uint64)
-            if buf.remaining() < 8 { return Err(NfsError::Xdr("space_limit size truncated".to_string())); }
+            if buf.remaining() < 8 {
+                return Err(NfsError::Xdr("space_limit size truncated".to_string()));
+            }
             buf.advance(8);
         }
         2 => {
             // NFS_LIMIT_BLOCKS: num_blocks(4) + bytes_per_block(4) = 8
-            if buf.remaining() < 8 { return Err(NfsError::Xdr("space_limit blocks truncated".to_string())); }
+            if buf.remaining() < 8 {
+                return Err(NfsError::Xdr("space_limit blocks truncated".to_string()));
+            }
             buf.advance(8);
         }
         _ => return Err(NfsError::Xdr(format!("unknown limit_by {}", limit_by))),
@@ -1269,17 +1484,27 @@ fn skip_exchange_id_result(buf: &mut Bytes) -> Result<()> {
             buf.advance(16); // hash_alg + encr_alg + ssv_len + window
             // gss_handles: opaque<>[]
             if buf.remaining() < 4 {
-                return Err(NfsError::Xdr("SP4_SSV gss_handles len truncated".to_string()));
+                return Err(NfsError::Xdr(
+                    "SP4_SSV gss_handles len truncated".to_string(),
+                ));
             }
             let nh = buf.get_u32() as usize;
             if nh > 64 {
-                return Err(NfsError::Xdr(format!("SP4_SSV has {} gss_handles, max 64", nh)));
+                return Err(NfsError::Xdr(format!(
+                    "SP4_SSV has {} gss_handles, max 64",
+                    nh
+                )));
             }
             for _ in 0..nh {
                 skip_var_bytes(buf)?;
             }
         }
-        _ => return Err(NfsError::Xdr(format!("unsupported state_protect type {}", sp))),
+        _ => {
+            return Err(NfsError::Xdr(format!(
+                "unsupported state_protect type {}",
+                sp
+            )));
+        }
     }
     // server_owner4: minor_id(8) + major_id(var)
     if buf.remaining() < 8 {
@@ -1295,7 +1520,10 @@ fn skip_exchange_id_result(buf: &mut Bytes) -> Result<()> {
     }
     let n = buf.get_u32() as usize;
     if n > 1 {
-        return Err(NfsError::Xdr(format!("nfs_impl_id4 has {} elements, max 1", n)));
+        return Err(NfsError::Xdr(format!(
+            "nfs_impl_id4 has {} elements, max 1",
+            n
+        )));
     }
     for _ in 0..n {
         skip_var_bytes(buf)?; // domain
@@ -1326,7 +1554,8 @@ fn skip_create_session_result(buf: &mut Bytes) -> Result<()> {
             return Err(NfsError::Xdr("ca_rdma_ird length truncated".to_string()));
         }
         let n = buf.get_u32() as usize;
-        let bytes_needed = n.checked_mul(4)
+        let bytes_needed = n
+            .checked_mul(4)
             .ok_or_else(|| NfsError::Xdr("ca_rdma_ird count overflow".to_string()))?;
         if buf.remaining() < bytes_needed {
             return Err(NfsError::Xdr("ca_rdma_ird data truncated".to_string()));
@@ -1422,7 +1651,10 @@ mod tests {
         assert_eq!(&buf[4..9], b"empty");
         // op count = 0
         let opcount_offset = 12 + 4; // tag(12) + minorversion(4) = 16
-        assert_eq!(&buf[opcount_offset..opcount_offset + 4], &0u32.to_be_bytes());
+        assert_eq!(
+            &buf[opcount_offset..opcount_offset + 4],
+            &0u32.to_be_bytes()
+        );
     }
 
     #[test]
@@ -1501,8 +1733,7 @@ mod tests {
 
     #[test]
     fn compound_builder_create_symlink_encode() {
-        let builder = CompoundBuilder::new("t")
-            .create_symlink("link", "/target/path", &[], &[]);
+        let builder = CompoundBuilder::new("t").create_symlink("link", "/target/path", &[], &[]);
         assert_eq!(builder.op_count(), 1);
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
@@ -1632,8 +1863,7 @@ mod tests {
     #[test]
     fn compound_builder_sequence_encode() {
         let session_id = [1u8; 16];
-        let builder = CompoundBuilder::new("seq")
-            .sequence(&session_id, 42, 0, 0, false);
+        let builder = CompoundBuilder::new("seq").sequence(&session_id, 42, 0, 0, false);
 
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
@@ -1641,7 +1871,10 @@ mod tests {
         // Skip tag (4+4=8) + minor_version (4) + op_count (4) = 20 bytes header
         // Then SEQUENCE opcode (4) = 24
         let op_start = 16; // after "seq\0" tag + minorversion + opcount
-        assert_eq!(&buf[op_start..op_start + 4], &(OpNum::Sequence as u32).to_be_bytes());
+        assert_eq!(
+            &buf[op_start..op_start + 4],
+            &(OpNum::Sequence as u32).to_be_bytes()
+        );
         // session_id starts at op_start + 4
         assert_eq!(&buf[op_start + 4..op_start + 20], &session_id);
         // sequence_id = 42 at op_start + 20

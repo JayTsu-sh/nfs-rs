@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{nfs_fh3, PATHCONF3args, Mount, Result};
+use super::{Mount, PATHCONF3args, Result, nfs_fh3};
 use bytes::Bytes;
 
 #[allow(unused)]

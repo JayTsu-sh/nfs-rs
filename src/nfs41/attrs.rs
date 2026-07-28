@@ -9,10 +9,10 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::error::{NfsError, Result};
-use crate::mount::Attr;
 use super::acl::{decode_acl, skip_acl};
 use crate::Time;
+use crate::error::{NfsError, Result};
+use crate::mount::Attr;
 
 // ─── NFSv4.1 attribute numbers (RFC 5661 §5.8 / RFC 8881 §5.8) ─────────────
 // Attribute number = bit position in the bitmap. Word 0 = bits 0-31, Word 1 = bits 32-63.
@@ -40,16 +40,14 @@ use crate::Time;
 ///   rawdev(41), space_used(45), time_access(47),
 ///   time_metadata(52), time_modify(53)
 pub(crate) fn standard_getattr_bitmap() -> [u32; 2] {
-    let word0: u32 =
-        (1 << 1)  | // type
+    let word0: u32 = (1 << 1)  | // type
         (1 << 4)  | // size
         (1 << 8)  | // fsid
         (1 << 12) | // ACL
         (1 << 19) | // filehandle (NFSv4.1)
-        (1 << 20);  // fileid
+        (1 << 20); // fileid
 
-    let word1: u32 =
-        (1 << 1)  | // mode (attr 33)
+    let word1: u32 = (1 << 1)  | // mode (attr 33)
         (1 << 3)  | // numlinks (attr 35)
         (1 << 4)  | // owner (attr 36)
         (1 << 5)  | // owner_group (attr 37)
@@ -57,7 +55,7 @@ pub(crate) fn standard_getattr_bitmap() -> [u32; 2] {
         (1 << 13) | // space_used (attr 45)
         (1 << 15) | // time_access (attr 47)
         (1 << 20) | // time_metadata (attr 52)
-        (1 << 21);  // time_modify (attr 53)
+        (1 << 21); // time_modify (attr 53)
 
     [word0, word1]
 }
@@ -75,7 +73,12 @@ fn bitmap_has(bitmap: &[u32], attr_num: u32) -> bool {
 /// Skip `n` bytes from the attribute values buffer with bounds checking.
 fn skip_fixed(vals: &mut Bytes, n: usize, attr_name: &str) -> Result<()> {
     if vals.remaining() < n {
-        return Err(NfsError::Xdr(format!("fattr4 {} truncated (need {} have {})", attr_name, n, vals.remaining())));
+        return Err(NfsError::Xdr(format!(
+            "fattr4 {} truncated (need {} have {})",
+            attr_name,
+            n,
+            vals.remaining()
+        )));
     }
     vals.advance(n);
     Ok(())
@@ -84,7 +87,10 @@ fn skip_fixed(vals: &mut Bytes, n: usize, attr_name: &str) -> Result<()> {
 /// Skip a `settime4` union: how(u32), then nfstime4(12) if `how == SET_TO_CLIENT_TIME(1)`.
 fn skip_settime4(vals: &mut Bytes, attr_name: &str) -> Result<()> {
     if vals.remaining() < 4 {
-        return Err(NfsError::Xdr(format!("fattr4 {} settime4 truncated", attr_name)));
+        return Err(NfsError::Xdr(format!(
+            "fattr4 {} settime4 truncated",
+            attr_name
+        )));
     }
     let how = vals.get_u32();
     if how == 1 {
@@ -97,12 +103,20 @@ fn skip_settime4(vals: &mut Bytes, attr_name: &str) -> Result<()> {
 /// Decode an XDR opaque<> (variable-length): len(u32) + data + pad to 4.
 fn decode_opaque(vals: &mut Bytes, attr_name: &str) -> Result<Bytes> {
     if vals.remaining() < 4 {
-        return Err(NfsError::Xdr(format!("fattr4 {} opaque length truncated", attr_name)));
+        return Err(NfsError::Xdr(format!(
+            "fattr4 {} opaque length truncated",
+            attr_name
+        )));
     }
     let len = vals.get_u32() as usize;
     let padded = (len + 3) & !3;
     if vals.remaining() < padded {
-        return Err(NfsError::Xdr(format!("fattr4 {} opaque data truncated (need {} have {})", attr_name, padded, vals.remaining())));
+        return Err(NfsError::Xdr(format!(
+            "fattr4 {} opaque data truncated (need {} have {})",
+            attr_name,
+            padded,
+            vals.remaining()
+        )));
     }
     let data = vals.slice(..len);
     vals.advance(padded);
@@ -112,7 +126,10 @@ fn decode_opaque(vals: &mut Bytes, attr_name: &str) -> Result<Bytes> {
 /// Skip a `bitmap4` (variable-length bitmap): count(u32) + count * u32 words.
 fn skip_bitmap4(vals: &mut Bytes, attr_name: &str) -> Result<()> {
     if vals.remaining() < 4 {
-        return Err(NfsError::Xdr(format!("fattr4 {} bitmap count truncated", attr_name)));
+        return Err(NfsError::Xdr(format!(
+            "fattr4 {} bitmap count truncated",
+            attr_name
+        )));
     }
     let count = vals.get_u32() as usize;
     skip_fixed(vals, count * 4, attr_name)
@@ -124,7 +141,9 @@ fn skip_bitmap4(vals: &mut Bytes, attr_name: &str) -> Result<()> {
 fn skip_fs_locations(vals: &mut Bytes) -> Result<()> {
     // pathname4 root: count(u32) + count * utf8str
     if vals.remaining() < 4 {
-        return Err(NfsError::Xdr("fattr4 fs_locations root truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "fattr4 fs_locations root truncated".to_string(),
+        ));
     }
     let root_count = vals.get_u32() as usize;
     for _ in 0..root_count {
@@ -132,13 +151,17 @@ fn skip_fs_locations(vals: &mut Bytes) -> Result<()> {
     }
     // locations<>: count(u32) + count * fs_location4
     if vals.remaining() < 4 {
-        return Err(NfsError::Xdr("fattr4 fs_locations locations count truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "fattr4 fs_locations locations count truncated".to_string(),
+        ));
     }
     let loc_count = vals.get_u32() as usize;
     for _ in 0..loc_count {
         // fs_location4.server: utf8str_cis<> = count(u32) + count * utf8str
         if vals.remaining() < 4 {
-            return Err(NfsError::Xdr("fattr4 fs_location4 server count truncated".to_string()));
+            return Err(NfsError::Xdr(
+                "fattr4 fs_location4 server count truncated".to_string(),
+            ));
         }
         let srv_count = vals.get_u32() as usize;
         for _ in 0..srv_count {
@@ -146,7 +169,9 @@ fn skip_fs_locations(vals: &mut Bytes) -> Result<()> {
         }
         // fs_location4.rootpath: pathname4
         if vals.remaining() < 4 {
-            return Err(NfsError::Xdr("fattr4 fs_location4 rootpath count truncated".to_string()));
+            return Err(NfsError::Xdr(
+                "fattr4 fs_location4 rootpath count truncated".to_string(),
+            ));
         }
         let path_count = vals.get_u32() as usize;
         for _ in 0..path_count {
@@ -170,41 +195,65 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
     // ── Word 0 attributes (0-31) in strict numeric order ──
 
     // Attr 0: supported_attrs (bitmap4, variable)
-    if bitmap_has(bitmap, 0) { skip_bitmap4(vals, "supported_attrs")?; }
+    if bitmap_has(bitmap, 0) {
+        skip_bitmap4(vals, "supported_attrs")?;
+    }
     // Attr 1: type (nfs_ftype4 = uint32)
     if bitmap_has(bitmap, 1) {
-        if vals.remaining() < 4 { return Err(NfsError::Xdr("fattr4 type truncated".to_string())); }
+        if vals.remaining() < 4 {
+            return Err(NfsError::Xdr("fattr4 type truncated".to_string()));
+        }
         attr.type_ = vals.get_u32();
     }
     // Attr 2: fh_expire_type (uint32)
-    if bitmap_has(bitmap, 2) { skip_fixed(vals, 4, "fh_expire_type")?; }
+    if bitmap_has(bitmap, 2) {
+        skip_fixed(vals, 4, "fh_expire_type")?;
+    }
     // Attr 3: change (uint64)
-    if bitmap_has(bitmap, 3) { skip_fixed(vals, 8, "change")?; }
+    if bitmap_has(bitmap, 3) {
+        skip_fixed(vals, 8, "change")?;
+    }
     // Attr 4: size (uint64)
     if bitmap_has(bitmap, 4) {
-        if vals.remaining() < 8 { return Err(NfsError::Xdr("fattr4 size truncated".to_string())); }
+        if vals.remaining() < 8 {
+            return Err(NfsError::Xdr("fattr4 size truncated".to_string()));
+        }
         attr.filesize = vals.get_u64();
     }
     // Attr 5: link_support (bool = uint32)
-    if bitmap_has(bitmap, 5) { skip_fixed(vals, 4, "link_support")?; }
+    if bitmap_has(bitmap, 5) {
+        skip_fixed(vals, 4, "link_support")?;
+    }
     // Attr 6: symlink_support (bool)
-    if bitmap_has(bitmap, 6) { skip_fixed(vals, 4, "symlink_support")?; }
+    if bitmap_has(bitmap, 6) {
+        skip_fixed(vals, 4, "symlink_support")?;
+    }
     // Attr 7: named_attr (bool)
-    if bitmap_has(bitmap, 7) { skip_fixed(vals, 4, "named_attr")?; }
+    if bitmap_has(bitmap, 7) {
+        skip_fixed(vals, 4, "named_attr")?;
+    }
     // Attr 8: fsid (fsid4 = major:uint64 + minor:uint64)
     if bitmap_has(bitmap, 8) {
-        if vals.remaining() < 16 { return Err(NfsError::Xdr("fattr4 fsid truncated".to_string())); }
+        if vals.remaining() < 16 {
+            return Err(NfsError::Xdr("fattr4 fsid truncated".to_string()));
+        }
         let major = vals.get_u64();
         let _minor = vals.get_u64();
         attr.fsid = major;
     }
     // Attr 9: unique_handles (bool)
-    if bitmap_has(bitmap, 9) { skip_fixed(vals, 4, "unique_handles")?; }
+    if bitmap_has(bitmap, 9) {
+        skip_fixed(vals, 4, "unique_handles")?;
+    }
     // Attr 10: lease_time (uint32)
-    if bitmap_has(bitmap, 10) { skip_fixed(vals, 4, "lease_time")?; }
+    if bitmap_has(bitmap, 10) {
+        skip_fixed(vals, 4, "lease_time")?;
+    }
     // Attr 11: rdattr_error (nfsstat4 = uint32)
     if bitmap_has(bitmap, 11) {
-        if vals.remaining() < 4 { return Err(NfsError::Xdr("fattr4 rdattr_error truncated".to_string())); }
+        if vals.remaining() < 4 {
+            return Err(NfsError::Xdr("fattr4 rdattr_error truncated".to_string()));
+        }
         let code = vals.get_u32();
         if code != 0 {
             return Err(NfsError::RdattrError(code));
@@ -215,63 +264,107 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
         attr.acl = Some(decode_acl(vals)?);
     }
     // Attr 13: aclsupport (uint32)
-    if bitmap_has(bitmap, 13) { skip_fixed(vals, 4, "aclsupport")?; }
+    if bitmap_has(bitmap, 13) {
+        skip_fixed(vals, 4, "aclsupport")?;
+    }
     // Attr 14: archive (bool)
-    if bitmap_has(bitmap, 14) { skip_fixed(vals, 4, "archive")?; }
+    if bitmap_has(bitmap, 14) {
+        skip_fixed(vals, 4, "archive")?;
+    }
     // Attr 15: cansettime (bool)
-    if bitmap_has(bitmap, 15) { skip_fixed(vals, 4, "cansettime")?; }
+    if bitmap_has(bitmap, 15) {
+        skip_fixed(vals, 4, "cansettime")?;
+    }
     // Attr 16: case_insensitive (bool)
-    if bitmap_has(bitmap, 16) { skip_fixed(vals, 4, "case_insensitive")?; }
+    if bitmap_has(bitmap, 16) {
+        skip_fixed(vals, 4, "case_insensitive")?;
+    }
     // Attr 17: case_preserving (bool)
-    if bitmap_has(bitmap, 17) { skip_fixed(vals, 4, "case_preserving")?; }
+    if bitmap_has(bitmap, 17) {
+        skip_fixed(vals, 4, "case_preserving")?;
+    }
     // Attr 18: chown_restricted (bool)
-    if bitmap_has(bitmap, 18) { skip_fixed(vals, 4, "chown_restricted")?; }
+    if bitmap_has(bitmap, 18) {
+        skip_fixed(vals, 4, "chown_restricted")?;
+    }
     // Attr 19: filehandle (nfs_fh4 = opaque<>, variable-length) — NEW in NFSv4.1
     if bitmap_has(bitmap, 19) {
         attr.filehandle = decode_opaque(vals, "filehandle")?;
     }
     // Attr 20: fileid (uint64)
     if bitmap_has(bitmap, 20) {
-        if vals.remaining() < 8 { return Err(NfsError::Xdr("fattr4 fileid truncated".to_string())); }
+        if vals.remaining() < 8 {
+            return Err(NfsError::Xdr("fattr4 fileid truncated".to_string()));
+        }
         attr.fileid = vals.get_u64();
     }
     // Attr 21: files_avail (uint64)
-    if bitmap_has(bitmap, 21) { skip_fixed(vals, 8, "files_avail")?; }
+    if bitmap_has(bitmap, 21) {
+        skip_fixed(vals, 8, "files_avail")?;
+    }
     // Attr 22: files_free (uint64)
-    if bitmap_has(bitmap, 22) { skip_fixed(vals, 8, "files_free")?; }
+    if bitmap_has(bitmap, 22) {
+        skip_fixed(vals, 8, "files_free")?;
+    }
     // Attr 23: files_total (uint64)
-    if bitmap_has(bitmap, 23) { skip_fixed(vals, 8, "files_total")?; }
+    if bitmap_has(bitmap, 23) {
+        skip_fixed(vals, 8, "files_total")?;
+    }
     // Attr 24: fs_locations (complex variable)
-    if bitmap_has(bitmap, 24) { skip_fs_locations(vals)?; }
+    if bitmap_has(bitmap, 24) {
+        skip_fs_locations(vals)?;
+    }
     // Attr 25: hidden (bool)
-    if bitmap_has(bitmap, 25) { skip_fixed(vals, 4, "hidden")?; }
+    if bitmap_has(bitmap, 25) {
+        skip_fixed(vals, 4, "hidden")?;
+    }
     // Attr 26: homogeneous (bool)
-    if bitmap_has(bitmap, 26) { skip_fixed(vals, 4, "homogeneous")?; }
+    if bitmap_has(bitmap, 26) {
+        skip_fixed(vals, 4, "homogeneous")?;
+    }
     // Attr 27: maxfilesize (uint64)
-    if bitmap_has(bitmap, 27) { skip_fixed(vals, 8, "maxfilesize")?; }
+    if bitmap_has(bitmap, 27) {
+        skip_fixed(vals, 8, "maxfilesize")?;
+    }
     // Attr 28: maxlink (uint32)
-    if bitmap_has(bitmap, 28) { skip_fixed(vals, 4, "maxlink")?; }
+    if bitmap_has(bitmap, 28) {
+        skip_fixed(vals, 4, "maxlink")?;
+    }
     // Attr 29: maxname (uint32)
-    if bitmap_has(bitmap, 29) { skip_fixed(vals, 4, "maxname")?; }
+    if bitmap_has(bitmap, 29) {
+        skip_fixed(vals, 4, "maxname")?;
+    }
     // Attr 30: maxread (uint64)
-    if bitmap_has(bitmap, 30) { skip_fixed(vals, 8, "maxread")?; }
+    if bitmap_has(bitmap, 30) {
+        skip_fixed(vals, 8, "maxread")?;
+    }
     // Attr 31: maxwrite (uint64)
-    if bitmap_has(bitmap, 31) { skip_fixed(vals, 8, "maxwrite")?; }
+    if bitmap_has(bitmap, 31) {
+        skip_fixed(vals, 8, "maxwrite")?;
+    }
 
     // ── Word 1 attributes (32-63) in strict numeric order ──
 
     // Attr 32: mimetype (utf8str, variable)
-    if bitmap_has(bitmap, 32) { let _ = decode_utf8str(vals)?; }
+    if bitmap_has(bitmap, 32) {
+        let _ = decode_utf8str(vals)?;
+    }
     // Attr 33: mode (mode4 = uint32)
     if bitmap_has(bitmap, 33) {
-        if vals.remaining() < 4 { return Err(NfsError::Xdr("fattr4 mode truncated".to_string())); }
+        if vals.remaining() < 4 {
+            return Err(NfsError::Xdr("fattr4 mode truncated".to_string()));
+        }
         attr.file_mode = vals.get_u32();
     }
     // Attr 34: no_trunc (bool)
-    if bitmap_has(bitmap, 34) { skip_fixed(vals, 4, "no_trunc")?; }
+    if bitmap_has(bitmap, 34) {
+        skip_fixed(vals, 4, "no_trunc")?;
+    }
     // Attr 35: numlinks (uint32)
     if bitmap_has(bitmap, 35) {
-        if vals.remaining() < 4 { return Err(NfsError::Xdr("fattr4 numlinks truncated".to_string())); }
+        if vals.remaining() < 4 {
+            return Err(NfsError::Xdr("fattr4 numlinks truncated".to_string()));
+        }
         attr.nlink = vals.get_u32();
     }
     // Attr 36: owner (utf8str_cs) — store raw string AND numeric uid
@@ -287,42 +380,68 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
         attr.owner_group = group_str;
     }
     // Attr 38: quota_avail_hard (uint64)
-    if bitmap_has(bitmap, 38) { skip_fixed(vals, 8, "quota_avail_hard")?; }
+    if bitmap_has(bitmap, 38) {
+        skip_fixed(vals, 8, "quota_avail_hard")?;
+    }
     // Attr 39: quota_avail_soft (uint64)
-    if bitmap_has(bitmap, 39) { skip_fixed(vals, 8, "quota_avail_soft")?; }
+    if bitmap_has(bitmap, 39) {
+        skip_fixed(vals, 8, "quota_avail_soft")?;
+    }
     // Attr 40: quota_used (uint64)
-    if bitmap_has(bitmap, 40) { skip_fixed(vals, 8, "quota_used")?; }
+    if bitmap_has(bitmap, 40) {
+        skip_fixed(vals, 8, "quota_used")?;
+    }
     // Attr 41: rawdev (specdata4 = uint32 + uint32)
     if bitmap_has(bitmap, 41) {
-        if vals.remaining() < 8 { return Err(NfsError::Xdr("fattr4 rawdev truncated".to_string())); }
+        if vals.remaining() < 8 {
+            return Err(NfsError::Xdr("fattr4 rawdev truncated".to_string()));
+        }
         attr.spec_data[0] = vals.get_u32();
         attr.spec_data[1] = vals.get_u32();
     }
     // Attr 42: space_avail (uint64)
-    if bitmap_has(bitmap, 42) { skip_fixed(vals, 8, "space_avail")?; }
+    if bitmap_has(bitmap, 42) {
+        skip_fixed(vals, 8, "space_avail")?;
+    }
     // Attr 43: space_free (uint64)
-    if bitmap_has(bitmap, 43) { skip_fixed(vals, 8, "space_free")?; }
+    if bitmap_has(bitmap, 43) {
+        skip_fixed(vals, 8, "space_free")?;
+    }
     // Attr 44: space_total (uint64)
-    if bitmap_has(bitmap, 44) { skip_fixed(vals, 8, "space_total")?; }
+    if bitmap_has(bitmap, 44) {
+        skip_fixed(vals, 8, "space_total")?;
+    }
     // Attr 45: space_used (uint64)
     if bitmap_has(bitmap, 45) {
-        if vals.remaining() < 8 { return Err(NfsError::Xdr("fattr4 space_used truncated".to_string())); }
+        if vals.remaining() < 8 {
+            return Err(NfsError::Xdr("fattr4 space_used truncated".to_string()));
+        }
         attr.used = vals.get_u64();
     }
     // Attr 46: system (bool)
-    if bitmap_has(bitmap, 46) { skip_fixed(vals, 4, "system")?; }
+    if bitmap_has(bitmap, 46) {
+        skip_fixed(vals, 4, "system")?;
+    }
     // Attr 47: time_access (nfstime4)
     if bitmap_has(bitmap, 47) {
         attr.atime = decode_nfstime4(vals)?;
     }
     // Attr 48: time_access_set (settime4, variable)
-    if bitmap_has(bitmap, 48) { skip_settime4(vals, "time_access_set")?; }
+    if bitmap_has(bitmap, 48) {
+        skip_settime4(vals, "time_access_set")?;
+    }
     // Attr 49: time_backup (nfstime4)
-    if bitmap_has(bitmap, 49) { skip_fixed(vals, 12, "time_backup")?; }
+    if bitmap_has(bitmap, 49) {
+        skip_fixed(vals, 12, "time_backup")?;
+    }
     // Attr 50: time_create (nfstime4)
-    if bitmap_has(bitmap, 50) { skip_fixed(vals, 12, "time_create")?; }
+    if bitmap_has(bitmap, 50) {
+        skip_fixed(vals, 12, "time_create")?;
+    }
     // Attr 51: time_delta (nfstime4)
-    if bitmap_has(bitmap, 51) { skip_fixed(vals, 12, "time_delta")?; }
+    if bitmap_has(bitmap, 51) {
+        skip_fixed(vals, 12, "time_delta")?;
+    }
     // Attr 52: time_metadata (nfstime4, maps to ctime)
     if bitmap_has(bitmap, 52) {
         attr.ctime = decode_nfstime4(vals)?;
@@ -332,20 +451,34 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
         attr.mtime = decode_nfstime4(vals)?;
     }
     // Attr 54: time_modify_set (settime4, variable)
-    if bitmap_has(bitmap, 54) { skip_settime4(vals, "time_modify_set")?; }
+    if bitmap_has(bitmap, 54) {
+        skip_settime4(vals, "time_modify_set")?;
+    }
     // Attr 55: mounted_on_fileid (uint64)
-    if bitmap_has(bitmap, 55) { skip_fixed(vals, 8, "mounted_on_fileid")?; }
+    if bitmap_has(bitmap, 55) {
+        skip_fixed(vals, 8, "mounted_on_fileid")?;
+    }
 
     // ── Word 2 attributes (64-95, NFSv4.1 extensions) ──
     // Attr 56: dir_notif_delay (nfstime4)
-    if bitmap_has(bitmap, 56) { skip_fixed(vals, 12, "dir_notif_delay")?; }
+    if bitmap_has(bitmap, 56) {
+        skip_fixed(vals, 12, "dir_notif_delay")?;
+    }
     // Attr 57: dirent_notif_delay (nfstime4)
-    if bitmap_has(bitmap, 57) { skip_fixed(vals, 12, "dirent_notif_delay")?; }
+    if bitmap_has(bitmap, 57) {
+        skip_fixed(vals, 12, "dirent_notif_delay")?;
+    }
     // Attrs 58-59: dacl/sacl (nfsacl41, complex ACL)
-    if bitmap_has(bitmap, 58) { skip_acl(vals)?; }
-    if bitmap_has(bitmap, 59) { skip_acl(vals)?; }
+    if bitmap_has(bitmap, 58) {
+        skip_acl(vals)?;
+    }
+    if bitmap_has(bitmap, 59) {
+        skip_acl(vals)?;
+    }
     // Attr 60: change_policy (uint64 + uint64 = 16 bytes)
-    if bitmap_has(bitmap, 60) { skip_fixed(vals, 16, "change_policy")?; }
+    if bitmap_has(bitmap, 60) {
+        skip_fixed(vals, 16, "change_policy")?;
+    }
 
     Ok(attr)
 }
@@ -358,7 +491,10 @@ pub(super) fn decode_getattr_envelope(data: &mut Bytes) -> Result<(Vec<u32>, Byt
     }
     let bitmap_len = data.get_u32() as usize;
     if bitmap_len > 16 {
-        return Err(NfsError::Xdr(format!("GETATTR bitmap has {} words, max 16", bitmap_len)));
+        return Err(NfsError::Xdr(format!(
+            "GETATTR bitmap has {} words, max 16",
+            bitmap_len
+        )));
     }
     let mut bitmap = vec![0u32; bitmap_len];
     for word in &mut bitmap {
@@ -368,7 +504,9 @@ pub(super) fn decode_getattr_envelope(data: &mut Bytes) -> Result<(Vec<u32>, Byt
         *word = data.get_u32();
     }
     if data.remaining() < 4 {
-        return Err(NfsError::Xdr("GETATTR attr_vals length truncated".to_string()));
+        return Err(NfsError::Xdr(
+            "GETATTR attr_vals length truncated".to_string(),
+        ));
     }
     let vals_len = data.get_u32() as usize;
     if data.remaining() < vals_len {
@@ -392,8 +530,13 @@ pub(crate) fn decode_getattr_response(data: &mut Bytes) -> Result<Attr> {
         let set_bits: Vec<u32> = (0u32..((bitmap.len() as u32) * 32))
             .filter(|&bit| bitmap_has(&bitmap, bit))
             .collect();
-        tracing::warn!("GETATTR decode failed: {} (bitmap={:?} set_attrs={:?} vals_len={})",
-            e, bitmap, set_bits, vals.len());
+        tracing::warn!(
+            "GETATTR decode failed: {} (bitmap={:?} set_attrs={:?} vals_len={})",
+            e,
+            bitmap,
+            set_bits,
+            vals.len()
+        );
     }
     result
 }
@@ -406,7 +549,13 @@ fn decode_nfstime4(buf: &mut Bytes) -> Result<Time> {
     let nseconds = buf.get_u32();
     // Clamp i64 seconds to u32 range (crate::Time uses u32).
     // Negative timestamps (pre-1970) become 0; timestamps after 2106 are capped.
-    let clamped = if seconds < 0 { 0u32 } else if seconds > u32::MAX as i64 { u32::MAX } else { seconds as u32 };
+    let clamped = if seconds < 0 {
+        0u32
+    } else if seconds > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        seconds as u32
+    };
     Ok(Time {
         seconds: clamped,
         nseconds,
@@ -459,9 +608,9 @@ mod tests {
     fn standard_bitmap_has_expected_bits() {
         let bm = standard_getattr_bitmap();
         // Word 0 (NFSv4.1 numbering)
-        assert!(bitmap_has(&bm, 1));  // type
-        assert!(bitmap_has(&bm, 4));  // size
-        assert!(bitmap_has(&bm, 8));  // fsid
+        assert!(bitmap_has(&bm, 1)); // type
+        assert!(bitmap_has(&bm, 4)); // size
+        assert!(bitmap_has(&bm, 8)); // fsid
         assert!(bitmap_has(&bm, 12)); // ACL
         assert!(bitmap_has(&bm, 19)); // filehandle (NFSv4.1)
         assert!(bitmap_has(&bm, 20)); // fileid
@@ -476,8 +625,8 @@ mod tests {
         assert!(bitmap_has(&bm, 52)); // time_metadata
         assert!(bitmap_has(&bm, 53)); // time_modify
         // Should NOT have these
-        assert!(!bitmap_has(&bm, 0));  // supported_attrs
-        assert!(!bitmap_has(&bm, 3));  // change
+        assert!(!bitmap_has(&bm, 0)); // supported_attrs
+        assert!(!bitmap_has(&bm, 3)); // change
         assert!(!bitmap_has(&bm, 34)); // no_trunc
     }
 
@@ -629,63 +778,45 @@ mod tests {
         //
         // Response bitmap = [0x00081112, 0x00181C1C] but we re-derive from data.
         // Attrs in server response: 1,4,8,12,19, 34,35,36,44,51,52
-        let bitmap_word0: u32 =
-            (1 << 1)  | // type
+        let bitmap_word0: u32 = (1 << 1)  | // type
             (1 << 4)  | // size
             (1 << 8)  | // fsid
             (1 << 12) | // acl
-            (1 << 19);  // filehandle
-        let bitmap_word1: u32 =
-            (1 << 2)  | // no_trunc (attr 34)
+            (1 << 19); // filehandle
+        let bitmap_word1: u32 = (1 << 2)  | // no_trunc (attr 34)
             (1 << 3)  | // numlinks (attr 35)
             (1 << 4)  | // owner (attr 36)
             (1 << 12) | // space_total (attr 44)
             (1 << 19) | // time_delta (attr 51)
-            (1 << 20);  // time_metadata (attr 52)
+            (1 << 20); // time_metadata (attr 52)
         let bitmap = [bitmap_word0, bitmap_word1];
 
         let hex: Vec<u8> = vec![
             // type=2 (NF4DIR)
-            0x00, 0x00, 0x00, 0x02,
-            // size=81
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51,
-            // fsid major=0, minor=0
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // ACL: count=3
-            0x00, 0x00, 0x00, 0x03,
-            // ACE 1: ALLOW OWNER@ mask=0x001601e7
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x16, 0x01, 0xe7, 0x00, 0x00, 0x00, 0x06,
-            0x4f, 0x57, 0x4e, 0x45, 0x52, 0x40, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, // size=81
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, // fsid major=0, minor=0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, // ACL: count=3
+            0x00, 0x00, 0x00, 0x03, // ACE 1: ALLOW OWNER@ mask=0x001601e7
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x01, 0xe7, 0x00, 0x00,
+            0x00, 0x06, 0x4f, 0x57, 0x4e, 0x45, 0x52, 0x40, 0x00, 0x00,
             // ACE 2: ALLOW GROUP@ mask=0x001200a1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x12, 0x00, 0xa1, 0x00, 0x00, 0x00, 0x06,
-            0x47, 0x52, 0x4f, 0x55, 0x50, 0x40, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0xa1, 0x00, 0x00,
+            0x00, 0x06, 0x47, 0x52, 0x4f, 0x55, 0x50, 0x40, 0x00, 0x00,
             // ACE 3: ALLOW EVERYONE@ mask=0x001200a1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x12, 0x00, 0xa1, 0x00, 0x00, 0x00, 0x09,
-            0x45, 0x56, 0x45, 0x52, 0x59, 0x4f, 0x4e, 0x45,
-            0x40, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0xa1, 0x00, 0x00,
+            0x00, 0x09, 0x45, 0x56, 0x45, 0x52, 0x59, 0x4f, 0x4e, 0x45, 0x40, 0x00, 0x00, 0x00,
             // filehandle: len=20, data=0100018100...87718b63
-            0x00, 0x00, 0x00, 0x14,
-            0x01, 0x00, 0x01, 0x81, 0x00, 0x00, 0x00, 0x00,
-            0x75, 0xd0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x87, 0x71, 0x8b, 0x63,
-            // no_trunc=1
-            0x00, 0x00, 0x00, 0x01,
-            // numlinks=8
-            0x00, 0x00, 0x00, 0x08,
-            // owner: len=1, "0"
-            0x00, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x00,
-            // space_total=65,250,787,328
+            0x00, 0x00, 0x00, 0x14, 0x01, 0x00, 0x01, 0x81, 0x00, 0x00, 0x00, 0x00, 0x75, 0xd0,
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x87, 0x71, 0x8b, 0x63, // no_trunc=1
+            0x00, 0x00, 0x00, 0x01, // numlinks=8
+            0x00, 0x00, 0x00, 0x08, // owner: len=1, "0"
+            0x00, 0x00, 0x00, 0x01, 0x30, 0x00, 0x00, 0x00, // space_total=65,250,787,328
             0x00, 0x00, 0x00, 0x0f, 0x31, 0x40, 0x00, 0x00,
             // time_delta: 0s 1000000ns (1ms granularity)
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x0f, 0x42, 0x40,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x42, 0x40,
             // time_metadata: 0x69d0a53a seconds, 0x9a36 nseconds
-            0x00, 0x00, 0x00, 0x00, 0x69, 0xd0, 0xa5, 0x3a,
-            0x00, 0x00, 0x9a, 0x36,
+            0x00, 0x00, 0x00, 0x00, 0x69, 0xd0, 0xa5, 0x3a, 0x00, 0x00, 0x9a, 0x36,
         ];
         assert_eq!(hex.len(), 180);
 

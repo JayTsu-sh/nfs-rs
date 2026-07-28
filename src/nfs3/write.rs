@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{nfs_fh3, stable_how, Mount, WRITE3args, WriteStable};
+use super::{Mount, WRITE3args, WriteStable, nfs_fh3, stable_how};
 use crate::error::{NfsError, Result};
 use bytes::Bytes;
 
@@ -74,9 +74,7 @@ mod tests {
             wsize: 16384,
         };
         let data = vec![0u8; (u32::MAX as usize) + 1];
-        let res = mount
-            .write(Bytes::new(), 0, Bytes::from(data))
-            .await;
+        let res = mount.write(Bytes::new(), 0, Bytes::from(data)).await;
         assert!(matches!(res, Err(NfsError::InvalidInput(_))));
     }
 }

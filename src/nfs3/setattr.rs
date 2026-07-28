@@ -15,8 +15,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    nfs_fh3, nfstime3_req, sattr3, sattrguard3, set_atime, set_gid3, set_mode3, set_mtime,
-    set_size3, set_uid3, Mount, Result, SETATTR3args, Time,
+    Mount, Result, SETATTR3args, Time, nfs_fh3, nfstime3_req, sattr3, sattrguard3, set_atime,
+    set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
 };
 use bytes::Bytes;
 

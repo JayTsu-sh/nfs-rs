@@ -14,12 +14,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{NfsError, Result};
 use crate::Time;
+use crate::error::{NfsError, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::Stream;
 use futures::TryStreamExt;
+use futures::stream::Stream;
 use std::pin::Pin;
 
 pub(crate) fn block_on_compat<F: std::future::Future>(f: F) -> F::Output {
@@ -31,11 +31,9 @@ pub(crate) fn block_on_compat<F: std::future::Future>(f: F) -> F::Output {
     }
 }
 
-pub type ReaddirStream<'a> =
-    Pin<Box<dyn Stream<Item = Result<ReaddirEntry>> + Send + 'a>>;
+pub type ReaddirStream<'a> = Pin<Box<dyn Stream<Item = Result<ReaddirEntry>> + Send + 'a>>;
 
-pub type ReaddirplusStream<'a> =
-    Pin<Box<dyn Stream<Item = Result<ReaddirplusEntry>> + Send + 'a>>;
+pub type ReaddirplusStream<'a> = Pin<Box<dyn Stream<Item = Result<ReaddirplusEntry>> + Send + 'a>>;
 
 /// Access modes for [`Mount::open`].
 pub const OPEN_READ: u32 = 1;
@@ -224,12 +222,16 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Procedure DELEGPURGE purges delegations (NFSv4 only; returns Unsupported on NFSv3).
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {
-        Err(NfsError::Unsupported("DELEGPURGE requires NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "DELEGPURGE requires NFSv4".to_string(),
+        ))
     }
 
     /// Procedure DELEGRETURN returns a delegation (NFSv4 only; returns Unsupported on NFSv3).
     async fn delegreturn(&self, _stateid: u64) -> Result<()> {
-        Err(NfsError::Unsupported("DELEGRETURN requires NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "DELEGRETURN requires NFSv4".to_string(),
+        ))
     }
 
     /// Procedure LOCK acquires a byte-range lock (NFSv4 only; returns Unsupported on NFSv3).
@@ -239,7 +241,14 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Procedure LOCKU releases a byte-range lock (NFSv4 only; returns Unsupported on NFSv3).
-    async fn locku(&self, _fh: Bytes, _lock_stateid: Bytes, _lock_type: u32, _offset: u64, _length: u64) -> Result<()> {
+    async fn locku(
+        &self,
+        _fh: Bytes,
+        _lock_stateid: Bytes,
+        _lock_type: u32,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<()> {
         Err(NfsError::Unsupported("LOCKU requires NFSv4".to_string()))
     }
 
@@ -267,12 +276,16 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Query which ACE types the server supports (FATTR4_ACLSUPPORT, NFSv4 only).
     async fn aclsupport(&self, _fh: Bytes) -> Result<AclSupport> {
-        Err(NfsError::Unsupported("ACLSUPPORT requires NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "ACLSUPPORT requires NFSv4".to_string(),
+        ))
     }
 
     /// Get a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
     async fn getxattr(&self, _fh: Bytes, _name: &str) -> Result<Bytes> {
-        Err(NfsError::Unsupported("Named attributes require NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "Named attributes require NFSv4".to_string(),
+        ))
     }
 
     /// Get a named attribute (xattr) value by path.
@@ -283,7 +296,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Set a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
     async fn setxattr(&self, _fh: Bytes, _name: &str, _value: Bytes) -> Result<()> {
-        Err(NfsError::Unsupported("Named attributes require NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "Named attributes require NFSv4".to_string(),
+        ))
     }
 
     /// Set a named attribute (xattr) value by path.
@@ -294,7 +309,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// List named attribute (xattr) names (NFSv4 only; returns Unsupported on NFSv3).
     async fn listxattr(&self, _fh: Bytes) -> Result<Vec<String>> {
-        Err(NfsError::Unsupported("Named attributes require NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "Named attributes require NFSv4".to_string(),
+        ))
     }
 
     /// List named attribute (xattr) names by path.
@@ -305,7 +322,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Remove a named attribute (xattr) (NFSv4 only; returns Unsupported on NFSv3).
     async fn removexattr(&self, _fh: Bytes, _name: &str) -> Result<()> {
-        Err(NfsError::Unsupported("Named attributes require NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "Named attributes require NFSv4".to_string(),
+        ))
     }
 
     /// Remove a named attribute (xattr) by path.
@@ -521,7 +540,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ) -> Result<ObjRes> {
         let obj = self.symlink(src_path, dst_dir_fh, dst_filename).await?;
         if uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
-            self.setattr(obj.fh.clone(), None, None, uid, gid, None, atime, mtime).await?;
+            self.setattr(obj.fh.clone(), None, None, uid, gid, None, atime, mtime)
+                .await?;
         }
         Ok(obj)
     }
@@ -1166,9 +1186,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Blocking version of [`Mount::readdirplus_path`]
     fn sync_readdirplus_path(&self, dir_path: &str) -> Result<Vec<ReaddirplusEntry>> {
-        block_on_compat(async {
-            self.readdirplus_path(dir_path).await?.try_collect().await
-        })
+        block_on_compat(async { self.readdirplus_path(dir_path).await?.try_collect().await })
     }
 
     /// Blocking version of [`Mount::mkdir`]
@@ -1309,9 +1327,9 @@ pub struct Attr {
 #[repr(u32)]
 pub enum AceType {
     AccessAllowed = 0,
-    AccessDenied  = 1,
-    SystemAudit   = 2,
-    SystemAlarm   = 3,
+    AccessDenied = 1,
+    SystemAudit = 2,
+    SystemAlarm = 3,
 }
 
 /// NFSv4 ACE flags bitfield (RFC 7530 §6.2.1.4).
@@ -1319,15 +1337,17 @@ pub enum AceType {
 pub struct AceFlags(pub u32);
 
 impl AceFlags {
-    pub const FILE_INHERIT: u32         = 0x0000_0001;
-    pub const DIRECTORY_INHERIT: u32    = 0x0000_0002;
+    pub const FILE_INHERIT: u32 = 0x0000_0001;
+    pub const DIRECTORY_INHERIT: u32 = 0x0000_0002;
     pub const NO_PROPAGATE_INHERIT: u32 = 0x0000_0004;
-    pub const INHERIT_ONLY: u32         = 0x0000_0008;
-    pub const SUCCESSFUL_ACCESS: u32    = 0x0000_0010;
-    pub const FAILED_ACCESS: u32        = 0x0000_0020;
-    pub const IDENTIFIER_GROUP: u32     = 0x0000_0040;
+    pub const INHERIT_ONLY: u32 = 0x0000_0008;
+    pub const SUCCESSFUL_ACCESS: u32 = 0x0000_0010;
+    pub const FAILED_ACCESS: u32 = 0x0000_0020;
+    pub const IDENTIFIER_GROUP: u32 = 0x0000_0040;
 
-    pub fn contains(self, flag: u32) -> bool { self.0 & flag != 0 }
+    pub fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
 }
 
 /// NFSv4 ACE access mask bitfield (RFC 7530 §6.2.1.3).
@@ -1335,25 +1355,27 @@ impl AceFlags {
 pub struct AceMask(pub u32);
 
 impl AceMask {
-    pub const READ_DATA: u32         = 0x0000_0001;
-    pub const LIST_DIRECTORY: u32    = 0x0000_0001;
-    pub const WRITE_DATA: u32        = 0x0000_0002;
-    pub const ADD_FILE: u32          = 0x0000_0002;
-    pub const APPEND_DATA: u32       = 0x0000_0004;
-    pub const ADD_SUBDIRECTORY: u32  = 0x0000_0004;
-    pub const READ_NAMED_ATTRS: u32  = 0x0000_0008;
+    pub const READ_DATA: u32 = 0x0000_0001;
+    pub const LIST_DIRECTORY: u32 = 0x0000_0001;
+    pub const WRITE_DATA: u32 = 0x0000_0002;
+    pub const ADD_FILE: u32 = 0x0000_0002;
+    pub const APPEND_DATA: u32 = 0x0000_0004;
+    pub const ADD_SUBDIRECTORY: u32 = 0x0000_0004;
+    pub const READ_NAMED_ATTRS: u32 = 0x0000_0008;
     pub const WRITE_NAMED_ATTRS: u32 = 0x0000_0010;
-    pub const EXECUTE: u32           = 0x0000_0020;
-    pub const DELETE_CHILD: u32      = 0x0000_0040;
-    pub const READ_ATTRIBUTES: u32   = 0x0000_0080;
-    pub const WRITE_ATTRIBUTES: u32  = 0x0000_0100;
-    pub const DELETE: u32            = 0x0001_0000;
-    pub const READ_ACL: u32          = 0x0002_0000;
-    pub const WRITE_ACL: u32         = 0x0004_0000;
-    pub const WRITE_OWNER: u32       = 0x0008_0000;
-    pub const SYNCHRONIZE: u32       = 0x0010_0000;
+    pub const EXECUTE: u32 = 0x0000_0020;
+    pub const DELETE_CHILD: u32 = 0x0000_0040;
+    pub const READ_ATTRIBUTES: u32 = 0x0000_0080;
+    pub const WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    pub const DELETE: u32 = 0x0001_0000;
+    pub const READ_ACL: u32 = 0x0002_0000;
+    pub const WRITE_ACL: u32 = 0x0004_0000;
+    pub const WRITE_OWNER: u32 = 0x0008_0000;
+    pub const SYNCHRONIZE: u32 = 0x0010_0000;
 
-    pub fn contains(self, mask: u32) -> bool { self.0 & mask != 0 }
+    pub fn contains(self, mask: u32) -> bool {
+        self.0 & mask != 0
+    }
 }
 
 /// A single NFSv4 Access Control Entry (RFC 7530 §6.2.1).
@@ -1377,11 +1399,13 @@ pub struct AclSupport(pub u32);
 
 impl AclSupport {
     pub const ALLOW: u32 = 0x0000_0001;
-    pub const DENY: u32  = 0x0000_0002;
+    pub const DENY: u32 = 0x0000_0002;
     pub const AUDIT: u32 = 0x0000_0004;
     pub const ALARM: u32 = 0x0000_0008;
 
-    pub fn supports(self, ace_type: u32) -> bool { self.0 & ace_type != 0 }
+    pub fn supports(self, ace_type: u32) -> bool {
+        self.0 & ace_type != 0
+    }
 }
 
 /// Struct describing non-volatile file system state information.

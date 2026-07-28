@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{nfs_fh3, FSSTAT3args, Mount, Result};
+use super::{FSSTAT3args, Mount, Result, nfs_fh3};
 
 impl Mount {
     #[allow(unused)]

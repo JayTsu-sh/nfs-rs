@@ -14,7 +14,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bytes_to_string, entry3, nfs_fh3, paged_dir_stream, Mount, READDIR3args, READDIR3resok, Result};
+use super::{
+    Mount, READDIR3args, READDIR3resok, Result, bytes_to_string, entry3, nfs_fh3, paged_dir_stream,
+};
 use bytes::Bytes;
 use futures::stream::Stream;
 
@@ -44,10 +46,16 @@ impl Mount {
     }
 
     pub async fn readdir(&self, dir_fh: Bytes) -> impl Stream<Item = Result<ReaddirEntry>> + '_ {
-        paged_dir_stream!(self, dir_fh, readdir_at, |entry: Box<entry3>| ReaddirEntry {
-            fileid: entry.fileid.0,
-            file_name: bytes_to_string(entry.name.0),
-        }, "readdir page received")
+        paged_dir_stream!(
+            self,
+            dir_fh,
+            readdir_at,
+            |entry: Box<entry3>| ReaddirEntry {
+                fileid: entry.fileid.0,
+                file_name: bytes_to_string(entry.name.0),
+            },
+            "readdir page received"
+        )
     }
 
     pub async fn readdir_at(
@@ -64,5 +72,4 @@ impl Mount {
         };
         self._readdir(args).await
     }
-
 }

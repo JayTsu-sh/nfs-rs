@@ -60,7 +60,9 @@ impl AccessMode {
     pub fn upgrade(&self, requested: AccessMode) -> AccessMode {
         match (self, requested) {
             (AccessMode::Both, _) | (_, AccessMode::Both) => AccessMode::Both,
-            (AccessMode::Read, AccessMode::Write) | (AccessMode::Write, AccessMode::Read) => AccessMode::Both,
+            (AccessMode::Read, AccessMode::Write) | (AccessMode::Write, AccessMode::Read) => {
+                AccessMode::Both
+            }
             _ => *self,
         }
     }
@@ -110,14 +112,21 @@ impl StateManager {
                 existing.access = existing.access.upgrade(access);
                 existing.stateid = stateid;
                 existing.ref_count += 1;
-                debug!(fh_len = fh.len(), ref_count = existing.ref_count, "state: reuse open");
+                debug!(
+                    fh_len = fh.len(),
+                    ref_count = existing.ref_count,
+                    "state: reuse open"
+                );
             }
             None => {
-                files.insert(fh.clone(), OpenState {
-                    stateid,
-                    access,
-                    ref_count: 1,
-                });
+                files.insert(
+                    fh.clone(),
+                    OpenState {
+                        stateid,
+                        access,
+                        ref_count: 1,
+                    },
+                );
                 debug!(fh_len = fh.len(), "state: new open registered");
             }
         }
@@ -134,7 +143,11 @@ impl StateManager {
                 debug!(fh_len = fh.len(), "state: last ref released, should CLOSE");
                 return Some(sid);
             }
-            debug!(fh_len = fh.len(), ref_count = state.ref_count, "state: ref released");
+            debug!(
+                fh_len = fh.len(),
+                ref_count = state.ref_count,
+                "state: ref released"
+            );
         }
         None
     }
@@ -216,7 +229,8 @@ mod tests {
         assert!(mgr.has_open(&fh, AccessMode::Write).await.is_none());
 
         // Upgrade to Both
-        mgr.register_open(&fh, sid2.clone(), AccessMode::Write).await;
+        mgr.register_open(&fh, sid2.clone(), AccessMode::Write)
+            .await;
         assert!(mgr.has_open(&fh, AccessMode::Read).await.is_some());
         assert!(mgr.has_open(&fh, AccessMode::Write).await.is_some());
         assert!(mgr.has_open(&fh, AccessMode::Both).await.is_some());
@@ -230,8 +244,10 @@ mod tests {
         let sid1 = StateId::from_bytes(&[10u8; 16]);
         let sid2 = StateId::from_bytes(&[20u8; 16]);
 
-        mgr.register_open(&fh1, sid1.clone(), AccessMode::Read).await;
-        mgr.register_open(&fh2, sid2.clone(), AccessMode::Write).await;
+        mgr.register_open(&fh1, sid1.clone(), AccessMode::Read)
+            .await;
+        mgr.register_open(&fh2, sid2.clone(), AccessMode::Write)
+            .await;
 
         let pairs = mgr.drain().await;
         assert_eq!(pairs.len(), 2);

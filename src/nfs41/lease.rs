@@ -43,14 +43,13 @@ impl LeaseRenewal {
                 let session = session_holder.get().await;
                 match session.acquire_slot().await {
                     Ok(slot) => {
-                        let builder = CompoundBuilder::new("renew")
-                            .sequence(
-                                session.id(),
-                                slot.sequence_id,
-                                slot.slot_id,
-                                session.highest_slot_id(),
-                                false,
-                            );
+                        let builder = CompoundBuilder::new("renew").sequence(
+                            session.id(),
+                            slot.sequence_id,
+                            slot.slot_id,
+                            session.highest_slot_id(),
+                            false,
+                        );
                         let mut buf = Vec::new();
                         builder.encode_with_header(&auth, &mut buf);
                         match rpc.call(buf, 1, Duration::from_secs(5)).await {

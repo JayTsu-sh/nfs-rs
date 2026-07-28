@@ -1,14 +1,14 @@
 use bytes::{Buf, Bytes};
 
-use super::mount::{decode_string_from_bytes, Mount41};
+use super::mount::{Mount41, decode_string_from_bytes};
 use super::state::{AccessMode, StateId};
 use crate::error::{NfsError, Result};
 
 impl Mount41 {
     pub(crate) async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
-        let resp = self.compound("access", |b| {
-            b.putfh(&fh).access(mode)
-        }).await?;
+        let resp = self
+            .compound("access", |b| b.putfh(&fh).access(mode))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let access_op = resp.op_ok(2)?;
         let mut data = access_op.data.clone();
@@ -38,12 +38,17 @@ impl Mount41 {
     async fn mds_read(&self, fh: &Bytes, offset: u64, count: u32) -> Result<Bytes> {
         // Use a cached read stateid if available; anonymous otherwise.
         // has_open guards against accidentally using a write-only stateid for reads.
-        let sid = self.state.has_open(fh, AccessMode::Read).await
+        let sid = self
+            .state
+            .has_open(fh, AccessMode::Read)
+            .await
             .unwrap_or_else(StateId::anonymous);
         let stateid = sid.raw;
-        let resp = self.compound_data("read", count as usize, |b| {
-            b.putfh(fh).read(&stateid, offset, count)
-        }).await?;
+        let resp = self
+            .compound_data("read", count as usize, |b| {
+                b.putfh(fh).read(&stateid, offset, count)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let read_op = resp.op_ok(2)?;
         let mut data = read_op.data.clone();
@@ -68,9 +73,9 @@ impl Mount41 {
     }
 
     pub(crate) async fn readlink(&self, fh: Bytes) -> Result<String> {
-        let resp = self.compound("readlink", |b| {
-            b.putfh(&fh).readlink()
-        }).await?;
+        let resp = self
+            .compound("readlink", |b| b.putfh(&fh).readlink())
+            .await?;
         resp.op_ok(1)?; // PUTFH
         let readlink_op = resp.op_ok(2)?;
         let mut data = readlink_op.data.clone();

@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{diropargs3, filename3, nfs_fh3, Mount, REMOVE3args, Result};
+use super::{Mount, REMOVE3args, Result, diropargs3, filename3, nfs_fh3};
 use crate::split_path;
 use bytes::Bytes;
 

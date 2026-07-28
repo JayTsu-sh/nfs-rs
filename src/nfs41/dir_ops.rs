@@ -3,7 +3,7 @@ use tracing::{debug, warn};
 
 use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::compound::OpResponse;
-use super::mount::{decode_fh, Mount41};
+use super::mount::{Mount41, decode_fh};
 use super::setattr::encode_setattr;
 use crate::error::Result;
 use crate::mount;
@@ -23,9 +23,9 @@ fn parse_change_info(op: &OpResponse) -> Option<(bool, u64, u64)> {
 
 impl Mount41 {
     pub(crate) async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
-        let resp = self.compound("remove", |b| {
-            b.putfh(&dir_fh).remove(filename)
-        }).await?;
+        let resp = self
+            .compound("remove", |b| b.putfh(&dir_fh).remove(filename))
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // REMOVE
         if let Some(remove_op) = resp.results.get(2)
@@ -59,12 +59,14 @@ impl Mount41 {
         to_filename: &str,
     ) -> Result<()> {
         // NFSv4 RENAME: PUTFH(src_dir) + SAVEFH + PUTFH(dst_dir) + RENAME(old, new)
-        let resp = self.compound("rename", |b| {
-            b.putfh(&from_dir_fh)
-             .savefh()
-             .putfh(&to_dir_fh)
-             .rename(from_filename, to_filename)
-        }).await?;
+        let resp = self
+            .compound("rename", |b| {
+                b.putfh(&from_dir_fh)
+                    .savefh()
+                    .putfh(&to_dir_fh)
+                    .rename(from_filename, to_filename)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // SAVEFH
         resp.op_ok(3)?; // PUTFH
@@ -79,9 +81,14 @@ impl Mount41 {
                 let dst_before = data.get_u64();
                 let dst_after = data.get_u64();
                 debug!(
-                    src_atomic, src_before, src_after,
-                    dst_atomic, dst_before, dst_after,
-                    from = from_filename, to = to_filename,
+                    src_atomic,
+                    src_before,
+                    src_after,
+                    dst_atomic,
+                    dst_before,
+                    dst_after,
+                    from = from_filename,
+                    to = to_filename,
                     "RENAME change_info"
                 );
             }
@@ -94,7 +101,8 @@ impl Mount41 {
         let (to_dir, to_name) = crate::split_path(to_path)?;
         let from_obj = self.lookup_path(&from_dir).await?;
         let to_obj = self.lookup_path(&to_dir).await?;
-        self.rename(from_obj.fh, &from_name, to_obj.fh, &to_name).await
+        self.rename(from_obj.fh, &from_name, to_obj.fh, &to_name)
+            .await
     }
 
     pub(crate) async fn link(
@@ -105,14 +113,16 @@ impl Mount41 {
     ) -> Result<mount::Attr> {
         // NFSv4 LINK: PUTFH(src) + SAVEFH + PUTFH(dst_dir) + LINK(newname)
         let bitmap = standard_getattr_bitmap();
-        let resp = self.compound("link", |b| {
-            b.putfh(&src_fh)
-             .savefh()
-             .putfh(&dst_dir_fh)
-             .link(dst_filename)
-             .putfh(&src_fh)
-             .getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .compound("link", |b| {
+                b.putfh(&src_fh)
+                    .savefh()
+                    .putfh(&dst_dir_fh)
+                    .link(dst_filename)
+                    .putfh(&src_fh)
+                    .getattr(&bitmap)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH(src)
         resp.op_ok(2)?; // SAVEFH
         resp.op_ok(3)?; // PUTFH(dst_dir)
@@ -120,7 +130,13 @@ impl Mount41 {
         if let Some(link_op) = resp.results.get(4)
             && let Some((atomic, before, after)) = parse_change_info(link_op)
         {
-            debug!(atomic, before, after, name = dst_filename, "LINK change_info");
+            debug!(
+                atomic,
+                before,
+                after,
+                name = dst_filename,
+                "LINK change_info"
+            );
         }
         resp.op_ok(5)?; // PUTFH(src) again for getattr
         let getattr = resp.op_ok(6)?;
@@ -143,12 +159,14 @@ impl Mount41 {
     ) -> Result<mount::ObjRes> {
         // NFSv4 symlink: CREATE with NF4LNK type
         let bitmap = standard_getattr_bitmap();
-        let resp = self.compound("symlink", |b| {
-            b.putfh(&dst_dir_fh)
-             .create_symlink(dst_filename, target, &[], &[])
-             .getfh()
-             .getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .compound("symlink", |b| {
+                b.putfh(&dst_dir_fh)
+                    .create_symlink(dst_filename, target, &[], &[])
+                    .getfh()
+                    .getattr(&bitmap)
+            })
+            .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // CREATE(NF4LNK)
         let getfh = resp.op_ok(3)?;
@@ -157,14 +175,13 @@ impl Mount41 {
         let getattr = resp.op_ok(4)?;
         let mut attr_data = getattr.data.clone();
         let attr = decode_getattr_response(&mut attr_data)?;
-        Ok(mount::ObjRes { fh, attr: Some(attr) })
+        Ok(mount::ObjRes {
+            fh,
+            attr: Some(attr),
+        })
     }
 
-    pub(crate) async fn symlink_path(
-        &self,
-        target: &str,
-        dst_path: &str,
-    ) -> Result<mount::ObjRes> {
+    pub(crate) async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
         let (dst_dir, dst_name) = crate::split_path(dst_path)?;
         let dst_dir_obj = self.lookup_path(&dst_dir).await?;
         self.symlink(target, dst_dir_obj.fh, &dst_name).await
@@ -198,13 +215,15 @@ impl Mount41 {
 
         let bitmap = standard_getattr_bitmap();
         let stateid = [0u8; 16]; // anonymous stateid（RFC 5661 §8.2.3）
-        let resp = self.compound("symlink_with_attrs", |b| {
-            b.putfh(&dst_dir_fh)
-             .create_symlink(dst_filename, target, &[], &[])
-             .getfh()
-             .setattr(&stateid, &setattr_mask, &setattr_vals)
-             .getattr(&bitmap)
-        }).await?;
+        let resp = self
+            .compound("symlink_with_attrs", |b| {
+                b.putfh(&dst_dir_fh)
+                    .create_symlink(dst_filename, target, &[], &[])
+                    .getfh()
+                    .setattr(&stateid, &setattr_mask, &setattr_vals)
+                    .getattr(&bitmap)
+            })
+            .await?;
 
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // CREATE(NF4LNK) — 此点之后 symlink 已落地
@@ -219,14 +238,21 @@ impl Mount41 {
                 error = ?e,
                 "symlink_with_attrs: in-compound SETATTR failed, falling back to separate SETATTR"
             );
-            self.setattr(fh.clone(), None, None, uid, gid, None, atime, mtime).await?;
+            self.setattr(fh.clone(), None, None, uid, gid, None, atime, mtime)
+                .await?;
             let attr = self.getattr(fh.clone()).await?;
-            return Ok(mount::ObjRes { fh, attr: Some(attr) });
+            return Ok(mount::ObjRes {
+                fh,
+                attr: Some(attr),
+            });
         }
 
         let getattr = resp.op_ok(5)?;
         let mut attr_data = getattr.data.clone();
         let attr = decode_getattr_response(&mut attr_data)?;
-        Ok(mount::ObjRes { fh, attr: Some(attr) })
+        Ok(mount::ObjRes {
+            fh,
+            attr: Some(attr),
+        })
     }
 }
