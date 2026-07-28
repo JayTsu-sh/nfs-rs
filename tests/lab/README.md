@@ -14,3 +14,12 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`run-e2e.sh` mounts the isolated run directory on both source and destination
+over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,
+directory and file creation, chunked write/commit/read, attributes, READDIR,
+READDIRPLUS, rename, hard links, symbolic links, removal, and unmount.
+
+The Rust integration test is ignored by default and requires both
+`NFS_RS_LAB_E2E=1` and a whitespace-separated `NFS_RS_LAB_URLS` value. This
+keeps normal CI from accidentally accessing the private lab.
