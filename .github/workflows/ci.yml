@@ -13,13 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
-          components: clippy
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
-      # Existing main references a cfg(wasi) module that is not present in the
-      # repository, so cargo fmt cannot resolve the module tree. Keep clippy
-      # non-denying until the existing warning baseline is recorded.
-      - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets --no-fail-fast
