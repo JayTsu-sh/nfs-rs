@@ -110,8 +110,6 @@ published crate.
 
 Licensed under the [Apache License 2.0](LICENSE).
 
-This project is not an officially supported NetApp product.
-
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/JayTsu-sh/nfs-rs/blob/main/CONTRIBUTING.md).
