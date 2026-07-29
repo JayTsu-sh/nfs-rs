@@ -14,6 +14,43 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+//! An asynchronous, pure Rust client library for NFSv3 and NFSv4.1.
+//!
+//! Start with [`parse_url_and_mount`] to connect to an NFS export. The returned
+//! [`Mount`] trait object provides file, directory, metadata, link, and
+//! filesystem operations shared across the supported protocol versions.
+//!
+//! ```no_run
+//! use bytes::Bytes;
+//! use nfs_rs::{OPEN_READ, Result, parse_url_and_mount};
+//!
+//! # async fn example() -> Result<()> {
+//! let mount = parse_url_and_mount(
+//!     "nfs://127.0.0.1/some/export?version=4.1&noresvport=true",
+//! )
+//! .await?;
+//!
+//! let created = mount.create_path("hello.txt", Some(0o644)).await?;
+//! mount
+//!     .write(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+//!     .await?;
+//! mount.commit(created.fh.clone(), 0, 9).await?;
+//! mount.close(created.fh).await?;
+//!
+//! let opened = mount.open_path("hello.txt", OPEN_READ).await?;
+//! let contents = mount.read(opened.fh.clone(), 0, 9).await?;
+//! mount.close(opened.fh).await?;
+//! assert_eq!(&contents[..], b"hello NFS");
+//!
+//! mount.umount().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! By default the client binds a privileged source port. Add
+//! `noresvport=true` when the server export accepts non-privileged source
+//! ports.
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use tokio::net::{TcpSocket, TcpStream};
 
