@@ -13,6 +13,8 @@ const ORIGINAL_FILE: &str = "nfs-rs-e2e/payload.bin";
 const RENAMED_FILE: &str = "nfs-rs-e2e/renamed.bin";
 const HARD_LINK: &str = "nfs-rs-e2e/payload.hardlink";
 const SYMLINK: &str = "nfs-rs-e2e/payload.symlink";
+const SESSION_WSIZE_FILE: &str = "nfs-rs-e2e/session-wsize.bin";
+const NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -33,6 +35,15 @@ fn payload() -> Bytes {
 
 async fn write_all(mount: &dyn Mount, fh: Bytes, data: &Bytes) -> TestResult {
     let chunk_size = (mount.get_max_write_size() as usize).min(64 * 1024);
+    write_all_with_chunk_size(mount, fh, data, chunk_size).await
+}
+
+async fn write_all_with_chunk_size(
+    mount: &dyn Mount,
+    fh: Bytes,
+    data: &Bytes,
+    chunk_size: usize,
+) -> TestResult {
     ensure(chunk_size > 0, "server reported a zero maximum write size")?;
 
     let mut offset = 0usize;
@@ -70,7 +81,13 @@ async fn read_all(mount: &dyn Mount, fh: Bytes, expected_len: usize) -> TestResu
 }
 
 async fn cleanup_case(mount: &dyn Mount) {
-    for path in [SYMLINK, HARD_LINK, RENAMED_FILE, ORIGINAL_FILE] {
+    for path in [
+        SYMLINK,
+        HARD_LINK,
+        RENAMED_FILE,
+        ORIGINAL_FILE,
+        SESSION_WSIZE_FILE,
+    ] {
         let _ = mount.remove_path(path).await;
     }
     let _ = mount.rmdir_path(CASE_DIR).await;
@@ -139,6 +156,40 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             actual == expected,
             format!("{url}: read data differs from written payload"),
         )?;
+
+        if expected_version == NFSVersion::NFSv4p1 {
+            let negotiated_wsize = mount.get_max_write_size() as usize;
+            ensure(
+                negotiated_wsize < NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE,
+                format!(
+                    "{url}: effective wsize {negotiated_wsize} must be smaller than the \
+                     {NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE}-byte session request limit"
+                ),
+            )?;
+
+            let expected = Bytes::from(
+                (0..(negotiated_wsize + 37))
+                    .map(|index| ((index * 31 + 17) % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let created = mount.create_path(SESSION_WSIZE_FILE, Some(0o640)).await?;
+            write_all_with_chunk_size(
+                mount.as_ref(),
+                created.fh.clone(),
+                &expected,
+                negotiated_wsize,
+            )
+            .await?;
+            mount.close(created.fh).await?;
+
+            let opened = mount.open_path(SESSION_WSIZE_FILE, OPEN_READ).await?;
+            let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+            mount.close(opened.fh).await?;
+            ensure(
+                actual == expected,
+                format!("{url}: session-limited wsize round trip differs from written payload"),
+            )?;
+        }
 
         let names = mount
             .readdir_path(CASE_DIR)
