@@ -876,7 +876,11 @@ async fn get_fs_limits(
     let renewal_secs = (server_lease_secs / 2).clamp(5, 45);
     let renewal_interval = std::time::Duration::from_secs(renewal_secs as u64);
 
-    // Clamp requested sizes to server limits (same logic as v3)
+    // Clamp requested sizes to server limits (same logic as v3).
+    // A WRITE request also contains RPC, authentication, COMPOUND, SEQUENCE,
+    // PUTFH, and WRITE metadata. Reserve conservative headroom so the encoded
+    // request stays below the fore-channel ca_maxrequestsize negotiated by
+    // CREATE_SESSION (RFC 5661 §2.10.1).
     let rsize_max: u32 = 4_194_304; // 4 MiB
     let wsize_max: u32 = 4_194_304;
     let rsize_min: u32 = 8192;
@@ -885,11 +889,40 @@ async fn get_fs_limits(
     let rsize = requested_rsize
         .min(server_maxread.min(rsize_max as u64) as u32)
         .max(rsize_min);
-    let wsize = requested_wsize
-        .min(server_maxwrite.min(wsize_max as u64) as u32)
-        .max(wsize_min);
+    let wsize = effective_wsize(
+        requested_wsize,
+        server_maxwrite,
+        wsize_max,
+        wsize_min,
+        session.max_request_size(),
+    )?;
 
     Ok((rsize, wsize, renewal_interval))
+}
+
+const NFS41_WRITE_REQUEST_HEADROOM: u32 = 4 * 1024;
+
+fn effective_wsize(
+    requested_wsize: u32,
+    server_maxwrite: u64,
+    client_wsize_max: u32,
+    client_wsize_min: u32,
+    session_max_request_size: u32,
+) -> Result<u32> {
+    let session_payload_limit = session_max_request_size
+        .checked_sub(NFS41_WRITE_REQUEST_HEADROOM)
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            NfsError::Rpc(format!(
+                "NFSv4.1 session max request size {} is too small for WRITE overhead",
+                session_max_request_size
+            ))
+        })?;
+
+    Ok(requested_wsize
+        .min(server_maxwrite.min(client_wsize_max as u64) as u32)
+        .max(client_wsize_min)
+        .min(session_payload_limit))
 }
 
 // ─── Mount trait implementation ──────────────────────────────────────────────
@@ -1500,6 +1533,57 @@ pub(super) fn extract_open_delegation(data: &mut Bytes) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_wsize_preserves_server_maxwrite_negotiation() {
+        let wsize = effective_wsize(1_048_576, 64 * 1024, 4_194_304, 8192, 1_048_576).unwrap();
+        assert_eq!(wsize, 64 * 1024);
+    }
+
+    #[test]
+    fn effective_wsize_reserves_session_request_headroom() {
+        let session_max_request_size = 1_048_576;
+        let wsize = effective_wsize(
+            1_048_576,
+            4_194_304,
+            4_194_304,
+            8192,
+            session_max_request_size,
+        )
+        .unwrap();
+        assert_eq!(
+            wsize,
+            session_max_request_size - NFS41_WRITE_REQUEST_HEADROOM
+        );
+        assert!(wsize < session_max_request_size);
+    }
+
+    #[test]
+    fn effective_wsize_never_exceeds_small_session_limit() {
+        let session_max_request_size = NFS41_WRITE_REQUEST_HEADROOM + 4096;
+        let wsize = effective_wsize(
+            1_048_576,
+            4_194_304,
+            4_194_304,
+            8192,
+            session_max_request_size,
+        )
+        .unwrap();
+        assert_eq!(wsize, 4096);
+        assert!(wsize < session_max_request_size);
+    }
+
+    #[test]
+    fn effective_wsize_rejects_session_without_payload_capacity() {
+        let result = effective_wsize(
+            1_048_576,
+            4_194_304,
+            4_194_304,
+            8192,
+            NFS41_WRITE_REQUEST_HEADROOM,
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn jitter_lands_in_half_to_full_range() {
