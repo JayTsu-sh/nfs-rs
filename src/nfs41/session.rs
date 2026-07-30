@@ -64,6 +64,8 @@ pub(crate) struct Session {
     client_id: u64,
     /// Slot table for concurrent request management.
     slot_table: SlotTable,
+    /// Fore-channel request limit negotiated by CREATE_SESSION.
+    max_request_size: u32,
     /// 服务端在 EXCHANGE_ID eir_flags 中确认自己是 pNFS MDS（RFC 5661 §18.35.3）。
     /// 为 false 时整个 mount 禁用 pNFS（与 Linux 客户端行为一致），跳过所有 LAYOUTGET。
     pnfs_mds: bool,
@@ -211,6 +213,11 @@ impl Session {
         (self.slot_table.slots.len() as u32).saturating_sub(1)
     }
 
+    /// Maximum encoded RPC request size accepted by the fore channel.
+    pub fn max_request_size(&self) -> u32 {
+        self.max_request_size
+    }
+
     /// Establish a new session: EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE.
     ///
     /// This sends 3 separate COMPOUND calls (each with only the session-setup op,
@@ -234,7 +241,7 @@ impl Session {
         info!(client_id, create_seq_id, pnfs_mds, "EXCHANGE_ID successful");
 
         // ─── Step 2: CREATE_SESSION ──────────────────────────────────────
-        let (session_id, num_slots) = create_session_step(
+        let (session_id, fore_channel) = create_session_step(
             rpc,
             auth,
             client_id,
@@ -246,7 +253,8 @@ impl Session {
         let session = Session {
             session_id,
             client_id,
-            slot_table: SlotTable::new(num_slots),
+            slot_table: SlotTable::new(fore_channel.max_requests),
+            max_request_size: fore_channel.max_request_size,
             pnfs_mds,
         };
 
@@ -332,13 +340,14 @@ impl Session {
             create_seq_id, eir_flags, "DS EXCHANGE_ID successful"
         );
 
-        let (session_id, num_slots) =
+        let (session_id, fore_channel) =
             create_session_step(rpc, auth, client_id, create_seq_id, 0).await?;
 
         Ok(Session {
             session_id,
             client_id,
-            slot_table: SlotTable::new(num_slots),
+            slot_table: SlotTable::new(fore_channel.max_requests),
+            max_request_size: fore_channel.max_request_size,
             // DS session 不参与 layout 获取，此标志仅对 MDS session 有意义
             pnfs_mds: false,
         })
@@ -378,14 +387,14 @@ async fn exchange_id_step(
     Ok((client_id, create_seq_id, eir_flags))
 }
 
-/// CREATE_SESSION：返回 (session_id, 协商出的 slot 数)。
+/// CREATE_SESSION：返回 session ID 和协商出的前向通道属性。
 async fn create_session_step(
     rpc: &rpc::Client,
     auth: &Auth,
     client_id: u64,
     create_seq_id: u32,
     csa_flags: u32,
-) -> Result<([u8; 16], u32)> {
+) -> Result<([u8; 16], ChannelAttrs)> {
     let fore_attrs = ChannelAttrsArgs {
         headerpadsize: 0,
         maxrequestsize: 1048576, // 1 MiB
@@ -438,7 +447,7 @@ async fn create_session_step(
         max_req_size = fore_channel.max_request_size,
         "CREATE_SESSION successful"
     );
-    Ok((session_id, num_slots))
+    Ok((session_id, fore_channel))
 }
 
 /// Send a COMPOUND without session SEQUENCE (used during session establishment).
