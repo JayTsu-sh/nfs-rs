@@ -21,7 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Discover persisted Rust toolchain
-        run: echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+        run: |
+          rustup_path=""
+          for candidate in \
+            "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" \
+            "/home/github-runner/.cargo/bin/rustup" \
+            "/opt/rust/cargo/bin/rustup"; do
+            if [[ -x "$candidate" ]]; then
+              rustup_path="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$rustup_path" ]]; then
+            echo "pre-provisioned rustup not found" >&2
+            exit 1
+          fi
+          rust_bin="$(dirname "$rustup_path")"
+          echo "$rust_bin" >> "$GITHUB_PATH"
+          echo "using pre-provisioned rustup at $rustup_path"
       - name: Use pre-provisioned Rust 1.95.0
         run: |
           rustup toolchain list | grep -q '^1\.95\.0-'
