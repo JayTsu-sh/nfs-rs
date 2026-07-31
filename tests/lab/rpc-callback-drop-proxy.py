@@ -24,6 +24,7 @@ async def main():
     host, port = args.upstream.rsplit(":", 1)
     callback_seen = asyncio.Event()
     dropped = False
+    replay_forwarded = False
     held_calls = []
     last_callback = None
 
@@ -48,7 +49,7 @@ async def main():
                 await write_record(client_w, record)
 
         async def client_to_server():
-            nonlocal dropped
+            nonlocal dropped, replay_forwarded
             while True:
                 record = await read_record(client_r)
                 msg_type = struct.unpack(">I", record[4:8])[0] if len(record) >= 8 else -1
@@ -68,8 +69,9 @@ async def main():
                     for held in held_calls:
                         await write_record(server_w, held)
                     held_calls.clear()
+                    replay_forwarded = True
                     continue
-                if msg_type == 0 and dropped:
+                if msg_type == 0 and dropped and not replay_forwarded:
                     held_calls.append(record)
                     with open(args.events, "a") as out:
                         out.write("fore-call-held\n")

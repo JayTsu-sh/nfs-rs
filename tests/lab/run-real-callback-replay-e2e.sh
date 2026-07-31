@@ -57,6 +57,7 @@ done
 [[ -e "$done_file" ]] || { cat "$events" >&2; echo "callback replay evidence incomplete" >&2; exit 1; }
 if ! wait "$test_pid"; then
   cat "$test_log"
+  cat "$events" 2>/dev/null || true
   exit 1
 fi
 cat "$test_log"
