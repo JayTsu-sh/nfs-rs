@@ -427,6 +427,8 @@ async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
     ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
     let _ = mount.remove_path(CALLBACK_FILE).await;
     let created = mount.create_path(CALLBACK_FILE, Some(0o600)).await?;
+    mount.close(created.fh).await?;
+    let delegated = mount.open_path(CALLBACK_FILE, OPEN_BOTH).await?;
     std::fs::write(&ready, b"delegation-open")?;
     tokio::time::timeout(Duration::from_secs(120), async {
         while !std::path::Path::new(&completed).exists() {
@@ -437,8 +439,8 @@ async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
     .map_err(|_| io::Error::other("callback retransmission was not observed"))?;
 
     let expected = payload();
-    write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
-    mount.close(created.fh).await?;
+    write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
+    mount.close(delegated.fh).await?;
     let opened = mount.open_path(CALLBACK_FILE, OPEN_READ).await?;
     let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
     mount.close(opened.fh).await?;
