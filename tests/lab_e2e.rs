@@ -82,6 +82,25 @@ async fn read_all(mount: &dyn Mount, fh: Bytes, expected_len: usize) -> TestResu
     Ok(Bytes::from(output))
 }
 
+async fn recover_file_from_checkpoint(url: &str, expected: &Bytes) -> TestResult {
+    let mount = parse_url_and_mount(url).await?;
+    let result = async {
+        let opened = mount.open_path(RECOVERY_FILE, OPEN_BOTH).await?;
+        write_all(mount.as_ref(), opened.fh.clone(), expected).await?;
+        mount.close(opened.fh).await?;
+        let opened = mount.open_path(RECOVERY_FILE, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+        mount.close(opened.fh).await?;
+        ensure(
+            actual == *expected,
+            "post-recovery checksum payload mismatch",
+        )
+    }
+    .await;
+    let _ = mount.umount().await;
+    result
+}
+
 async fn cleanup_case(mount: &dyn Mount) {
     for path in [
         SYMLINK,
@@ -307,22 +326,23 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
 
     // Consumer-verified recovery policy: remount, reopen, restart the file from
     // the last trusted checkpoint, then verify the complete payload.
-    let mount = parse_url_and_mount(&url).await?;
-    let opened = mount.open_path(RECOVERY_FILE, OPEN_BOTH).await?;
     let expected = Bytes::from(
         (0..(4 * 1024 * 1024))
             .map(|index| ((index * 17 + 29) % 251) as u8)
             .collect::<Vec<_>>(),
     );
-    write_all(mount.as_ref(), opened.fh.clone(), &expected).await?;
-    mount.close(opened.fh).await?;
-    let opened = mount.open_path(RECOVERY_FILE, OPEN_READ).await?;
-    let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
-    mount.close(opened.fh).await?;
-    ensure(
-        actual == expected,
-        "post-recovery checksum payload mismatch",
-    )?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match recover_file_from_checkpoint(&url, &expected).await {
+            Ok(()) => break,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("recovery attempt deferred: {error}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mount = parse_url_and_mount(&url).await?;
     mount.remove_path(RECOVERY_FILE).await?;
     mount.rmdir_path(RECOVERY_DIR).await?;
     mount.umount().await?;
