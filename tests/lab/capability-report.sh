@@ -74,9 +74,9 @@ find /usr/local/sbin -maxdepth 1 -type f -name 'terrasync-lab-*' -printf '%f\n' 
   LC_ALL=C sort || true
 
 section callback-fault-injection
-echo 'real_server_callback_origin=unsupported-by-current-lab-contract'
-echo 'selective_callback_reply_loss=unsupported-by-current-lab-contract'
-echo 'required=server callback trigger (delegation/layout recall), inline RPC-aware proxy or server tracepoint able to drop one matching CB_COMPOUND reply, and run-scoped sudo allow-list with cleanup/status'
+echo 'real_server_callback_origin=supported:knfsd-write-delegation-conflict'
+echo 'selective_callback_reply_loss=supported:runner-rpc-aware-proxy'
+echo 'callback_retransmission=supported:proxy-replays-original-knfsd-cb-compound'
 
 section sudo-allow-list
 sudo -n -l 2>&1 || true

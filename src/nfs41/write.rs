@@ -84,6 +84,7 @@ impl Mount41 {
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
             claim_file: filename.to_string(),
+            want_no_delegation: !self.retain_delegations,
         };
         let resp = self
             .compound("open", |b| {
@@ -103,7 +104,9 @@ impl Mount41 {
         let mut attr_data = getattr.data.clone();
         let attr = decode_getattr_response(&mut attr_data)?;
 
-        self.return_unsolicited_delegation(delegation, &fh);
+        if !self.retain_delegations {
+            self.return_unsolicited_delegation(delegation, &fh);
+        }
 
         // Register in StateManager for READ/WRITE to use
         self.state
@@ -184,6 +187,7 @@ impl Mount41 {
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
             claim_file: filename.to_string(),
+            want_no_delegation: !self.retain_delegations,
         };
         let resp = self
             .compound("create", |b| {
@@ -199,7 +203,9 @@ impl Mount41 {
         let getfh = resp.op_ok(3)?;
         let mut fh_data = getfh.data.clone();
         let fh = decode_fh(&mut fh_data)?;
-        self.return_unsolicited_delegation(delegation, &fh);
+        if !self.retain_delegations {
+            self.return_unsolicited_delegation(delegation, &fh);
+        }
         let getattr = resp.op_ok(4)?;
         let mut attr_data = getattr.data.clone();
         let mut attr = decode_getattr_response(&mut attr_data)?;

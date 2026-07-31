@@ -188,6 +188,7 @@ pub(crate) struct Mount41 {
     /// DELEGRETURN（复用 recall handler），避免 server 后续 CB_RECALL
     /// 时阻塞其它 client 对同一文件的访问。
     pub(crate) recall_tx: tokio::sync::mpsc::Sender<RecallNotification>,
+    pub(crate) retain_delegations: bool,
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
 }
@@ -778,6 +779,7 @@ async fn mount_on_addr(
         lease_renewal,
         recall_handle,
         recall_tx,
+        retain_delegations: args.retain_delegations,
         rsize,
         wsize,
     };

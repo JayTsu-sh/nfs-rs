@@ -20,6 +20,15 @@ flock --wait 30 9
 marker="$state_root/$run_id"
 
 case "$action" in
+  trigger-delegation-recall)
+    target="/srv/nfs/v4/ci/$run_id/callback-recall.bin"
+    [[ -f "$target" ]] || {
+      echo "callback recall target missing" >&2
+      exit 1
+    }
+    printf 'server-conflict' >>"$target"
+    echo "delegation recall triggered for $run_id"
+    ;;
   apply-tcp-reset)
     if [[ -e "$marker" ]]; then
       echo "TCP reset already applied for $run_id"
@@ -71,7 +80,7 @@ case "$action" in
     echo "session fault restored for $run_id"
     ;;
   *)
-    echo "usage: $0 {apply-tcp-reset|apply-session-fault|status|restore} RUN_ID" >&2
+    echo "usage: $0 {trigger-delegation-recall|apply-tcp-reset|apply-session-fault|status|restore} RUN_ID" >&2
     exit 2
     ;;
 esac
