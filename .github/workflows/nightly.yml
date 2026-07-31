@@ -25,7 +25,15 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --no-fail-fast
+      - name: Validate reliability coverage manifest
+        run: cargo test --locked --test reliability_coverage -- --nocapture
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Upload reliability coverage manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfs41-reliability-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tests/nfs41-reliability-coverage.json
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
