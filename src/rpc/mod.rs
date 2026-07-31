@@ -199,6 +199,29 @@ const CONNECTION_READY: u8 = 0;
 const CONNECTION_REBINDING: u8 = 1;
 const CONNECTION_FAILED: u8 = 2;
 
+struct RebindPublicationGuard<'a> {
+    readiness: &'a AtomicU8,
+    notify: &'a Notify,
+    published: bool,
+}
+
+impl RebindPublicationGuard<'_> {
+    fn publish(mut self) {
+        self.readiness.store(CONNECTION_READY, Ordering::Release);
+        self.notify.notify_waiters();
+        self.published = true;
+    }
+}
+
+impl Drop for RebindPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.readiness.store(CONNECTION_FAILED, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+    }
+}
+
 /// Shared slot for the optional backchannel handler. Installed after the session
 /// is established (see `enable_backchannel`); read by the reader loop on each CALL.
 type BackchannelSlot = Arc<std::sync::Mutex<Option<BackchannelHandler>>>;
@@ -388,6 +411,11 @@ impl StreamMux {
         }
         self.readiness
             .store(CONNECTION_REBINDING, Ordering::Release);
+        let publication = RebindPublicationGuard {
+            readiness: &self.readiness,
+            notify: &self.readiness_notify,
+            published: false,
+        };
         // Abort old reader.
         if let Ok(mut guard) = self.reader_handle.lock()
             && let Some(handle) = guard.take()
@@ -434,13 +462,10 @@ impl StreamMux {
         if let Some(handler) = handler
             && let Err(error) = handler(Client::new(Arc::clone(self), None), next_generation).await
         {
-            self.readiness.store(CONNECTION_FAILED, Ordering::Release);
-            self.readiness_notify.notify_waiters();
             return Err(error);
         }
         self.generation.store(next_generation, Ordering::Release);
-        self.readiness.store(CONNECTION_READY, Ordering::Release);
-        self.readiness_notify.notify_waiters();
+        publication.publish();
         info!(addr = %self.addr, generation = next_generation, "reconnection ready");
         Ok(())
     }
@@ -1097,6 +1122,38 @@ mod tests {
         .unwrap();
 
         assert!(mux.reconnect(0).await.is_err());
+        assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
+        assert!(mux.wait_until_ready().await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_rebind_marks_replacement_connection_unready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let (second, _) = listener.accept().await?;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, std::io::Error>((first, second))
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let entered_for_handler = Arc::clone(&entered);
+        mux.set_reconnect_handler(Arc::new(move |_client, _generation| {
+            let entered = Arc::clone(&entered_for_handler);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<Result<()>>().await
+            })
+        }))
+        .unwrap();
+
+        let mux_for_task = Arc::clone(&mux);
+        let task = tokio::spawn(async move { mux_for_task.reconnect(0).await });
+        entered.notified().await;
+        task.abort();
+        let _ = task.await;
         assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
         assert!(mux.wait_until_ready().await.is_err());
         server.abort();

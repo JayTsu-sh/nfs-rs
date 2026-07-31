@@ -359,6 +359,8 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     let url = env::var("NFS_RS_LAB_FAULT_URL")?;
     let ready = env::var("NFS_RS_LAB_FAULT_READY_FILE")?;
     let completed = env::var("NFS_RS_LAB_FAULT_DONE_FILE")?;
+    let stage = env::var("NFS_RS_LAB_FAULT_STAGE_FILE")?;
+    let acknowledged = env::var("NFS_RS_LAB_FAULT_ACK_FILE")?;
     let mount = parse_url_and_mount(&url).await?;
     ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
     let _ = mount.remove_path(RECOVERY_FILE).await;
@@ -368,7 +370,8 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     let chunk = Bytes::from(vec![0xa5; 64 * 1024]);
 
     std::fs::write(&ready, b"ready")?;
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let mut acknowledged_stage = 0u8;
+    tokio::time::timeout(Duration::from_secs(120), async {
         while !std::path::Path::new(&completed).exists() {
             let writes = (0..64u64).map(|index| {
                 mount.write(
@@ -377,11 +380,20 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
                     chunk.clone(),
                 )
             });
-            let _outcomes = futures::future::join_all(writes).await;
+            let outcomes = futures::future::join_all(writes).await;
+            let requested_stage = std::fs::read_to_string(&stage)
+                .ok()
+                .and_then(|value| value.trim().parse::<u8>().ok())
+                .unwrap_or(0);
+            if requested_stage > acknowledged_stage && outcomes.iter().any(Result::is_ok) {
+                std::fs::write(&acknowledged, requested_stage.to_string())?;
+                acknowledged_stage = requested_stage;
+            }
         }
+        Ok::<(), io::Error>(())
     })
     .await
-    .map_err(|_| io::Error::other("TCP reset did not complete"))?;
+    .map_err(|_| io::Error::other("TCP resets did not complete"))??;
 
     let expected = Bytes::from(
         (0..(4 * 1024 * 1024))

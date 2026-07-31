@@ -1789,6 +1789,9 @@ mod tests {
         );
         assert!(validate_bound_connection(bind_response([8; 16], 3), &session_id).is_err());
         assert!(validate_bound_connection(bind_response(session_id, 1), &session_id).is_err());
+        let mut truncated = bind_response(session_id, 3).to_vec();
+        truncated.truncate(truncated.len() - 8);
+        assert!(validate_bound_connection(Bytes::from(truncated), &session_id).is_err());
     }
 
     #[test]
