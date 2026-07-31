@@ -32,7 +32,7 @@ async def main():
         async def server_to_client():
             while True:
                 record = await read_record(server_r)
-                if len(record) >= 8 and record[4:8] == b"\\0\\0\\0\\0":
+                if len(record) >= 8 and struct.unpack(">I", record[4:8])[0] == 0:
                     callback_seen.set()
                     with open(args.events, "a") as out:
                         out.write("callback-call\\n")
@@ -42,7 +42,9 @@ async def main():
             nonlocal dropped
             while True:
                 record = await read_record(client_r)
-                is_reply = len(record) >= 8 and record[4:8] == b"\\0\\0\\0\\1"
+                is_reply = (
+                    len(record) >= 8 and struct.unpack(">I", record[4:8])[0] == 1
+                )
                 if is_reply and callback_seen.is_set() and not dropped:
                     dropped = True
                     with open(args.events, "a") as out:
