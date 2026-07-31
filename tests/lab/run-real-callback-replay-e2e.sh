@@ -55,7 +55,10 @@ for _ in $(seq 1 1200); do
   sleep 0.1
 done
 [[ -e "$done_file" ]] || { cat "$events" >&2; echo "callback replay evidence incomplete" >&2; exit 1; }
-wait "$test_pid"
+if ! wait "$test_pid"; then
+  cat "$test_log"
+  exit 1
+fi
 cat "$test_log"
 printf 'callback calls=%s dropped=%s injected=%s forwarded=%s\n' \
   "$calls" "$dropped" "$injected" "$forwarded"
