@@ -70,6 +70,11 @@ pub(crate) struct Session {
     max_request_size: u32,
     /// Maximum complete reply the server agreed to cache for a slot replay.
     max_cached_response_size: u32,
+    /// Backchannel callback slots negotiated by CREATE_SESSION.
+    backchannel_max_requests: u32,
+    /// Backchannel request and operation bounds negotiated by CREATE_SESSION.
+    backchannel_max_request_size: u32,
+    backchannel_max_operations: u32,
     /// 服务端在 EXCHANGE_ID eir_flags 中确认自己是 pNFS MDS（RFC 5661 §18.35.3）。
     /// 为 false 时整个 mount 禁用 pNFS（与 Linux 客户端行为一致），跳过所有 LAYOUTGET。
     pnfs_mds: bool,
@@ -257,6 +262,18 @@ impl Session {
         self.max_cached_response_size
     }
 
+    pub fn backchannel_max_requests(&self) -> u32 {
+        self.backchannel_max_requests
+    }
+
+    pub fn backchannel_max_request_size(&self) -> u32 {
+        self.backchannel_max_request_size
+    }
+
+    pub fn backchannel_max_operations(&self) -> u32 {
+        self.backchannel_max_operations
+    }
+
     /// Establish a new session: EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE.
     ///
     /// This sends 3 separate COMPOUND calls (each with only the session-setup op,
@@ -280,7 +297,7 @@ impl Session {
         info!(client_id, create_seq_id, pnfs_mds, "EXCHANGE_ID successful");
 
         // ─── Step 2: CREATE_SESSION ──────────────────────────────────────
-        let (session_id, fore_channel) = create_session_step(
+        let (session_id, fore_channel, back_channel) = create_session_step(
             rpc,
             auth,
             client_id,
@@ -296,6 +313,9 @@ impl Session {
             slot_table: SlotTable::new(fore_channel.max_requests),
             max_request_size: fore_channel.max_request_size,
             max_cached_response_size: fore_channel.max_cached_response_size,
+            backchannel_max_requests: back_channel.max_requests,
+            backchannel_max_request_size: back_channel.max_request_size,
+            backchannel_max_operations: back_channel.max_ops,
             pnfs_mds,
         };
 
@@ -380,7 +400,7 @@ impl Session {
             create_seq_id, eir_flags, "DS EXCHANGE_ID successful"
         );
 
-        let (session_id, fore_channel) =
+        let (session_id, fore_channel, _back_channel) =
             create_session_step(rpc, auth, client_id, create_seq_id, 0).await?;
 
         Ok(Session {
@@ -390,6 +410,9 @@ impl Session {
             slot_table: SlotTable::new(fore_channel.max_requests),
             max_request_size: fore_channel.max_request_size,
             max_cached_response_size: fore_channel.max_cached_response_size,
+            backchannel_max_requests: 1,
+            backchannel_max_request_size: 4096,
+            backchannel_max_operations: 2,
             // DS session 不参与 layout 获取，此标志仅对 MDS session 有意义
             pnfs_mds: false,
         })
@@ -436,7 +459,7 @@ async fn create_session_step(
     client_id: u64,
     create_seq_id: u32,
     csa_flags: u32,
-) -> Result<([u8; 16], ChannelAttrs)> {
+) -> Result<([u8; 16], ChannelAttrs, ChannelAttrs)> {
     let fore_attrs = ChannelAttrsArgs {
         headerpadsize: 0,
         maxrequestsize: 1048576, // 1 MiB
@@ -478,8 +501,7 @@ async fn create_session_step(
     let _csr_flags = data.get_u32();
     // Decode fore channel attrs
     let fore_channel = decode_channel_attrs(&mut data)?;
-    // Skip back channel attrs
-    let _back_channel = decode_channel_attrs(&mut data)?;
+    let back_channel = decode_channel_attrs(&mut data)?;
 
     let num_slots = fore_channel.max_requests;
     info!(
@@ -489,7 +511,7 @@ async fn create_session_step(
         max_req_size = fore_channel.max_request_size,
         "CREATE_SESSION successful"
     );
-    Ok((session_id, fore_channel))
+    Ok((session_id, fore_channel, back_channel))
 }
 
 /// Send a COMPOUND without session SEQUENCE (used during session establishment).
@@ -567,6 +589,7 @@ impl SessionHolder {
     }
 
     /// Replace the session (exclusive write lock, used during recovery).
+    #[cfg(test)]
     pub async fn replace_if_current(&self, expected: u64, mut new_session: Session) -> bool {
         let mut guard = self.inner.write().await;
         if guard.generation != expected {
@@ -575,6 +598,31 @@ impl SessionHolder {
         new_session.generation = expected.saturating_add(1);
         *guard = Arc::new(new_session);
         true
+    }
+
+    /// Publish a replacement session and its callback identity under the same
+    /// holder write lock, so no caller can observe the new fore-channel session
+    /// while the backchannel still accepts the old session ID.
+    pub async fn replace_with_callback_if_current(
+        &self,
+        expected: u64,
+        mut new_session: Session,
+        callback: &super::callback::CallbackState,
+    ) -> Result<bool> {
+        let mut guard = self.inner.write().await;
+        if guard.generation != expected {
+            return Ok(false);
+        }
+        new_session.generation = expected.saturating_add(1);
+        callback.update_session(
+            new_session.session_id,
+            new_session.generation,
+            new_session.backchannel_max_requests,
+            new_session.backchannel_max_request_size,
+            new_session.backchannel_max_operations,
+        )?;
+        *guard = Arc::new(new_session);
+        Ok(true)
     }
 }
 
@@ -597,6 +645,9 @@ mod tests {
             slot_table: SlotTable::new(1),
             max_request_size: 4096,
             max_cached_response_size: 512,
+            backchannel_max_requests: 1,
+            backchannel_max_request_size: 4096,
+            backchannel_max_operations: 2,
             pnfs_mds: false,
         }
     }

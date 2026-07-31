@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use tracing::{debug, info, warn};
 
-use super::callback::RecallNotification;
+use super::callback::{CallbackState, RecallNotification};
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::fastxdr::nfsstat4;
 use super::layout::{DsConnection, LayoutManager};
@@ -171,6 +171,8 @@ pub(crate) struct Mount41 {
     pub(crate) root_fh: Bytes,
     /// Holder for atomic session replacement on BADSESSION/DEADSESSION recovery.
     pub(crate) session_holder: Arc<SessionHolder>,
+    /// Active session identity and bounded replay cache for backchannel callbacks.
+    callback_state: Arc<CallbackState>,
     /// Serializes session recovery publication for this mount.
     recovery_lock: tokio::sync::Mutex<()>,
     /// 客户端身份标识，re-establishment 时复用，避免 EXCHANGE_ID 互相销毁 session。
@@ -455,8 +457,12 @@ impl Mount41 {
                             self.layout_manager.transition_to(next_generation).await;
                             if !self
                                 .session_holder
-                                .replace_if_current(expected_generation, new_session)
-                                .await
+                                .replace_with_callback_if_current(
+                                    expected_generation,
+                                    new_session,
+                                    &self.callback_state,
+                                )
+                                .await?
                             {
                                 return Err(NfsError::Rpc(
                                     "session generation changed during recovery publication"
@@ -707,8 +713,15 @@ async fn mount_on_addr(
     // register a handler with the RPC layer rather than opening a separate
     // listener (the v4.0 model). RFC 8881 §2.10.3.1, §18.34.
     let (recall_tx, recall_rx) = tokio::sync::mpsc::channel(32);
-    client.enable_backchannel(super::callback::make_backchannel_handler(
+    let callback_state = CallbackState::new_negotiated(
         *session.id(),
+        session.generation(),
+        session.backchannel_max_requests(),
+        session.backchannel_max_request_size(),
+        session.backchannel_max_operations(),
+    );
+    client.enable_backchannel(super::callback::make_backchannel_handler(
+        Arc::clone(&callback_state),
         recall_tx.clone(),
     ));
 
@@ -756,6 +769,7 @@ async fn mount_on_addr(
         auth: auth.clone(),
         root_fh,
         session_holder,
+        callback_state,
         recovery_lock: tokio::sync::Mutex::new(()),
         client_identity,
         state: StateManager::new(),
