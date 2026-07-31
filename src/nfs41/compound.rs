@@ -1001,6 +1001,7 @@ impl ChannelAttrsArgs {
 /// 本客户端面向迁移/批量传输负载（每个文件只写一遍），delegation 没有缓存收益，
 /// 只会引入 CB_RECALL / NFS4ERR_DELAY 停顿，因此所有 OPEN 一律拒绝。
 const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0100;
+const OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG: u32 = 0x0300;
 
 /// OPEN arguments.
 pub(crate) struct OpenArgs {
@@ -1023,7 +1024,7 @@ impl OpenArgs {
         let share_access = if self.want_no_delegation {
             self.share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG
         } else {
-            self.share_access
+            self.share_access | OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG
         };
         xdr_u32(buf, share_access);
         xdr_u32(buf, self.share_deny);
