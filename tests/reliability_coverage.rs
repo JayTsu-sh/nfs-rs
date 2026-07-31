@@ -133,8 +133,14 @@ fn lab_capability_probe_is_read_only() {
 fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
-    assert!(workflow.contains("/home/github-runner/.cargo/bin/rustup"));
-    assert!(workflow.contains("pre-provisioned rustup not found"));
+    assert!(
+        workflow
+            .contains("/home/github-runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin")
+    );
+    assert!(workflow.contains("complete pre-provisioned Rust 1.95.0 toolchain not found"));
+    assert!(workflow.contains("cache-bin: false"));
+    assert!(workflow.contains("rustc --version | grep -q '^rustc 1\\.95\\.0 '"));
+    assert!(!workflow.contains("rustup default"));
     assert!(!workflow.contains("dtolnay/rust-toolchain"));
     assert!(!workflow.contains("rustup toolchain install"));
 }
@@ -144,11 +150,14 @@ fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
     let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
         .expect("NFS fault helper must be readable");
     assert!(source.contains("apply-session-fault)"));
+    assert!(source.contains("apply-tcp-reset)"));
     assert!(source.contains("status)"));
     assert!(source.contains("restore)"));
     assert!(source.contains("^(nightly|release)-"));
     assert!(source.contains("flock --wait"));
     assert!(source.contains("nfs-server.service"));
+    assert!(source.contains("10.10.1.11"));
+    assert!(source.contains("ss -K sport = :2049"));
     for forbidden in [
         "eval ", "bash -c", "sh -c", "rm -rf", "iptables", "nft ", "reboot", "poweroff",
     ] {

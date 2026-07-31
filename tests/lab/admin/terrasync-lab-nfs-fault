@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly service_unit="nfs-server.service"
+readonly runner_data_ip="10.10.1.11"
 readonly state_root="/run/terrasync-lab-nfs-fault"
 readonly lock_file="/run/lock/terrasync-lab-nfs-fault.lock"
 
@@ -19,6 +20,19 @@ flock --wait 30 9
 marker="$state_root/$run_id"
 
 case "$action" in
+  apply-tcp-reset)
+    if [[ -e "$marker" ]]; then
+      echo "TCP reset already applied for $run_id"
+      exit 0
+    fi
+    : >"$marker"
+    if ! ss -K sport = :2049 dst "$runner_data_ip"; then
+      rm -f -- "$marker"
+      echo "failed to reset runner NFS TCP connections" >&2
+      exit 1
+    fi
+    echo "TCP reset applied for $run_id"
+    ;;
   apply-session-fault)
     if [[ -e "$marker" ]]; then
       echo "session fault already applied for $run_id"
@@ -57,7 +71,7 @@ case "$action" in
     echo "session fault restored for $run_id"
     ;;
   *)
-    echo "usage: $0 {apply-session-fault|status|restore} RUN_ID" >&2
+    echo "usage: $0 {apply-tcp-reset|apply-session-fault|status|restore} RUN_ID" >&2
     exit 2
     ;;
 esac

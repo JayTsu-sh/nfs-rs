@@ -348,3 +348,66 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
     mount.umount().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires an authorized Terrasync NFS TCP reset"]
+async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_FAULT_URL")?;
+    let ready = env::var("NFS_RS_LAB_FAULT_READY_FILE")?;
+    let completed = env::var("NFS_RS_LAB_FAULT_DONE_FILE")?;
+    let stage = env::var("NFS_RS_LAB_FAULT_STAGE_FILE")?;
+    let acknowledged = env::var("NFS_RS_LAB_FAULT_ACK_FILE")?;
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
+    let _ = mount.remove_path(RECOVERY_FILE).await;
+    let _ = mount.rmdir_path(RECOVERY_DIR).await;
+    mount.mkdir_path(RECOVERY_DIR, 0o755).await?;
+    let created = mount.create_path(RECOVERY_FILE, Some(0o600)).await?;
+    let chunk = Bytes::from(vec![0xa5; 64 * 1024]);
+
+    std::fs::write(&ready, b"ready")?;
+    let mut acknowledged_stage = 0u8;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !std::path::Path::new(&completed).exists() {
+            let writes = (0..64u64).map(|index| {
+                mount.write(
+                    created.fh.clone(),
+                    index * chunk.len() as u64,
+                    chunk.clone(),
+                )
+            });
+            let outcomes = futures::future::join_all(writes).await;
+            let requested_stage = std::fs::read_to_string(&stage)
+                .ok()
+                .and_then(|value| value.trim().parse::<u8>().ok())
+                .unwrap_or(0);
+            if requested_stage > acknowledged_stage && outcomes.iter().any(Result::is_ok) {
+                std::fs::write(&acknowledged, requested_stage.to_string())?;
+                acknowledged_stage = requested_stage;
+            }
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::other("TCP resets did not complete"))??;
+
+    let expected = Bytes::from(
+        (0..(4 * 1024 * 1024))
+            .map(|index| ((index * 13 + 41) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
+    mount.close(created.fh).await?;
+    let opened = mount.open_path(RECOVERY_FILE, OPEN_READ).await?;
+    let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+    mount.close(opened.fh).await?;
+    ensure(actual == expected, "post-rebind checksum payload mismatch")?;
+    mount.remove_path(RECOVERY_FILE).await?;
+    mount.rmdir_path(RECOVERY_DIR).await?;
+    mount.umount().await?;
+    Ok(())
+}
