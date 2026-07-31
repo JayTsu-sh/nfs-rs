@@ -201,10 +201,8 @@ impl Mount41 {
                 // Wait briefly for the caller's slot to be released.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let sess = session_holder.get().await;
-                // Build buf before any await that keeps `slot` alive across suspension.
-                // Advance the slot optimistically so it can be dropped before rpc.call().
-                let buf = match sess.acquire_slot().await {
-                    Ok(slot) => {
+                match sess.acquire_slot().await {
+                    Ok(mut slot) => {
                         let seq_id = slot.current_sequence_id();
                         let sess_id = *sess.id();
                         let highest = sess.highest_slot_id();
@@ -214,18 +212,46 @@ impl Mount41 {
                             .reclaim_complete(false);
                         let mut buf = Vec::new();
                         builder.encode_with_header(&auth, &mut buf);
-                        slot.advance();
-                        // slot and sess dropped here — buf is owned, no borrow
-                        buf
+                        slot.fence_on_drop();
+                        let response = rpc
+                            .call(buf, 1, std::time::Duration::from_secs(10))
+                            .await
+                            .and_then(CompoundResponse::decode);
+                        match response {
+                            Ok(response) => {
+                                let sequence_ok = response.op_ok(0).is_ok();
+                                let status = response.check_status();
+                                if sequence_ok {
+                                    slot.advance();
+                                }
+                                if sequence_ok && status.is_ok() {
+                                    slot.resolve();
+                                    warn!("RECLAIM_COMPLETE sent successfully");
+                                    return;
+                                }
+                                let error = match status {
+                                    Err(error) => error,
+                                    Ok(()) => NfsError::Xdr(
+                                        "RECLAIM_COMPLETE missing valid SEQUENCE".to_string(),
+                                    ),
+                                };
+                                warn!(error = %error, "RECLAIM_COMPLETE failed");
+                                if !matches!(
+                                    error,
+                                    NfsError::Nfs4(nfsstat4::NFS4ERR_RETRY_UNCACHED_REP)
+                                        | NfsError::Nfs4(nfsstat4::NFS4ERR_SEQ_FALSE_RETRY)
+                                ) {
+                                    slot.resolve();
+                                }
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "RECLAIM_COMPLETE failed");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "RECLAIM_COMPLETE: failed to acquire slot");
-                        return;
+                    Err(error) => {
+                        warn!(error = %error, "RECLAIM_COMPLETE: failed to acquire slot");
                     }
-                };
-                match rpc.call(buf, 1, std::time::Duration::from_secs(10)).await {
-                    Ok(_) => warn!("RECLAIM_COMPLETE sent successfully"),
-                    Err(e) => warn!(error = %e, "RECLAIM_COMPLETE failed"),
                 }
             });
         }
@@ -276,7 +302,7 @@ impl Mount41 {
     ) -> Result<CompoundResponse> {
         for attempt in 0..=DELAY_RETRY_MAX {
             let sess = self.session_holder.get().await;
-            let slot = sess.acquire_slot().await?;
+            let mut slot = sess.acquire_slot().await?;
 
             let seq_id = slot.current_sequence_id();
             let builder = CompoundBuilder::new(tag).sequence(
@@ -289,6 +315,9 @@ impl Mount41 {
                 build_ops(builder).apply_sequence_cache_policy(sess.max_cached_response_size())?;
             let operation_class = builder.operation_class();
             let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
+            if operation_class != OperationClass::ReadOnly {
+                slot.fence_on_drop();
+            }
             let mut buf = Vec::new();
             builder.encode_with_header(&self.auth, &mut buf);
 
@@ -313,6 +342,7 @@ impl Mount41 {
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
                     let delay_ms = delay_with_jitter_ms(attempt);
                     warn!(tag, attempt, delay_ms, "NFS4ERR_DELAY, retrying with jitter");
+                    slot.resolve();
                     drop(slot);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
@@ -320,6 +350,7 @@ impl Mount41 {
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
                     let delay_ms = grace_with_jitter_ms(attempt);
                     warn!(tag, attempt, delay_ms, "NFS4ERR_GRACE, waiting for server grace period");
+                    slot.resolve();
                     drop(slot);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
@@ -332,6 +363,7 @@ impl Mount41 {
                     if attempt < DELAY_RETRY_MAX =>
                 {
                     warn!(tag, attempt, "session invalid — re-establishing");
+                    slot.resolve();
                     drop(slot);
                     match Session::establish(&self.rpc, &self.auth, &self.client_identity).await {
                         Ok(new_session) => {
@@ -348,13 +380,21 @@ impl Mount41 {
                         }
                     }
                 }
-                Err(error) => return Err(sent_error(operation_class, &context, error)),
+                Err(error) => {
+                    let error = sent_error(operation_class, &context, error);
+                    if error.operation_outcome().is_none() {
+                        slot.resolve();
+                    }
+                    return Err(error);
+                }
                 Ok(()) => {}
             }
-            resp.op_ok(0)?; // SEQUENCE
+            resp.op_ok(0)
+                .map_err(|error| sent_error(operation_class, &context, error))?; // SEQUENCE
             if let Some(seq_op) = resp.results.first() {
                 self.handle_seq_status(seq_op).await;
             }
+            slot.resolve();
             return Ok(resp);
         }
         Err(NfsError::Rpc(
@@ -371,7 +411,7 @@ impl Mount41 {
         data_size: usize,
         build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
     ) -> Result<CompoundResponse> {
-        let slot = ds.session.acquire_slot().await?;
+        let mut slot = ds.session.acquire_slot().await?;
         let builder = CompoundBuilder::new(tag).sequence(
             ds.session.id(),
             slot.current_sequence_id(),
@@ -387,6 +427,9 @@ impl Mount41 {
             slot.slot_id,
             slot.current_sequence_id(),
         );
+        if operation_class != OperationClass::ReadOnly {
+            slot.fence_on_drop();
+        }
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data_size);
@@ -398,11 +441,22 @@ impl Mount41 {
         let resp = CompoundResponse::decode(response_bytes)
             .map_err(|error| sent_error(operation_class, &context, error))?;
         // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
-        if resp.op_ok(0).is_ok() {
-            slot.advance();
+        if let Err(error) = resp.op_ok(0) {
+            let error = sent_error(operation_class, &context, error);
+            if error.operation_outcome().is_none() {
+                slot.resolve();
+            }
+            return Err(error);
         }
-        resp.check_status()
-            .map_err(|error| sent_error(operation_class, &context, error))?;
+        slot.advance();
+        if let Err(error) = resp.check_status() {
+            let error = sent_error(operation_class, &context, error);
+            if error.operation_outcome().is_none() {
+                slot.resolve();
+            }
+            return Err(error);
+        }
+        slot.resolve();
         Ok(resp)
     }
 
@@ -414,7 +468,7 @@ impl Mount41 {
         data: Bytes,
         build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
     ) -> Result<CompoundResponse> {
-        let slot = ds.session.acquire_slot().await?;
+        let mut slot = ds.session.acquire_slot().await?;
         let builder = CompoundBuilder::new(tag).sequence(
             ds.session.id(),
             slot.current_sequence_id(),
@@ -430,6 +484,9 @@ impl Mount41 {
             slot.slot_id,
             slot.current_sequence_id(),
         );
+        if operation_class != OperationClass::ReadOnly {
+            slot.fence_on_drop();
+        }
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data.len());
@@ -440,11 +497,22 @@ impl Mount41 {
             .map_err(|error| sent_error(operation_class, &context, error))?;
         let resp = CompoundResponse::decode(response_bytes)
             .map_err(|error| sent_error(operation_class, &context, error))?;
-        if resp.op_ok(0).is_ok() {
-            slot.advance();
+        if let Err(error) = resp.op_ok(0) {
+            let error = sent_error(operation_class, &context, error);
+            if error.operation_outcome().is_none() {
+                slot.resolve();
+            }
+            return Err(error);
         }
-        resp.check_status()
-            .map_err(|error| sent_error(operation_class, &context, error))?;
+        slot.advance();
+        if let Err(error) = resp.check_status() {
+            let error = sent_error(operation_class, &context, error);
+            if error.operation_outcome().is_none() {
+                slot.resolve();
+            }
+            return Err(error);
+        }
+        slot.resolve();
         Ok(resp)
     }
 }
@@ -750,7 +818,7 @@ async fn send_recall_return(
     // returns use the current session ID rather than a stale one.
     let session = session_holder.get().await;
     match session.acquire_slot().await {
-        Ok(slot) => {
+        Ok(mut slot) => {
             let builder = CompoundBuilder::new("recall_return").sequence(
                 session.id(),
                 slot.sequence_id,
@@ -766,15 +834,49 @@ async fn send_recall_return(
                     return;
                 }
             };
+            let operation_class = builder.operation_class();
+            let context = request_context(
+                "recall_return",
+                session.id(),
+                slot.slot_id,
+                slot.sequence_id,
+            );
             let mut buf = Vec::new();
             builder.encode_with_header(auth, &mut buf);
-            match rpc.call(buf, 1, METADATA_TIMEOUT).await {
-                Ok(_) => {
+            slot.fence_on_drop();
+            let response = rpc
+                .call(buf, 1, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| sent_error(operation_class, &context, error))
+                .and_then(|bytes| {
+                    CompoundResponse::decode(bytes)
+                        .map_err(|error| sent_error(operation_class, &context, error))
+                });
+            match response {
+                Ok(response) if response.op_ok(0).is_ok() && response.check_status().is_ok() => {
                     slot.advance();
+                    slot.resolve();
                     debug!("recall return sent");
                 }
-                Err(e) => {
-                    warn!(error = %e, "recall return failed");
+                Ok(response) => {
+                    if response.op_ok(0).is_ok() {
+                        slot.advance();
+                    }
+                    let error = match response.check_status() {
+                        Err(error) => sent_error(operation_class, &context, error),
+                        Ok(()) => sent_error(
+                            operation_class,
+                            &context,
+                            NfsError::Xdr("recall return missing valid SEQUENCE".to_string()),
+                        ),
+                    };
+                    if error.operation_outcome().is_none() {
+                        slot.resolve();
+                    }
+                    warn!(error = %error, "recall return failed");
+                }
+                Err(error) => {
+                    warn!(error = %error, "recall return failed");
                 }
             }
         }
