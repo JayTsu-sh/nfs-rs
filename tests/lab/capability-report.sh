@@ -73,6 +73,11 @@ section repository-owned-lab-commands
 find /usr/local/sbin -maxdepth 1 -type f -name 'terrasync-lab-*' -printf '%f\n' 2>/dev/null |
   LC_ALL=C sort || true
 
+section callback-fault-injection
+echo 'real_server_callback_origin=unsupported-by-current-lab-contract'
+echo 'selective_callback_reply_loss=unsupported-by-current-lab-contract'
+echo 'required=server callback trigger (delegation/layout recall), inline RPC-aware proxy or server tracepoint able to drop one matching CB_COMPOUND reply, and run-scoped sudo allow-list with cleanup/status'
+
 section sudo-allow-list
 sudo -n -l 2>&1 || true
 REMOTE

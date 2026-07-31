@@ -167,3 +167,21 @@ fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
         );
     }
 }
+
+#[test]
+fn callback_fault_coverage_is_explicit_and_capability_honest() {
+    let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-callback-replay-e2e.sh"))
+        .expect("callback replay runner must be readable");
+    let capabilities = fs::read_to_string(workspace_path("tests/lab/capability-report.sh"))
+        .expect("capability report must be readable");
+
+    assert!(workflow.contains("tests/lab/run-callback-replay-e2e.sh"));
+    assert!(
+        runner
+            .contains("scripted_callback_reply_loss_replays_cached_body_and_executes_recall_once")
+    );
+    assert!(capabilities.contains("selective_callback_reply_loss=unsupported"));
+    assert!(capabilities.contains("inline RPC-aware proxy or server tracepoint"));
+}
