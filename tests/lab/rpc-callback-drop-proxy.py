@@ -25,12 +25,14 @@ async def main():
     callback_seen = asyncio.Event()
     dropped = False
     held_calls = []
+    last_callback = None
 
     async def handle(client_r, client_w):
         nonlocal dropped
         server_r, server_w = await asyncio.open_connection(host, int(port))
 
         async def server_to_client():
+            nonlocal last_callback
             while True:
                 record = await read_record(server_r)
                 is_cb_compound = (
@@ -39,6 +41,7 @@ async def main():
                     and struct.unpack(">I", record[20:24])[0] == 1
                 )
                 if is_cb_compound:
+                    last_callback = record
                     callback_seen.set()
                     with open(args.events, "a") as out:
                         out.write("callback-call\n")
@@ -54,6 +57,9 @@ async def main():
                     dropped = True
                     with open(args.events, "a") as out:
                         out.write("callback-reply-dropped\n")
+                        out.write("callback-retransmit-injected\n")
+                        out.write("callback-call\n")
+                    await write_record(client_w, last_callback)
                     continue
                 if is_reply and callback_seen.is_set():
                     with open(args.events, "a") as out:

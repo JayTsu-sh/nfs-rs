@@ -46,7 +46,8 @@ for _ in $(seq 1 1200); do
   calls="$(grep -c '^callback-call$' "$events" 2>/dev/null || true)"
   dropped="$(grep -c '^callback-reply-dropped$' "$events" 2>/dev/null || true)"
   forwarded="$(grep -c '^callback-reply-forwarded$' "$events" 2>/dev/null || true)"
-  if [[ "$calls" -ge 2 && "$dropped" -eq 1 && "$forwarded" -ge 1 ]]; then
+  injected="$(grep -c '^callback-retransmit-injected$' "$events" 2>/dev/null || true)"
+  if [[ "$calls" -eq 2 && "$dropped" -eq 1 && "$injected" -eq 1 && "$forwarded" -eq 1 ]]; then
     : >"$done_file"
     break
   fi
@@ -56,4 +57,5 @@ done
 [[ -e "$done_file" ]] || { cat "$events" >&2; echo "callback replay evidence incomplete" >&2; exit 1; }
 wait "$test_pid"
 cat "$test_log"
-printf 'callback calls=%s dropped=%s forwarded=%s\n' "$calls" "$dropped" "$forwarded"
+printf 'callback calls=%s dropped=%s injected=%s forwarded=%s\n' \
+  "$calls" "$dropped" "$injected" "$forwarded"
