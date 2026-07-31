@@ -74,6 +74,59 @@ pub(crate) enum OpNum {
     FreeStateId = 56,
 }
 
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum OperationClass {
+    ReadOnly,
+    SessionControl,
+    ReplaySensitive,
+}
+
+impl OpNum {
+    pub(crate) const fn class(self) -> OperationClass {
+        match self {
+            Self::Access
+            | Self::GetAttr
+            | Self::GetFh
+            | Self::GetDeviceInfo
+            | Self::Lockt
+            | Self::Lookup
+            | Self::Lookupp
+            | Self::PutFh
+            | Self::PutRootFh
+            | Self::Read
+            | Self::ReadDir
+            | Self::ReadLink
+            | Self::RestoreFh
+            | Self::SaveFh
+            | Self::TestStateId => OperationClass::ReadOnly,
+            Self::BindConnToSession
+            | Self::CreateSession
+            | Self::DestroyClientId
+            | Self::DestroySession
+            | Self::ExchangeId
+            | Self::ReclaimComplete
+            | Self::Sequence => OperationClass::SessionControl,
+            Self::Close
+            | Self::Commit
+            | Self::Create
+            | Self::DelegReturn
+            | Self::FreeStateId
+            | Self::LayoutCommit
+            | Self::LayoutGet
+            | Self::LayoutReturn
+            | Self::Link
+            | Self::Lock
+            | Self::Locku
+            | Self::Open
+            | Self::OpenAttr
+            | Self::Remove
+            | Self::Rename
+            | Self::SetAttr
+            | Self::Write => OperationClass::ReplaySensitive,
+        }
+    }
+}
+
 // ─── XDR encoding helpers (same pattern as nfs3) ─────────────────────────────
 
 fn xdr_u32(buf: &mut Vec<u8>, v: u32) {
@@ -133,6 +186,9 @@ struct EncodedOp {
     args: Vec<u8>,
 }
 
+const SEQUENCE_CACHE_THIS_OFFSET: usize = 28;
+pub(crate) const MIN_CACHED_RESPONSE_SIZE: u32 = 4096;
+
 #[allow(dead_code)] // Builder offers full NFSv4.1 op set; not all ops used yet
 impl CompoundBuilder {
     pub fn new(tag: &str) -> Self {
@@ -155,19 +211,55 @@ impl CompoundBuilder {
         sequence_id: u32,
         slot_id: u32,
         highest_slot_id: u32,
-        cachethis: bool,
     ) -> Self {
         let mut args = Vec::new();
         args.extend_from_slice(session_id); // fixed 16 bytes, no length prefix
         xdr_u32(&mut args, sequence_id);
         xdr_u32(&mut args, slot_id);
         xdr_u32(&mut args, highest_slot_id);
-        xdr_bool(&mut args, cachethis);
+        xdr_bool(&mut args, false);
         self.ops.push(EncodedOp {
             opcode: OpNum::Sequence,
             args,
         });
         self
+    }
+
+    /// Apply the reply-cache policy after all COMPOUND operations have been added.
+    ///
+    /// RFC 5661 §2.10.6.1.3 requires replay-sensitive requests to retain enough
+    /// reply state for exactly-once handling. The current modifying operation set
+    /// has bounded, small replies; CREATE_SESSION requests a 4 KiB cached-reply
+    /// channel, so a smaller negotiated value is rejected before transmission.
+    pub fn apply_sequence_cache_policy(mut self, max_cached_response_size: u32) -> Result<Self> {
+        let class = self
+            .ops
+            .iter()
+            .skip(1)
+            .map(|op| op.opcode.class())
+            .max()
+            .unwrap_or(OperationClass::SessionControl);
+        let cachethis = class == OperationClass::ReplaySensitive;
+        if cachethis && max_cached_response_size < MIN_CACHED_RESPONSE_SIZE {
+            return Err(NfsError::Rpc(format!(
+                "replay-sensitive COMPOUND requires at least {} cached response bytes, server negotiated {}",
+                MIN_CACHED_RESPONSE_SIZE, max_cached_response_size
+            )));
+        }
+        let sequence = self
+            .ops
+            .first_mut()
+            .ok_or_else(|| NfsError::Rpc("COMPOUND has no SEQUENCE operation".to_string()))?;
+        if sequence.opcode as u32 != OpNum::Sequence as u32
+            || sequence.args.len() < SEQUENCE_CACHE_THIS_OFFSET + 4
+        {
+            return Err(NfsError::Rpc(
+                "COMPOUND first operation is not a valid SEQUENCE".to_string(),
+            ));
+        }
+        sequence.args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4]
+            .copy_from_slice(&(cachethis as u32).to_be_bytes());
+        Ok(self)
     }
 
     pub fn exchange_id(
@@ -1863,7 +1955,7 @@ mod tests {
     #[test]
     fn compound_builder_sequence_encode() {
         let session_id = [1u8; 16];
-        let builder = CompoundBuilder::new("seq").sequence(&session_id, 42, 0, 0, false);
+        let builder = CompoundBuilder::new("seq").sequence(&session_id, 42, 0, 0);
 
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
@@ -1879,5 +1971,131 @@ mod tests {
         assert_eq!(&buf[op_start + 4..op_start + 20], &session_id);
         // sequence_id = 42 at op_start + 20
         assert_eq!(&buf[op_start + 20..op_start + 24], &42u32.to_be_bytes());
+    }
+
+    #[test]
+    fn operation_classes_cover_supported_opnums() {
+        let read_only = [
+            OpNum::Access,
+            OpNum::GetAttr,
+            OpNum::GetFh,
+            OpNum::GetDeviceInfo,
+            OpNum::Lockt,
+            OpNum::Lookup,
+            OpNum::Lookupp,
+            OpNum::PutFh,
+            OpNum::PutRootFh,
+            OpNum::Read,
+            OpNum::ReadDir,
+            OpNum::ReadLink,
+            OpNum::RestoreFh,
+            OpNum::SaveFh,
+            OpNum::TestStateId,
+        ];
+        let control = [
+            OpNum::BindConnToSession,
+            OpNum::CreateSession,
+            OpNum::DestroyClientId,
+            OpNum::DestroySession,
+            OpNum::ExchangeId,
+            OpNum::ReclaimComplete,
+            OpNum::Sequence,
+        ];
+        let replay_sensitive = [
+            OpNum::Close,
+            OpNum::Commit,
+            OpNum::Create,
+            OpNum::DelegReturn,
+            OpNum::FreeStateId,
+            OpNum::LayoutCommit,
+            OpNum::LayoutGet,
+            OpNum::LayoutReturn,
+            OpNum::Link,
+            OpNum::Lock,
+            OpNum::Locku,
+            OpNum::Open,
+            OpNum::OpenAttr,
+            OpNum::Remove,
+            OpNum::Rename,
+            OpNum::SetAttr,
+            OpNum::Write,
+        ];
+        assert!(
+            read_only
+                .iter()
+                .all(|op| op.class() == OperationClass::ReadOnly)
+        );
+        assert!(
+            control
+                .iter()
+                .all(|op| op.class() == OperationClass::SessionControl)
+        );
+        assert!(
+            replay_sensitive
+                .iter()
+                .all(|op| op.class() == OperationClass::ReplaySensitive)
+        );
+        assert_eq!(read_only.len() + control.len() + replay_sensitive.len(), 39);
+    }
+
+    #[test]
+    fn cache_policy_is_false_for_read_only_compound() {
+        let session_id = [1u8; 16];
+        let builder = CompoundBuilder::new("read")
+            .sequence(&session_id, 1, 0, 0)
+            .putrootfh()
+            .lookup("file")
+            .getattr(&[1])
+            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE)
+            .unwrap();
+        assert_eq!(
+            &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
+            &0u32.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn cache_policy_is_true_for_mixed_modifying_compound() {
+        let session_id = [1u8; 16];
+        let stateid = [0u8; 16];
+        let builder = CompoundBuilder::new("write")
+            .sequence(&session_id, 1, 0, 0)
+            .putfh(b"fh")
+            .write_header(&stateid, 0, 2, 1_048_576)
+            .getattr(&[1])
+            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE)
+            .unwrap();
+        assert_eq!(
+            &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
+            &1u32.to_be_bytes()
+        );
+        assert_eq!(builder.ops[2].args.len(), 32);
+        assert_eq!(&builder.ops[2].args[28..32], &1_048_576u32.to_be_bytes());
+    }
+
+    #[test]
+    fn cache_policy_rejects_insufficient_negotiated_capacity_before_encode() {
+        let session_id = [1u8; 16];
+        let builder = CompoundBuilder::new("remove")
+            .sequence(&session_id, 1, 0, 0)
+            .putfh(b"fh")
+            .remove("file");
+        let error = match builder.apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE - 1) {
+            Ok(_) => panic!("modifying compound requires cached reply capacity"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires at least 4096"));
+    }
+
+    #[test]
+    fn cache_policy_requires_sequence_first() {
+        let result = CompoundBuilder::new("invalid")
+            .putrootfh()
+            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE);
+        let error = match result {
+            Ok(_) => panic!("missing SEQUENCE must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a valid SEQUENCE"));
     }
 }

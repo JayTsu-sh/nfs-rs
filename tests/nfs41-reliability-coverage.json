@@ -7,7 +7,7 @@
     "R10", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18"
   ],
   "tests": [
-    {"id":"T01","ci":"planned:issue-10-harness","nightly":"planned:fore-reply-loss","required":true},
+    {"id":"T01","ci":"nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound","nightly":"existing-v41-modifying-compound-e2e","required":true},
     {"id":"T02","ci":"planned:retry-uncached","nightly":"planned:retry-uncached","required":true},
     {"id":"T03","ci":"planned:seq-false-retry","nightly":"planned:seq-false-retry","required":true},
     {"id":"T04","ci":"planned:renewal-validation","nightly":"planned:renewal-session-fault","required":true},
@@ -29,7 +29,7 @@
     {"id":"T20","ci":"existing-all-targets","nightly":"existing-v3-v41-e2e","required":true},
     {"id":"T21","ci":"planned:repeated-renew-reconnect","nightly":"planned:three-lease-intervals","required":true},
     {"id":"T22","ci":"planned:cancellation-cleanup","nightly":"planned:workflow-cleanup","required":true},
-    {"id":"T23","ci":"planned:zero-copy-framing","nightly":"planned:large-mds-ds-write-metrics","required":true},
+    {"id":"T23","ci":"nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound","nightly":"existing-v41-session-limited-large-write","required":true},
     {"id":"T24","ci":"production_code_has_no_unwrap_or_expect","nightly":"planned:fault-no-process-panic","required":true},
     {"id":"T25","ci":"planned:performance-structural","nightly":"planned:before-after-performance","required":true}
   ]

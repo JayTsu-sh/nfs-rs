@@ -48,7 +48,6 @@ impl LeaseRenewal {
                             slot.sequence_id,
                             slot.slot_id,
                             session.highest_slot_id(),
-                            false,
                         );
                         let mut buf = Vec::new();
                         builder.encode_with_header(&auth, &mut buf);

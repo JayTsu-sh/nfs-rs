@@ -66,6 +66,8 @@ pub(crate) struct Session {
     slot_table: SlotTable,
     /// Fore-channel request limit negotiated by CREATE_SESSION.
     max_request_size: u32,
+    /// Maximum complete reply the server agreed to cache for a slot replay.
+    max_cached_response_size: u32,
     /// 服务端在 EXCHANGE_ID eir_flags 中确认自己是 pNFS MDS（RFC 5661 §18.35.3）。
     /// 为 false 时整个 mount 禁用 pNFS（与 Linux 客户端行为一致），跳过所有 LAYOUTGET。
     pnfs_mds: bool,
@@ -76,6 +78,7 @@ struct ChannelAttrs {
     max_request_size: u32,
     #[allow(dead_code)]
     max_response_size: u32,
+    max_cached_response_size: u32,
     max_ops: u32,
     max_requests: u32,
 }
@@ -218,6 +221,10 @@ impl Session {
         self.max_request_size
     }
 
+    pub fn max_cached_response_size(&self) -> u32 {
+        self.max_cached_response_size
+    }
+
     /// Establish a new session: EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE.
     ///
     /// This sends 3 separate COMPOUND calls (each with only the session-setup op,
@@ -255,6 +262,7 @@ impl Session {
             client_id,
             slot_table: SlotTable::new(fore_channel.max_requests),
             max_request_size: fore_channel.max_request_size,
+            max_cached_response_size: fore_channel.max_cached_response_size,
             pnfs_mds,
         };
 
@@ -269,7 +277,6 @@ impl Session {
                         slot.current_sequence_id(),
                         slot.slot_id,
                         session.highest_slot_id(),
-                        false,
                     )
                     .reclaim_complete(false);
 
@@ -348,6 +355,7 @@ impl Session {
             client_id,
             slot_table: SlotTable::new(fore_channel.max_requests),
             max_request_size: fore_channel.max_request_size,
+            max_cached_response_size: fore_channel.max_cached_response_size,
             // DS session 不参与 layout 获取，此标志仅对 MDS session 有意义
             pnfs_mds: false,
         })
@@ -479,7 +487,7 @@ fn decode_channel_attrs(data: &mut Bytes) -> Result<ChannelAttrs> {
     let _headerpadsize = data.get_u32();
     let max_request_size = data.get_u32();
     let max_response_size = data.get_u32();
-    let _max_response_cached = data.get_u32();
+    let max_cached_response_size = data.get_u32();
     let max_ops = data.get_u32();
     let max_requests = data.get_u32();
     // ca_rdma_ird<1>
@@ -495,6 +503,7 @@ fn decode_channel_attrs(data: &mut Bytes) -> Result<ChannelAttrs> {
     Ok(ChannelAttrs {
         max_request_size,
         max_response_size,
+        max_cached_response_size,
         max_ops,
         max_requests,
     })
@@ -628,6 +637,7 @@ mod tests {
         let attrs = decode_channel_attrs(&mut bytes).unwrap();
         assert_eq!(attrs.max_request_size, 1048576);
         assert_eq!(attrs.max_response_size, 1048576);
+        assert_eq!(attrs.max_cached_response_size, 4096);
         assert_eq!(attrs.max_ops, 16);
         assert_eq!(attrs.max_requests, 4);
     }

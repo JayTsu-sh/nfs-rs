@@ -188,7 +188,7 @@ impl Mount41 {
                         let highest = sess.highest_slot_id();
                         let slot_id = slot.slot_id;
                         let builder = super::compound::CompoundBuilder::new("reclaim_complete")
-                            .sequence(&sess_id, seq_id, slot_id, highest, false)
+                            .sequence(&sess_id, seq_id, slot_id, highest)
                             .reclaim_complete(false);
                         let mut buf = Vec::new();
                         builder.encode_with_header(&auth, &mut buf);
@@ -262,9 +262,9 @@ impl Mount41 {
                 seq_id,
                 slot.slot_id,
                 sess.highest_slot_id(),
-                false,
             );
-            let builder = build_ops(builder);
+            let builder =
+                build_ops(builder).apply_sequence_cache_policy(sess.max_cached_response_size())?;
             let mut buf = Vec::new();
             builder.encode_with_header(&self.auth, &mut buf);
 
@@ -351,9 +351,9 @@ impl Mount41 {
             slot.current_sequence_id(),
             slot.slot_id,
             ds.session.highest_slot_id(),
-            false,
         );
-        let builder = build_ops(builder);
+        let builder = build_ops(builder)
+            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data_size);
@@ -381,9 +381,9 @@ impl Mount41 {
             slot.current_sequence_id(),
             slot.slot_id,
             ds.session.highest_slot_id(),
-            false,
         );
-        let builder = build_ops(builder);
+        let builder = build_ops(builder)
+            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data.len());
@@ -707,9 +707,16 @@ async fn send_recall_return(
                 slot.sequence_id,
                 slot.slot_id,
                 session.highest_slot_id(),
-                false,
             );
-            let builder = build_ops(builder);
+            let builder = match build_ops(builder)
+                .apply_sequence_cache_policy(session.max_cached_response_size())
+            {
+                Ok(builder) => builder,
+                Err(e) => {
+                    warn!(error = %e, "recall return cache policy rejected");
+                    return;
+                }
+            };
             let mut buf = Vec::new();
             builder.encode_with_header(auth, &mut buf);
             match rpc.call(buf, 1, METADATA_TIMEOUT).await {
@@ -742,7 +749,6 @@ async fn navigate_to_export(
             slot.sequence_id,
             slot.slot_id,
             session.highest_slot_id(),
-            false,
         )
         .putrootfh();
 
@@ -805,7 +811,6 @@ async fn get_fs_limits(
             slot.sequence_id,
             slot.slot_id,
             session.highest_slot_id(),
-            false,
         )
         .putfh(root_fh)
         .getattr(&bitmap);
