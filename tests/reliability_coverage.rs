@@ -138,3 +138,23 @@ fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
     assert!(!workflow.contains("dtolnay/rust-toolchain"));
     assert!(!workflow.contains("rustup toolchain install"));
 }
+
+#[test]
+fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
+    let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
+        .expect("NFS fault helper must be readable");
+    assert!(source.contains("apply-session-fault)"));
+    assert!(source.contains("status)"));
+    assert!(source.contains("restore)"));
+    assert!(source.contains("^(nightly|release)-"));
+    assert!(source.contains("flock --wait"));
+    assert!(source.contains("nfs-server.service"));
+    for forbidden in [
+        "eval ", "bash -c", "sh -c", "rm -rf", "iptables", "nft ", "reboot", "poweroff",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "fault helper contains forbidden capability: {forbidden}"
+        );
+    }
+}

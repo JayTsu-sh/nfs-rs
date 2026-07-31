@@ -59,6 +59,8 @@ jobs:
       - name: Validate reliability coverage manifest
         run: cargo test --locked --test reliability_coverage -- --nocapture
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: NFSv4.1 session recovery E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"
       - name: Upload reliability coverage manifest
         if: always()
         uses: actions/upload-artifact@v4
