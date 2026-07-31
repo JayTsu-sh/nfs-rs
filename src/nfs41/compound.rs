@@ -187,7 +187,12 @@ struct EncodedOp {
 }
 
 const SEQUENCE_CACHE_THIS_OFFSET: usize = 28;
-pub(crate) const MIN_CACHED_RESPONSE_SIZE: u32 = 4096;
+// Minimum accepted RPC reply (AUTH_NONE verifier) plus COMPOUND4res, a successful
+// SEQUENCE result, and the opcode/status pair for each remaining operation.
+const MIN_RPC_REPLY_ENVELOPE_SIZE: usize = 24;
+const MIN_COMPOUND_REPLY_ENVELOPE_SIZE: usize = 12;
+const SEQUENCE_SUCCESS_REPLY_SIZE: usize = 44;
+const MIN_OPERATION_REPLY_SIZE: usize = 8;
 
 #[allow(dead_code)] // Builder offers full NFSv4.1 op set; not all ops used yet
 impl CompoundBuilder {
@@ -228,9 +233,9 @@ impl CompoundBuilder {
     /// Apply the reply-cache policy after all COMPOUND operations have been added.
     ///
     /// RFC 5661 §2.10.6.1.3 requires replay-sensitive requests to retain enough
-    /// reply state for exactly-once handling. The current modifying operation set
-    /// has bounded, small replies; CREATE_SESSION requests a 4 KiB cached-reply
-    /// channel, so a smaller negotiated value is rejected before transmission.
+    /// reply state for exactly-once handling. Reject a channel that cannot hold
+    /// even the smallest successful reply for this COMPOUND. Larger,
+    /// operation-dependent replies remain subject to NFS4ERR_REP_TOO_BIG_TO_CACHE.
     pub fn apply_sequence_cache_policy(mut self, max_cached_response_size: u32) -> Result<Self> {
         let class = self
             .ops
@@ -240,10 +245,11 @@ impl CompoundBuilder {
             .max()
             .unwrap_or(OperationClass::SessionControl);
         let cachethis = class == OperationClass::ReplaySensitive;
-        if cachethis && max_cached_response_size < MIN_CACHED_RESPONSE_SIZE {
+        let required_minimum = self.minimum_cached_response_size();
+        if cachethis && max_cached_response_size < required_minimum {
             return Err(NfsError::Rpc(format!(
                 "replay-sensitive COMPOUND requires at least {} cached response bytes, server negotiated {}",
-                MIN_CACHED_RESPONSE_SIZE, max_cached_response_size
+                required_minimum, max_cached_response_size
             )));
         }
         let sequence = self
@@ -260,6 +266,17 @@ impl CompoundBuilder {
         sequence.args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4]
             .copy_from_slice(&(cachethis as u32).to_be_bytes());
         Ok(self)
+    }
+
+    fn minimum_cached_response_size(&self) -> u32 {
+        let padded_tag_len = self.tag.len().saturating_add(3) & !3;
+        let remaining_ops = self.ops.len().saturating_sub(1);
+        let size = MIN_RPC_REPLY_ENVELOPE_SIZE
+            .saturating_add(MIN_COMPOUND_REPLY_ENVELOPE_SIZE)
+            .saturating_add(padded_tag_len)
+            .saturating_add(SEQUENCE_SUCCESS_REPLY_SIZE)
+            .saturating_add(remaining_ops.saturating_mul(MIN_OPERATION_REPLY_SIZE));
+        u32::try_from(size).unwrap_or(u32::MAX)
     }
 
     pub fn exchange_id(
@@ -2046,7 +2063,7 @@ mod tests {
             .putrootfh()
             .lookup("file")
             .getattr(&[1])
-            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE)
+            .apply_sequence_cache_policy(0)
             .unwrap();
         assert_eq!(
             &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
@@ -2063,7 +2080,7 @@ mod tests {
             .putfh(b"fh")
             .write_header(&stateid, 0, 2, 1_048_576)
             .getattr(&[1])
-            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE)
+            .apply_sequence_cache_policy(2128)
             .unwrap();
         assert_eq!(
             &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
@@ -2074,24 +2091,39 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_rejects_insufficient_negotiated_capacity_before_encode() {
+    fn cache_policy_checks_negotiated_capacity_boundary_before_encode() {
         let session_id = [1u8; 16];
-        let builder = CompoundBuilder::new("remove")
+        let builder_at_limit = CompoundBuilder::new("remove")
             .sequence(&session_id, 1, 0, 0)
             .putfh(b"fh")
             .remove("file");
-        let error = match builder.apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE - 1) {
+        let required = builder_at_limit.minimum_cached_response_size();
+        assert!(
+            builder_at_limit
+                .apply_sequence_cache_policy(required)
+                .is_ok()
+        );
+
+        let builder_below_limit = CompoundBuilder::new("remove")
+            .sequence(&session_id, 1, 0, 0)
+            .putfh(b"fh")
+            .remove("file");
+        let error = match builder_below_limit.apply_sequence_cache_policy(required - 1) {
             Ok(_) => panic!("modifying compound requires cached reply capacity"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("requires at least 4096"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("requires at least {required}"))
+        );
     }
 
     #[test]
     fn cache_policy_requires_sequence_first() {
         let result = CompoundBuilder::new("invalid")
             .putrootfh()
-            .apply_sequence_cache_policy(MIN_CACHED_RESPONSE_SIZE);
+            .apply_sequence_cache_policy(2128);
         let error = match result {
             Ok(_) => panic!("missing SEQUENCE must fail"),
             Err(error) => error,
