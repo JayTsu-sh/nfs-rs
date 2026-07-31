@@ -12,6 +12,7 @@ use crate::rpc::BackchannelHandler;
 const MAX_CB_OPS: u32 = 64;
 const MAX_REFERRING_LISTS: usize = 256;
 const NFS4_OK: u32 = 0;
+const NFS4ERR_DELAY: u32 = 10008;
 const NFS4ERR_BADXDR: u32 = 10036;
 const NFS4ERR_BADSESSION: u32 = 10052;
 const NFS4ERR_BADSLOT: u32 = 10053;
@@ -254,7 +255,7 @@ fn parse_compound(
         return Ok(compound_body(&tag, NFS4ERR_BADSLOT, &[op]).into());
     };
 
-    if sequence.sequence_id == slot.next_sequence.wrapping_sub(1) {
+    if sequence.sequence_id == slot.next_sequence.wrapping_sub(1) && slot.request.is_some() {
         if slot.request.as_ref() == Some(&request)
             && let Some(reply) = &slot.compound_reply
         {
@@ -376,7 +377,7 @@ fn parse_callback_op(
             {
                 NFS4_OK
             } else {
-                NFS4ERR_INVAL
+                NFS4ERR_DELAY
             };
             Ok((op_status(opcode, status), status))
         }
@@ -431,7 +432,7 @@ fn parse_layout_recall(
     let status = if recall_tx.try_send(notification).is_ok() {
         NFS4_OK
     } else {
-        NFS4ERR_INVAL
+        NFS4ERR_DELAY
     };
     Ok((op_status(opcode, status), status))
 }
@@ -726,7 +727,7 @@ mod tests {
 
         tx.try_send(RecallNotification::LayoutAll).unwrap();
         let reply = handle_cb_rpc(frame(2, session, 1, 0, b"", Some(1)), &state, &tx).unwrap();
-        assert_eq!(u32_at(&reply, 24), NFS4ERR_INVAL);
+        assert_eq!(u32_at(&reply, 24), NFS4ERR_DELAY);
         assert!(matches!(
             rx.try_recv().unwrap(),
             RecallNotification::LayoutAll
@@ -754,5 +755,9 @@ mod tests {
             1,
             "slot cache must remain bounded by ca_maxrequests"
         );
+
+        let fresh = CallbackState::new(session, 1, 1);
+        let reply = handle_cb_rpc(frame(3, session, 0, 0, b"", None), &fresh, &tx).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4ERR_SEQ_MISORDERED);
     }
 }
