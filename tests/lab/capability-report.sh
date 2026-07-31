@@ -22,7 +22,7 @@ hostname
 uname -a
 
 section nfs-status
-sudo -n /usr/local/sbin/terrasync-lab-nfs-status
+sudo -n /usr/local/sbin/terrasync-lab-nfs-status 2>&1 || true
 
 section nfs-implementation
 for command in rpc.nfsd ganesha.nfsd nfs-ganesha systemctl exportfs nfsstat; do
