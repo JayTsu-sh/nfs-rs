@@ -45,6 +45,56 @@ const DELAY_RETRY_CAP_MS: u64 = 5000;
 const GRACE_RETRY_BASE_MS: u64 = 1000;
 const GRACE_RETRY_CAP_MS: u64 = 8000;
 
+fn bind_connection_request(auth: &Auth, session_id: &[u8; 16]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    CompoundBuilder::new("bind_conn")
+        .bind_conn_to_session(session_id, 3, false)
+        .encode_with_header(auth, &mut buf);
+    buf
+}
+
+fn validate_bound_connection(response: Bytes, expected_session_id: &[u8; 16]) -> Result<u32> {
+    let response = CompoundResponse::decode(response)?;
+    let op = response.op_ok(0)?;
+    let mut data = op.data.clone();
+    if data.remaining() < 20 {
+        return Err(NfsError::Xdr(
+            "BIND_CONN_TO_SESSION result truncated".to_string(),
+        ));
+    }
+    let mut confirmed_session_id = [0; 16];
+    data.copy_to_slice(&mut confirmed_session_id);
+    let direction = data.get_u32();
+    if &confirmed_session_id != expected_session_id {
+        return Err(NfsError::Rpc(
+            "BIND_CONN_TO_SESSION returned a mismatched session ID".to_string(),
+        ));
+    }
+    if direction & 2 == 0 {
+        return Err(NfsError::Rpc(format!(
+            "BIND_CONN_TO_SESSION did not restore the required backchannel: direction {direction}"
+        )));
+    }
+    Ok(direction)
+}
+
+async fn bind_connection(
+    client: &rpc::Client,
+    auth: &Auth,
+    session_id: &[u8; 16],
+    during_reconnect: bool,
+) -> Result<u32> {
+    let request = bind_connection_request(auth, session_id);
+    let response = if during_reconnect {
+        client
+            .call_during_reconnect(request, METADATA_TIMEOUT)
+            .await?
+    } else {
+        client.call(request, 1, METADATA_TIMEOUT).await?
+    };
+    validate_bound_connection(response, session_id)
+}
+
 fn request_context(
     tag: &str,
     session_id: &[u8; 16],
@@ -662,51 +712,25 @@ async fn mount_on_addr(
         recall_tx.clone(),
     ));
 
-    // Tell the server this connection also carries the backchannel.
-    // BIND_CONN_TO_SESSION must be the sole op in COMPOUND (RFC 8881 §18.34.3).
-    let mut bcts_buf = Vec::new();
-    CompoundBuilder::new("bind_conn")
-        .bind_conn_to_session(session.id(), 3, false) // CDFC4_FORE_OR_BOTH
-        .encode_with_header(auth, &mut bcts_buf);
-    match client.call(bcts_buf, 1, METADATA_TIMEOUT).await {
-        Ok(resp_bytes) => match CompoundResponse::decode(resp_bytes) {
-            // BIND_CONN_TO_SESSION4resok: sessionid(16) + dir(4)
-            Ok(resp) => match resp.op_ok(0) {
-                Ok(op) => {
-                    let mut d = op.data.clone();
-                    if d.remaining() >= 20 {
-                        let mut confirmed_sid = [0u8; 16];
-                        d.copy_to_slice(&mut confirmed_sid);
-                        let dir = d.get_u32();
-                        // RFC 8881 §18.34.3: validate the echoed session ID and the
-                        // granted direction. CDFS4_BACK=2, CDFS4_BOTH=3 → the
-                        // backchannel is granted iff bit 1 is set.
-                        if &confirmed_sid != session.id() {
-                            warn!("BIND_CONN_TO_SESSION: server returned mismatched session ID");
-                        } else if dir & 2 == 0 {
-                            warn!(
-                                dir,
-                                "BIND_CONN_TO_SESSION: server did not grant the backchannel direction"
-                            );
-                        } else {
-                            info!(dir, "backchannel bound via BIND_CONN_TO_SESSION");
-                        }
-                    } else {
-                        warn!("BIND_CONN_TO_SESSION result truncated; cannot confirm backchannel");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "BIND_CONN_TO_SESSION op result failed; backchannel may not work");
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, "failed to decode BIND_CONN_TO_SESSION response");
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "BIND_CONN_TO_SESSION failed, backchannel may not work");
+    // A connection is not NFSv4.1-ready until BOTH has been confirmed.
+    let direction = bind_connection(&client, auth, session.id(), false).await?;
+    info!(direction, "backchannel bound via BIND_CONN_TO_SESSION");
+    let reconnect_auth = auth.clone();
+    let reconnect_sessions = Arc::clone(&session_holder);
+    client.set_reconnect_handler(move |client, connection_generation| {
+        let auth = reconnect_auth.clone();
+        let sessions = Arc::clone(&reconnect_sessions);
+        async move {
+            let session = sessions.get().await;
+            let session_generation = session.generation();
+            let direction = bind_connection(&client, &auth, session.id(), true).await?;
+            info!(
+                connection_generation,
+                session_generation, direction, "NFSv4.1 connection rebound and ready"
+            );
+            Ok(())
         }
-    }
+    })?;
 
     // Always run the recall handler: OPEN 一律带 WANT_NO_DELEG，正常情况下服务器
     // 不会授予 delegation；若不合规服务器仍强塞并 CB_RECALL，则用 recall 报文里
@@ -1742,6 +1766,30 @@ pub(super) fn extract_open_delegation(data: &mut Bytes) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bind_response(session_id: [u8; 16], direction: u32) -> Bytes {
+        let mut response = Vec::new();
+        response.extend_from_slice(&0u32.to_be_bytes()); // COMPOUND status
+        response.extend_from_slice(&0u32.to_be_bytes()); // empty tag
+        response.extend_from_slice(&1u32.to_be_bytes()); // result count
+        response.extend_from_slice(&41u32.to_be_bytes()); // OP_BIND_CONN_TO_SESSION
+        response.extend_from_slice(&0u32.to_be_bytes()); // operation status
+        response.extend_from_slice(&session_id);
+        response.extend_from_slice(&direction.to_be_bytes());
+        response.extend_from_slice(&0u32.to_be_bytes()); // RDMA mode false
+        Bytes::from(response)
+    }
+
+    #[test]
+    fn bind_validation_requires_matching_session_and_backchannel() {
+        let session_id = [9; 16];
+        assert_eq!(
+            validate_bound_connection(bind_response(session_id, 3), &session_id).unwrap(),
+            3
+        );
+        assert!(validate_bound_connection(bind_response([8; 16], 3), &session_id).is_err());
+        assert!(validate_bound_connection(bind_response(session_id, 1), &session_id).is_err());
+    }
 
     #[test]
     fn effective_wsize_preserves_server_maxwrite_negotiation() {

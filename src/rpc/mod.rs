@@ -21,12 +21,14 @@ use crate::error::{NfsError, Result};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex as TokioMutex, oneshot};
+use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -190,6 +192,12 @@ impl Drop for PendingRequestGuard {
 /// The handler is synchronous — CB processing is pure parsing plus a non-blocking
 /// `try_send` to the recall channel, so it never needs to await.
 pub(crate) type BackchannelHandler = Arc<dyn Fn(Bytes) -> Option<Vec<u8>> + Send + Sync>;
+type ReconnectFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type ReconnectHandler = Arc<dyn Fn(Client, u64) -> ReconnectFuture + Send + Sync>;
+
+const CONNECTION_READY: u8 = 0;
+const CONNECTION_REBINDING: u8 = 1;
+const CONNECTION_FAILED: u8 = 2;
 
 /// Shared slot for the optional backchannel handler. Installed after the session
 /// is established (see `enable_backchannel`); read by the reader loop on each CALL.
@@ -204,6 +212,10 @@ pub(crate) struct StreamMux {
     addr: SocketAddr,
     noresvport: bool,
     generation: AtomicU64,
+    reconnect_lock: TokioMutex<()>,
+    reconnect_handler: std::sync::Mutex<Option<ReconnectHandler>>,
+    readiness: AtomicU8,
+    readiness_notify: Notify,
     reader_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// 标记 shutdown 已调用，阻止后续 reconnect 尝试
     shutdown_flag: AtomicBool,
@@ -231,6 +243,10 @@ impl StreamMux {
             addr,
             noresvport,
             generation: AtomicU64::new(0),
+            reconnect_lock: TokioMutex::new(()),
+            reconnect_handler: std::sync::Mutex::new(None),
+            readiness: AtomicU8::new(CONNECTION_READY),
+            readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
         }))
@@ -249,16 +265,48 @@ impl StreamMux {
         }
     }
 
+    fn set_reconnect_handler(&self, handler: ReconnectHandler) -> Result<()> {
+        let mut slot = self
+            .reconnect_handler
+            .lock()
+            .map_err(|_| NfsError::Rpc("reconnect handler lock poisoned".to_string()))?;
+        *slot = Some(handler);
+        Ok(())
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        loop {
+            match self.readiness.load(Ordering::Acquire) {
+                CONNECTION_READY => return Ok(()),
+                CONNECTION_FAILED => {
+                    return Err(NfsError::Rpc(
+                        "NFSv4.1 connection rebind failed; connection is not ready".to_string(),
+                    ));
+                }
+                _ => {
+                    let notified = self.readiness_notify.notified();
+                    if self.readiness.load(Ordering::Acquire) == CONNECTION_REBINDING {
+                        notified.await;
+                    }
+                }
+            }
+        }
+    }
+
     /// `header` is the pre-assembled RPC frame header + msg_body (prefix already prepended).
     /// `data` is the optional large payload (e.g. WRITE data), sent zero-copy after the header.
-    async fn send_and_receive(
+    async fn send_and_receive_inner(
         &self,
         xid: u32,
         header: &[u8],
         data: &[u8],
         data_pad: usize,
         timeout: std::time::Duration,
+        bypass_readiness: bool,
     ) -> Result<Bytes> {
+        if !bypass_readiness {
+            self.wait_until_ready().await?;
+        }
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -302,7 +350,7 @@ impl StreamMux {
         }
     }
 
-    async fn reconnect(&self, failed_gen: u64) -> Result<()> {
+    async fn reconnect(self: &Arc<Self>, failed_gen: u64) -> Result<()> {
         // 已关闭的连接不再重连
         if self.shutdown_flag.load(Ordering::Acquire) {
             return Err(NfsError::Io(std::io::Error::new(
@@ -310,6 +358,7 @@ impl StreamMux {
                 "mux is shut down",
             )));
         }
+        let _reconnect = self.reconnect_lock.lock().await;
         info!(addr = %self.addr, failed_gen, "initiating reconnection");
         // Fast path: another caller already reconnected (no lock needed).
         let current_gen = self.generation.load(Ordering::Acquire);
@@ -337,6 +386,8 @@ impl StreamMux {
                 "mux is shut down",
             )));
         }
+        self.readiness
+            .store(CONNECTION_REBINDING, Ordering::Release);
         // Abort old reader.
         if let Ok(mut guard) = self.reader_handle.lock()
             && let Some(handle) = guard.take()
@@ -373,8 +424,24 @@ impl StreamMux {
                 Arc::clone(&self.backchannel),
             )));
         }
-        self.generation.fetch_add(1, Ordering::Release);
-        info!(addr = %self.addr, generation = self.generation.load(Ordering::Acquire), "reconnection successful");
+        drop(writer);
+        let next_generation = failed_gen.saturating_add(1);
+        let handler = self
+            .reconnect_handler
+            .lock()
+            .map_err(|_| NfsError::Rpc("reconnect handler lock poisoned".to_string()))?
+            .clone();
+        if let Some(handler) = handler
+            && let Err(error) = handler(Client::new(Arc::clone(self), None), next_generation).await
+        {
+            self.readiness.store(CONNECTION_FAILED, Ordering::Release);
+            self.readiness_notify.notify_waiters();
+            return Err(error);
+        }
+        self.generation.store(next_generation, Ordering::Release);
+        self.readiness.store(CONNECTION_READY, Ordering::Release);
+        self.readiness_notify.notify_waiters();
+        info!(addr = %self.addr, generation = next_generation, "reconnection ready");
         Ok(())
     }
 
@@ -594,6 +661,17 @@ impl Client {
         self.nfs_mux.enable_backchannel(handler);
     }
 
+    pub(crate) fn set_reconnect_handler<F, Fut>(&self, handler: F) -> Result<()>
+    where
+        F: Fn(Client, u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.nfs_mux
+            .set_reconnect_handler(Arc::new(move |client, generation| {
+                Box::pin(handler(client, generation))
+            }))
+    }
+
     fn get_mux(&self, program: u32) -> Result<&Arc<StreamMux>> {
         match program {
             MOUNT_PROG => Ok(self.mount_mux.as_ref().unwrap_or(&self.nfs_mux)),
@@ -620,10 +698,31 @@ impl Client {
     /// end); the raw payload bytes and their padding are written to the stream separately.
     pub(crate) async fn call_with_data(
         &self,
+        msg_body: Vec<u8>,
+        data: Bytes,
+        max_retries: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes> {
+        self.call_with_data_inner(msg_body, data, max_retries, timeout, false)
+            .await
+    }
+
+    pub(crate) async fn call_during_reconnect(
+        &self,
+        msg_body: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes> {
+        self.call_with_data_inner(msg_body, Bytes::new(), 1, timeout, true)
+            .await
+    }
+
+    async fn call_with_data_inner(
+        &self,
         mut msg_body: Vec<u8>,
         data: Bytes,
         max_retries: usize,
         timeout: std::time::Duration,
+        bypass_readiness: bool,
     ) -> Result<Bytes> {
         const SIZE_HDR_BIT: u32 = 0x80000000;
         const PREFIX_LEN: usize = 12;
@@ -672,7 +771,7 @@ impl Client {
             );
             let r#gen = mux.generation();
             let res = mux
-                .send_and_receive(xid, &msg_body, &data, data_pad, timeout)
+                .send_and_receive_inner(xid, &msg_body, &data, data_pad, timeout, bypass_readiness)
                 .await;
 
             match res {
@@ -681,6 +780,9 @@ impl Client {
                     return parse_rpc_response(response_data, xid);
                 }
                 Err(e) => {
+                    if bypass_readiness {
+                        return Err(e);
+                    }
                     let (is_conn_error, is_timeout) = match &e {
                         NfsError::Io(io_err) => (
                             matches!(
@@ -774,6 +876,10 @@ impl Client {
             addr,
             noresvport: false,
             generation: AtomicU64::new(0),
+            reconnect_lock: TokioMutex::new(()),
+            reconnect_handler: std::sync::Mutex::new(None),
+            readiness: AtomicU8::new(CONNECTION_READY),
+            readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
         });
@@ -903,6 +1009,7 @@ pub(crate) fn get_current_time() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     async fn read_test_record(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;
@@ -929,6 +1036,70 @@ mod tests {
             .await?;
         stream.write_all(&reply).await?;
         stream.write_all(payload).await
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconnect_observers_run_one_effective_rebind() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(Notify::new());
+        let accepted_for_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let (second, _) = listener.accept().await?;
+            accepted_for_server.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, std::io::Error>((first, second))
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let binds = Arc::new(AtomicUsize::new(0));
+        let binds_for_handler = Arc::clone(&binds);
+        mux.set_reconnect_handler(Arc::new(move |_client, generation| {
+            let binds = Arc::clone(&binds_for_handler);
+            Box::pin(async move {
+                assert_eq!(generation, 1);
+                binds.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }))
+        .unwrap();
+
+        let tasks = (0..64)
+            .map(|_| {
+                let mux = Arc::clone(&mux);
+                tokio::spawn(async move { mux.reconnect(0).await })
+            })
+            .collect::<Vec<_>>();
+        accepted.notified().await;
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(binds.load(Ordering::Acquire), 1);
+        assert_eq!(mux.generation(), 1);
+        assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_READY);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_rebind_marks_replacement_connection_unready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let (second, _) = listener.accept().await?;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok::<_, std::io::Error>((first, second))
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        mux.set_reconnect_handler(Arc::new(|_client, _generation| {
+            Box::pin(async { Err(NfsError::Rpc("injected bind failure".to_string())) })
+        }))
+        .unwrap();
+
+        assert!(mux.reconnect(0).await.is_err());
+        assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
+        assert!(mux.wait_until_ready().await.is_err());
+        server.abort();
     }
 
     #[test]
