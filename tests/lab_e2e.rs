@@ -17,6 +17,7 @@ const SESSION_WSIZE_FILE: &str = "nfs-rs-e2e/session-wsize.bin";
 const NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const RECOVERY_DIR: &str = "nfs41-session-recovery";
 const RECOVERY_FILE: &str = "nfs41-session-recovery/payload.bin";
+const CALLBACK_FILE: &str = "callback-recall.bin";
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -408,6 +409,41 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     ensure(actual == expected, "post-rebind checksum payload mismatch")?;
     mount.remove_path(RECOVERY_FILE).await?;
     mount.rmdir_path(RECOVERY_DIR).await?;
+    mount.umount().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires real knfsd delegation recall and callback reply-loss proxy"]
+async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_FAULT_URL")?;
+    let ready = env::var("NFS_RS_LAB_FAULT_READY_FILE")?;
+    let completed = env::var("NFS_RS_LAB_FAULT_DONE_FILE")?;
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
+    let _ = mount.remove_path(CALLBACK_FILE).await;
+    let created = mount.create_path(CALLBACK_FILE, Some(0o600)).await?;
+    std::fs::write(&ready, b"delegation-open")?;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !std::path::Path::new(&completed).exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("callback retransmission was not observed"))?;
+
+    let expected = payload();
+    write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
+    mount.close(created.fh).await?;
+    let opened = mount.open_path(CALLBACK_FILE, OPEN_READ).await?;
+    let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+    mount.close(opened.fh).await?;
+    ensure(actual == expected, "post-callback checksum mismatch")?;
+    mount.remove_path(CALLBACK_FILE).await?;
     mount.umount().await?;
     Ok(())
 }

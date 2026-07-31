@@ -1013,13 +1013,19 @@ pub(crate) struct OpenArgs {
     pub create_attrs_mask: Vec<u32>,
     pub create_attrs_vals: Vec<u8>,
     pub claim_file: String,
+    pub want_no_delegation: bool,
 }
 
 impl OpenArgs {
     fn encode(&self, buf: &mut Vec<u8>) {
         xdr_u32(buf, self.seqid);
         // 统一附加 WANT_NO_DELEG：合规服务器（knfsd/ONTAP）将不再授予 delegation
-        xdr_u32(buf, self.share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG);
+        let share_access = if self.want_no_delegation {
+            self.share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG
+        } else {
+            self.share_access
+        };
+        xdr_u32(buf, share_access);
         xdr_u32(buf, self.share_deny);
         // open_owner4
         xdr_u64(buf, self.client_id);

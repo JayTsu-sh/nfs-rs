@@ -82,6 +82,7 @@ impl Mount41 {
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
             claim_file: name.to_string(),
+            want_no_delegation: true,
         };
         let resp = self
             .compound("setxattr-open", |b| {

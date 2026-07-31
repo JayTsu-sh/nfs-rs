@@ -306,6 +306,7 @@ struct MountArgs {
     rsize: u32,
     wsize: u32,
     noresvport: bool,
+    retain_delegations: bool,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -454,6 +455,12 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         false,
         "specified URL contains bad noresvport value",
     )?;
+    let retain_delegations = get_url_query_param(
+        &parsed_url,
+        "retain-delegations",
+        false,
+        "specified URL contains bad retain-delegations value",
+    )?;
     let host = parsed_url.host_str().unwrap_or_default().to_string();
     Ok(MountArgs {
         versions,
@@ -468,6 +475,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         rsize,
         wsize,
         noresvport,
+        retain_delegations,
     })
 }
 
@@ -943,6 +951,7 @@ mod tests {
             rsize: Default::default(),
             wsize: Default::default(),
             noresvport: Default::default(),
+            retain_delegations: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -965,6 +974,7 @@ mod tests {
             rsize: Default::default(),
             wsize: Default::default(),
             noresvport: Default::default(),
+            retain_delegations: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -987,6 +997,7 @@ mod tests {
             rsize: Default::default(),
             wsize: Default::default(),
             noresvport: Default::default(),
+            retain_delegations: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
