@@ -15,6 +15,11 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
 
+`capability-report.sh` performs read-only discovery of the NFS implementation,
+pNFS configuration, installed fault tools, repository-owned lab commands, and
+the `ci-runner` sudo allow-list. Nightly uploads its output as an artifact. It
+must not change service or network state.
+
 `run-e2e.sh` mounts the isolated run directory on both source and destination
 over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,
 directory and file creation, chunked write/commit/read, attributes, READDIR,

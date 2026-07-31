@@ -103,3 +103,28 @@ fn production_code_has_no_unwrap_or_expect() {
         }
     }
 }
+
+#[test]
+fn lab_capability_probe_is_read_only() {
+    let path = workspace_path("tests/lab/capability-report.sh");
+    let source = fs::read_to_string(&path).expect("capability probe must be readable");
+    for forbidden in [
+        "systemctl restart",
+        "systemctl stop",
+        "systemctl kill",
+        "service restart",
+        "iptables -",
+        "nft add",
+        "nft delete",
+        "tc qdisc",
+        "killall",
+        "pkill",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "read-only capability probe contains forbidden mutation: {forbidden}"
+        );
+    }
+    assert!(source.contains("sudo -n -l"));
+    assert!(source.contains("terrasync-lab-nfs-status"));
+}
