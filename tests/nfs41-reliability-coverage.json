@@ -8,7 +8,7 @@
   ],
   "tests": [
     {"id":"T01","ci":"nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound","nightly":"existing-v41-modifying-compound-e2e","required":true},
-    {"id":"T02","ci":"error::tests::replay_protocol_errors_have_operation_aware_outcomes","nightly":"blocked-capability:retry-uncached-injection","required":true},
+    {"id":"T02","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"blocked-capability:retry-uncached-injection","required":true},
     {"id":"T03","ci":"error::tests::replay_protocol_errors_have_operation_aware_outcomes","nightly":"blocked-capability:seq-false-retry-injection","required":true},
     {"id":"T04","ci":"planned:renewal-validation","nightly":"planned:renewal-session-fault","required":true},
     {"id":"T05","ci":"planned:recovery-convergence","nightly":"planned:parallel-session-invalidation","required":true},
@@ -28,9 +28,9 @@
     {"id":"T19","ci":"error::tests::outcome_error_preserves_source_without_payload_context","nightly":"planned:artifact-redaction","required":true},
     {"id":"T20","ci":"existing-all-targets","nightly":"existing-v3-v41-e2e","required":true},
     {"id":"T21","ci":"planned:repeated-renew-reconnect","nightly":"planned:three-lease-intervals","required":true},
-    {"id":"T22","ci":"planned:cancellation-cleanup","nightly":"planned:workflow-cleanup","required":true},
-    {"id":"T23","ci":"nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound","nightly":"existing-v41-session-limited-large-write","required":true},
+    {"id":"T22","ci":"nfs41::session::tests::cancellation_keeps_armed_slot_fenced","nightly":"existing-workflow-cleanup","required":true},
+    {"id":"T23","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"existing-v41-session-limited-large-write","required":true},
     {"id":"T24","ci":"production_code_has_no_unwrap_or_expect","nightly":"planned:fault-no-process-panic","required":true},
-    {"id":"T25","ci":"planned:performance-structural","nightly":"planned:before-after-performance","required":true}
+    {"id":"T25","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"planned:before-after-performance","required":true}
   ]
 }

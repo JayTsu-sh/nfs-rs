@@ -168,6 +168,19 @@ impl GETPORT2args {
 
 type PendingMap = Arc<std::sync::Mutex<HashMap<u32, oneshot::Sender<Result<Bytes>>>>>;
 
+struct PendingRequestGuard {
+    pending: PendingMap,
+    xid: u32,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending.lock() {
+            map.remove(&self.xid);
+        }
+    }
+}
+
 /// Handler for inbound NFSv4.1 backchannel CALLs (server→client CB_COMPOUND).
 ///
 /// Input: the full RPC CALL frame, starting at the xid (record mark already stripped).
@@ -251,6 +264,10 @@ impl StreamMux {
             .lock()
             .map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?
             .insert(xid, tx);
+        let _pending_guard = PendingRequestGuard {
+            pending: Arc::clone(&self.pending),
+            xid,
+        };
 
         // Write request under the writer lock — released before awaiting the response.
         // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
@@ -269,12 +286,7 @@ impl StreamMux {
             .await
         };
 
-        if let Err(e) = write_result {
-            if let Ok(mut map) = self.pending.lock() {
-                map.remove(&xid);
-            }
-            return Err(e);
-        }
+        write_result?;
 
         // Wait for response from the reader task with timeout.
         match tokio::time::timeout(timeout, rx).await {
@@ -283,15 +295,10 @@ impl StreamMux {
                 std::io::ErrorKind::BrokenPipe,
                 "reader task terminated",
             ))),
-            Err(_) => {
-                if let Ok(mut map) = self.pending.lock() {
-                    map.remove(&xid);
-                }
-                Err(NfsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "RPC response timeout",
-                )))
-            }
+            Err(_) => Err(NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "RPC response timeout",
+            ))),
         }
     }
 
@@ -897,6 +904,33 @@ pub(crate) fn get_current_time() -> u32 {
 mod tests {
     use super::*;
 
+    async fn read_test_record(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+        let marker = stream.read_u32().await?;
+        let len = (marker & 0x7fff_ffff) as usize;
+        let mut record = vec![0; len];
+        stream.read_exact(&mut record).await?;
+        Ok(record)
+    }
+
+    async fn write_test_rpc_reply(
+        stream: &mut tokio::net::TcpStream,
+        xid: u32,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        let mut reply = Vec::with_capacity(24 + payload.len());
+        reply.extend_from_slice(&xid.to_be_bytes());
+        reply.extend_from_slice(&(MessageType::Response as u32).to_be_bytes());
+        reply.extend_from_slice(&(MessageStatus::Accepted as u32).to_be_bytes());
+        reply.extend_from_slice(&0u32.to_be_bytes()); // AUTH_NONE
+        reply.extend_from_slice(&0u32.to_be_bytes()); // verifier length
+        reply.extend_from_slice(&(AcceptStatus::Success as u32).to_be_bytes());
+        stream
+            .write_u32(0x8000_0000 | reply.len().saturating_add(payload.len()) as u32)
+            .await?;
+        stream.write_all(&reply).await?;
+        stream.write_all(payload).await
+    }
+
     #[test]
     fn message_rpc_version() {
         // Program field is at offset 4 in the body: rpcvers(4) prog(4) vers(4) proc(4)
@@ -937,5 +971,109 @@ mod tests {
             "portmap error should expose underlying detail, got: {}",
             msg
         );
+    }
+
+    #[tokio::test]
+    async fn retransmission_changes_only_xid_and_preserves_zero_copy_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_test_record(&mut stream).await?;
+            let second = read_test_record(&mut stream).await?;
+            if first.len() < 8 || second.len() < 8 {
+                return Err(std::io::Error::other("RPC request too short"));
+            }
+            if first[0..4] == second[0..4] {
+                return Err(std::io::Error::other(
+                    "transport attempts must use distinct XIDs",
+                ));
+            }
+            if first[4..] != second[4..] {
+                return Err(std::io::Error::other(
+                    "logical request changed across retransmission",
+                ));
+            }
+            let xid = BigEndian::read_u32(&second[0..4]);
+            write_test_rpc_reply(&mut stream, xid, b"cached-result").await?;
+            Ok::<(Vec<u8>, Vec<u8>), std::io::Error>((first, second))
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(mux, None);
+        let payload = Bytes::from(vec![0x5a; 64 * 1024]);
+        let payload_ptr = payload.as_ptr();
+        let session_id = [0x33; 16];
+        let state_id = [0x44; 16];
+        let builder = crate::nfs41::compound::CompoundBuilder::new("retry-write")
+            .sequence(&session_id, 17, 3, 7)
+            .putfh(b"file-handle")
+            .write_header(&state_id, 4096, 2, payload.len() as u32)
+            .apply_sequence_cache_policy(4096)
+            .unwrap();
+        let mut body = Vec::new();
+        builder.encode_with_header(&Auth::new_null(), &mut body);
+        let response = client
+            .call_with_data(
+                body,
+                payload.clone(),
+                2,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"cached-result"[..]);
+        assert_eq!(payload.as_ptr(), payload_ptr);
+
+        let (first, second) = server.await.unwrap().unwrap();
+        let mut request_identity = Vec::from(session_id);
+        request_identity.extend_from_slice(&17u32.to_be_bytes());
+        request_identity.extend_from_slice(&3u32.to_be_bytes());
+        assert!(
+            first
+                .windows(request_identity.len())
+                .any(|window| window == request_identity)
+        );
+        assert_eq!(&first[first.len() - payload.len()..], payload.as_ref());
+        assert_eq!(&second[second.len() - payload.len()..], payload.as_ref());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_rpc_removes_pending_xid() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _request = read_test_record(&mut stream).await?;
+            let _ = received_tx.send(());
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(Arc::clone(&mux), None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        let call_client = client.clone();
+        let call = tokio::spawn(async move {
+            call_client
+                .call(body, 1, std::time::Duration::from_secs(30))
+                .await
+        });
+        received_rx.await.unwrap();
+        call.abort();
+        let _ = call.await;
+        tokio::task::yield_now().await;
+        assert_eq!(mux.pending.lock().unwrap().len(), 0);
+
+        server.abort();
+        let _ = server.await;
+        client.shutdown().await;
     }
 }

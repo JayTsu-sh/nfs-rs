@@ -95,6 +95,8 @@ struct SlotTable {
     free_pool: std::sync::Mutex<VecDeque<u32>>,
     /// Semaphore for bounded backpressure.
     semaphore: Semaphore,
+    /// Permanently retained ambiguous slots in this session generation.
+    fenced_slots: AtomicU32,
 }
 
 /// A single slot in the session's slot table.
@@ -109,7 +111,13 @@ pub(crate) struct AcquiredSlot<'a> {
     pub sequence_id: u32,
     table: &'a SlotTable,
     slot: &'a Slot,
-    released: bool,
+    disposition: SlotDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotDisposition {
+    Release,
+    Fence,
 }
 
 impl SlotTable {
@@ -125,6 +133,7 @@ impl SlotTable {
             semaphore: Semaphore::new(num),
             free_pool: std::sync::Mutex::new(free_pool),
             slots,
+            fenced_slots: AtomicU32::new(0),
         }
     }
 
@@ -154,7 +163,7 @@ impl SlotTable {
             sequence_id: seq_id,
             table: self,
             slot,
-            released: false,
+            disposition: SlotDisposition::Release,
         })
     }
 
@@ -168,6 +177,19 @@ impl SlotTable {
 }
 
 impl AcquiredSlot<'_> {
+    /// Fence this slot if the request future is cancelled or exits without an
+    /// authoritative result. The permit is intentionally retained until the
+    /// session is replaced, preventing a different request from reusing an
+    /// ambiguous sequence ID.
+    pub fn fence_on_drop(&mut self) {
+        self.disposition = SlotDisposition::Fence;
+    }
+
+    /// Mark the logical request terminal so Drop can return the slot.
+    pub fn resolve(&mut self) {
+        self.disposition = SlotDisposition::Release;
+    }
+
     /// Advance the slot's sequence ID after a successful COMPOUND response.
     pub fn advance(&self) {
         self.slot.sequence_id.fetch_add(1, Ordering::Release);
@@ -183,9 +205,13 @@ impl AcquiredSlot<'_> {
 
 impl Drop for AcquiredSlot<'_> {
     fn drop(&mut self) {
-        if !self.released {
-            self.released = true;
+        if self.disposition == SlotDisposition::Release {
             self.table.release(self.slot_id);
+        } else {
+            let fenced = self.table.fenced_slots.fetch_add(1, Ordering::AcqRel) + 1;
+            if fenced as usize >= self.table.slots.len() {
+                self.table.semaphore.close();
+            }
         }
     }
 }
@@ -605,6 +631,61 @@ mod tests {
         tokio::task::yield_now().await;
         let slot2 = table.acquire().await.unwrap();
         assert_eq!(slot2.slot_id, 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_slot_is_not_reused() {
+        let table = SlotTable::new(1);
+        {
+            let mut slot = table.acquire().await.unwrap();
+            slot.fence_on_drop();
+        }
+        let acquire =
+            tokio::time::timeout(std::time::Duration::from_millis(20), table.acquire()).await;
+        assert!(
+            !matches!(acquire, Ok(Ok(_))),
+            "fenced slot must retain its permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_slot_is_released_after_being_armed() {
+        let table = SlotTable::new(1);
+        {
+            let mut slot = table.acquire().await.unwrap();
+            slot.fence_on_drop();
+            slot.resolve();
+        }
+        let slot = tokio::time::timeout(std::time::Duration::from_millis(100), table.acquire())
+            .await
+            .expect("resolved slot should be available")
+            .expect("slot acquisition should succeed");
+        assert_eq!(slot.slot_id, 0);
+        assert_eq!(slot.sequence_id, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_armed_slot_fenced() {
+        let table = Arc::new(SlotTable::new(1));
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let table_for_task = Arc::clone(&table);
+        let acquired_for_task = Arc::clone(&acquired);
+        let task = tokio::spawn(async move {
+            let mut slot = table_for_task.acquire().await.unwrap();
+            slot.fence_on_drop();
+            acquired_for_task.notify_one();
+            std::future::pending::<()>().await;
+        });
+        acquired.notified().await;
+        task.abort();
+        let _ = task.await;
+
+        let acquire =
+            tokio::time::timeout(std::time::Duration::from_millis(20), table.acquire()).await;
+        assert!(
+            !matches!(acquire, Ok(Ok(_))),
+            "cancellation must not release an ambiguous slot"
+        );
     }
 
     #[test]

@@ -20,7 +20,13 @@ jobs:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Discover persisted Rust toolchain
+        run: echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+      - name: Use pre-provisioned Rust 1.95.0
+        run: |
+          rustup toolchain list | grep -q '^1\.95\.0-'
+          rustup default 1.95.0
+          rustc --version --verbose
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
