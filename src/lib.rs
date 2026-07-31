@@ -1175,6 +1175,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_retain_delegations_is_explicit_and_default_off() {
+        let default = parse_url("nfs://127.0.0.1/export?version=4.1").unwrap();
+        let enabled =
+            parse_url("nfs://127.0.0.1/export?version=4.1&retain-delegations=true").unwrap();
+        assert!(!default.retain_delegations);
+        assert!(enabled.retain_delegations);
+        assert!(parse_url("nfs://127.0.0.1/export?version=4.1&retain-delegations=maybe").is_err());
+    }
+
+    #[test]
     fn parse_url_noresvport_explicit_false() {
         let args = parse_url("nfs://127.0.0.1/some/export?noresvport=false").unwrap();
         assert!(!args.noresvport, "noresvport=false should parse to false");

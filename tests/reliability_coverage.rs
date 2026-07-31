@@ -151,6 +151,7 @@ fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
         .expect("NFS fault helper must be readable");
     assert!(source.contains("apply-session-fault)"));
     assert!(source.contains("apply-tcp-reset)"));
+    assert!(source.contains("trigger-delegation-recall)"));
     assert!(source.contains("status)"));
     assert!(source.contains("restore)"));
     assert!(source.contains("^(nightly|release)-"));
@@ -182,6 +183,17 @@ fn callback_fault_coverage_is_explicit_and_capability_honest() {
         runner
             .contains("scripted_callback_reply_loss_replays_cached_body_and_executes_recall_once")
     );
-    assert!(capabilities.contains("selective_callback_reply_loss=unsupported"));
-    assert!(capabilities.contains("inline RPC-aware proxy or server tracepoint"));
+    assert!(capabilities.contains("selective_callback_reply_loss=supported"));
+    assert!(capabilities.contains("callback_retransmission=supported"));
+    assert!(workflow.contains("tests/lab/run-real-callback-replay-e2e.sh"));
+    let proxy = fs::read_to_string(workspace_path("tests/lab/rpc-callback-drop-proxy.py"))
+        .expect("callback proxy must be readable");
+    for evidence in [
+        "callback-reply-dropped",
+        "callback-retransmit-injected",
+        "fore-call-held",
+        "replay_forwarded",
+    ] {
+        assert!(proxy.contains(evidence), "proxy lacks {evidence} state");
+    }
 }
