@@ -24,6 +24,7 @@ async def main():
     host, port = args.upstream.rsplit(":", 1)
     callback_seen = asyncio.Event()
     dropped = False
+    held_calls = []
 
     async def handle(client_r, client_w):
         nonlocal dropped
@@ -32,27 +33,41 @@ async def main():
         async def server_to_client():
             while True:
                 record = await read_record(server_r)
-                if len(record) >= 8 and struct.unpack(">I", record[4:8])[0] == 0:
+                is_cb_compound = (
+                    len(record) >= 24
+                    and struct.unpack(">I", record[4:8])[0] == 0
+                    and struct.unpack(">I", record[20:24])[0] == 1
+                )
+                if is_cb_compound:
                     callback_seen.set()
                     with open(args.events, "a") as out:
-                        out.write("callback-call\\n")
+                        out.write("callback-call\n")
                 await write_record(client_w, record)
 
         async def client_to_server():
             nonlocal dropped
             while True:
                 record = await read_record(client_r)
-                is_reply = (
-                    len(record) >= 8 and struct.unpack(">I", record[4:8])[0] == 1
-                )
+                msg_type = struct.unpack(">I", record[4:8])[0] if len(record) >= 8 else -1
+                is_reply = msg_type == 1
                 if is_reply and callback_seen.is_set() and not dropped:
                     dropped = True
                     with open(args.events, "a") as out:
-                        out.write("callback-reply-dropped\\n")
+                        out.write("callback-reply-dropped\n")
                     continue
                 if is_reply and callback_seen.is_set():
                     with open(args.events, "a") as out:
-                        out.write("callback-reply-forwarded\\n")
+                        out.write("callback-reply-forwarded\n")
+                    await write_record(server_w, record)
+                    for held in held_calls:
+                        await write_record(server_w, held)
+                    held_calls.clear()
+                    continue
+                if msg_type == 0 and dropped:
+                    held_calls.append(record)
+                    with open(args.events, "a") as out:
+                        out.write("fore-call-held\n")
+                    continue
                 await write_record(server_w, record)
 
         try:
