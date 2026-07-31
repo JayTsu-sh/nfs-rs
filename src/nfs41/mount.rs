@@ -529,6 +529,7 @@ impl std::fmt::Debug for Mount41 {
             .field("root_fh_len", &self.root_fh.len())
             .field("rsize", &self.rsize)
             .field("wsize", &self.wsize)
+            .field("lease_health", &self.lease_renewal.health())
             .field("state", &"StateManager")
             .field("layout_manager", &"LayoutManager")
             .finish()
