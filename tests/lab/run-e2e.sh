@@ -15,4 +15,4 @@ urls=(
 export NFS_RS_LAB_E2E=1
 export NFS_RS_LAB_URLS="${urls[*]}"
 
-cargo test --locked --test lab_e2e -- --ignored --nocapture
+cargo test --locked --test lab_e2e nfs_v3_and_v41_end_to_end -- --ignored --nocapture
