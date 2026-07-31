@@ -286,9 +286,7 @@ impl StreamMux {
             .await
         };
 
-        if let Err(e) = write_result {
-            return Err(e);
-        }
+        write_result?;
 
         // Wait for response from the reader task with timeout.
         match tokio::time::timeout(timeout, rx).await {
