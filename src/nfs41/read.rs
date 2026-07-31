@@ -46,7 +46,9 @@ impl Mount41 {
         let stateid = sid.raw;
         let resp = self
             .compound_data("read", count as usize, |b| {
-                b.putfh(fh).read(&stateid, offset, count)
+                b.require_generation(sid.generation)
+                    .putfh(fh)
+                    .read(&stateid, offset, count)
             })
             .await?;
         resp.op_ok(1)?; // PUTFH

@@ -260,6 +260,7 @@ mod tests {
                 status,
                 data: Bytes::from(data),
             }],
+            session_generation: 1,
         }
     }
 

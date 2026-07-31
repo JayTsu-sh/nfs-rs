@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly service_unit="nfs-server.service"
+readonly state_root="/run/terrasync-lab-nfs-fault"
+readonly lock_file="/run/lock/terrasync-lab-nfs-fault.lock"
+
+action="${1:-}"
+run_id="${2:-}"
+
+if [[ ! "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]]; then
+  echo "invalid run id" >&2
+  exit 2
+fi
+
+mkdir -p "$state_root"
+exec 9>"$lock_file"
+flock --wait 30 9
+marker="$state_root/$run_id"
+
+case "$action" in
+  apply-session-fault)
+    if [[ -e "$marker" ]]; then
+      echo "session fault already applied for $run_id"
+      exit 0
+    fi
+    systemctl is-active --quiet "$service_unit" || {
+      echo "$service_unit is not active; refusing to alter pre-existing state" >&2
+      exit 1
+    }
+    : >"$marker"
+    if ! systemctl restart "$service_unit"; then
+      systemctl start "$service_unit" || true
+      rm -f -- "$marker"
+      echo "failed to restart $service_unit" >&2
+      exit 1
+    fi
+    systemctl is-active --quiet "$service_unit"
+    echo "session fault applied for $run_id; $service_unit is active"
+    ;;
+  status)
+    systemctl is-active "$service_unit"
+    if [[ -e "$marker" ]]; then
+      echo "fault-marker=present"
+    else
+      echo "fault-marker=absent"
+    fi
+    ;;
+  restore)
+    if [[ ! -e "$marker" ]]; then
+      echo "no session fault recorded for $run_id"
+      exit 0
+    fi
+    systemctl start "$service_unit"
+    systemctl is-active --quiet "$service_unit"
+    rm -f -- "$marker"
+    echo "session fault restored for $run_id"
+    ;;
+  *)
+    echo "usage: $0 {apply-session-fault|status|restore} RUN_ID" >&2
+    exit 2
+    ;;
+esac

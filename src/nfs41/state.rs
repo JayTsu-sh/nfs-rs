@@ -7,6 +7,7 @@
 //! - `close(fh)`: decrements ref_count, sends CLOSE when it reaches 0
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::RwLock;
@@ -16,16 +17,31 @@ use tracing::debug;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct StateId {
     pub raw: [u8; 16],
+    pub generation: u64,
 }
 
 impl StateId {
     /// Anonymous stateid (all-zeros) — used for operations that don't require OPEN.
     pub fn anonymous() -> Self {
-        Self { raw: [0u8; 16] }
+        Self {
+            raw: [0u8; 16],
+            generation: 0,
+        }
     }
 
+    #[cfg(test)]
     pub fn from_bytes(bytes: &[u8; 16]) -> Self {
-        Self { raw: *bytes }
+        Self {
+            raw: *bytes,
+            generation: 1,
+        }
+    }
+
+    pub fn from_bytes_at(bytes: &[u8; 16], generation: u64) -> Self {
+        Self {
+            raw: *bytes,
+            generation,
+        }
     }
 }
 
@@ -73,6 +89,7 @@ struct OpenState {
     stateid: StateId,
     access: AccessMode,
     ref_count: u32,
+    generation: u64,
 }
 
 /// Manages OPEN/CLOSE stateids for NFSv4.1 files.
@@ -84,13 +101,23 @@ pub(crate) struct StateManager {
     /// Uses `tokio::sync::RwLock` per CLAUDE.md (async context, not Mutex).
     /// Keys are `Bytes` (zero-copy, ref-counted) instead of `Vec<u8>`.
     open_files: RwLock<HashMap<Bytes, OpenState>>,
+    active_generation: AtomicU64,
 }
 
 impl StateManager {
     pub fn new() -> Self {
         Self {
             open_files: RwLock::new(HashMap::new()),
+            active_generation: AtomicU64::new(1),
         }
+    }
+
+    pub async fn transition_to(&self, generation: u64) {
+        // Fence stale state before awaiting the cleanup lock. Accessors and
+        // registration validate this value, making cancellation fail closed.
+        self.active_generation.store(generation, Ordering::Release);
+        let mut files = self.open_files.write().await;
+        files.clear();
     }
 
     /// Get the stateid for a file, or return anonymous stateid if not opened.
@@ -98,20 +125,36 @@ impl StateManager {
     pub async fn get_stateid(&self, fh: &Bytes) -> StateId {
         let files = self.open_files.read().await;
         match files.get(fh) {
-            Some(state) => state.stateid.clone(),
-            None => StateId::anonymous(),
+            Some(state) if state.generation == self.active_generation.load(Ordering::Acquire) => {
+                state.stateid.clone()
+            }
+            Some(_) | None => StateId::anonymous(),
         }
     }
 
     /// Register an OPEN result. Called after a successful OPEN COMPOUND.
-    pub async fn register_open(&self, fh: &Bytes, stateid: StateId, access: AccessMode) {
+    pub async fn register_open(
+        &self,
+        fh: &Bytes,
+        stateid: StateId,
+        access: AccessMode,
+    ) -> Result<(), crate::error::NfsError> {
         let mut files = self.open_files.write().await;
+        let active = self.active_generation.load(Ordering::Acquire);
+        if stateid.generation != active {
+            return Err(crate::error::NfsError::Rpc(format!(
+                "cannot register OPEN from generation {}, active {active}",
+                stateid.generation
+            )));
+        }
+        let generation = stateid.generation;
         match files.get_mut(fh) {
             Some(existing) => {
                 // Upgrade access mode and update stateid
                 existing.access = existing.access.upgrade(access);
                 existing.stateid = stateid;
                 existing.ref_count += 1;
+                existing.generation = generation;
                 debug!(
                     fh_len = fh.len(),
                     ref_count = existing.ref_count,
@@ -125,11 +168,13 @@ impl StateManager {
                         stateid,
                         access,
                         ref_count: 1,
+                        generation,
                     },
                 );
                 debug!(fh_len = fh.len(), "state: new open registered");
             }
         }
+        Ok(())
     }
 
     /// Release a reference. Returns true if ref_count reached 0 (caller should CLOSE).
@@ -175,7 +220,9 @@ impl StateManager {
     pub async fn has_open(&self, fh: &Bytes, access: AccessMode) -> Option<StateId> {
         let files = self.open_files.read().await;
         files.get(fh).and_then(|state| {
-            if state.access.covers(access) {
+            if state.generation == self.active_generation.load(Ordering::Acquire)
+                && state.access.covers(access)
+            {
                 Some(state.stateid.clone())
             } else {
                 None
@@ -196,7 +243,9 @@ mod tests {
 
         assert_eq!(mgr.get_stateid(&fh).await, StateId::anonymous());
 
-        mgr.register_open(&fh, sid.clone(), AccessMode::Read).await;
+        mgr.register_open(&fh, sid.clone(), AccessMode::Read)
+            .await
+            .unwrap();
         assert_eq!(mgr.get_stateid(&fh).await, sid);
     }
 
@@ -206,8 +255,12 @@ mod tests {
         let fh = Bytes::from_static(b"test_fh");
         let sid = StateId::from_bytes(&[2u8; 16]);
 
-        mgr.register_open(&fh, sid.clone(), AccessMode::Read).await;
-        mgr.register_open(&fh, sid.clone(), AccessMode::Read).await;
+        mgr.register_open(&fh, sid.clone(), AccessMode::Read)
+            .await
+            .unwrap();
+        mgr.register_open(&fh, sid.clone(), AccessMode::Read)
+            .await
+            .unwrap();
 
         // First release: ref_count goes to 1
         assert!(mgr.release(&fh).await.is_none());
@@ -224,13 +277,16 @@ mod tests {
         let sid1 = StateId::from_bytes(&[3u8; 16]);
         let sid2 = StateId::from_bytes(&[4u8; 16]);
 
-        mgr.register_open(&fh, sid1, AccessMode::Read).await;
+        mgr.register_open(&fh, sid1, AccessMode::Read)
+            .await
+            .unwrap();
         assert!(mgr.has_open(&fh, AccessMode::Read).await.is_some());
         assert!(mgr.has_open(&fh, AccessMode::Write).await.is_none());
 
         // Upgrade to Both
         mgr.register_open(&fh, sid2.clone(), AccessMode::Write)
-            .await;
+            .await
+            .unwrap();
         assert!(mgr.has_open(&fh, AccessMode::Read).await.is_some());
         assert!(mgr.has_open(&fh, AccessMode::Write).await.is_some());
         assert!(mgr.has_open(&fh, AccessMode::Both).await.is_some());
@@ -245,14 +301,42 @@ mod tests {
         let sid2 = StateId::from_bytes(&[20u8; 16]);
 
         mgr.register_open(&fh1, sid1.clone(), AccessMode::Read)
-            .await;
+            .await
+            .unwrap();
         mgr.register_open(&fh2, sid2.clone(), AccessMode::Write)
-            .await;
+            .await
+            .unwrap();
 
         let pairs = mgr.drain().await;
         assert_eq!(pairs.len(), 2);
         // All cleared
         assert_eq!(mgr.get_stateid(&fh1).await, StateId::anonymous());
         assert_eq!(mgr.get_stateid(&fh2).await, StateId::anonymous());
+    }
+
+    #[tokio::test]
+    async fn transition_rejects_late_open_from_old_generation() {
+        let mgr = StateManager::new();
+        let fh = Bytes::from_static(b"generation-fh");
+        let old = StateId::from_bytes_at(&[1; 16], 1);
+        mgr.register_open(&fh, old, AccessMode::Write)
+            .await
+            .unwrap();
+
+        mgr.transition_to(2).await;
+        assert_eq!(mgr.get_stateid(&fh).await, StateId::anonymous());
+        let late = StateId::from_bytes_at(&[2; 16], 1);
+        assert!(
+            mgr.register_open(&fh, late, AccessMode::Write)
+                .await
+                .is_err()
+        );
+        assert_eq!(mgr.get_stateid(&fh).await, StateId::anonymous());
+
+        let current = StateId::from_bytes_at(&[3; 16], 2);
+        mgr.register_open(&fh, current.clone(), AccessMode::Write)
+            .await
+            .unwrap();
+        assert_eq!(mgr.get_stateid(&fh).await, current);
     }
 }

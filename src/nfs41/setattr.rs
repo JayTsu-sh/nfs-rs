@@ -79,7 +79,7 @@ impl Mount41 {
 
         let resp = self
             .compound("lock", |b| {
-                b.putfh(&fh).lock(
+                b.require_generation(sid.generation).putfh(&fh).lock(
                     lock_type,
                     false, // reclaim
                     offset,
