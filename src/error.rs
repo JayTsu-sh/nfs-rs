@@ -16,6 +16,78 @@
 
 use thiserror::Error;
 
+/// Retry/recovery safety of an NFS operation after an authoritative result is unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationOutcome {
+    /// The request is known not to have taken effect.
+    DefiniteFailure,
+    /// Repeating the operation is safe because it is read-only or idempotent.
+    SafeToRetry,
+    /// The request may have taken effect; blind retry can duplicate a mutation.
+    Uncertain,
+}
+
+/// Protocol-level side-effect class used for migration recovery decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationClass {
+    ReadOnly,
+    SessionControl,
+    ReplaySensitive,
+}
+
+/// Recovery action recommended to callers without requiring string parsing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryAction {
+    Retry,
+    Reopen,
+    Remount,
+    VerifyThenResume,
+    DoNotRetry,
+}
+
+/// Bounded request identity. It deliberately excludes file handles and payload bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestContext {
+    pub operation: String,
+    pub session_id: [u8; 16],
+    pub slot_id: u32,
+    pub sequence_id: u32,
+}
+
+/// Structured disposition for an operation whose normal result was not returned.
+#[derive(Error, Debug)]
+#[error("{outcome:?} NFS operation {operation_class:?}; recovery={recovery:?}")]
+pub struct OperationOutcomeError {
+    pub outcome: OperationOutcome,
+    pub operation_class: OperationClass,
+    pub recovery: RecoveryAction,
+    #[source]
+    pub source: Box<NfsError>,
+    context: RequestContext,
+}
+
+impl OperationOutcomeError {
+    pub fn new(
+        outcome: OperationOutcome,
+        operation_class: OperationClass,
+        recovery: RecoveryAction,
+        context: RequestContext,
+        source: NfsError,
+    ) -> Self {
+        Self {
+            outcome,
+            operation_class,
+            recovery,
+            source: Box::new(source),
+            context,
+        }
+    }
+
+    pub fn context(&self) -> &RequestContext {
+        &self.context
+    }
+}
+
 /// Structured error type for NFS operations.
 ///
 /// Replaces the previous `std::io::Error` + `ErrorKind::Other` pattern,
@@ -57,9 +129,21 @@ pub enum NfsError {
     /// Server returned rdattr_error for an entry (READDIRPLUS per-entry error).
     #[error("rdattr_error: server returned nfsstat4 {0} for entry attributes")]
     RdattrError(u32),
+
+    /// An operation failed without an authoritative result and carries retry guidance.
+    #[error(transparent)]
+    OperationOutcome(#[from] Box<OperationOutcomeError>),
 }
 
 impl NfsError {
+    /// Returns structured retry/verification guidance when the result is non-authoritative.
+    pub fn operation_outcome(&self) -> Option<&OperationOutcomeError> {
+        match self {
+            Self::OperationOutcome(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// 目标已存在（NFS3ERR_EXIST / NFS4ERR_EXIST，errno 17）
     pub fn is_exist(&self) -> bool {
         matches!(
@@ -91,8 +175,43 @@ impl NfsError {
             NfsError::Unsupported(_) => std::io::ErrorKind::Unsupported,
             NfsError::InvalidInput(_) => std::io::ErrorKind::InvalidInput,
             NfsError::RdattrError(_) => std::io::ErrorKind::Other,
+            NfsError::OperationOutcome(_) => std::io::ErrorKind::Other,
         }
     }
+}
+
+pub(crate) fn classify_sent_nfs41_error(
+    operation_class: OperationClass,
+    context: RequestContext,
+    source: NfsError,
+) -> NfsError {
+    let lacks_authoritative_result = matches!(
+        &source,
+        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
+    ) || matches!(
+        &source,
+        NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP)
+            | NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY)
+    );
+    if !lacks_authoritative_result {
+        return source;
+    }
+
+    let (outcome, recovery) = match operation_class {
+        OperationClass::ReadOnly => (OperationOutcome::SafeToRetry, RecoveryAction::Retry),
+        OperationClass::SessionControl => (OperationOutcome::Uncertain, RecoveryAction::Remount),
+        OperationClass::ReplaySensitive => (
+            OperationOutcome::Uncertain,
+            RecoveryAction::VerifyThenResume,
+        ),
+    };
+    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+        outcome,
+        operation_class,
+        recovery,
+        context,
+        source,
+    )))
 }
 
 /// Convenience alias used throughout the crate.
@@ -115,6 +234,7 @@ impl From<NfsError> for std::io::Error {
             NfsError::RdattrError(code) => {
                 std::io::Error::other(format!("rdattr_error: nfsstat4 {}", code))
             }
+            NfsError::OperationOutcome(error) => std::io::Error::other(error),
         }
     }
 }
@@ -122,6 +242,7 @@ impl From<NfsError> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn nfs3_error_display() {
@@ -261,5 +382,111 @@ mod tests {
         let nfs_err = NfsError::Io(original);
         let io_err: std::io::Error = nfs_err.into();
         assert_eq!(io_err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    fn context() -> RequestContext {
+        RequestContext {
+            operation: "write".to_string(),
+            session_id: [7; 16],
+            slot_id: 3,
+            sequence_id: 9,
+        }
+    }
+
+    #[test]
+    fn sent_read_only_transport_failure_is_safe_to_retry() {
+        let error = classify_sent_nfs41_error(
+            OperationClass::ReadOnly,
+            context(),
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "reply timeout",
+            )),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("outcome must be structured");
+        assert_eq!(outcome.outcome, OperationOutcome::SafeToRetry);
+        assert_eq!(outcome.recovery, RecoveryAction::Retry);
+        assert_eq!(outcome.context(), &context());
+        assert!(outcome.source().is_some());
+    }
+
+    #[test]
+    fn sent_modifying_transport_failure_is_uncertain() {
+        let error = classify_sent_nfs41_error(
+            OperationClass::ReplaySensitive,
+            context(),
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "lost after send",
+            )),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("outcome must be structured");
+        assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+        assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+        assert_eq!(outcome.operation_class, OperationClass::ReplaySensitive);
+    }
+
+    #[test]
+    fn replay_protocol_errors_have_operation_aware_outcomes() {
+        for code in [
+            crate::nfs41::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP,
+            crate::nfs41::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY,
+        ] {
+            let read = classify_sent_nfs41_error(
+                OperationClass::ReadOnly,
+                context(),
+                NfsError::Nfs4(code),
+            );
+            assert_eq!(
+                read.operation_outcome().map(|error| error.outcome),
+                Some(OperationOutcome::SafeToRetry)
+            );
+
+            let write = classify_sent_nfs41_error(
+                OperationClass::ReplaySensitive,
+                context(),
+                NfsError::Nfs4(code),
+            );
+            assert_eq!(
+                write.operation_outcome().map(|error| error.outcome),
+                Some(OperationOutcome::Uncertain)
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_protocol_failure_remains_definite_and_unwrapped() {
+        let error = classify_sent_nfs41_error(
+            OperationClass::ReplaySensitive,
+            context(),
+            NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_ACCESS),
+        );
+        assert!(error.operation_outcome().is_none());
+        assert!(matches!(
+            error,
+            NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_ACCESS)
+        ));
+    }
+
+    #[test]
+    fn outcome_error_preserves_source_without_payload_context() {
+        let error = classify_sent_nfs41_error(
+            OperationClass::ReplaySensitive,
+            context(),
+            NfsError::Rpc("truncated authoritative reply".to_string()),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("outcome must be structured");
+        assert!(
+            matches!(&*outcome.source, NfsError::Rpc(message) if message.contains("truncated"))
+        );
+        let debug = format!("{outcome:?}");
+        assert!(!debug.contains("file handle"));
+        assert!(!debug.contains("payload"));
     }
 }

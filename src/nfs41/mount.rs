@@ -19,7 +19,7 @@ use super::lease::LeaseRenewal;
 use super::session::{ClientIdentity, Session, SessionHolder};
 use super::state::StateManager;
 use super::{NFS4_DEFAULT_PORT, NFS4_NULL_PROC, NFS4_PROGRAM, NFS4_VERSION};
-use crate::error::{NfsError, Result};
+use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs41_error};
 use crate::mount::{self, NFSVersion};
 use crate::rpc;
 use crate::rpc::auth::Auth;
@@ -41,6 +41,28 @@ const DELAY_RETRY_BASE_MS: u64 = 200;
 const DELAY_RETRY_CAP_MS: u64 = 5000;
 const GRACE_RETRY_BASE_MS: u64 = 1000;
 const GRACE_RETRY_CAP_MS: u64 = 8000;
+
+fn request_context(
+    tag: &str,
+    session_id: &[u8; 16],
+    slot_id: u32,
+    sequence_id: u32,
+) -> RequestContext {
+    RequestContext {
+        operation: tag.chars().take(64).collect(),
+        session_id: *session_id,
+        slot_id,
+        sequence_id,
+    }
+}
+
+fn sent_error(
+    operation_class: OperationClass,
+    context: &RequestContext,
+    error: NfsError,
+) -> NfsError {
+    classify_sent_nfs41_error(operation_class, context.clone(), error)
+}
 
 fn backoff_jitter_ms(attempt: usize, base_ms: u64, cap_ms: u64) -> u64 {
     let base = base_ms
@@ -265,17 +287,21 @@ impl Mount41 {
             );
             let builder =
                 build_ops(builder).apply_sequence_cache_policy(sess.max_cached_response_size())?;
+            let operation_class = builder.operation_class();
+            let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
             let mut buf = Vec::new();
             builder.encode_with_header(&self.auth, &mut buf);
 
             let response_bytes = if let Some(ref data) = write_data {
                 self.rpc
                     .call_with_data(buf, data.clone(), NFS_RETRIES, timeout)
-                    .await?
+                    .await
             } else {
-                self.rpc.call(buf, NFS_RETRIES, timeout).await?
-            };
-            let resp = CompoundResponse::decode(response_bytes)?;
+                self.rpc.call(buf, NFS_RETRIES, timeout).await
+            }
+            .map_err(|error| sent_error(operation_class, &context, error))?;
+            let resp = CompoundResponse::decode(response_bytes)
+                .map_err(|error| sent_error(operation_class, &context, error))?;
             // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
             if resp.results.first().is_some_and(|r| {
                 r.opcode == super::compound::OpNum::Sequence as u32
@@ -322,7 +348,7 @@ impl Mount41 {
                         }
                     }
                 }
-                Err(e) => return Err(e),
+                Err(error) => return Err(sent_error(operation_class, &context, error)),
                 Ok(()) => {}
             }
             resp.op_ok(0)?; // SEQUENCE
@@ -354,16 +380,29 @@ impl Mount41 {
         );
         let builder = build_ops(builder)
             .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+        let operation_class = builder.operation_class();
+        let context = request_context(
+            tag,
+            ds.session.id(),
+            slot.slot_id,
+            slot.current_sequence_id(),
+        );
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data_size);
-        let response_bytes = ds.client.call(buf, NFS_RETRIES, timeout).await?;
-        let resp = CompoundResponse::decode(response_bytes)?;
+        let response_bytes = ds
+            .client
+            .call(buf, NFS_RETRIES, timeout)
+            .await
+            .map_err(|error| sent_error(operation_class, &context, error))?;
+        let resp = CompoundResponse::decode(response_bytes)
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
         if resp.op_ok(0).is_ok() {
             slot.advance();
         }
-        resp.check_status()?;
+        resp.check_status()
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         Ok(resp)
     }
 
@@ -384,18 +423,28 @@ impl Mount41 {
         );
         let builder = build_ops(builder)
             .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+        let operation_class = builder.operation_class();
+        let context = request_context(
+            tag,
+            ds.session.id(),
+            slot.slot_id,
+            slot.current_sequence_id(),
+        );
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
         let timeout = data_timeout(data.len());
         let response_bytes = ds
             .client
             .call_with_data(buf, data, NFS_RETRIES, timeout)
-            .await?;
-        let resp = CompoundResponse::decode(response_bytes)?;
+            .await
+            .map_err(|error| sent_error(operation_class, &context, error))?;
+        let resp = CompoundResponse::decode(response_bytes)
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         if resp.op_ok(0).is_ok() {
             slot.advance();
         }
-        resp.check_status()?;
+        resp.check_status()
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         Ok(resp)
     }
 }

@@ -127,6 +127,16 @@ impl OpNum {
     }
 }
 
+impl From<OperationClass> for crate::error::OperationClass {
+    fn from(value: OperationClass) -> Self {
+        match value {
+            OperationClass::ReadOnly => Self::ReadOnly,
+            OperationClass::SessionControl => Self::SessionControl,
+            OperationClass::ReplaySensitive => Self::ReplaySensitive,
+        }
+    }
+}
+
 // ─── XDR encoding helpers (same pattern as nfs3) ─────────────────────────────
 
 fn xdr_u32(buf: &mut Vec<u8>, v: u32) {
@@ -206,6 +216,16 @@ impl CompoundBuilder {
     /// Number of operations currently in the builder.
     pub fn op_count(&self) -> usize {
         self.ops.len()
+    }
+
+    pub(crate) fn operation_class(&self) -> crate::error::OperationClass {
+        self.ops
+            .iter()
+            .skip(1)
+            .map(|op| op.opcode.class())
+            .max()
+            .unwrap_or(OperationClass::SessionControl)
+            .into()
     }
 
     // ─── Session ops ─────────────────────────────────────────────────────

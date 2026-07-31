@@ -540,6 +540,7 @@ fn nfs_error_msg(err: &NfsError) -> String {
         | NfsError::Unsupported(s)
         | NfsError::InvalidInput(s) => s.clone(),
         NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
+        NfsError::OperationOutcome(error) => error.to_string(),
     }
 }
 

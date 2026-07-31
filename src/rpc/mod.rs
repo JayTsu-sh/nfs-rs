@@ -673,8 +673,8 @@ impl Client {
                     trace!(xid, "RPC response received");
                     return parse_rpc_response(response_data, xid);
                 }
-                Err(ref e) => {
-                    let (is_conn_error, is_timeout) = match e {
+                Err(e) => {
+                    let (is_conn_error, is_timeout) = match &e {
                         NfsError::Io(io_err) => (
                             matches!(
                                 io_err.kind(),
@@ -717,7 +717,7 @@ impl Client {
                         continue;
                     } else {
                         error!(xid, error = %e, "RPC call failed with non-retryable error");
-                        return Err(NfsError::Rpc(e.to_string()));
+                        return Err(e);
                     }
                 }
             }
