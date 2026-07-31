@@ -58,6 +58,8 @@ impl ClientIdentity {
 
 /// NFSv4.1 session state.
 pub(crate) struct Session {
+    /// Monotonic local generation assigned when published by SessionHolder.
+    generation: u64,
     /// 16-byte session ID from CREATE_SESSION.
     session_id: [u8; 16],
     /// Client ID from EXCHANGE_ID.
@@ -222,6 +224,10 @@ impl Session {
         &self.session_id
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Client ID from EXCHANGE_ID.
     pub fn client_id(&self) -> u64 {
         self.client_id
@@ -284,6 +290,7 @@ impl Session {
         .await?;
 
         let session = Session {
+            generation: 1,
             session_id,
             client_id,
             slot_table: SlotTable::new(fore_channel.max_requests),
@@ -377,6 +384,7 @@ impl Session {
             create_session_step(rpc, auth, client_id, create_seq_id, 0).await?;
 
         Ok(Session {
+            generation: 1,
             session_id,
             client_id,
             slot_table: SlotTable::new(fore_channel.max_requests),
@@ -546,6 +554,8 @@ pub(crate) struct SessionHolder {
 
 impl SessionHolder {
     pub fn new(session: Session) -> Self {
+        let mut session = session;
+        session.generation = 1;
         Self {
             inner: tokio::sync::RwLock::new(Arc::new(session)),
         }
@@ -557,9 +567,14 @@ impl SessionHolder {
     }
 
     /// Replace the session (exclusive write lock, used during recovery).
-    pub async fn replace(&self, new_session: Session) {
+    pub async fn replace_if_current(&self, expected: u64, mut new_session: Session) -> bool {
         let mut guard = self.inner.write().await;
+        if guard.generation != expected {
+            return false;
+        }
+        new_session.generation = expected.saturating_add(1);
         *guard = Arc::new(new_session);
+        true
     }
 }
 
@@ -573,6 +588,18 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(marker: u8) -> Session {
+        Session {
+            generation: 0,
+            session_id: [marker; 16],
+            client_id: marker as u64,
+            slot_table: SlotTable::new(1),
+            max_request_size: 4096,
+            max_cached_response_size: 512,
+            pnfs_mds: false,
+        }
+    }
 
     #[tokio::test]
     async fn slot_table_single_slot() {
@@ -741,5 +768,37 @@ mod tests {
         assert_eq!(slot.current_sequence_id(), 2);
         // The snapshot field is unchanged (still 1, as captured at acquisition time)
         assert_eq!(slot.sequence_id, 1);
+    }
+
+    #[tokio::test]
+    async fn session_holder_generations_are_monotonic_and_stale_safe() {
+        let holder = SessionHolder::new(test_session(1));
+        assert_eq!(holder.get().await.generation(), 1);
+        assert!(holder.replace_if_current(1, test_session(2)).await);
+        assert_eq!(holder.get().await.generation(), 2);
+        assert!(!holder.replace_if_current(1, test_session(3)).await);
+        let active = holder.get().await;
+        assert_eq!(active.generation(), 2);
+        assert_eq!(active.id(), &[2; 16]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_replacements_publish_once() {
+        let holder = Arc::new(SessionHolder::new(test_session(1)));
+        let mut tasks = Vec::new();
+        for marker in 2..=65 {
+            let holder = Arc::clone(&holder);
+            tasks.push(tokio::spawn(async move {
+                holder.replace_if_current(1, test_session(marker)).await
+            }));
+        }
+        let mut published = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 1);
+        assert_eq!(holder.get().await.generation(), 2);
     }
 }

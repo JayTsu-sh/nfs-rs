@@ -188,6 +188,7 @@ fn xdr_bitmap(buf: &mut Vec<u8>, bitmap: &[u32]) {
 pub(crate) struct CompoundBuilder {
     tag: String,
     ops: Vec<EncodedOp>,
+    required_generation: Option<u64>,
 }
 
 /// A single encoded operation (opcode + pre-serialized args).
@@ -210,6 +211,7 @@ impl CompoundBuilder {
         Self {
             tag: tag.to_string(),
             ops: Vec::new(),
+            required_generation: None,
         }
     }
 
@@ -226,6 +228,17 @@ impl CompoundBuilder {
             .max()
             .unwrap_or(OperationClass::SessionControl)
             .into()
+    }
+
+    pub(crate) fn require_generation(mut self, generation: u64) -> Self {
+        if generation != 0 {
+            self.required_generation = Some(generation);
+        }
+        self
+    }
+
+    pub(crate) fn required_generation(&self) -> Option<u64> {
+        self.required_generation
     }
 
     // ─── Session ops ─────────────────────────────────────────────────────
@@ -1035,6 +1048,8 @@ pub(crate) struct CompoundResponse {
     pub tag: String,
     pub status: nfsstat4,
     pub results: Vec<OpResponse>,
+    /// Local session generation that carried this response (zero before publication).
+    pub session_generation: u64,
 }
 
 /// A single operation result: opcode + status + remaining bytes for the caller to decode.
@@ -1095,6 +1110,7 @@ impl CompoundResponse {
             tag,
             status,
             results,
+            session_generation: 0,
         })
     }
 
@@ -2149,5 +2165,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("not a valid SEQUENCE"));
+    }
+
+    #[test]
+    fn required_generation_is_preserved_by_builder_chaining() {
+        let builder = CompoundBuilder::new("generation-fence")
+            .require_generation(7)
+            .putrootfh()
+            .getattr(&[1]);
+        assert_eq!(builder.required_generation(), Some(7));
+    }
+
+    #[test]
+    fn anonymous_stateid_generation_is_not_fenced() {
+        let builder = CompoundBuilder::new("anonymous")
+            .require_generation(0)
+            .putrootfh();
+        assert_eq!(builder.required_generation(), None);
     }
 }

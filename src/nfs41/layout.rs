@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
 use tokio::sync::RwLock;
@@ -86,6 +86,8 @@ pub(crate) enum LayoutContent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Protocol struct: all fields decoded from wire format
 pub(crate) struct Layout {
+    /// MDS session generation that granted this layout.
+    pub generation: u64,
     pub stateid: [u8; 16],
     pub return_on_close: bool,
     pub segments: Vec<LayoutSegment>,
@@ -116,6 +118,8 @@ pub(crate) struct StripeChunk {
 pub(crate) struct DsConnection {
     pub client: rpc::Client,
     pub session: Arc<Session>,
+    /// MDS generation for which this DS connection was established.
+    pub owner_generation: u64,
 }
 
 impl DsConnection {
@@ -143,10 +147,10 @@ pub(crate) struct LayoutManager {
     /// Cached connections to data servers (each with its own session).
     data_servers: RwLock<HashMap<SocketAddr, DsConnection>>,
     /// Cached device info indexed by device ID.
-    device_cache: RwLock<HashMap<[u8; 16], DeviceInfo>>,
+    device_cache: RwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
-    dirty: RwLock<HashMap<Bytes, (u64, u64)>>,
+    dirty: RwLock<HashMap<Bytes, (u64, u64, u64)>>,
     /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
     degenerate_logged: AtomicBool,
     /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
@@ -155,6 +159,7 @@ pub(crate) struct LayoutManager {
     unreachable_ds: RwLock<HashSet<SocketAddr>>,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
+    active_generation: AtomicU64,
 }
 
 impl LayoutManager {
@@ -167,7 +172,27 @@ impl LayoutManager {
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: RwLock::new(HashSet::new()),
             noresvport,
+            active_generation: AtomicU64::new(1),
         }
+    }
+
+    pub async fn transition_to(&self, generation: u64) {
+        // Publish the fence before the first cancellation point. Every cache
+        // lookup below validates ownership, so partially completed cleanup is
+        // safe if the recovering request is cancelled.
+        self.active_generation.store(generation, Ordering::Release);
+        let mut layouts = self.layouts.write().await;
+        let mut servers = self.data_servers.write().await;
+        let mut devices = self.device_cache.write().await;
+        let mut dirty = self.dirty.write().await;
+        layouts.clear();
+        servers.clear();
+        devices.clear();
+        dirty.clear();
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.active_generation.load(Ordering::Acquire)
     }
 
     /// 把一个连接失败的 DS 地址记入负缓存（mount 生命周期内不再尝试）。
@@ -192,6 +217,7 @@ impl LayoutManager {
     }
 
     /// Store a layout for a file.
+    #[cfg(test)]
     pub async fn store_layout(&self, fh: &Bytes, layout: Layout) {
         let mut map = self.layouts.write().await;
         debug!(
@@ -202,10 +228,23 @@ impl LayoutManager {
         map.insert(fh.clone(), layout);
     }
 
+    pub async fn store_layout_at(&self, fh: &Bytes, generation: u64, mut layout: Layout) -> bool {
+        let mut map = self.layouts.write().await;
+        if generation != self.active_generation.load(Ordering::Acquire) {
+            return false;
+        }
+        layout.generation = generation;
+        map.insert(fh.clone(), layout);
+        true
+    }
+
     /// Get the layout for a file, if any.
     pub async fn get_layout(&self, fh: &Bytes) -> Option<Layout> {
         let map = self.layouts.read().await;
-        map.get(fh).cloned()
+        let generation = self.generation();
+        map.get(fh)
+            .filter(|layout| layout.generation == generation)
+            .cloned()
     }
 
     /// Remove the layout for a file.
@@ -235,34 +274,64 @@ impl LayoutManager {
     }
 
     /// 记录一段已通过 layout 写入、待 LAYOUTCOMMIT 的范围；与已有范围 merge（min/max）。
-    pub async fn mark_dirty(&self, fh: &Bytes, start: u64, end: u64) {
+    pub async fn mark_dirty_at(&self, fh: &Bytes, generation: u64, start: u64, end: u64) -> bool {
         let mut dirty = self.dirty.write().await;
+        if generation != self.active_generation.load(Ordering::Acquire) {
+            return false;
+        }
         dirty
             .entry(fh.clone())
-            .and_modify(|(s, e)| {
+            .and_modify(|(_, s, e)| {
                 *s = (*s).min(start);
                 *e = (*e).max(end);
             })
-            .or_insert((start, end));
+            .or_insert((generation, start, end));
+        true
+    }
+
+    #[cfg(test)]
+    pub async fn mark_dirty(&self, fh: &Bytes, start: u64, end: u64) {
+        let _ = self.mark_dirty_at(fh, self.generation(), start, end).await;
     }
 
     /// 取出并清除一个文件的待提交范围。
     pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
         let mut dirty = self.dirty.write().await;
-        dirty.remove(fh)
+        dirty.remove(fh).and_then(|(generation, start, end)| {
+            (generation == self.active_generation.load(Ordering::Acquire)).then_some((start, end))
+        })
     }
 
     /// Store a device info entry in the cache.
+    #[cfg(test)]
     pub async fn store_device(&self, device_id: [u8; 16], info: DeviceInfo) {
+        let generation = self.generation();
+        let _ = self.store_device_at(device_id, generation, info).await;
+    }
+
+    pub async fn store_device_at(
+        &self,
+        device_id: [u8; 16],
+        generation: u64,
+        info: DeviceInfo,
+    ) -> bool {
         let mut cache = self.device_cache.write().await;
+        if generation != self.active_generation.load(Ordering::Acquire) {
+            return false;
+        }
         debug!(device_id = ?device_id, ds_count = info.ds_addrs.len(), "device info cached");
-        cache.insert(device_id, info);
+        cache.insert(device_id, (generation, info));
+        true
     }
 
     /// Get a device info entry from the cache.
     pub async fn get_device(&self, device_id: &[u8; 16]) -> Option<DeviceInfo> {
         let cache = self.device_cache.read().await;
-        cache.get(device_id).cloned()
+        let generation = self.generation();
+        cache
+            .get(device_id)
+            .filter(|(owner, _)| *owner == generation)
+            .map(|(_, info)| info.clone())
     }
 
     /// Get or create a connection (with session) to a data server.
@@ -274,11 +343,20 @@ impl LayoutManager {
         addr: SocketAddr,
         auth: &Auth,
         client_identity: &ClientIdentity,
+        owner_generation: u64,
     ) -> Result<DsConnection> {
+        if owner_generation != self.generation() {
+            return Err(NfsError::Rpc(
+                "refusing data-server I/O for stale MDS generation".to_string(),
+            ));
+        }
         // Fast path: read lock only
         {
             let servers = self.data_servers.read().await;
-            if let Some(conn) = servers.get(&addr) {
+            if let Some(conn) = servers
+                .get(&addr)
+                .filter(|conn| conn.owner_generation == owner_generation)
+            {
                 return Ok(conn.clone());
             }
         }
@@ -299,6 +377,7 @@ impl LayoutManager {
             Ok::<DsConnection, NfsError>(DsConnection {
                 client: new_client,
                 session: Arc::new(session),
+                owner_generation,
             })
         };
         let conn = match tokio::time::timeout(DS_CONNECT_TIMEOUT, connect_and_establish).await {
@@ -316,7 +395,18 @@ impl LayoutManager {
         };
         // Acquire write lock and re-check (another task may have connected concurrently)
         let mut servers = self.data_servers.write().await;
-        if let Some(existing) = servers.get(&addr) {
+        if self.generation() != owner_generation {
+            drop(servers);
+            let auth = auth.clone();
+            tokio::spawn(async move { conn.destroy(&auth).await });
+            return Err(NfsError::Rpc(
+                "discarding data-server connection from stale MDS generation".to_string(),
+            ));
+        }
+        if let Some(existing) = servers
+            .get(&addr)
+            .filter(|existing| existing.owner_generation == owner_generation)
+        {
             // Race: another task already connected; destroy the duplicate
             // session best-effort and use the existing connection
             let existing = existing.clone();
@@ -468,6 +558,7 @@ pub(crate) fn decode_layoutget_response(data: &mut Bytes) -> Result<Layout> {
     }
 
     Ok(Layout {
+        generation: 0,
         stateid,
         return_on_close,
         segments,
@@ -824,6 +915,7 @@ mod tests {
         let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file1");
         let layout = Layout {
+            generation: 1,
             stateid: [1u8; 16],
             return_on_close: true,
             segments: vec![],
@@ -835,12 +927,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transition_rejects_late_layout_from_old_generation() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"generation-layout");
+        let layout = Layout {
+            generation: 1,
+            stateid: [2; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        assert!(
+            mgr.store_layout_at(&fh, 1, layout.clone()).await,
+            "initial generation should accept layout"
+        );
+        mgr.transition_to(2).await;
+        assert!(mgr.get_layout(&fh).await.is_none());
+        assert!(!mgr.store_layout_at(&fh, 1, layout.clone()).await);
+        assert!(mgr.get_layout(&fh).await.is_none());
+        assert!(mgr.store_layout_at(&fh, 2, layout).await);
+        assert!(mgr.get_layout(&fh).await.is_some());
+    }
+
+    #[tokio::test]
     async fn layout_manager_remove() {
         let mgr = LayoutManager::new(false);
         let fh = Bytes::from_static(b"file2");
         mgr.store_layout(
             &fh,
             Layout {
+                generation: 1,
                 stateid: [2u8; 16],
                 return_on_close: false,
                 segments: vec![],
@@ -991,11 +1106,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transition_rejects_late_device_and_dirty_updates() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"stale-side-caches");
+        let device_id = [7; 16];
+        let info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec!["192.0.2.10:2049".parse().unwrap()]],
+        };
+
+        mgr.transition_to(2).await;
+        assert!(!mgr.store_device_at(device_id, 1, info.clone()).await);
+        assert!(mgr.get_device(&device_id).await.is_none());
+        assert!(!mgr.mark_dirty_at(&fh, 1, 0, 4096).await);
+        assert_eq!(mgr.take_dirty(&fh).await, None);
+
+        assert!(mgr.store_device_at(device_id, 2, info).await);
+        assert!(mgr.get_device(&device_id).await.is_some());
+        assert!(mgr.mark_dirty_at(&fh, 2, 0, 4096).await);
+        assert_eq!(mgr.take_dirty(&fh).await, Some((0, 4096)));
+    }
+
+    #[tokio::test]
     async fn layout_manager_clear() {
         let mgr = LayoutManager::new(false);
         mgr.store_layout(
             &Bytes::from_static(b"a"),
             Layout {
+                generation: 1,
                 stateid: [0u8; 16],
                 return_on_close: false,
                 segments: vec![],
@@ -1005,6 +1143,7 @@ mod tests {
         mgr.store_layout(
             &Bytes::from_static(b"b"),
             Layout {
+                generation: 1,
                 stateid: [0u8; 16],
                 return_on_close: false,
                 segments: vec![],

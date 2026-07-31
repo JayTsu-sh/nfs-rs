@@ -54,7 +54,7 @@ impl Mount41 {
             .unwrap_or_else(StateId::anonymous);
         let result = self
             .compound("layoutget", |b| {
-                b.putfh(fh).layoutget(
+                b.require_generation(sid.generation).putfh(fh).layoutget(
                     false,                 // signal_layout_avail
                     1,                     // LAYOUT4_NFSV4_1_FILES
                     iomode,                // 1=READ, 2=RW
@@ -72,11 +72,24 @@ impl Mount41 {
                 // LAYOUTGET result is after SEQUENCE=0, PUTFH=1 → index 2
                 let op = resp.op_ok(2).ok()?;
                 let mut data = op.data.clone();
-                let layout = super::layout::decode_layoutget_response(&mut data).ok()?;
-                // Fetch device info for layout segments
-                self.fetch_devices_for_layout(&layout).await;
-                self.layout_manager.store_layout(fh, layout.clone()).await;
-                Some(layout)
+                let mut layout = super::layout::decode_layoutget_response(&mut data).ok()?;
+                layout.generation = resp.session_generation;
+                if self
+                    .layout_manager
+                    .store_layout_at(fh, resp.session_generation, layout.clone())
+                    .await
+                {
+                    // Only an accepted layout may populate generation-owned caches.
+                    self.fetch_devices_for_layout(&layout).await;
+                    Some(layout)
+                } else {
+                    debug!(
+                        response_generation = resp.session_generation,
+                        active_generation = self.layout_manager.generation(),
+                        "discarding stale LAYOUTGET response"
+                    );
+                    None
+                }
             }
             Err(e) => {
                 debug!(error = %e, "LAYOUTGET failed, falling back to MDS I/O");
@@ -129,7 +142,9 @@ impl Mount41 {
                 // GETDEVICEINFO: COMPOUND(SEQUENCE, PUTROOTFH, GETDEVICEINFO)
                 match self
                     .compound("getdeviceinfo", |b| {
-                        b.putrootfh().getdeviceinfo(device_id, 1, 1024 * 1024)
+                        b.require_generation(layout.generation)
+                            .putrootfh()
+                            .getdeviceinfo(device_id, 1, 1024 * 1024)
                     })
                     .await
                 {
@@ -146,7 +161,16 @@ impl Mount41 {
                                     &mut info,
                                     &self.server_addr,
                                 );
-                                self.layout_manager.store_device(*device_id, info).await;
+                                if !self
+                                    .layout_manager
+                                    .store_device_at(*device_id, layout.generation, info)
+                                    .await
+                                {
+                                    debug!(
+                                        layout_generation = layout.generation,
+                                        "discarding stale GETDEVICEINFO response"
+                                    );
+                                }
                             }
                         }
                     }
@@ -168,19 +192,22 @@ impl Mount41 {
         ds_addr: SocketAddr,
         ds_fh: &Bytes,
         stateid: &[u8; 16],
+        generation: u64,
         offset: u64,
         count: u32,
     ) -> Result<CompoundResponse> {
         if ds_addr == self.server_addr {
             return self
                 .compound_data("ds-read-mds", count as usize, |b| {
-                    b.putfh(ds_fh).read(stateid, offset, count)
+                    b.require_generation(generation)
+                        .putfh(ds_fh)
+                        .read(stateid, offset, count)
                 })
                 .await;
         }
         let ds = self
             .layout_manager
-            .get_data_server(ds_addr, &self.auth, &self.client_identity)
+            .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
             .await?;
         let result = Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
             b.putfh(ds_fh).read(stateid, offset, count)
@@ -192,7 +219,7 @@ impl Mount41 {
                 self.layout_manager.remove_data_server(ds_addr).await;
                 let ds = self
                     .layout_manager
-                    .get_data_server(ds_addr, &self.auth, &self.client_identity)
+                    .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
                     .await?;
                 Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
                     b.putfh(ds_fh).read(stateid, offset, count)
@@ -210,6 +237,7 @@ impl Mount41 {
         ds_addr: SocketAddr,
         ds_fh: &Bytes,
         stateid: &[u8; 16],
+        generation: u64,
         ds_off: u64,
         data: Bytes,
     ) -> Result<CompoundResponse> {
@@ -217,14 +245,15 @@ impl Mount41 {
         if ds_addr == self.server_addr {
             return self
                 .compound_write("ds-write-mds", data, |b| {
-                    b.putfh(ds_fh)
+                    b.require_generation(generation)
+                        .putfh(ds_fh)
                         .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
                 })
                 .await;
         }
         let ds = self
             .layout_manager
-            .get_data_server(ds_addr, &self.auth, &self.client_identity)
+            .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
             .await?;
         let result = Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data.clone(), |b| {
             b.putfh(ds_fh)
@@ -236,7 +265,7 @@ impl Mount41 {
                 self.layout_manager.remove_data_server(ds_addr).await;
                 let ds = self
                     .layout_manager
-                    .get_data_server(ds_addr, &self.auth, &self.client_identity)
+                    .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
                     .await?;
                 Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data, |b| {
                     b.putfh(ds_fh)
@@ -348,7 +377,14 @@ impl Mount41 {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
                     let resp = self
-                        .ds_read_chunk(ds_addr, &ds_fh, &io_stateid, chunk_ds_offset, chunk_len)
+                        .ds_read_chunk(
+                            ds_addr,
+                            &ds_fh,
+                            &io_stateid,
+                            layout.generation,
+                            chunk_ds_offset,
+                            chunk_len,
+                        )
                         .await?;
                     // 主 session 复用与独立 DS session 两条路径的 op 布局一致：
                     // SEQUENCE=0, PUTFH=1, READ=2
@@ -374,6 +410,11 @@ impl Mount41 {
 
         match futures::future::try_join_all(futures).await {
             Ok(results) => {
+                if layout.generation != self.layout_manager.generation() {
+                    return Some(Err(NfsError::Rpc(
+                        "discarding pNFS READ result from stale session generation".to_string(),
+                    )));
+                }
                 if results.len() == 1 {
                     Some(Ok(results.into_iter().next().unwrap_or_default()))
                 } else {
@@ -496,7 +537,14 @@ impl Mount41 {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
                     let resp = self
-                        .ds_write_chunk(ds_addr, &ds_fh, &io_stateid, ds_off, chunk_data)
+                        .ds_write_chunk(
+                            ds_addr,
+                            &ds_fh,
+                            &io_stateid,
+                            layout.generation,
+                            ds_off,
+                            chunk_data,
+                        )
                         .await?;
                     // SEQUENCE=0, PUTFH=1, WRITE=2（两条路径布局一致）
                     resp.op_ok(1)?; // PUTFH
@@ -517,6 +565,11 @@ impl Mount41 {
 
         match futures::future::try_join_all(futures).await {
             Ok(results) => {
+                if layout.generation != self.layout_manager.generation() {
+                    return Some(Err(NfsError::Rpc(
+                        "pNFS WRITE outcome crossed a session generation boundary".to_string(),
+                    )));
+                }
                 let total: u32 = results.iter().map(|(n, _)| n).sum();
                 let needs_commit = results.iter().any(|(_, c)| *c);
                 // RFC 5661 §18.42.3：LAYOUTCOMMIT 不必每次 WRITE 后发，只需在
@@ -525,7 +578,7 @@ impl Mount41 {
                 // 避免每个 wsize 块一次串行 MDS RTT。
                 if data_len > 0 {
                     self.layout_manager
-                        .mark_dirty(fh, offset, offset + data_len as u64)
+                        .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
                         .await;
                 }
                 // RFC 5661 §18.32.3: if any DS downgraded write stability, COMMIT to MDS.
@@ -535,6 +588,11 @@ impl Mount41 {
                 Some(Ok(total))
             }
             Err(e) => {
+                if layout.generation != self.layout_manager.generation() {
+                    return Some(Err(NfsError::Rpc(format!(
+                        "pNFS WRITE failed across a session generation boundary: {e}"
+                    ))));
+                }
                 // 驱逐 layout 前先提交此前成功写入的范围
                 self.flush_layoutcommit(fh).await;
                 self.layout_manager.remove_layout(fh).await;
@@ -667,6 +725,7 @@ mod tests {
     #[test]
     fn find_covering_segment_whole_file() {
         let layout = Layout {
+            generation: 1,
             stateid: [0u8; 16],
             return_on_close: false,
             segments: vec![LayoutSegment {
@@ -684,6 +743,7 @@ mod tests {
     #[test]
     fn find_covering_segment_bounded() {
         let layout = Layout {
+            generation: 1,
             stateid: [0u8; 16],
             return_on_close: false,
             segments: vec![LayoutSegment {
@@ -703,6 +763,7 @@ mod tests {
     #[test]
     fn find_covering_segment_empty() {
         let layout = Layout {
+            generation: 1,
             stateid: [0u8; 16],
             return_on_close: false,
             segments: vec![],
@@ -713,6 +774,7 @@ mod tests {
     #[test]
     fn find_covering_segment_multiple() {
         let layout = Layout {
+            generation: 1,
             stateid: [0u8; 16],
             return_on_close: false,
             segments: vec![

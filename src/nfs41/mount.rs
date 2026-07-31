@@ -19,7 +19,10 @@ use super::lease::LeaseRenewal;
 use super::session::{ClientIdentity, Session, SessionHolder};
 use super::state::StateManager;
 use super::{NFS4_DEFAULT_PORT, NFS4_NULL_PROC, NFS4_PROGRAM, NFS4_VERSION};
-use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs41_error};
+use crate::error::{
+    NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
+    RequestContext, Result, classify_sent_nfs41_error,
+};
 use crate::mount::{self, NFSVersion};
 use crate::rpc;
 use crate::rpc::auth::Auth;
@@ -118,6 +121,8 @@ pub(crate) struct Mount41 {
     pub(crate) root_fh: Bytes,
     /// Holder for atomic session replacement on BADSESSION/DEADSESSION recovery.
     pub(crate) session_holder: Arc<SessionHolder>,
+    /// Serializes session recovery publication for this mount.
+    recovery_lock: tokio::sync::Mutex<()>,
     /// 客户端身份标识，re-establishment 时复用，避免 EXCHANGE_ID 互相销毁 session。
     pub(crate) client_identity: ClientIdentity,
     pub(crate) state: StateManager,
@@ -311,8 +316,24 @@ impl Mount41 {
                 slot.slot_id,
                 sess.highest_slot_id(),
             );
-            let builder =
-                build_ops(builder).apply_sequence_cache_policy(sess.max_cached_response_size())?;
+            let builder = build_ops(builder);
+            if let Some(required) = builder.required_generation()
+                && required != sess.generation()
+            {
+                return Err(NfsError::OperationOutcome(Box::new(
+                    OperationOutcomeError::new(
+                        OperationOutcome::DefiniteFailure,
+                        builder.operation_class(),
+                        RecoveryAction::Reopen,
+                        request_context(tag, sess.id(), slot.slot_id, seq_id),
+                        NfsError::Rpc(format!(
+                            "stale session generation {required}, active {}",
+                            sess.generation()
+                        )),
+                    ),
+                )));
+            }
+            let builder = builder.apply_sequence_cache_policy(sess.max_cached_response_size())?;
             let operation_class = builder.operation_class();
             let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
             if operation_class != OperationClass::ReadOnly {
@@ -329,8 +350,9 @@ impl Mount41 {
                 self.rpc.call(buf, NFS_RETRIES, timeout).await
             }
             .map_err(|error| sent_error(operation_class, &context, error))?;
-            let resp = CompoundResponse::decode(response_bytes)
+            let mut resp = CompoundResponse::decode(response_bytes)
                 .map_err(|error| sent_error(operation_class, &context, error))?;
+            resp.session_generation = sess.generation();
             // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
             if resp.results.first().is_some_and(|r| {
                 r.opcode == super::compound::OpNum::Sequence as u32
@@ -363,11 +385,34 @@ impl Mount41 {
                     if attempt < DELAY_RETRY_MAX =>
                 {
                     warn!(tag, attempt, "session invalid — re-establishing");
+                    let expected_generation = sess.generation();
                     slot.resolve();
                     drop(slot);
+                    let _recovery = self.recovery_lock.lock().await;
+                    if self.session_holder.get().await.generation() != expected_generation {
+                        warn!(
+                            tag,
+                            attempt,
+                            expected_generation,
+                            "session already recovered by another request"
+                        );
+                        continue;
+                    }
                     match Session::establish(&self.rpc, &self.auth, &self.client_identity).await {
                         Ok(new_session) => {
-                            self.session_holder.replace(new_session).await;
+                            let next_generation = expected_generation.saturating_add(1);
+                            self.state.transition_to(next_generation).await;
+                            self.layout_manager.transition_to(next_generation).await;
+                            if !self
+                                .session_holder
+                                .replace_if_current(expected_generation, new_session)
+                                .await
+                            {
+                                return Err(NfsError::Rpc(
+                                    "session generation changed during recovery publication"
+                                        .to_string(),
+                                ));
+                            }
                             warn!(tag, attempt, "session re-established, retrying with new session");
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             continue;
@@ -438,8 +483,9 @@ impl Mount41 {
             .call(buf, NFS_RETRIES, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
-        let resp = CompoundResponse::decode(response_bytes)
+        let mut resp = CompoundResponse::decode(response_bytes)
             .map_err(|error| sent_error(operation_class, &context, error))?;
+        resp.session_generation = ds.session.generation();
         // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
         if let Err(error) = resp.op_ok(0) {
             let error = sent_error(operation_class, &context, error);
@@ -495,8 +541,9 @@ impl Mount41 {
             .call_with_data(buf, data, NFS_RETRIES, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
-        let resp = CompoundResponse::decode(response_bytes)
+        let mut resp = CompoundResponse::decode(response_bytes)
             .map_err(|error| sent_error(operation_class, &context, error))?;
+        resp.session_generation = ds.session.generation();
         if let Err(error) = resp.op_ok(0) {
             let error = sent_error(operation_class, &context, error);
             if error.operation_outcome().is_none() {
@@ -685,6 +732,7 @@ async fn mount_on_addr(
         auth: auth.clone(),
         root_fh,
         session_holder,
+        recovery_lock: tokio::sync::Mutex::new(()),
         client_identity,
         state: StateManager::new(),
         layout_manager,
@@ -1144,7 +1192,11 @@ impl crate::Mount for Mount41Wrapper {
         for (fh, sid) in &open_files {
             let _ = self
                 .m
-                .compound("close", |b| b.putfh(fh).close(0, &sid.raw))
+                .compound("close", |b| {
+                    b.require_generation(sid.generation)
+                        .putfh(fh)
+                        .close(0, &sid.raw)
+                })
                 .await;
         }
         // Return all pNFS layouts to the server

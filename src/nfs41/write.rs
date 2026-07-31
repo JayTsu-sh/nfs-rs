@@ -32,7 +32,8 @@ impl Mount41 {
         let fh_ref = fh.clone();
         let resp = self
             .compound_write("write", data, |b| {
-                b.putfh(&fh_ref)
+                b.require_generation(sid.generation)
+                    .putfh(&fh_ref)
                     .write_header(&stateid, offset, 2 /* FILE_SYNC4 */, data_len)
             })
             .await?;
@@ -106,8 +107,12 @@ impl Mount41 {
 
         // Register in StateManager for READ/WRITE to use
         self.state
-            .register_open(&fh, StateId::from_bytes(&stateid), access_mode)
-            .await;
+            .register_open(
+                &fh,
+                StateId::from_bytes_at(&stateid, resp.session_generation),
+                access_mode,
+            )
+            .await?;
 
         Ok(mount::ObjRes {
             fh,
@@ -151,7 +156,11 @@ impl Mount41 {
         // Release ref in StateManager; if ref_count hits 0, send CLOSE to server
         if let Some(sid) = self.state.release(&fh).await {
             let _ = self
-                .compound("close", |b| b.putfh(&fh).close(0, &sid.raw))
+                .compound("close", |b| {
+                    b.require_generation(sid.generation)
+                        .putfh(&fh)
+                        .close(0, &sid.raw)
+                })
                 .await;
         }
         Ok(())
@@ -217,8 +226,12 @@ impl Mount41 {
         // RFC 8881 §13.9.1 禁止 DS I/O 使用 special stateid，提前 CLOSE 会导致
         // pNFS 写全部 NFS4ERR_BAD_STATEID 回退 MDS。
         self.state
-            .register_open(&fh, StateId::from_bytes(&stateid), AccessMode::Both)
-            .await;
+            .register_open(
+                &fh,
+                StateId::from_bytes_at(&stateid, resp.session_generation),
+                AccessMode::Both,
+            )
+            .await?;
         Ok(mount::ObjRes {
             fh,
             attr: Some(attr),
