@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:?action required}"
+run_id="${2:?run id required}"
+runner_ip=10.131.9.11
+ds_ip=10.128.56.161
+state_file=/run/nfsrs-lab-pnfs-fault.run-id
+table=nfsrs_pnfs_fault
+
+[[ "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
+  echo "unsafe run id: $run_id" >&2
+  exit 2
+}
+ip -o -4 addr show | grep -Fq " $runner_ip/" || {
+  echo "refusing pNFS fault outside the authorized runner" >&2
+  exit 2
+}
+
+restore() {
+  nft list table inet "$table" >/dev/null 2>&1 && nft delete table inet "$table"
+  rm -f "$state_file"
+}
+
+case "$action" in
+  isolate-ds)
+    if [[ -e "$state_file" ]]; then
+      [[ "$(<"$state_file")" == "$run_id" ]] || {
+        echo "pNFS fault belongs to a different run" >&2
+        exit 2
+      }
+      echo "pNFS DS already isolated for $run_id"
+      exit 0
+    fi
+    nft add table inet "$table"
+    nft "add chain inet $table output { type filter hook output priority -10; policy accept; }"
+    nft add rule inet "$table" output ip daddr "$ds_ip" tcp dport 2049 drop
+    printf '%s\n' "$run_id" >"$state_file"
+    ss -K dst "$ds_ip" dport = :2049 >/dev/null 2>&1 || true
+    echo "pNFS DS isolated for $run_id"
+    ;;
+  restore-ds)
+    if [[ -e "$state_file" ]] && [[ "$(<"$state_file")" != "$run_id" ]]; then
+      echo "pNFS fault belongs to a different run" >&2
+      exit 2
+    fi
+    restore
+    echo "pNFS DS restored for $run_id"
+    ;;
+  status)
+    if nft list table inet "$table" >/dev/null 2>&1; then
+      printf 'isolated run_id=%s ds=%s\n' "$(<"$state_file")" "$ds_ip"
+    else
+      echo 'restored'
+    fi
+    ;;
+  *)
+    echo "unsupported action: $action" >&2
+    exit 2
+    ;;
+esac

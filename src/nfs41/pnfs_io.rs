@@ -15,7 +15,30 @@ use super::fastxdr::nfsstat4;
 use super::layout::{Layout, LayoutContent, LayoutSegment};
 use super::mount::Mount41;
 use super::state::{AccessMode, StateId};
-use crate::error::{NfsError, Result};
+use crate::error::{
+    NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
+    RequestContext, Result,
+};
+
+/// Whether pNFS WRITE transmitted a DS mutation.
+///
+/// Only `NotAttempted` permits the caller to fall back to an MDS WRITE. Once a
+/// DS batch starts, every result remains on the `Attempted` path so an
+/// ambiguous mutation can never be silently overwritten through the MDS.
+pub(crate) enum PnfsWriteOutcome {
+    NotAttempted,
+    Attempted(Result<u32>),
+}
+
+fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
+    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+        OperationOutcome::Uncertain,
+        OperationClass::ReplaySensitive,
+        RecoveryAction::VerifyThenResume,
+        context,
+        source,
+    )))
+}
 
 /// Find the layout segment covering a given file offset.
 fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment> {
@@ -439,15 +462,21 @@ impl Mount41 {
     // ─── pNFS Write ─────────────────────────────────────────────────────────
 
     /// Attempt a pNFS parallel write.
-    /// Returns `None` if layout is unavailable (caller should fall back to MDS).
+    /// Returns `NotAttempted` only while MDS fallback is provably safe. After
+    /// any DS batch starts, failures are returned as an uncertain attempted
+    /// mutation and must be verified by the migration consumer.
     pub(crate) async fn pnfs_write(
         &self,
         fh: &Bytes,
         offset: u64,
         data: Bytes,
-    ) -> Option<Result<u32>> {
-        let layout = self.get_or_fetch_layout(fh, 2 /* IOMODE_RW */).await?;
-        let seg = find_covering_segment(&layout, offset)?;
+    ) -> PnfsWriteOutcome {
+        let Some(layout) = self.get_or_fetch_layout(fh, 2 /* IOMODE_RW */).await else {
+            return PnfsWriteOutcome::NotAttempted;
+        };
+        let Some(seg) = find_covering_segment(&layout, offset) else {
+            return PnfsWriteOutcome::NotAttempted;
+        };
         let (device_id, stripe_unit, is_dense, first_stripe_index, pattern_offset, fh_list) =
             match &seg.content {
                 LayoutContent::FilesLayout {
@@ -466,23 +495,25 @@ impl Mount41 {
                     *pattern_offset,
                     fh_list,
                 ),
-                _ => return None,
+                _ => return PnfsWriteOutcome::NotAttempted,
             };
 
         if stripe_unit == 0 || fh_list.is_empty() {
-            return None;
+            return PnfsWriteOutcome::NotAttempted;
         }
-        let device = self.layout_manager.get_device(&device_id).await?;
+        let Some(device) = self.layout_manager.get_device(&device_id).await else {
+            return PnfsWriteOutcome::NotAttempted;
+        };
         if device.ds_addrs.len() < fh_list.len() {
-            return None;
+            return PnfsWriteOutcome::NotAttempted;
         }
         // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
         if self.device_degenerate(&device) {
-            return None;
+            return PnfsWriteOutcome::NotAttempted;
         }
         // DS 已知不可达：回退 MDS I/O（layout 保留，不再反复尝试）
         if self.device_ds_unreachable(&device).await {
-            return None;
+            return PnfsWriteOutcome::NotAttempted;
         }
 
         // RFC 8881 §13.9.1：DS 上的 WRITE 使用 open/delegation stateid，
@@ -566,8 +597,20 @@ impl Mount41 {
         match futures::future::try_join_all(futures).await {
             Ok(results) => {
                 if layout.generation != self.layout_manager.generation() {
-                    return Some(Err(NfsError::Rpc(
-                        "pNFS WRITE outcome crossed a session generation boundary".to_string(),
+                    // This is aggregate pNFS batch context, so slot/sequence are
+                    // intentionally zero rather than claiming one DS request.
+                    let active_session = self.session_holder.get().await;
+                    let context = RequestContext {
+                        operation: "pnfs_write".to_string(),
+                        session_id: *active_session.id(),
+                        slot_id: 0,
+                        sequence_id: 0,
+                    };
+                    return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
+                        context,
+                        NfsError::Rpc(
+                            "pNFS WRITE outcome crossed a session generation boundary".to_string(),
+                        ),
                     )));
                 }
                 let total: u32 = results.iter().map(|(n, _)| n).sum();
@@ -585,19 +628,25 @@ impl Mount41 {
                 if needs_commit {
                     let _ = self.commit(fh.clone(), offset, total).await;
                 }
-                Some(Ok(total))
+                PnfsWriteOutcome::Attempted(Ok(total))
             }
             Err(e) => {
-                if layout.generation != self.layout_manager.generation() {
-                    return Some(Err(NfsError::Rpc(format!(
-                        "pNFS WRITE failed across a session generation boundary: {e}"
-                    ))));
+                if data_len > 0 {
+                    self.layout_manager
+                        .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
+                        .await;
                 }
-                // 驱逐 layout 前先提交此前成功写入的范围
-                self.flush_layoutcommit(fh).await;
-                self.layout_manager.remove_layout(fh).await;
-                debug!(error = %e, "pNFS write failed, falling back to MDS");
-                None
+                // Preserve hot-path performance: aggregate diagnostic context
+                // is only materialized when the DS batch actually fails.
+                let active_session = self.session_holder.get().await;
+                let context = RequestContext {
+                    operation: "pnfs_write".to_string(),
+                    session_id: *active_session.id(),
+                    slot_id: 0,
+                    sequence_id: 0,
+                };
+                debug!(error = %e, "pNFS write result is uncertain; refusing MDS fallback");
+                PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(context, e)))
             }
         }
     }
@@ -800,5 +849,26 @@ mod tests {
         let seg2 = find_covering_segment(&layout, 1500);
         assert!(seg2.is_some());
         assert_eq!(seg2.map(|s| s.offset), Some(1000));
+    }
+
+    #[test]
+    fn attempted_ds_error_is_uncertain_and_requires_verification() {
+        let context = RequestContext {
+            operation: "pnfs_write".to_string(),
+            session_id: [7; 16],
+            slot_id: 0,
+            sequence_id: 0,
+        };
+        let error = uncertain_pnfs_write(
+            context,
+            NfsError::Rpc("DS connection reset after send".to_string()),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("attempted pNFS WRITE must have structured guidance");
+        assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+        assert_eq!(outcome.operation_class, OperationClass::ReplaySensitive);
+        assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+        assert_eq!(outcome.context().operation, "pnfs_write");
     }
 }

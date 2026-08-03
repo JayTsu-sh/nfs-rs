@@ -237,7 +237,10 @@ mod nfs41;
 mod rpc;
 mod shared;
 
-pub use error::{NfsError, Result};
+pub use error::{
+    NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
+    RequestContext, Result,
+};
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, AclSupport, Attr, ExportEntry, FSInfo, FSStat, Mount,
     NFSVersion, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes, Pathconf, ReaddirEntry,

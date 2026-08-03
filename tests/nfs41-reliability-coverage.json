@@ -18,7 +18,7 @@
     {"id":"T09","ci":"nfs41::callback::tests::opaque_tag_is_echoed_and_operation_error_sets_compound_status+nfs41::callback::tests::malformed_and_wrong_rpc_fields_return_deterministic_errors+nfs41::callback::tests::zero_ops_minor_version_excessive_ops_and_sequence_position_are_validated","nightly":"scripted:callback-golden-wire;blocked-capability:real-server-layout-recall","required":true},
     {"id":"T10","ci":"planned:channel-bounds","nightly":"planned:effective-limits","required":true},
     {"id":"T11","ci":"planned:ds-fail-before-write","nightly":"planned:ds-isolate-before-write","required":true},
-    {"id":"T12","ci":"planned:ds-partial-write","nightly":"planned:ds-isolate-after-stripe","required":true},
+    {"id":"T12","ci":"pnfs attempted-write error requires verify-then-resume","nightly":"ontap-ds-isolate uncertain-no-fallback restart-resume-checksum","required":true},
     {"id":"T13","ci":"planned:layoutcommit-failure","nightly":"planned:layoutcommit-fault","required":true},
     {"id":"T14","ci":"planned:recall-write-close-race","nightly":"planned:recall-during-write","required":true},
     {"id":"T15","ci":"planned:multi-ds-partial-failure","nightly":"planned:single-ds-isolation","required":true},

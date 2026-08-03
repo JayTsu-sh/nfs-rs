@@ -214,6 +214,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
         .expect("capability report must be readable");
     let rust_test = fs::read_to_string(workspace_path("tests/lab_e2e.rs"))
         .expect("lab E2E test must be readable");
+    let fault_runner = fs::read_to_string(workspace_path("tests/lab/run-pnfs-ds-reset-e2e.sh"))
+        .expect("pNFS fault runner must be readable");
+    let fault_helper = fs::read_to_string(workspace_path("tests/lab/admin/nfsrs-lab-pnfs-fault"))
+        .expect("pNFS fault helper must be readable");
 
     for value in [
         "LAB_PNFS_MDS_DATA",
@@ -242,6 +246,18 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(capability.contains("BLOCKED_CAPABILITY(netapp-pnfs-data-lif)"));
     assert!(rust_test.contains("nfs_v41_pnfs_write_uses_independent_ds"));
     assert!(rust_test.contains("pNFS full-payload checksum mismatch"));
+    assert!(workflow.contains("NetApp pNFS DS reset uncertain-outcome E2E"));
+    assert!(workflow.contains("tests/lab/run-pnfs-ds-reset-e2e.sh \"$RUN_ID\""));
+    assert!(workflow.contains("Restore NetApp pNFS DS connectivity"));
+    assert!(fault_runner.contains("trap cleanup EXIT"));
+    assert!(fault_runner.contains("uncertain=1 mds-fallback=0 restored=1 checksum=ok"));
+    assert!(fault_helper.contains("runner_ip=10.131.9.11"));
+    assert!(fault_helper.contains("ds_ip=10.128.56.161"));
+    assert!(fault_helper.contains("tcp dport 2049 drop"));
+    assert!(!fault_helper.contains("eval "));
+    assert!(rust_test.contains("nfs_v41_pnfs_ds_reset_returns_uncertain"));
+    assert!(rust_test.contains("VerifyThenResume"));
+    assert!(rust_test.contains("pNFS checkpoint recovery full-payload checksum mismatch"));
 
     for path in [
         common,
@@ -251,6 +267,8 @@ fn netapp_pnfs_lab_contract_is_wired() {
         workflow,
         capability,
         rust_test,
+        fault_runner,
+        fault_helper,
     ] {
         assert!(
             !path.contains("Netapp1!"),
