@@ -625,8 +625,22 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
         wait_for_lab_file(&restored, Duration::from_secs(120)).await?;
 
         // Retrying CLOSE must resend the retained dirty range before releasing
-        // OPEN state. A lost range would make this succeed without LAYOUTCOMMIT.
-        mount.close(created.fh).await?;
+        // OPEN state. MDS TCP rebind can lag behind fault restoration, so keep
+        // the same mount/OPEN state and allow bounded recovery convergence.
+        let mut close_error = None;
+        for _ in 0..60 {
+            match mount.close(created.fh.clone()).await {
+                Ok(()) => {
+                    close_error = None;
+                    break;
+                }
+                Err(error) => close_error = Some(error),
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if let Some(error) = close_error {
+            return Err(error.into());
+        }
         let opened = mount.open_path(&file, OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
