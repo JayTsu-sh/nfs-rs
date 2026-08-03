@@ -40,6 +40,17 @@ pub const OPEN_READ: u32 = 1;
 pub const OPEN_WRITE: u32 = 2;
 pub const OPEN_BOTH: u32 = 3;
 
+/// Negotiated and currently effective NFSv4.1 fore-channel bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nfs41ChannelLimits {
+    pub max_request_size: u32,
+    pub max_response_size: u32,
+    pub max_cached_response_size: u32,
+    pub max_operations: u32,
+    pub max_requests: u32,
+    pub effective_highest_slot_id: u32,
+}
+
 /// Trait which defines the procedures that can be performed on an NFS mount.
 ///
 /// NFS version agnostic.  However, since NFSv4 introduces procedures that are not present in NFSv3, invoking those
@@ -74,6 +85,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// }
     /// ```
     fn get_max_write_size(&self) -> u32;
+
+    /// Return NFSv4.1 fore-channel limits, or `None` for other protocol versions.
+    async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
+        None
+    }
 
     /// Procedure NULL does not do any work. It is made available to allow server response testing and timing.
     ///

@@ -16,14 +16,14 @@ use super::compound::{CompoundBuilder, CompoundResponse};
 use super::fastxdr::nfsstat4;
 use super::layout::{DsConnection, LayoutManager};
 use super::lease::LeaseRenewal;
-use super::session::{ClientIdentity, Session, SessionHolder};
+use super::session::{ClientIdentity, Session, SessionHolder, validate_sequence_result};
 use super::state::StateManager;
 use super::{NFS4_DEFAULT_PORT, NFS4_NULL_PROC, NFS4_PROGRAM, NFS4_VERSION};
 use crate::error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, Result, classify_sent_nfs41_error,
 };
-use crate::mount::{self, NFSVersion};
+use crate::mount::{self, NFSVersion, Nfs41ChannelLimits};
 use crate::rpc;
 use crate::rpc::auth::Auth;
 
@@ -44,6 +44,53 @@ const DELAY_RETRY_BASE_MS: u64 = 200;
 const DELAY_RETRY_CAP_MS: u64 = 5000;
 const GRACE_RETRY_BASE_MS: u64 = 1000;
 const GRACE_RETRY_CAP_MS: u64 = 8000;
+const RPC_CALL_PREFIX_SIZE: usize = 8; // XID + message type; record marker is transport framing.
+const MIN_RPC_REPLY_ENVELOPE_SIZE: usize = 24;
+
+fn enforce_request_size(session: &Session, header_len: usize, data_len: usize) -> Result<()> {
+    let encoded = header_len
+        .checked_add(RPC_CALL_PREFIX_SIZE)
+        .and_then(|size| size.checked_add(data_len))
+        .and_then(|size| size.checked_add((4 - (data_len & 3)) & 3))
+        .ok_or_else(|| NfsError::Rpc("encoded COMPOUND request size overflow".to_string()))?;
+    let maximum = usize::try_from(session.max_request_size())
+        .map_err(|_| NfsError::Rpc("channel request limit exceeds usize".to_string()))?;
+    enforce_encoded_size("request", encoded, maximum)
+}
+
+fn enforce_response_size(session: &Session, response_len: usize) -> Result<()> {
+    let maximum = usize::try_from(session.max_response_size())
+        .map_err(|_| NfsError::Rpc("channel response limit exceeds usize".to_string()))?;
+    let encoded = response_len
+        .checked_add(MIN_RPC_REPLY_ENVELOPE_SIZE)
+        .ok_or_else(|| NfsError::Rpc("encoded COMPOUND response size overflow".to_string()))?;
+    enforce_encoded_size("response", encoded, maximum)
+}
+
+fn enforce_encoded_size(kind: &str, actual: usize, maximum: usize) -> Result<()> {
+    if actual > maximum {
+        return Err(NfsError::Rpc(format!(
+            "encoded COMPOUND {kind} size {actual} exceeds channel maximum {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_response_operations(
+    session: &Session,
+    response: &CompoundResponse,
+    requested: usize,
+) -> Result<()> {
+    let negotiated = usize::try_from(session.max_operations())
+        .map_err(|_| NfsError::Rpc("channel operation limit exceeds usize".to_string()))?;
+    if response.results.len() > negotiated || response.results.len() > requested {
+        return Err(NfsError::Xdr(format!(
+            "COMPOUND response contains {} operations; requested {requested}, channel maximum {negotiated}",
+            response.results.len()
+        )));
+    }
+    Ok(())
+}
 
 fn bind_connection_request(auth: &Auth, session_id: &[u8; 16]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -199,16 +246,7 @@ impl Mount41 {
     /// RFC 5661 §2.10.6.2: the server reports session/state conditions via
     /// `status_flags` in SEQUENCE4resok. This method parses those flags and
     /// triggers the appropriate recovery (clearing state, layouts, etc.).
-    async fn handle_seq_status(&self, seq_op: &super::compound::OpResponse) {
-        // SEQUENCE4resok layout:
-        //   sessionid(16) + sequenceid(4) + slotid(4) + highest_slotid(4)
-        //   + target_highest_slotid(4) + status_flags(4) = 36 bytes total
-        let mut data = seq_op.data.clone();
-        if data.remaining() < 36 {
-            return;
-        }
-        data.advance(32); // skip to status_flags
-        let flags = data.get_u32();
+    async fn handle_seq_status(&self, flags: u32) {
         if flags == 0 {
             return; // fast path: no flags set
         }
@@ -387,6 +425,8 @@ impl Mount41 {
                 )));
             }
             let builder = builder.apply_sequence_cache_policy(sess.max_cached_response_size())?;
+            builder.enforce_max_operations(sess.max_operations())?;
+            let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
             let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
             if operation_class != OperationClass::ReadOnly {
@@ -394,6 +434,7 @@ impl Mount41 {
             }
             let mut buf = Vec::new();
             builder.encode_with_header(&self.auth, &mut buf);
+            enforce_request_size(&sess, buf.len(), write_data.as_ref().map_or(0, Bytes::len))?;
 
             let response_bytes = if let Some(ref data) = write_data {
                 self.rpc
@@ -403,16 +444,38 @@ impl Mount41 {
                 self.rpc.call(buf, NFS_RETRIES, timeout).await
             }
             .map_err(|error| sent_error(operation_class, &context, error))?;
+            enforce_response_size(&sess, response_bytes.len())
+                .map_err(|error| sent_error(operation_class, &context, error))?;
             let mut resp = CompoundResponse::decode(response_bytes)
                 .map_err(|error| sent_error(operation_class, &context, error))?;
+            enforce_response_operations(&sess, &resp, request_op_count)
+                .map_err(|error| sent_error(operation_class, &context, error))?;
             resp.session_generation = sess.generation();
-            // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
-            if resp.results.first().is_some_and(|r| {
-                r.opcode == super::compound::OpNum::Sequence as u32
-                    && matches!(r.status, nfsstat4::NFS4_OK)
-            }) {
+            // Validate the wire identity before advancing or changing slot limits.
+            let sequence_result = if let Some(sequence_op) = resp.results.first()
+                && sequence_op.opcode == super::compound::OpNum::Sequence as u32
+                && sequence_op.status == nfsstat4::NFS4_OK
+            {
+                let sequence =
+                    match validate_sequence_result(sequence_op, sess.id(), seq_id, slot.slot_id) {
+                        Ok(sequence) => sequence,
+                        Err(error) => {
+                            slot.fence_on_drop();
+                            return Err(sent_error(operation_class, &context, error));
+                        }
+                    };
+                if let Err(error) = sess.update_sequence_slot_limits(
+                    sequence.highest_slot_id,
+                    sequence.target_highest_slot_id,
+                ) {
+                    slot.fence_on_drop();
+                    return Err(sent_error(operation_class, &context, error));
+                }
                 slot.advance();
-            }
+                Some(sequence)
+            } else {
+                None
+            };
             match resp.check_status() {
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
                     let delay_ms = delay_with_jitter_ms(attempt);
@@ -493,8 +556,8 @@ impl Mount41 {
             }
             resp.op_ok(0)
                 .map_err(|error| sent_error(operation_class, &context, error))?; // SEQUENCE
-            if let Some(seq_op) = resp.results.first() {
-                self.handle_seq_status(seq_op).await;
+            if let Some(sequence) = sequence_result {
+                self.handle_seq_status(sequence.status_flags).await;
             }
             slot.resolve();
             return Ok(resp);
@@ -522,6 +585,8 @@ impl Mount41 {
         );
         let builder = build_ops(builder)
             .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+        builder.enforce_max_operations(ds.session.max_operations())?;
+        let request_op_count = builder.op_count();
         let operation_class = builder.operation_class();
         let context = request_context(
             tag,
@@ -534,13 +599,18 @@ impl Mount41 {
         }
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
+        enforce_request_size(&ds.session, buf.len(), 0)?;
         let timeout = data_timeout(data_size);
         let response_bytes = ds
             .client
             .call(buf, NFS_RETRIES, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
+        enforce_response_size(&ds.session, response_bytes.len())
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         let mut resp = CompoundResponse::decode(response_bytes)
+            .map_err(|error| sent_error(operation_class, &context, error))?;
+        enforce_response_operations(&ds.session, &resp, request_op_count)
             .map_err(|error| sent_error(operation_class, &context, error))?;
         resp.session_generation = ds.session.generation();
         // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
@@ -550,6 +620,25 @@ impl Mount41 {
                 slot.resolve();
             }
             return Err(error);
+        }
+        let sequence = match validate_sequence_result(
+            &resp.results[0],
+            ds.session.id(),
+            slot.current_sequence_id(),
+            slot.slot_id,
+        ) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                slot.fence_on_drop();
+                return Err(sent_error(operation_class, &context, error));
+            }
+        };
+        if let Err(error) = ds
+            .session
+            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
+        {
+            slot.fence_on_drop();
+            return Err(sent_error(operation_class, &context, error));
         }
         slot.advance();
         if let Err(error) = resp.check_status() {
@@ -580,6 +669,8 @@ impl Mount41 {
         );
         let builder = build_ops(builder)
             .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+        builder.enforce_max_operations(ds.session.max_operations())?;
+        let request_op_count = builder.op_count();
         let operation_class = builder.operation_class();
         let context = request_context(
             tag,
@@ -592,13 +683,18 @@ impl Mount41 {
         }
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
+        enforce_request_size(&ds.session, buf.len(), data.len())?;
         let timeout = data_timeout(data.len());
         let response_bytes = ds
             .client
             .call_with_data(buf, data, NFS_RETRIES, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
+        enforce_response_size(&ds.session, response_bytes.len())
+            .map_err(|error| sent_error(operation_class, &context, error))?;
         let mut resp = CompoundResponse::decode(response_bytes)
+            .map_err(|error| sent_error(operation_class, &context, error))?;
+        enforce_response_operations(&ds.session, &resp, request_op_count)
             .map_err(|error| sent_error(operation_class, &context, error))?;
         resp.session_generation = ds.session.generation();
         if let Err(error) = resp.op_ok(0) {
@@ -607,6 +703,25 @@ impl Mount41 {
                 slot.resolve();
             }
             return Err(error);
+        }
+        let sequence = match validate_sequence_result(
+            &resp.results[0],
+            ds.session.id(),
+            slot.current_sequence_id(),
+            slot.slot_id,
+        ) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                slot.fence_on_drop();
+                return Err(sent_error(operation_class, &context, error));
+            }
+        };
+        if let Err(error) = ds
+            .session
+            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
+        {
+            slot.fence_on_drop();
+            return Err(sent_error(operation_class, &context, error));
         }
         slot.advance();
         if let Err(error) = resp.check_status() {
@@ -923,6 +1038,11 @@ async fn send_recall_return(
                     return;
                 }
             };
+            if let Err(e) = builder.enforce_max_operations(session.max_operations()) {
+                warn!(error = %e, "recall return operation limit rejected");
+                return;
+            }
+            let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
             let context = request_context(
                 "recall_return",
@@ -932,23 +1052,61 @@ async fn send_recall_return(
             );
             let mut buf = Vec::new();
             builder.encode_with_header(auth, &mut buf);
+            if let Err(e) = enforce_request_size(&session, buf.len(), 0) {
+                warn!(error = %e, "recall return request limit rejected");
+                return;
+            }
             slot.fence_on_drop();
             let response = rpc
                 .call(buf, 1, METADATA_TIMEOUT)
                 .await
                 .map_err(|error| sent_error(operation_class, &context, error))
                 .and_then(|bytes| {
-                    CompoundResponse::decode(bytes)
-                        .map_err(|error| sent_error(operation_class, &context, error))
+                    enforce_response_size(&session, bytes.len())?;
+                    let response = CompoundResponse::decode(bytes)
+                        .map_err(|error| sent_error(operation_class, &context, error))?;
+                    enforce_response_operations(&session, &response, request_op_count)?;
+                    Ok(response)
                 });
             match response {
                 Ok(response) if response.op_ok(0).is_ok() && response.check_status().is_ok() => {
-                    slot.advance();
-                    slot.resolve();
-                    debug!("recall return sent");
+                    match validate_sequence_result(
+                        &response.results[0],
+                        session.id(),
+                        slot.sequence_id,
+                        slot.slot_id,
+                    ) {
+                        Ok(sequence) => {
+                            if session
+                                .update_sequence_slot_limits(
+                                    sequence.highest_slot_id,
+                                    sequence.target_highest_slot_id,
+                                )
+                                .is_ok()
+                            {
+                                slot.advance();
+                                slot.resolve();
+                                debug!("recall return sent");
+                            }
+                        }
+                        Err(error) => warn!(error = %error, "recall return SEQUENCE mismatch"),
+                    }
                 }
                 Ok(response) => {
-                    if response.op_ok(0).is_ok() {
+                    if let Ok(sequence_op) = response.op_ok(0)
+                        && let Ok(sequence) = validate_sequence_result(
+                            sequence_op,
+                            session.id(),
+                            slot.sequence_id,
+                            slot.slot_id,
+                        )
+                        && session
+                            .update_sequence_slot_limits(
+                                sequence.highest_slot_id,
+                                sequence.target_highest_slot_id,
+                            )
+                            .is_ok()
+                    {
                         slot.advance();
                     }
                     let error = match response.check_status() {
@@ -982,7 +1140,8 @@ async fn navigate_to_export(
     auth: &Auth,
     dirpath: &str,
 ) -> Result<Bytes> {
-    let slot = session.acquire_slot().await?;
+    let mut slot = session.acquire_slot().await?;
+    let sequence_id = slot.sequence_id;
     let mut builder = CompoundBuilder::new("navigate")
         .sequence(
             session.id(),
@@ -998,13 +1157,26 @@ async fn navigate_to_export(
         builder = builder.lookup(component);
     }
     builder = builder.getfh();
+    builder.enforce_max_operations(session.max_operations())?;
+    let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
     builder.encode_with_header(auth, &mut buf);
+    enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc.call(buf, 2, std::time::Duration::from_secs(10)).await?;
+    enforce_response_size(session, response_bytes.len())?;
     let resp = CompoundResponse::decode(response_bytes)?;
+    enforce_response_operations(session, &resp, request_op_count)?;
     resp.check_status()?;
-    resp.op_ok(0)?; // SEQUENCE
+    let sequence =
+        validate_sequence_result(resp.op_ok(0)?, session.id(), sequence_id, slot.slot_id)
+            .inspect_err(|_| slot.fence_on_drop())?;
+    if let Err(error) = session
+        .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
+    {
+        slot.fence_on_drop();
+        return Err(error);
+    }
     resp.op_ok(1)?; // PUTROOTFH
 
     // Check each LOOKUP result
@@ -1044,7 +1216,8 @@ async fn get_fs_limits(
     // NFSv4.1: lease_time=10, maxread=30, maxwrite=31
     let bitmap = [(1u32 << 10) | (1u32 << 30) | (1u32 << 31)]; // word0 only
 
-    let slot = session.acquire_slot().await?;
+    let mut slot = session.acquire_slot().await?;
+    let sequence_id = slot.sequence_id;
     let builder = CompoundBuilder::new("fsinfo")
         .sequence(
             session.id(),
@@ -1054,13 +1227,26 @@ async fn get_fs_limits(
         )
         .putfh(root_fh)
         .getattr(&bitmap);
+    builder.enforce_max_operations(session.max_operations())?;
+    let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
     builder.encode_with_header(auth, &mut buf);
+    enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc.call(buf, 2, std::time::Duration::from_secs(10)).await?;
+    enforce_response_size(session, response_bytes.len())?;
     let resp = CompoundResponse::decode(response_bytes)?;
+    enforce_response_operations(session, &resp, request_op_count)?;
     resp.check_status()?;
-    resp.op_ok(0)?; // SEQUENCE
+    let sequence =
+        validate_sequence_result(resp.op_ok(0)?, session.id(), sequence_id, slot.slot_id)
+            .inspect_err(|_| slot.fence_on_drop())?;
+    if let Err(error) = session
+        .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
+    {
+        slot.fence_on_drop();
+        return Err(error);
+    }
     resp.op_ok(1)?; // PUTFH
     let getattr_op = resp.op_ok(2)?; // GETATTR
     slot.advance();
@@ -1131,9 +1317,13 @@ async fn get_fs_limits(
     let rsize_min: u32 = 8192;
     let wsize_min: u32 = 8192;
 
-    let rsize = requested_rsize
-        .min(server_maxread.min(rsize_max as u64) as u32)
-        .max(rsize_min);
+    let rsize = effective_rsize(
+        requested_rsize,
+        server_maxread,
+        rsize_max,
+        rsize_min,
+        session.max_response_size(),
+    )?;
     let wsize = effective_wsize(
         requested_wsize,
         server_maxwrite,
@@ -1146,6 +1336,29 @@ async fn get_fs_limits(
 }
 
 const NFS41_WRITE_REQUEST_HEADROOM: u32 = 4 * 1024;
+const NFS41_READ_RESPONSE_HEADROOM: u32 = 4 * 1024;
+
+fn effective_rsize(
+    requested_rsize: u32,
+    server_maxread: u64,
+    client_rsize_max: u32,
+    client_rsize_min: u32,
+    session_max_response_size: u32,
+) -> Result<u32> {
+    let session_payload_limit = session_max_response_size
+        .checked_sub(NFS41_READ_RESPONSE_HEADROOM)
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            NfsError::Rpc(format!(
+                "NFSv4.1 session max response size {} is too small for READ overhead",
+                session_max_response_size
+            ))
+        })?;
+    Ok(requested_rsize
+        .min(server_maxread.min(client_rsize_max as u64) as u32)
+        .max(client_rsize_min)
+        .min(session_payload_limit))
+}
 
 fn effective_wsize(
     requested_wsize: u32,
@@ -1182,6 +1395,18 @@ impl crate::Mount for Mount41Wrapper {
 
     fn get_max_write_size(&self) -> u32 {
         self.m.wsize
+    }
+
+    async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
+        let session = self.m.session_holder.get().await;
+        Some(Nfs41ChannelLimits {
+            max_request_size: session.max_request_size(),
+            max_response_size: session.max_response_size(),
+            max_cached_response_size: session.max_cached_response_size(),
+            max_operations: session.max_operations(),
+            max_requests: session.max_requests(),
+            effective_highest_slot_id: session.effective_highest_slot_id(),
+        })
     }
 
     fn version(&self) -> NFSVersion {
@@ -1859,6 +2084,30 @@ mod tests {
             NFS41_WRITE_REQUEST_HEADROOM,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn effective_rsize_reserves_negotiated_response_headroom() {
+        let maximum = 1_048_576;
+        let rsize = effective_rsize(4_194_304, u64::MAX, 4_194_304, 8192, maximum).unwrap();
+        assert_eq!(rsize, maximum - NFS41_READ_RESPONSE_HEADROOM);
+        assert!(rsize < maximum);
+    }
+
+    #[test]
+    fn effective_rsize_rejects_response_without_payload_capacity() {
+        assert!(effective_rsize(8192, u64::MAX, 4_194_304, 8192, 4096).is_err());
+    }
+
+    #[test]
+    fn negotiated_encoded_size_limits_accept_exact_boundary_only() {
+        assert!(enforce_encoded_size("request", 0, 1).is_ok());
+        assert!(enforce_encoded_size("request", 1, 1).is_ok());
+        assert!(enforce_encoded_size("request", 2, 1).is_err());
+        assert!(enforce_encoded_size("response", 4095, 4096).is_ok());
+        assert!(enforce_encoded_size("response", 4096, 4096).is_ok());
+        assert!(enforce_encoded_size("response", 4097, 4096).is_err());
+        assert!(usize::MAX.checked_add(1).is_none());
     }
 
     #[test]

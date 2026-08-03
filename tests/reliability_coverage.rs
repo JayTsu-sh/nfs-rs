@@ -276,3 +276,19 @@ fn netapp_pnfs_lab_contract_is_wired() {
         );
     }
 }
+
+#[test]
+fn negotiated_channel_limit_contract_is_wired() {
+    let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-channel-limits-e2e.sh"))
+        .expect("channel limit runner must be readable");
+    let rust_test = fs::read_to_string(workspace_path("tests/lab_e2e.rs"))
+        .expect("lab E2E test must be readable");
+    assert!(workflow.contains("NetApp NFSv4.1 negotiated channel limits E2E"));
+    assert!(workflow.contains("tests/lab/run-channel-limits-e2e.sh \"$RUN_ID\""));
+    assert!(runner.contains("validate_run_id"));
+    assert!(runner.contains("nfs_v41_channel_limits_at_effective_bounds"));
+    assert!(rust_test.contains("nfs41-channel-limits request="));
+    assert!(rust_test.contains("effective_highest_slot_id"));
+}

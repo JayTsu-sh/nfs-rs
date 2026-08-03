@@ -9,16 +9,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use bytes::Buf;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::compound::{CompoundBuilder, CompoundResponse, OpNum};
 use super::fastxdr::nfsstat4;
-use super::session::SessionHolder;
+use super::session::{SequenceResult, SessionHolder, validate_sequence_result};
 use crate::error::{NfsError, Result};
 use crate::rpc;
 use crate::rpc::auth::Auth;
+
+fn validate_renewal_wire_bounds(
+    request_len: usize,
+    response_len: usize,
+    max_request_size: u32,
+    max_response_size: u32,
+) -> Result<()> {
+    let request_len = request_len
+        .checked_add(8)
+        .ok_or_else(|| NfsError::Rpc("renewal request size overflow".to_string()))?;
+    let response_len = response_len
+        .checked_add(24)
+        .ok_or_else(|| NfsError::Rpc("renewal response size overflow".to_string()))?;
+    if request_len > max_request_size as usize || response_len > max_response_size as usize {
+        return Err(NfsError::Rpc(format!(
+            "lease renewal exceeds negotiated channel bounds: request {request_len}/{max_request_size}, response {response_len}/{max_response_size}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LeaseHealth {
@@ -60,8 +79,8 @@ fn validate_renewal_response(
     session_id: &[u8; 16],
     sequence_id: u32,
     slot_id: u32,
-    highest_slot_id: u32,
-) -> Result<u32> {
+    _highest_slot_id: u32,
+) -> Result<SequenceResult> {
     response.check_status()?;
     if response.tag != "renew" {
         return Err(NfsError::Xdr("renewal tag mismatch".to_string()));
@@ -80,41 +99,13 @@ fn validate_renewal_response(
             OpNum::Sequence as u32
         )));
     }
-    let mut data = sequence.data.clone();
-    if data.remaining() != 36 {
+    if sequence.data.len() != 36 {
         return Err(NfsError::Xdr(format!(
             "renewal SEQUENCE result length {}, expected 36",
-            data.remaining()
+            sequence.data.len()
         )));
     }
-    let mut echoed_session = [0; 16];
-    data.copy_to_slice(&mut echoed_session);
-    let echoed_sequence = data.get_u32();
-    let echoed_slot = data.get_u32();
-    let echoed_highest = data.get_u32();
-    let target_highest = data.get_u32();
-    let status_flags = data.get_u32();
-    if &echoed_session != session_id {
-        return Err(NfsError::Xdr(
-            "renewal SEQUENCE session mismatch".to_string(),
-        ));
-    }
-    if echoed_sequence != sequence_id {
-        return Err(NfsError::Xdr(format!(
-            "renewal SEQUENCE sequence mismatch: got {echoed_sequence}, expected {sequence_id}"
-        )));
-    }
-    if echoed_slot != slot_id {
-        return Err(NfsError::Xdr(format!(
-            "renewal SEQUENCE slot mismatch: got {echoed_slot}, expected {slot_id}"
-        )));
-    }
-    if echoed_highest != highest_slot_id || target_highest > highest_slot_id {
-        return Err(NfsError::Xdr(format!(
-            "renewal SEQUENCE highest-slot mismatch: echoed {echoed_highest}, target {target_highest}, expected maximum {highest_slot_id}"
-        )));
-    }
-    Ok(status_flags)
+    validate_sequence_result(sequence, session_id, sequence_id, slot_id)
 }
 
 /// Background lease renewal task.
@@ -157,13 +148,29 @@ impl LeaseRenewal {
                             slot_id,
                             highest_slot_id,
                         );
+                        if let Err(error) = builder.enforce_max_operations(session.max_operations())
+                        {
+                            task_health
+                                .store(LeaseHealth::ProtocolFailure as u8, Ordering::Release);
+                            warn!(error = %error, "lease renewal operation limit rejected");
+                            continue;
+                        }
                         let mut buf = Vec::new();
                         builder.encode_with_header(&auth, &mut buf);
+                        let request_len = buf.len();
                         slot.fence_on_drop();
                         let result = rpc
                             .call(buf, 1, Duration::from_secs(5))
                             .await
-                            .and_then(CompoundResponse::decode)
+                            .and_then(|bytes| {
+                                validate_renewal_wire_bounds(
+                                    request_len,
+                                    bytes.len(),
+                                    session.max_request_size(),
+                                    session.max_response_size(),
+                                )?;
+                                CompoundResponse::decode(bytes)
+                            })
                             .and_then(|response| {
                                 validate_renewal_response(
                                     &response,
@@ -174,12 +181,23 @@ impl LeaseRenewal {
                                 )
                             });
                         match result {
-                            Ok(status_flags) => {
+                            Ok(sequence) => {
+                                if let Err(error) = session.update_sequence_slot_limits(
+                                    sequence.highest_slot_id,
+                                    sequence.target_highest_slot_id,
+                                ) {
+                                    task_health.store(
+                                        LeaseHealth::ProtocolFailure as u8,
+                                        Ordering::Release,
+                                    );
+                                    warn!(error = %error, "lease renewal: invalid slot limit");
+                                    continue;
+                                }
                                 slot.advance();
                                 slot.resolve();
                                 task_health.store(LeaseHealth::Healthy as u8, Ordering::Release);
                                 debug!(
-                                    status_flags,
+                                    status_flags = sequence.status_flags,
                                     "lease renewal: validated SEQUENCE successful"
                                 );
                             }
@@ -264,14 +282,25 @@ mod tests {
         }
     }
 
-    fn validate(response: &CompoundResponse) -> Result<u32> {
+    fn validate(response: &CompoundResponse) -> Result<SequenceResult> {
         validate_renewal_response(response, &SESSION_ID, SEQUENCE_ID, SLOT_ID, HIGHEST_SLOT_ID)
     }
 
     #[test]
     fn valid_sequence_response_returns_status_flags() {
         let response = response(nfsstat4::NFS4_OK, OpNum::Sequence as u32, sequence_data());
-        assert_eq!(validate(&response).unwrap(), 0x400);
+        let sequence = validate(&response).unwrap();
+        assert_eq!(sequence.status_flags, 0x400);
+        assert_eq!(sequence.highest_slot_id, HIGHEST_SLOT_ID);
+        assert_eq!(sequence.target_highest_slot_id, HIGHEST_SLOT_ID);
+    }
+
+    #[test]
+    fn renewal_wire_bounds_include_rpc_envelopes() {
+        assert!(validate_renewal_wire_bounds(56, 40, 64, 64).is_ok());
+        assert!(validate_renewal_wire_bounds(57, 40, 64, 64).is_err());
+        assert!(validate_renewal_wire_bounds(56, 41, 64, 64).is_err());
+        assert!(validate_renewal_wire_bounds(usize::MAX, 0, u32::MAX, u32::MAX).is_err());
     }
 
     #[test]
@@ -308,17 +337,21 @@ mod tests {
 
     #[test]
     fn echoed_identity_mismatch_matrix_is_rejected() {
-        for offset in [0usize, 16, 20, 24] {
+        for offset in [0usize, 16, 20] {
             let mut data = sequence_data();
             data[offset] ^= 1;
             let response = response(nfsstat4::NFS4_OK, OpNum::Sequence as u32, data);
             assert!(validate(&response).is_err(), "offset {offset} must fail");
         }
 
-        let mut target_too_high = sequence_data();
-        target_too_high[28..32].copy_from_slice(&(HIGHEST_SLOT_ID + 1).to_be_bytes());
-        let response = response(nfsstat4::NFS4_OK, OpNum::Sequence as u32, target_too_high);
-        assert!(validate(&response).is_err());
+        let mut growth = sequence_data();
+        growth[24..28].copy_from_slice(&(HIGHEST_SLOT_ID + 1).to_be_bytes());
+        growth[28..32].copy_from_slice(&(HIGHEST_SLOT_ID + 1).to_be_bytes());
+        let response = response(nfsstat4::NFS4_OK, OpNum::Sequence as u32, growth);
+        assert_eq!(
+            validate(&response).unwrap().target_highest_slot_id,
+            HIGHEST_SLOT_ID + 1
+        );
     }
 
     #[test]
