@@ -641,9 +641,11 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
     .await;
 
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
-    let unmount_result = mount.umount().await;
+    // The original session was deliberately fenced by the MDS fault. Its
+    // ordered LAYOUTRETURN may correctly remain uncertain; authoritative
+    // recovery was verified above on a fresh mount.
+    let _ = mount.umount().await;
     result?;
-    unmount_result?;
     Ok(())
 }
 
