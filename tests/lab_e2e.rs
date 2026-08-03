@@ -635,6 +635,7 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
             actual == expected,
             "pNFS LAYOUTCOMMIT recovery full-payload checksum mismatch",
         )?;
+        cleanup_pnfs_case(verify_mount.as_ref(), &case_dir, &file).await;
         verify_mount.umount().await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
@@ -660,7 +661,7 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
     let run_id = validated_pnfs_run_id()?;
     let ready = env::var("NFS_RS_LAB_PNFS_READY_FILE")?;
     let applied = env::var("NFS_RS_LAB_PNFS_FAULT_APPLIED_FILE")?;
-    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let case_dir = format!("nfs-rs-pnfs-{run_id}-recall");
     let file = format!("{case_dir}/recall-race.bin");
     let mount = parse_url_and_mount(&url).await?;
     let baseline_callbacks = mount
