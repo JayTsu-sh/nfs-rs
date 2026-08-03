@@ -18,6 +18,7 @@ const NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const RECOVERY_DIR: &str = "nfs41-session-recovery";
 const RECOVERY_FILE: &str = "nfs41-session-recovery/payload.bin";
 const CALLBACK_FILE: &str = "callback-recall.bin";
+const PNFS_PAYLOAD_SIZE: usize = 8 * 1024 * 1024 + 37;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -34,6 +35,29 @@ fn payload() -> Bytes {
         .map(|index| ((index * 31 + 17) % 251) as u8)
         .collect::<Vec<_>>();
     Bytes::from(bytes)
+}
+
+fn validated_pnfs_run_id() -> TestResult<String> {
+    let run_id = env::var("NFS_RS_LAB_PNFS_RUN_ID")?;
+    ensure(
+        run_id
+            .strip_prefix("nightly-")
+            .or_else(|| run_id.strip_prefix("release-"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 80
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            }),
+        "unsafe pNFS run ID",
+    )?;
+    Ok(run_id)
+}
+
+async fn cleanup_pnfs_case(mount: &dyn Mount, case_dir: &str, file: &str) {
+    let _ = mount.remove_path(file).await;
+    let _ = mount.rmdir_path(case_dir).await;
 }
 
 async fn write_all(mount: &dyn Mount, fh: Bytes, data: &Bytes) -> TestResult {
@@ -287,6 +311,72 @@ async fn nfs_v3_and_v41_end_to_end() -> TestResult {
             .await
             .map_err(|_| io::Error::other(format!("{url}: E2E timed out")))??;
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the NetApp NFSv4.1 file-layout pNFS lab"]
+async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_PNFS_URL")?;
+    let run_id = validated_pnfs_run_id()?;
+    let ready = env::var("NFS_RS_LAB_PNFS_READY_FILE")?;
+    let completed = env::var("NFS_RS_LAB_PNFS_DONE_FILE")?;
+    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let file = format!("{case_dir}/payload.bin");
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+
+    let result = async {
+        mount.mkdir_path(&case_dir, 0o700).await?;
+        let created = mount.create_path(&file, Some(0o600)).await?;
+        let expected = Bytes::from(
+            (0..PNFS_PAYLOAD_SIZE)
+                .map(|index| ((index * 29 + 43) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
+        std::fs::write(&ready, b"pnfs-write-complete")?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !std::path::Path::new(&completed).exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("independent pNFS DS connection was not observed"))?;
+        mount.close(created.fh).await?;
+        let opened = mount.open_path(&file, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+        mount.close(opened.fh).await?;
+        ensure(actual == expected, "pNFS full-payload checksum mismatch")
+    }
+    .await;
+
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+    let unmount_result = mount.umount().await;
+    result?;
+    unmount_result?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the NetApp NFSv4.1 file-layout pNFS lab"]
+async fn nfs_v41_pnfs_cleanup_run() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_PNFS_URL")?;
+    let run_id = validated_pnfs_run_id()?;
+    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let file = format!("{case_dir}/payload.bin");
+    let mount = parse_url_and_mount(&url).await?;
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+    mount.umount().await?;
     Ok(())
 }
 

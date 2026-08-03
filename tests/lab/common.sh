@@ -11,6 +11,10 @@ LAB_DEST_DATA="${LAB_DEST_DATA:-10.10.1.13}"
 LAB_WORKER_DATA="${LAB_WORKER_DATA:-10.10.1.14}"
 LAB_NFS3_EXPORT="${LAB_NFS3_EXPORT:-/srv/nfs/v3}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
+LAB_PNFS_MDS_DATA="${LAB_PNFS_MDS_DATA:-10.128.56.160}"
+LAB_PNFS_DS_DATA="${LAB_PNFS_DS_DATA:-10.128.56.161}"
+LAB_PNFS_PRIMARY_EXPORT="${LAB_PNFS_PRIMARY_EXPORT:-/nfsrs_pnfs_a}"
+LAB_PNFS_SECONDARY_EXPORT="${LAB_PNFS_SECONDARY_EXPORT:-/nfsrs_pnfs_b}"
 
 ssh_lab() {
   local host="$1"
@@ -26,6 +30,30 @@ validate_run_id() {
   local run_id="$1"
   [[ "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
     echo "unsafe run id: $run_id" >&2
+    return 2
+  }
+}
+
+validate_ipv4() {
+  local address="$1"
+  [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
+    echo "unsafe IPv4 address: $address" >&2
+    return 2
+  }
+  local octet
+  IFS=. read -r -a octets <<<"$address"
+  for octet in "${octets[@]}"; do
+    ((10#$octet <= 255)) || {
+      echo "unsafe IPv4 address: $address" >&2
+      return 2
+    }
+  done
+}
+
+validate_export_path() {
+  local path="$1"
+  [[ "$path" =~ ^/[A-Za-z0-9._/-]{1,200}$ ]] && [[ "$path" != *".."* ]] || {
+    echo "unsafe export path: $path" >&2
     return 2
   }
 }

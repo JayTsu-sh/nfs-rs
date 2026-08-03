@@ -197,3 +197,50 @@ fn callback_fault_coverage_is_explicit_and_capability_honest() {
         assert!(proxy.contains(evidence), "proxy lacks {evidence} state");
     }
 }
+
+#[test]
+fn netapp_pnfs_lab_contract_is_wired() {
+    let common = fs::read_to_string(workspace_path("tests/lab/common.sh"))
+        .expect("lab common config must be readable");
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-pnfs-e2e.sh"))
+        .expect("pNFS runner must be readable");
+    let cleanup = fs::read_to_string(workspace_path("tests/lab/cleanup-pnfs-run.sh"))
+        .expect("pNFS cleanup must be readable");
+    let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    let capability = fs::read_to_string(workspace_path("tests/lab/capability-report.sh"))
+        .expect("capability report must be readable");
+    let rust_test = fs::read_to_string(workspace_path("tests/lab_e2e.rs"))
+        .expect("lab E2E test must be readable");
+
+    for value in [
+        "LAB_PNFS_MDS_DATA",
+        "LAB_PNFS_DS_DATA",
+        "LAB_PNFS_PRIMARY_EXPORT",
+        "LAB_PNFS_SECONDARY_EXPORT",
+    ] {
+        assert!(common.contains(value), "missing pNFS config key {value}");
+    }
+    assert!(runner.contains("validate_run_id"));
+    assert!(runner.contains("validate_ipv4"));
+    assert!(runner.contains("validate_export_path"));
+    assert!(runner.contains("observed_connections > baseline_connections"));
+    assert!(runner.contains("BLOCKED_CAPABILITY(netapp-pnfs-independent-ds)"));
+    assert!(runner.contains("trap cleanup EXIT"));
+    assert!(workflow.contains("NetApp NFSv4.1 pNFS WRITE E2E"));
+    assert!(workflow.contains("tests/lab/run-pnfs-e2e.sh \"$RUN_ID\""));
+    assert!(workflow.contains("tests/lab/cleanup-pnfs-run.sh \"$RUN_ID\""));
+    assert!(workflow.contains("Cleanup NetApp pNFS run"));
+    assert!(cleanup.contains("validate_run_id"));
+    assert!(cleanup.contains("nfs_v41_pnfs_cleanup_run"));
+    assert!(capability.contains("BLOCKED_CAPABILITY(netapp-pnfs-data-lif)"));
+    assert!(rust_test.contains("nfs_v41_pnfs_write_uses_independent_ds"));
+    assert!(rust_test.contains("pNFS full-payload checksum mismatch"));
+
+    for path in [common, runner, cleanup, workflow, capability, rust_test] {
+        assert!(
+            !path.contains("Netapp1!"),
+            "management credential leaked into repository"
+        );
+    }
+}
