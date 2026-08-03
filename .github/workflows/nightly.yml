@@ -60,6 +60,10 @@ jobs:
       - name: Validate reliability coverage manifest
         run: cargo test --locked --test reliability_coverage -- --nocapture
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.1 compatibility E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.1 pNFS WRITE E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
       - name: NFSv4.1 session recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"
       - name: NFSv4.1 TCP rebind E2E
@@ -74,6 +78,9 @@ jobs:
         with:
           name: nfs41-reliability-coverage-${{ github.run_id }}-${{ github.run_attempt }}
           path: tests/nfs41-reliability-coverage.json
+      - name: Cleanup NetApp pNFS run
+        if: always()
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/cleanup-pnfs-run.sh "$RUN_ID"
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

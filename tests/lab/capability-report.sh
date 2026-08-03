@@ -87,4 +87,23 @@ probe_host source "$LAB_SOURCE_MGMT"
 probe_host destination "$LAB_DEST_MGMT"
 probe_host worker "$LAB_WORKER_MGMT"
 
+validate_ipv4 "$LAB_PNFS_MDS_DATA"
+validate_ipv4 "$LAB_PNFS_DS_DATA"
+validate_export_path "$LAB_PNFS_PRIMARY_EXPORT"
+validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
+{
+  printf 'mds_data_lif=%s\n' "$LAB_PNFS_MDS_DATA"
+  printf 'ds_data_lif=%s\n' "$LAB_PNFS_DS_DATA"
+  printf 'primary_export=%s\n' "$LAB_PNFS_PRIMARY_EXPORT"
+  printf 'secondary_export=%s\n' "$LAB_PNFS_SECONDARY_EXPORT"
+  for endpoint in "$LAB_PNFS_MDS_DATA" "$LAB_PNFS_DS_DATA"; do
+    if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/2049' _ "$endpoint"; then
+      printf 'nfs41_port_%s=reachable\n' "$endpoint"
+    else
+      printf 'nfs41_port_%s=BLOCKED_CAPABILITY(netapp-pnfs-data-lif)\n' "$endpoint"
+      exit 1
+    fi
+  done
+} >"$report_dir/netapp-pnfs.txt"
+
 echo "lab capability report written to $report_dir"
