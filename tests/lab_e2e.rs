@@ -671,8 +671,8 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
                 .map(|index| ((index * 31 + 89) % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        for (chunk_index, chunk_start) in (0..expected.len()).step_by(1024 * 1024).enumerate() {
-            let chunk_end = (chunk_start + 1024 * 1024).min(expected.len());
+        for (chunk_index, chunk_start) in (0..expected.len()).step_by(512 * 1024).enumerate() {
+            let chunk_end = (chunk_start + 512 * 1024).min(expected.len());
             mount
                 .write(
                     created.fh.clone(),
