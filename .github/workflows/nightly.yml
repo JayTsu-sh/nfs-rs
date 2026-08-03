@@ -62,6 +62,8 @@ jobs:
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.1 negotiated channel limits E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-channel-limits-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 pNFS WRITE E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
       - name: NetApp pNFS DS reset uncertain-outcome E2E

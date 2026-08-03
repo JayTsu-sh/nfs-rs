@@ -422,6 +422,52 @@ async fn nfs_v41_pnfs_cleanup_run() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a real NFSv4.1 server for negotiated channel limits"]
+async fn nfs_v41_channel_limits_at_effective_bounds() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_CHANNEL_URL")?;
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
+    let limits = mount
+        .nfs41_channel_limits()
+        .await
+        .ok_or_else(|| io::Error::other("NFSv4.1 channel limits unavailable"))?;
+    ensure(limits.max_request_size > 0, "zero ca_maxrequestsize")?;
+    ensure(limits.max_response_size > 0, "zero ca_maxresponsesize")?;
+    ensure(
+        limits.max_cached_response_size > 0,
+        "zero ca_maxresponsesize_cached",
+    )?;
+    ensure(limits.max_operations > 0, "zero ca_maxoperations")?;
+    ensure(
+        (1..=64).contains(&limits.max_requests),
+        "ca_maxrequests outside offered range",
+    )?;
+    ensure(
+        limits.effective_highest_slot_id < limits.max_requests,
+        "effective highest slot exceeds negotiated table",
+    )?;
+
+    let concurrency = limits.effective_highest_slot_id as usize + 1;
+    futures::future::try_join_all((0..concurrency).map(|_| mount.fsstat())).await?;
+    eprintln!(
+        "nfs41-channel-limits request={} response={} cached={} operations={} requests={} effective_slots={} concurrency={} status=ok",
+        limits.max_request_size,
+        limits.max_response_size,
+        limits.max_cached_response_size,
+        limits.max_operations,
+        limits.max_requests,
+        limits.effective_highest_slot_id + 1,
+        concurrency,
+    );
+    mount.umount().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an authorized NetApp pNFS DS reset"]
 async fn nfs_v41_pnfs_ds_reset_returns_uncertain() -> TestResult {

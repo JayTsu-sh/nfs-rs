@@ -220,6 +220,17 @@ impl CompoundBuilder {
         self.ops.len()
     }
 
+    pub(crate) fn enforce_max_operations(&self, maximum: u32) -> Result<()> {
+        let count = u32::try_from(self.ops.len())
+            .map_err(|_| NfsError::Rpc("COMPOUND operation count exceeds u32".to_string()))?;
+        if count == 0 || count > maximum {
+            return Err(NfsError::Rpc(format!(
+                "COMPOUND contains {count} operations; channel maximum is {maximum}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn operation_class(&self) -> crate::error::OperationClass {
         self.ops
             .iter()
@@ -2054,6 +2065,21 @@ mod tests {
         assert_eq!(&buf[op_start + 4..op_start + 20], &session_id);
         // sequence_id = 42 at op_start + 20
         assert_eq!(&buf[op_start + 20..op_start + 24], &42u32.to_be_bytes());
+    }
+
+    #[test]
+    fn negotiated_operation_limit_is_enforced_at_boundaries() {
+        let session_id = [0u8; 16];
+        let one = CompoundBuilder::new("one").sequence(&session_id, 1, 0, 0);
+        assert!(one.enforce_max_operations(0).is_err());
+        assert!(one.enforce_max_operations(1).is_ok());
+
+        let two = CompoundBuilder::new("two")
+            .sequence(&session_id, 1, 0, 0)
+            .putrootfh();
+        assert!(two.enforce_max_operations(1).is_err());
+        assert!(two.enforce_max_operations(2).is_ok());
+        assert!(two.enforce_max_operations(3).is_ok());
     }
 
     #[test]
