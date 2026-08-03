@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tracing::{debug, info, warn};
 
 use super::compound::CompoundBuilder;
@@ -151,6 +151,10 @@ pub(crate) struct LayoutManager {
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
     dirty: RwLock<HashMap<Bytes, DirtyRange>>,
+    /// Per-file I/O gates. WRITEs take a shared guard; recall/CLOSE take an
+    /// exclusive guard so different files and same-file parallel WRITEs remain
+    /// concurrent while layout lifecycle transitions are serialized.
+    file_io_gates: Mutex<HashMap<Bytes, std::sync::Weak<RwLock<()>>>>,
     /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
     degenerate_logged: AtomicBool,
     /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
@@ -177,6 +181,7 @@ impl LayoutManager {
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
+            file_io_gates: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: RwLock::new(HashSet::new()),
             noresvport,
@@ -201,6 +206,25 @@ impl LayoutManager {
 
     pub fn generation(&self) -> u64 {
         self.active_generation.load(Ordering::Acquire)
+    }
+
+    async fn file_io_gate(&self, fh: &Bytes) -> Arc<RwLock<()>> {
+        let mut gates = self.file_io_gates.lock().await;
+        if let Some(gate) = gates.get(fh).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(RwLock::new(()));
+        gates.insert(fh.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    pub async fn read_file_io(&self, fh: &Bytes) -> OwnedRwLockReadGuard<()> {
+        self.file_io_gate(fh).await.read_owned().await
+    }
+
+    pub async fn write_file_io(&self, fh: &Bytes) -> OwnedRwLockWriteGuard<()> {
+        self.file_io_gate(fh).await.write_owned().await
     }
 
     /// 把一个连接失败的 DS 地址记入负缓存（mount 生命周期内不再尝试）。
@@ -261,10 +285,11 @@ impl LayoutManager {
         map.remove(fh)
     }
 
-    /// Drain all layouts, returning them for LAYOUTRETURN.
-    pub async fn drain_layouts(&self) -> Vec<(Bytes, Layout)> {
-        let mut map = self.layouts.write().await;
-        map.drain().collect()
+    pub async fn all_layouts(&self) -> Vec<(Bytes, Layout)> {
+        let map = self.layouts.read().await;
+        map.iter()
+            .map(|(fh, layout)| (fh.clone(), layout.clone()))
+            .collect()
     }
 
     /// Remove all layouts and device cache atomically.
@@ -331,6 +356,7 @@ impl LayoutManager {
     }
 
     /// Test/teardown helper that removes a pending range immediately.
+    #[cfg(test)]
     pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
         let mut dirty = self.dirty.write().await;
         dirty.remove(fh).and_then(|range| {
@@ -1166,6 +1192,45 @@ mod tests {
 
         assert!(mgr.acknowledge_dirty(&fh, snapshot).await);
         assert_eq!(mgr.snapshot_dirty(&fh).await, None);
+    }
+
+    #[tokio::test]
+    async fn file_io_gate_allows_parallel_writes_and_serializes_recall() {
+        let mgr = Arc::new(LayoutManager::new(false));
+        let fh = Bytes::from_static(b"gate-shared-exclusive");
+        let first_write = mgr.read_file_io(&fh).await;
+        let second_write =
+            tokio::time::timeout(std::time::Duration::from_millis(100), mgr.read_file_io(&fh))
+                .await
+                .expect("same-file WRITEs must remain parallel");
+
+        let recall_mgr = Arc::clone(&mgr);
+        let recall_fh = fh.clone();
+        let recall = tokio::spawn(async move { recall_mgr.write_file_io(&recall_fh).await });
+        tokio::task::yield_now().await;
+        assert!(!recall.is_finished());
+
+        drop(first_write);
+        drop(second_write);
+        let recall_guard = tokio::time::timeout(std::time::Duration::from_secs(1), recall)
+            .await
+            .expect("recall gate timeout")
+            .expect("recall task failed");
+        drop(recall_guard);
+    }
+
+    #[tokio::test]
+    async fn file_io_gate_does_not_serialize_different_files() {
+        let mgr = LayoutManager::new(false);
+        let first = mgr.write_file_io(&Bytes::from_static(b"gate-file-a")).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            mgr.write_file_io(&Bytes::from_static(b"gate-file-b")),
+        )
+        .await
+        .expect("different files must not share an exclusive gate");
+        drop(first);
+        drop(second);
     }
 
     #[tokio::test]

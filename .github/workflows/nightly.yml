@@ -72,6 +72,8 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-ds-reset-e2e.sh "$RUN_ID"
       - name: NetApp pNFS LAYOUTCOMMIT failure recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-layoutcommit-fault-e2e.sh "$RUN_ID"
+      - name: NetApp pNFS layout recall during WRITE/CLOSE E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-layout-recall-e2e.sh "$RUN_ID"
       - name: NFSv4.1 session recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"
       - name: NFSv4.1 TCP rebind E2E

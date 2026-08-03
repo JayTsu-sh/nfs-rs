@@ -13,6 +13,7 @@ use crate::mount;
 
 impl Mount41 {
     pub(crate) async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let _io_guard = self.layout_manager.read_file_io(&fh).await;
         // Try pNFS parallel write first
         match self.pnfs_write(&fh, offset, data.clone()).await {
             PnfsWriteOutcome::NotAttempted => {}
@@ -150,6 +151,7 @@ impl Mount41 {
     }
 
     pub(crate) async fn close_file(&self, fh: Bytes) -> Result<()> {
+        let _io_guard = self.layout_manager.write_file_io(&fh).await;
         // CLOSE 前提交累积的 layout 写入范围（size/mtime 对 MDS 可见）
         self.flush_layoutcommit(&fh).await?;
         // Return pNFS layout before CLOSE if server requested return_on_close

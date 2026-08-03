@@ -789,44 +789,13 @@ impl Mount41 {
     }
 
     /// Return all cached layouts to the server (used during umount).
-    pub(crate) async fn layoutreturn_all(&self) {
-        let layouts = self.layout_manager.drain_layouts().await;
-        for (fh, layout) in &layouts {
-            // layout 已从缓存 drain，用 drain 出的 stateid 提交 dirty 范围
-            if let Some((start, end)) = self.layout_manager.take_dirty(fh).await {
-                let _ = self
-                    .compound("layoutcommit", |b| {
-                        b.putfh(fh).layoutcommit(
-                            start,
-                            end - start,
-                            false,
-                            &layout.stateid,
-                            Some(end - 1),
-                            1, // LAYOUT4_NFSV4_1_FILES
-                        )
-                    })
-                    .await;
-            }
-            let iomode = if layout.segments.len() == 1 {
-                layout.segments[0].iomode as u32
-            } else {
-                3 // LAYOUTIOMODE4_ANY
-            };
-            let _ = self
-                .compound("layoutreturn", |b| {
-                    b.putfh(fh).layoutreturn(
-                        false,
-                        1, // LAYOUT4_NFSV4_1_FILES
-                        iomode,
-                        1, // LAYOUTRETURN4_FILE
-                        0,
-                        0xFFFF_FFFF_FFFF_FFFF,
-                        &layout.stateid,
-                    )
-                })
-                .await;
+    pub(crate) async fn layoutreturn_all(&self) -> Result<()> {
+        let layouts = self.layout_manager.all_layouts().await;
+        for (fh, _) in layouts {
+            let _io_guard = self.layout_manager.write_file_io(&fh).await;
+            self.layoutreturn_file(&fh).await?;
         }
-        self.layout_manager.clear().await;
+        Ok(())
     }
 }
 

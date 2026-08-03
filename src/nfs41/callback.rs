@@ -1,5 +1,6 @@
 //! NFSv4.1 callback handling and bounded backchannel replay (RFC 8881 §2.10.6.3).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
@@ -69,6 +70,8 @@ struct CallbackSession {
 /// duplicate deliveries cannot both publish a recall side effect.
 pub(crate) struct CallbackState {
     inner: Mutex<CallbackSession>,
+    layout_recalls_received: AtomicU64,
+    layout_returns_completed: AtomicU64,
 }
 
 impl CallbackState {
@@ -92,7 +95,25 @@ impl CallbackState {
                 max_operations: max_operations.clamp(1, MAX_CB_OPS),
                 slots: callback_slots(max_requests),
             }),
+            layout_recalls_received: AtomicU64::new(0),
+            layout_returns_completed: AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn record_layout_recall(&self) {
+        self.layout_recalls_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_layout_return(&self) {
+        self.layout_returns_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn layout_recall_stats(&self) -> (u64, u64) {
+        (
+            self.layout_recalls_received.load(Ordering::Relaxed),
+            self.layout_returns_completed.load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn update_session(
