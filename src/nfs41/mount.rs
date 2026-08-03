@@ -938,27 +938,36 @@ async fn handle_recalls(
                 length,
                 iomode,
             } => {
+                let _io_guard = layout_manager.write_file_io(&fh).await;
                 debug!(
                     fh_len = fh.len(),
                     offset, length, "returning recalled layout"
                 );
-                // RFC 5661 §18.42.3：先 LAYOUTCOMMIT 累积的写入范围再 LAYOUTRETURN
-                if let Some((start, end)) = layout_manager.take_dirty(&fh).await {
-                    send_recall_return(&rpc, &auth, &session_holder, |b| {
-                        b.putfh(&fh).layoutcommit(
-                            start,
-                            end - start,
+                info!(
+                    event = "pnfs_layout_recall_received",
+                    fh_len = fh.len(),
+                    offset,
+                    length,
+                    "serializing pNFS file-layout recall"
+                );
+                // A single ordered COMPOUND ensures LAYOUTRETURN is not
+                // executed if an earlier LAYOUTCOMMIT fails.
+                let dirty = layout_manager.snapshot_dirty(&fh).await;
+                let returned = send_recall_return(&rpc, &auth, &session_holder, |b| {
+                    let b = b.putfh(&fh);
+                    let b = if let Some(dirty) = dirty {
+                        b.layoutcommit(
+                            dirty.start,
+                            dirty.end - dirty.start,
                             false,
                             &stateid,
-                            Some(end - 1),
+                            Some(dirty.end - 1),
                             1, // LAYOUT4_NFSV4_1_FILES
                         )
-                    })
-                    .await;
-                }
-                layout_manager.remove_layout(&fh).await;
-                send_recall_return(&rpc, &auth, &session_holder, |b| {
-                    b.putfh(&fh).layoutreturn(
+                    } else {
+                        b
+                    };
+                    b.layoutreturn(
                         false, // reclaim
                         1,     // LAYOUT4_NFSV4_1_FILES
                         iomode, 1, // LAYOUTRETURN4_FILE
@@ -966,33 +975,48 @@ async fn handle_recalls(
                     )
                 })
                 .await;
+                let acknowledged = match dirty {
+                    Some(dirty) if returned => layout_manager.acknowledge_dirty(&fh, dirty).await,
+                    Some(_) => false,
+                    None => returned,
+                };
+                if returned && acknowledged {
+                    layout_manager.remove_layout(&fh).await;
+                    info!(event = "pnfs_layout_recall_returned", fh_len = fh.len());
+                } else {
+                    warn!(
+                        fh_len = fh.len(),
+                        "retaining recalled layout after LAYOUTRETURN failure"
+                    );
+                }
             }
             RecallNotification::LayoutAll => {
                 // FSID/ALL 召回：客户端不跟踪 fsid 映射，保守地逐个归还全部缓存 layout
-                let layouts = layout_manager.drain_layouts().await;
+                let layouts = layout_manager.all_layouts().await;
                 debug!(count = layouts.len(), "returning all layouts on recall");
                 for (fh, layout) in &layouts {
-                    // 先提交该 layout 累积的写入范围再归还
-                    if let Some((start, end)) = layout_manager.take_dirty(fh).await {
-                        send_recall_return(&rpc, &auth, &session_holder, |b| {
-                            b.putfh(fh).layoutcommit(
-                                start,
-                                end - start,
-                                false,
-                                &layout.stateid,
-                                Some(end - 1),
-                                1, // LAYOUT4_NFSV4_1_FILES
-                            )
-                        })
-                        .await;
-                    }
+                    let _io_guard = layout_manager.write_file_io(fh).await;
+                    let dirty = layout_manager.snapshot_dirty(fh).await;
                     let iomode = if layout.segments.len() == 1 {
                         layout.segments[0].iomode as u32
                     } else {
                         3 // LAYOUTIOMODE4_ANY
                     };
-                    send_recall_return(&rpc, &auth, &session_holder, |b| {
-                        b.putfh(fh).layoutreturn(
+                    let returned = send_recall_return(&rpc, &auth, &session_holder, |b| {
+                        let b = b.putfh(fh);
+                        let b = if let Some(dirty) = dirty {
+                            b.layoutcommit(
+                                dirty.start,
+                                dirty.end - dirty.start,
+                                false,
+                                &layout.stateid,
+                                Some(dirty.end - 1),
+                                1, // LAYOUT4_NFSV4_1_FILES
+                            )
+                        } else {
+                            b
+                        };
+                        b.layoutreturn(
                             false,
                             1, // LAYOUT4_NFSV4_1_FILES
                             iomode,
@@ -1003,6 +1027,21 @@ async fn handle_recalls(
                         )
                     })
                     .await;
+                    let acknowledged = match dirty {
+                        Some(dirty) if returned => {
+                            layout_manager.acknowledge_dirty(fh, dirty).await
+                        }
+                        Some(_) => false,
+                        None => returned,
+                    };
+                    if returned && acknowledged {
+                        layout_manager.remove_layout(fh).await;
+                    } else {
+                        warn!(
+                            fh_len = fh.len(),
+                            "retaining recalled layout after LAYOUTRETURN failure"
+                        );
+                    }
                 }
             }
         }
@@ -1017,7 +1056,8 @@ async fn send_recall_return(
     auth: &Auth,
     session_holder: &Arc<SessionHolder>,
     build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
-) {
+) -> bool {
+    let mut succeeded = false;
     // Always get the latest session from the holder so that post-recovery
     // returns use the current session ID rather than a stale one.
     let session = session_holder.get().await;
@@ -1035,12 +1075,12 @@ async fn send_recall_return(
                 Ok(builder) => builder,
                 Err(e) => {
                     warn!(error = %e, "recall return cache policy rejected");
-                    return;
+                    return false;
                 }
             };
             if let Err(e) = builder.enforce_max_operations(session.max_operations()) {
                 warn!(error = %e, "recall return operation limit rejected");
-                return;
+                return false;
             }
             let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
@@ -1054,7 +1094,7 @@ async fn send_recall_return(
             builder.encode_with_header(auth, &mut buf);
             if let Err(e) = enforce_request_size(&session, buf.len(), 0) {
                 warn!(error = %e, "recall return request limit rejected");
-                return;
+                return false;
             }
             slot.fence_on_drop();
             let response = rpc
@@ -1069,7 +1109,11 @@ async fn send_recall_return(
                     Ok(response)
                 });
             match response {
-                Ok(response) if response.op_ok(0).is_ok() && response.check_status().is_ok() => {
+                Ok(response)
+                    if response.results.len() == request_op_count
+                        && response.op_ok(0).is_ok()
+                        && response.check_status().is_ok() =>
+                {
                     match validate_sequence_result(
                         &response.results[0],
                         session.id(),
@@ -1087,6 +1131,7 @@ async fn send_recall_return(
                                 slot.advance();
                                 slot.resolve();
                                 debug!("recall return sent");
+                                succeeded = true;
                             }
                         }
                         Err(error) => warn!(error = %error, "recall return SEQUENCE mismatch"),
@@ -1131,6 +1176,7 @@ async fn send_recall_return(
             warn!(error = %e, "failed to acquire slot for recall return");
         }
     };
+    succeeded
 }
 
 /// Navigate to the export path using PUTROOTFH + LOOKUP chain + GETFH.
@@ -1452,6 +1498,9 @@ impl crate::Mount for Mount41Wrapper {
         }
         // Stop lease renewal
         self.m.lease_renewal.stop();
+        // Return pNFS layouts before CLOSE. Each file is exclusively fenced so
+        // LAYOUTCOMMIT -> LAYOUTRETURN cannot race a foreground WRITE/CLOSE.
+        self.m.layoutreturn_all().await?;
         // CLOSE all open files before destroying session
         let open_files = self.m.state.drain().await;
         for (fh, sid) in &open_files {
@@ -1464,8 +1513,6 @@ impl crate::Mount for Mount41Wrapper {
                 })
                 .await;
         }
-        // Return all pNFS layouts to the server
-        self.m.layoutreturn_all().await;
         // Tear down DS connections: destroy each DS session/client-id (best-effort)
         for (addr, ds) in self.m.layout_manager.drain_data_servers().await {
             debug!(addr = %addr, "destroying DS session");

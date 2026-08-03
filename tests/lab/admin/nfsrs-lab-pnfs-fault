@@ -8,6 +8,7 @@ ds_ip=10.128.56.161
 mds_ip=10.128.56.160
 state_file=/run/nfsrs-lab-pnfs-fault.run-id
 table=nfsrs_pnfs_fault
+pnfs_export=/nfsrs_pnfs_b
 
 [[ "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
   echo "unsafe run id: $run_id" >&2
@@ -61,6 +62,27 @@ case "$action" in
     else
       echo 'restored'
     fi
+    ;;
+  trigger-layout-recall)
+    recall_mount="/run/nfsrs-pnfs-recall-$run_id"
+    recall_file="$recall_mount/nfs-rs-pnfs-$run_id/recall-race.bin"
+    cleanup_recall_mount() {
+      mountpoint -q "$recall_mount" && umount "$recall_mount"
+      rmdir "$recall_mount" 2>/dev/null || true
+    }
+    trap cleanup_recall_mount EXIT
+    mkdir -p "$recall_mount"
+    mount -t nfs4 -o vers=4.1,proto=tcp "$mds_ip:$pnfs_export" "$recall_mount"
+    [[ -f "$recall_file" ]] || {
+      echo "run-scoped recall file not found" >&2
+      exit 2
+    }
+    # A conflicting size SETATTR from a distinct kernel NFS client forces the
+    # MDS to reconcile an outstanding write layout. Subsequent nfs-rs WRITEs
+    # overwrite the complete range, so the final checksum remains deterministic.
+    truncate -s 67108901 "$recall_file"
+    sync -f "$recall_file"
+    echo "pNFS layout recall trigger applied for $run_id"
     ;;
   *)
     echo "unsupported action: $action" >&2

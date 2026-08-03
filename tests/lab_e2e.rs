@@ -648,6 +648,65 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a real NetApp CB_LAYOUTRECALL trigger"]
+async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_PNFS_URL")?;
+    let run_id = validated_pnfs_run_id()?;
+    let ready = env::var("NFS_RS_LAB_PNFS_READY_FILE")?;
+    let applied = env::var("NFS_RS_LAB_PNFS_FAULT_APPLIED_FILE")?;
+    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let file = format!("{case_dir}/recall-race.bin");
+    let mount = parse_url_and_mount(&url).await?;
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+
+    let result = async {
+        mount.mkdir_path(&case_dir, 0o700).await?;
+        let created = mount.create_path(&file, Some(0o600)).await?;
+        let expected = Bytes::from(
+            (0..(64 * 1024 * 1024 + 37))
+                .map(|index| ((index * 31 + 89) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        for (chunk_index, chunk_start) in (0..expected.len()).step_by(1024 * 1024).enumerate() {
+            let chunk_end = (chunk_start + 1024 * 1024).min(expected.len());
+            mount
+                .write(
+                    created.fh.clone(),
+                    chunk_start as u64,
+                    expected.slice(chunk_start..chunk_end),
+                )
+                .await?;
+            if chunk_index == 0 {
+                std::fs::write(&ready, b"pnfs-write-active")?;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
+        mount.close(created.fh).await?;
+
+        let opened = mount.open_path(&file, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+        mount.close(opened.fh).await?;
+        ensure(
+            actual == expected,
+            "pNFS recall/write/close full-payload checksum mismatch",
+        )?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+    let unmount_result = mount.umount().await;
+    result?;
+    unmount_result?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires an authorized Terrasync NFS session fault"]
 async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
     ensure(
