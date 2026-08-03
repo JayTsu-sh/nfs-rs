@@ -60,6 +60,48 @@ async fn cleanup_pnfs_case(mount: &dyn Mount, case_dir: &str, file: &str) {
     let _ = mount.rmdir_path(case_dir).await;
 }
 
+async fn wait_for_lab_file(path: &str, timeout: Duration) -> TestResult {
+    tokio::time::timeout(timeout, async {
+        while !std::path::Path::new(path).exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other(format!("timed out waiting for lab signal {path}")))?;
+    Ok(())
+}
+
+async fn recover_pnfs_file_from_checkpoint(
+    url: &str,
+    case_dir: &str,
+    file: &str,
+    expected: &Bytes,
+) -> TestResult {
+    let mount = parse_url_and_mount(url).await?;
+    cleanup_pnfs_case(mount.as_ref(), case_dir, file).await;
+    let result = async {
+        mount.mkdir_path(case_dir, 0o700).await?;
+        let created = mount.create_path(file, Some(0o600)).await?;
+        write_all(mount.as_ref(), created.fh.clone(), expected).await?;
+        mount.close(created.fh).await?;
+
+        let opened = mount.open_path(file, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+        mount.close(opened.fh).await?;
+        ensure(
+            actual == *expected,
+            "pNFS checkpoint recovery full-payload checksum mismatch",
+        )
+    }
+    .await;
+
+    cleanup_pnfs_case(mount.as_ref(), case_dir, file).await;
+    let unmount_result = mount.umount().await;
+    result?;
+    unmount_result?;
+    Ok(())
+}
+
 async fn write_all(mount: &dyn Mount, fh: Bytes, data: &Bytes) -> TestResult {
     let chunk_size = (mount.get_max_write_size() as usize).min(64 * 1024);
     write_all_with_chunk_size(mount, fh, data, chunk_size).await
@@ -378,6 +420,69 @@ async fn nfs_v41_pnfs_cleanup_run() -> TestResult {
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
     mount.umount().await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an authorized NetApp pNFS DS reset"]
+async fn nfs_v41_pnfs_ds_reset_returns_uncertain() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_PNFS_URL")?;
+    let run_id = validated_pnfs_run_id()?;
+    let ready = env::var("NFS_RS_LAB_PNFS_READY_FILE")?;
+    let applied = env::var("NFS_RS_LAB_PNFS_FAULT_APPLIED_FILE")?;
+    let uncertain = env::var("NFS_RS_LAB_PNFS_UNCERTAIN_FILE")?;
+    let restored = env::var("NFS_RS_LAB_PNFS_RESTORED_FILE")?;
+    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let file = format!("{case_dir}/payload.bin");
+    let mount = parse_url_and_mount(&url).await?;
+    cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+
+    let result = async {
+        mount.mkdir_path(&case_dir, 0o700).await?;
+        let created = mount.create_path(&file, Some(0o600)).await?;
+        let seed = Bytes::from(vec![0x3c; 512 * 1024]);
+        write_all(mount.as_ref(), created.fh.clone(), &seed).await?;
+        std::fs::write(&ready, b"pnfs-ds-session-ready")?;
+        wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
+
+        let fault_payload = Bytes::from(vec![0xc3; 64 * 1024]);
+        let error = mount
+            .write(created.fh.clone(), seed.len() as u64, fault_payload)
+            .await
+            .expect_err("DS reset after send must not fall back to a successful MDS WRITE");
+        let outcome = error
+            .operation_outcome()
+            .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
+        ensure(
+            outcome.outcome == nfs_rs::OperationOutcome::Uncertain,
+            format!("unexpected pNFS fault outcome: {:?}", outcome.outcome),
+        )?;
+        ensure(
+            outcome.recovery == nfs_rs::RecoveryAction::VerifyThenResume,
+            format!("unexpected pNFS recovery action: {:?}", outcome.recovery),
+        )?;
+        std::fs::write(&uncertain, b"uncertain-no-mds-fallback")?;
+        wait_for_lab_file(&restored, Duration::from_secs(120)).await?;
+        let _ = mount.umount().await;
+
+        let expected = Bytes::from(
+            (0..(4 * 1024 * 1024 + 37))
+                .map(|index| ((index * 19 + 61) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        recover_pnfs_file_from_checkpoint(&url, &case_dir, &file, &expected).await
+    }
+    .await;
+
+    let cleanup_mount = parse_url_and_mount(&url).await;
+    if let Ok(cleanup_mount) = cleanup_mount {
+        cleanup_pnfs_case(cleanup_mount.as_ref(), &case_dir, &file).await;
+        let _ = cleanup_mount.umount().await;
+    }
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
