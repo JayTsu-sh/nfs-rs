@@ -516,14 +516,6 @@ impl Mount41 {
             return PnfsWriteOutcome::NotAttempted;
         }
 
-        let active_session = self.session_holder.get().await;
-        let context = RequestContext {
-            operation: "pnfs_write".to_string(),
-            session_id: *active_session.id(),
-            slot_id: 0,
-            sequence_id: 0,
-        };
-
         // RFC 8881 §13.9.1：DS 上的 WRITE 使用 open/delegation stateid，
         // 而非 layout stateid（layout stateid 仅用于 LAYOUTCOMMIT/LAYOUTRETURN）
         let io_stateid = self
@@ -605,6 +597,15 @@ impl Mount41 {
         match futures::future::try_join_all(futures).await {
             Ok(results) => {
                 if layout.generation != self.layout_manager.generation() {
+                    // This is aggregate pNFS batch context, so slot/sequence are
+                    // intentionally zero rather than claiming one DS request.
+                    let active_session = self.session_holder.get().await;
+                    let context = RequestContext {
+                        operation: "pnfs_write".to_string(),
+                        session_id: *active_session.id(),
+                        slot_id: 0,
+                        sequence_id: 0,
+                    };
                     return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
                         context,
                         NfsError::Rpc(
@@ -635,6 +636,15 @@ impl Mount41 {
                         .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
                         .await;
                 }
+                // Preserve hot-path performance: aggregate diagnostic context
+                // is only materialized when the DS batch actually fails.
+                let active_session = self.session_holder.get().await;
+                let context = RequestContext {
+                    operation: "pnfs_write".to_string(),
+                    session_id: *active_session.id(),
+                    slot_id: 0,
+                    sequence_id: 0,
+                };
                 debug!(error = %e, "pNFS write result is uncertain; refusing MDS fallback");
                 PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(context, e)))
             }
