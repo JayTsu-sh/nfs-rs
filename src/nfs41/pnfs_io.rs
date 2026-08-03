@@ -5,6 +5,7 @@
 //! parallel. If pNFS is unavailable or fails, callers fall back to MDS I/O.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -45,6 +46,20 @@ fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
         context,
         source,
     )))
+}
+
+/// Wait for every request in an already-issued DS batch before reporting its
+/// aggregate result. Unlike `try_join_all`, an early error cannot cancel a
+/// sibling WRITE whose request may already be on the wire. Errors are selected
+/// in plan order, so diagnostics do not depend on network completion order.
+async fn settle_ds_batch<T, F>(futures: Vec<F>) -> Result<Vec<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .collect()
 }
 
 /// Find the layout segment covering a given file offset.
@@ -651,7 +666,7 @@ impl Mount41 {
             })
             .collect();
 
-        match futures::future::try_join_all(futures).await {
+        match settle_ds_batch(futures).await {
             Ok(results) => {
                 if layout.generation != self.layout_manager.generation() {
                     // This is aggregate pNFS batch context, so slot/sequence are
@@ -803,6 +818,11 @@ impl Mount41 {
 mod tests {
     use super::*;
     use crate::nfs41::layout::{IoMode, Layout, LayoutContent, LayoutSegment, LayoutType};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type TestDsFuture = Pin<Box<dyn Future<Output = Result<u32>> + Send>>;
 
     #[test]
     fn find_covering_segment_whole_file() {
@@ -903,5 +923,96 @@ mod tests {
         assert_eq!(outcome.operation_class, OperationClass::ReplaySensitive);
         assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
         assert_eq!(outcome.context().operation, "pnfs_write");
+    }
+
+    #[tokio::test]
+    async fn ds_batch_waits_for_success_when_failure_completes_first() {
+        let (failure_seen_tx, failure_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_success_tx, release_success_rx) = tokio::sync::oneshot::channel();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let success_count_task = Arc::clone(&success_count);
+        let futures: Vec<TestDsFuture> = vec![
+            Box::pin(async move {
+                let _ = failure_seen_tx.send(());
+                Err(NfsError::Rpc("DS 0 failed".to_string()))
+            }),
+            Box::pin(async move {
+                let _ = release_success_rx.await;
+                success_count_task.fetch_add(1, Ordering::SeqCst);
+                Ok(17)
+            }),
+        ];
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        assert!(failure_seen_rx.await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(
+            !batch.is_finished(),
+            "early DS failure cancelled a sibling WRITE"
+        );
+        assert_eq!(success_count.load(Ordering::SeqCst), 0);
+        assert!(release_success_tx.send(()).is_ok());
+        let result = batch.await;
+        assert!(matches!(result, Ok(Err(NfsError::Rpc(message))) if message == "DS 0 failed"));
+        assert_eq!(success_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ds_batch_waits_for_failure_when_success_completes_first() {
+        let (success_seen_tx, success_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_failure_tx, release_failure_rx) = tokio::sync::oneshot::channel();
+        let futures: Vec<TestDsFuture> = vec![
+            Box::pin(async move {
+                let _ = success_seen_tx.send(());
+                Ok(23)
+            }),
+            Box::pin(async move {
+                let _ = release_failure_rx.await;
+                Err(NfsError::Rpc("DS 1 failed".to_string()))
+            }),
+        ];
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        assert!(success_seen_rx.await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(
+            !batch.is_finished(),
+            "successful stripe hid a pending DS WRITE"
+        );
+        assert!(release_failure_tx.send(()).is_ok());
+        let result = batch.await;
+        assert!(matches!(result, Ok(Err(NfsError::Rpc(message))) if message == "DS 1 failed"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_ds_batch_drops_every_pending_write() {
+        struct DropCount(Arc<AtomicUsize>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let futures: Vec<TestDsFuture> = (0..2)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let guard = DropCount(Arc::clone(&dropped));
+                Box::pin(async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<u32>>().await
+                }) as TestDsFuture
+            })
+            .collect();
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        while started.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+        batch.abort();
+        let _ = batch.await;
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 }

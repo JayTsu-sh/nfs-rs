@@ -296,6 +296,18 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(recall_proxy.contains("layout-recall-reply-status="));
     assert!(rust_test.contains("nfs_v41_pnfs_layout_recall_during_write_and_close"));
 
+    let pnfs_io = fs::read_to_string(workspace_path("src/nfs41/pnfs_io.rs"))
+        .expect("pNFS I/O implementation must be readable");
+    for test in [
+        "ds_batch_waits_for_success_when_failure_completes_first",
+        "ds_batch_waits_for_failure_when_success_completes_first",
+        "cancelling_ds_batch_drops_every_pending_write",
+    ] {
+        assert!(pnfs_io.contains(test), "missing T15 CI test {test}");
+    }
+    assert!(pnfs_io.contains("match settle_ds_batch(futures).await"));
+    assert!(pnfs_io.contains("RecoveryAction::VerifyThenResume"));
+
     for path in [
         common,
         runner,

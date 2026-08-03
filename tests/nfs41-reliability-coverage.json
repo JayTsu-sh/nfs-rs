@@ -21,7 +21,7 @@
     {"id":"T12","ci":"pnfs attempted-write error requires verify-then-resume","nightly":"ontap-ds-isolate uncertain-no-fallback restart-resume-checksum","required":true},
     {"id":"T13","ci":"versioned dirty snapshot survives failure/cancellation/concurrent write and clears only on matching acknowledgement","nightly":"ontap-layoutcommit mds-isolate uncertain dirty-retained reopen-verify restore checksum","required":true},
     {"id":"T14","ci":"per-file shared WRITE exclusive recall-close gate+ordered atomic layoutcommit-layoutreturn+cross-file concurrency","nightly":"ontap-real-cb-layoutrecall during active write ordered return close full checksum","required":true},
-    {"id":"T15","ci":"planned:multi-ds-partial-failure","nightly":"planned:single-ds-isolation","required":true},
+    {"id":"T15","ci":"pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write","nightly":"BLOCKED_CAPABILITY(netapp-pnfs-multi-ds-layout):cross-node-FlexGroup-requires-uniform-FabricPool-aggregates","required":true},
     {"id":"T16","ci":"planned:pnfs-disable","nightly":"planned:mds-only","required":true},
     {"id":"T17","ci":"coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired","nightly":"lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:netapp-file-layout-capability-artifact","required":true},
     {"id":"T18","ci":"planned:fault-cleanup-shell","nightly":"planned:fault-restore-smoke","required":true},
