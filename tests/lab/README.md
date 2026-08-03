@@ -18,7 +18,9 @@ Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
 
 The NetApp baseline uses `/nfsrs_pnfs_a` and `/nfsrs_pnfs_b`, both dedicated
-NFSv4-only FlexGroup exports. `run-pnfs-e2e.sh` mounts the second export through
+NFSv4-only FlexGroup exports. `run-netapp-v41-e2e.sh` first runs the ordinary
+NFSv4.1 compatibility suite against both exports without requiring pNFS path
+evidence. `run-pnfs-e2e.sh` then mounts the second export through
 the `.160` MDS LIF, performs an 8 MiB+ multi-chunk write through `nfs-rs`, and
 requires a new established connection to the `.161` DS LIF before accepting the
 full-payload checksum. ONTAP management credentials are not needed by nightly.

@@ -204,6 +204,8 @@ fn netapp_pnfs_lab_contract_is_wired() {
         .expect("lab common config must be readable");
     let runner = fs::read_to_string(workspace_path("tests/lab/run-pnfs-e2e.sh"))
         .expect("pNFS runner must be readable");
+    let compatibility = fs::read_to_string(workspace_path("tests/lab/run-netapp-v41-e2e.sh"))
+        .expect("NetApp compatibility runner must be readable");
     let cleanup = fs::read_to_string(workspace_path("tests/lab/cleanup-pnfs-run.sh"))
         .expect("pNFS cleanup must be readable");
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
@@ -228,6 +230,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(runner.contains("BLOCKED_CAPABILITY(netapp-pnfs-independent-ds)"));
     assert!(runner.contains("trap cleanup EXIT"));
     assert!(workflow.contains("NetApp NFSv4.1 pNFS WRITE E2E"));
+    assert!(workflow.contains("NetApp NFSv4.1 compatibility E2E"));
+    assert!(workflow.contains("tests/lab/run-netapp-v41-e2e.sh \"$RUN_ID\""));
+    assert!(compatibility.contains("nfs_v3_and_v41_end_to_end"));
+    assert!(compatibility.contains("version=4.1&noresvport=true"));
     assert!(workflow.contains("tests/lab/run-pnfs-e2e.sh \"$RUN_ID\""));
     assert!(workflow.contains("tests/lab/cleanup-pnfs-run.sh \"$RUN_ID\""));
     assert!(workflow.contains("Cleanup NetApp pNFS run"));
@@ -237,7 +243,15 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(rust_test.contains("nfs_v41_pnfs_write_uses_independent_ds"));
     assert!(rust_test.contains("pNFS full-payload checksum mismatch"));
 
-    for path in [common, runner, cleanup, workflow, capability, rust_test] {
+    for path in [
+        common,
+        runner,
+        compatibility,
+        cleanup,
+        workflow,
+        capability,
+        rust_test,
+    ] {
         assert!(
             !path.contains("Netapp1!"),
             "management credential leaked into repository"

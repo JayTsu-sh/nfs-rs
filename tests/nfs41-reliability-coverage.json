@@ -26,7 +26,7 @@
     {"id":"T17","ci":"coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired","nightly":"lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:netapp-file-layout-capability-artifact","required":true},
     {"id":"T18","ci":"planned:fault-cleanup-shell","nightly":"planned:fault-restore-smoke","required":true},
     {"id":"T19","ci":"error::tests::outcome_error_preserves_source_without_payload_context","nightly":"planned:artifact-redaction","required":true},
-    {"id":"T20","ci":"existing-all-targets","nightly":"existing-v3-v41-e2e","required":true},
+    {"id":"T20","ci":"existing-all-targets","nightly":"existing-v3-v41-e2e+netapp-v41-compatibility-e2e","required":true},
     {"id":"T21","ci":"nfs41::lease::tests::echoed_identity_mismatch_matrix_is_rejected","nightly":"blocked-capability:three-lease-intervals","required":true},
     {"id":"T22","ci":"nfs41::session::tests::cancellation_keeps_armed_slot_fenced","nightly":"existing-workflow-cleanup","required":true},
     {"id":"T23","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:zero-copy-stripes+full-checksum","required":true},
