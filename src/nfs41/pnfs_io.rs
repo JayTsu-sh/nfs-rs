@@ -736,7 +736,11 @@ impl Mount41 {
             .await?;
         response.op_ok(1)?; // PUTFH
         response.op_ok(2)?; // LAYOUTCOMMIT
-        self.layout_manager.acknowledge_dirty(fh, dirty).await;
+        if !self.layout_manager.acknowledge_dirty(fh, dirty).await {
+            return Err(NfsError::Rpc(
+                "pNFS dirty range changed during LAYOUTCOMMIT; retry before CLOSE".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -744,7 +748,8 @@ impl Mount41 {
 
     /// Return a layout to the metadata server (LAYOUTRETURN4_FILE).
     /// Removes the layout from the local cache and notifies the server.
-    /// Errors are logged but not propagated — layout return is best-effort.
+    /// A failed commit/return is propagated so CLOSE cannot release state while
+    /// layout changes are still pending.
     pub(crate) async fn layoutreturn_file(&self, fh: &Bytes) -> Result<()> {
         // RFC 5661 §18.42.3：LAYOUTCOMMIT 必须在 LAYOUTRETURN 之前
         self.flush_layoutcommit(fh).await?;
