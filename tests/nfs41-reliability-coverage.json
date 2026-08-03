@@ -19,7 +19,7 @@
     {"id":"T10","ci":"channel attrs+encoded sizes+operations+identity+dynamic slot shrink-growth boundaries","nightly":"ontap-negotiated-effective-limits+bounded-concurrency","required":true},
     {"id":"T11","ci":"pnfs two-phase DS preflight before zero-copy WRITE batch","nightly":"ontap-pre-write-ds-isolate zero-ds-connection mds-fallback checksum","required":true},
     {"id":"T12","ci":"pnfs attempted-write error requires verify-then-resume","nightly":"ontap-ds-isolate uncertain-no-fallback restart-resume-checksum","required":true},
-    {"id":"T13","ci":"planned:layoutcommit-failure","nightly":"planned:layoutcommit-fault","required":true},
+    {"id":"T13","ci":"versioned dirty snapshot survives failure/cancellation/concurrent write and clears only on matching acknowledgement","nightly":"ontap-layoutcommit mds-isolate uncertain dirty-retained retry restore checksum","required":true},
     {"id":"T14","ci":"planned:recall-write-close-race","nightly":"planned:recall-during-write","required":true},
     {"id":"T15","ci":"planned:multi-ds-partial-failure","nightly":"planned:single-ds-isolation","required":true},
     {"id":"T16","ci":"planned:pnfs-disable","nightly":"planned:mds-only","required":true},

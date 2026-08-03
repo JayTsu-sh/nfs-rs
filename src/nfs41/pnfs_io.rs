@@ -710,31 +710,34 @@ impl Mount41 {
 
     // ─── pNFS Layout Commit ──────────────────────────────────────────────
 
-    /// 将累积的 dirty 范围通过一次 LAYOUTCOMMIT 提交给 MDS（best-effort）。
-    /// 在 CLOSE / LAYOUTRETURN 前调用；无 dirty 范围或 layout 已不在缓存时为 no-op。
-    pub(crate) async fn flush_layoutcommit(&self, fh: &Bytes) {
-        let Some((start, end)) = self.layout_manager.take_dirty(fh).await else {
-            return;
+    /// Commit a versioned snapshot of the accumulated dirty range. The range
+    /// remains pending across transport errors, operation errors, and task
+    /// cancellation, and is acknowledged only after authoritative success.
+    pub(crate) async fn flush_layoutcommit(&self, fh: &Bytes) -> Result<()> {
+        let Some(dirty) = self.layout_manager.snapshot_dirty(fh).await else {
+            return Ok(());
         };
         let Some(layout) = self.layout_manager.get_layout(fh).await else {
-            // layout 已被驱逐（recall 等）：无法 LAYOUTCOMMIT，丢弃 dirty 记录
-            return;
+            return Err(NfsError::Rpc(
+                "cannot LAYOUTCOMMIT dirty range without an active layout".to_string(),
+            ));
         };
-        let result = self
+        let response = self
             .compound("layoutcommit", |b| {
                 b.putfh(fh).layoutcommit(
-                    start,
-                    end - start,
+                    dirty.start,
+                    dirty.end - dirty.start,
                     false,
                     &layout.stateid,
-                    Some(end - 1),
+                    Some(dirty.end - 1),
                     1, // LAYOUT4_NFSV4_1_FILES
                 )
             })
-            .await;
-        if let Err(e) = result {
-            debug!(error = %e, "LAYOUTCOMMIT flush failed");
-        }
+            .await?;
+        response.op_ok(1)?; // PUTFH
+        response.op_ok(2)?; // LAYOUTCOMMIT
+        self.layout_manager.acknowledge_dirty(fh, dirty).await;
+        Ok(())
     }
 
     // ─── pNFS Layout Return ──────────────────────────────────────────────
@@ -742,12 +745,12 @@ impl Mount41 {
     /// Return a layout to the metadata server (LAYOUTRETURN4_FILE).
     /// Removes the layout from the local cache and notifies the server.
     /// Errors are logged but not propagated — layout return is best-effort.
-    pub(crate) async fn layoutreturn_file(&self, fh: &Bytes) {
+    pub(crate) async fn layoutreturn_file(&self, fh: &Bytes) -> Result<()> {
         // RFC 5661 §18.42.3：LAYOUTCOMMIT 必须在 LAYOUTRETURN 之前
-        self.flush_layoutcommit(fh).await;
-        let layout = match self.layout_manager.remove_layout(fh).await {
+        self.flush_layoutcommit(fh).await?;
+        let layout = match self.layout_manager.get_layout(fh).await {
             Some(l) => l,
-            None => return,
+            None => return Ok(()),
         };
         // Use the first segment's iomode; for whole-file layouts this is correct.
         // If multiple iomodes exist, IOMODE_ANY (3) tells the server to return all.
@@ -771,14 +774,13 @@ impl Mount41 {
             .await;
         match result {
             Ok(resp) => {
-                if let Err(e) = resp.op_ok(2) {
-                    debug!(error = %e, "LAYOUTRETURN op failed");
-                }
+                resp.op_ok(1)?;
+                resp.op_ok(2)?;
             }
-            Err(e) => {
-                debug!(error = %e, "LAYOUTRETURN compound failed");
-            }
+            Err(e) => return Err(e),
         }
+        self.layout_manager.remove_layout(fh).await;
+        Ok(())
     }
 
     /// Return all cached layouts to the server (used during umount).

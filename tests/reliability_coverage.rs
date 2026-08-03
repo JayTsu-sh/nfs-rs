@@ -222,6 +222,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
         "tests/lab/run-pnfs-preflight-fallback-e2e.sh",
     ))
     .expect("pNFS preflight runner must be readable");
+    let layoutcommit_runner = fs::read_to_string(workspace_path(
+        "tests/lab/run-pnfs-layoutcommit-fault-e2e.sh",
+    ))
+    .expect("pNFS LAYOUTCOMMIT runner must be readable");
 
     for value in [
         "LAB_PNFS_MDS_DATA",
@@ -269,6 +273,11 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(preflight_runner.contains("maximum_connections > baseline_connections"));
     assert!(rust_test.contains("nfs_v41_pnfs_ds_unreachable_before_write_falls_back_to_mds"));
     assert!(rust_test.contains("pNFS preflight MDS fallback full-payload checksum mismatch"));
+    assert!(workflow.contains("NetApp pNFS LAYOUTCOMMIT failure recovery E2E"));
+    assert!(layoutcommit_runner.contains("trap cleanup EXIT"));
+    assert!(layoutcommit_runner.contains("isolate-mds"));
+    assert!(layoutcommit_runner.contains("dirty-retained=1 retry=1 restored=1 checksum=ok"));
+    assert!(rust_test.contains("nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range"));
 
     for path in [
         common,
@@ -281,6 +290,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
         fault_runner,
         fault_helper,
         preflight_runner,
+        layoutcommit_runner,
     ] {
         assert!(
             !path.contains("Netapp1!"),

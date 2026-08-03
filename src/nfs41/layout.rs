@@ -150,7 +150,7 @@ pub(crate) struct LayoutManager {
     device_cache: RwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
-    dirty: RwLock<HashMap<Bytes, (u64, u64, u64)>>,
+    dirty: RwLock<HashMap<Bytes, DirtyRange>>,
     /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
     degenerate_logged: AtomicBool,
     /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
@@ -160,6 +160,14 @@ pub(crate) struct LayoutManager {
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
     active_generation: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirtyRange {
+    pub generation: u64,
+    pub start: u64,
+    pub end: u64,
+    revision: u64,
 }
 
 impl LayoutManager {
@@ -281,11 +289,17 @@ impl LayoutManager {
         }
         dirty
             .entry(fh.clone())
-            .and_modify(|(_, s, e)| {
-                *s = (*s).min(start);
-                *e = (*e).max(end);
+            .and_modify(|range| {
+                range.start = range.start.min(start);
+                range.end = range.end.max(end);
+                range.revision = range.revision.wrapping_add(1);
             })
-            .or_insert((generation, start, end));
+            .or_insert(DirtyRange {
+                generation,
+                start,
+                end,
+                revision: 0,
+            });
         true
     }
 
@@ -294,11 +308,34 @@ impl LayoutManager {
         let _ = self.mark_dirty_at(fh, self.generation(), start, end).await;
     }
 
-    /// 取出并清除一个文件的待提交范围。
+    /// Snapshot a pending range without removing it. The revision lets a
+    /// successful LAYOUTCOMMIT acknowledge only the exact state it sent.
+    pub async fn snapshot_dirty(&self, fh: &Bytes) -> Option<DirtyRange> {
+        let dirty = self.dirty.read().await;
+        dirty
+            .get(fh)
+            .copied()
+            .filter(|range| range.generation == self.active_generation.load(Ordering::Acquire))
+    }
+
+    /// Clear a range only if no concurrent WRITE extended it while the
+    /// LAYOUTCOMMIT was in flight.
+    pub async fn acknowledge_dirty(&self, fh: &Bytes, committed: DirtyRange) -> bool {
+        let mut dirty = self.dirty.write().await;
+        let unchanged = dirty.get(fh).is_some_and(|current| *current == committed)
+            && committed.generation == self.active_generation.load(Ordering::Acquire);
+        if unchanged {
+            dirty.remove(fh);
+        }
+        unchanged
+    }
+
+    /// Test/teardown helper that removes a pending range immediately.
     pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
         let mut dirty = self.dirty.write().await;
-        dirty.remove(fh).and_then(|(generation, start, end)| {
-            (generation == self.active_generation.load(Ordering::Acquire)).then_some((start, end))
+        dirty.remove(fh).and_then(|range| {
+            (range.generation == self.active_generation.load(Ordering::Acquire))
+                .then_some((range.start, range.end))
         })
     }
 
@@ -1094,6 +1131,41 @@ mod tests {
         mgr.mark_dirty(&fh, 100, 200).await;
         assert_eq!(mgr.take_dirty(&fh).await, Some((100, 200)));
         assert_eq!(mgr.take_dirty(&fh).await, None);
+    }
+
+    #[tokio::test]
+    async fn dirty_snapshot_survives_unacknowledged_commit() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty-snapshot");
+        mgr.mark_dirty(&fh, 100, 200).await;
+
+        let snapshot = mgr.snapshot_dirty(&fh).await.expect("dirty snapshot");
+        // Dropping/cancelling the would-be LAYOUTCOMMIT does not mutate state.
+        assert_eq!(mgr.snapshot_dirty(&fh).await, Some(snapshot));
+        assert_eq!(mgr.take_dirty(&fh).await, Some((100, 200)));
+    }
+
+    #[tokio::test]
+    async fn dirty_acknowledgement_preserves_concurrent_write() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty-concurrent");
+        mgr.mark_dirty(&fh, 100, 200).await;
+        let snapshot = mgr.snapshot_dirty(&fh).await.expect("dirty snapshot");
+
+        mgr.mark_dirty(&fh, 300, 400).await;
+        assert!(!mgr.acknowledge_dirty(&fh, snapshot).await);
+        assert_eq!(mgr.take_dirty(&fh).await, Some((100, 400)));
+    }
+
+    #[tokio::test]
+    async fn dirty_acknowledgement_clears_only_matching_snapshot() {
+        let mgr = LayoutManager::new(false);
+        let fh = Bytes::from_static(b"dirty-ack");
+        mgr.mark_dirty(&fh, 0, 4096).await;
+        let snapshot = mgr.snapshot_dirty(&fh).await.expect("dirty snapshot");
+
+        assert!(mgr.acknowledge_dirty(&fh, snapshot).await);
+        assert_eq!(mgr.snapshot_dirty(&fh).await, None);
     }
 
     #[tokio::test]
