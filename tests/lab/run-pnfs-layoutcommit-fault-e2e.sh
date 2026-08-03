@@ -66,4 +66,4 @@ if ! wait "$test_pid"; then
 fi
 test_pid=""
 cat "$test_log"
-echo "pnfs-layoutcommit uncertain=1 dirty-retained=1 retry=1 restored=1 checksum=ok"
+echo "pnfs-layoutcommit uncertain=1 dirty-retained=1 reopen-verify=1 restored=1 checksum=ok"

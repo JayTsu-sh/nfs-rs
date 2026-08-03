@@ -276,7 +276,9 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(workflow.contains("NetApp pNFS LAYOUTCOMMIT failure recovery E2E"));
     assert!(layoutcommit_runner.contains("trap cleanup EXIT"));
     assert!(layoutcommit_runner.contains("isolate-mds"));
-    assert!(layoutcommit_runner.contains("dirty-retained=1 retry=1 restored=1 checksum=ok"));
+    assert!(
+        layoutcommit_runner.contains("dirty-retained=1 reopen-verify=1 restored=1 checksum=ok")
+    );
     assert!(rust_test.contains("nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range"));
 
     for path in [

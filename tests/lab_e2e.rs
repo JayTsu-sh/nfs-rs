@@ -624,30 +624,18 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
         std::fs::write(&uncertain, b"layoutcommit-uncertain-dirty-retained")?;
         wait_for_lab_file(&restored, Duration::from_secs(120)).await?;
 
-        // Retrying CLOSE must resend the retained dirty range before releasing
-        // OPEN state. MDS TCP rebind can lag behind fault restoration, so keep
-        // the same mount/OPEN state and allow bounded recovery convergence.
-        let mut close_error = None;
-        for _ in 0..60 {
-            match mount.close(created.fh.clone()).await {
-                Ok(()) => {
-                    close_error = None;
-                    break;
-                }
-                Err(error) => close_error = Some(error),
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        if let Some(error) = close_error {
-            return Err(error.into());
-        }
-        let opened = mount.open_path(&file, OPEN_READ).await?;
-        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
-        mount.close(opened.fh).await?;
+        // A full MDS isolation can invalidate the old connection/session. Follow
+        // VerifyThenResume by reopening on a fresh mount and verifying the
+        // authoritative file rather than retrying on a fenced slot table.
+        let verify_mount = parse_url_and_mount(&url).await?;
+        let opened = verify_mount.open_path(&file, OPEN_READ).await?;
+        let actual = read_all(verify_mount.as_ref(), opened.fh.clone(), expected.len()).await?;
+        verify_mount.close(opened.fh).await?;
         ensure(
             actual == expected,
-            "pNFS LAYOUTCOMMIT retry full-payload checksum mismatch",
+            "pNFS LAYOUTCOMMIT recovery full-payload checksum mismatch",
         )?;
+        verify_mount.umount().await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;
