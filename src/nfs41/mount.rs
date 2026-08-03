@@ -23,7 +23,7 @@ use crate::error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, Result, classify_sent_nfs41_error,
 };
-use crate::mount::{self, NFSVersion, Nfs41ChannelLimits};
+use crate::mount::{self, NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits};
 use crate::rpc;
 use crate::rpc::auth::Auth;
 
@@ -870,6 +870,7 @@ async fn mount_on_addr(
         auth.clone(),
         session_holder.clone(),
         layout_manager.clone(),
+        Arc::clone(&callback_state),
     )));
 
     // Start background lease renewal using COMPOUND(SEQUENCE) (interval = server lease_time / 2)
@@ -915,6 +916,7 @@ async fn handle_recalls(
     auth: Auth,
     session_holder: Arc<SessionHolder>,
     layout_manager: Arc<LayoutManager>,
+    callback_state: Arc<CallbackState>,
 ) {
     while let Some(notification) = recall_rx.recv().await {
         match notification {
@@ -938,6 +940,7 @@ async fn handle_recalls(
                 length,
                 iomode,
             } => {
+                callback_state.record_layout_recall();
                 let _io_guard = layout_manager.write_file_io(&fh).await;
                 debug!(
                     fh_len = fh.len(),
@@ -982,6 +985,7 @@ async fn handle_recalls(
                 };
                 if returned && acknowledged {
                     layout_manager.remove_layout(&fh).await;
+                    callback_state.record_layout_return();
                     info!(event = "pnfs_layout_recall_returned", fh_len = fh.len());
                 } else {
                     warn!(
@@ -1452,6 +1456,15 @@ impl crate::Mount for Mount41Wrapper {
             max_operations: session.max_operations(),
             max_requests: session.max_requests(),
             effective_highest_slot_id: session.effective_highest_slot_id(),
+        })
+    }
+
+    async fn nfs41_callback_stats(&self) -> Option<Nfs41CallbackStats> {
+        let (layout_recalls_received, layout_returns_completed) =
+            self.m.callback_state.layout_recall_stats();
+        Some(Nfs41CallbackStats {
+            layout_recalls_received,
+            layout_returns_completed,
         })
     }
 

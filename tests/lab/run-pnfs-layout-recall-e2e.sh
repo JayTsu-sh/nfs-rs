@@ -26,7 +26,6 @@ export NFS_RS_LAB_PNFS_URL="nfs://$LAB_PNFS_MDS_DATA$LAB_PNFS_SECONDARY_EXPORT?v
 export NFS_RS_LAB_PNFS_RUN_ID="$run_id"
 export NFS_RS_LAB_PNFS_READY_FILE="$ready_file"
 export NFS_RS_LAB_PNFS_FAULT_APPLIED_FILE="$applied_file"
-export RUST_LOG="nfs_rs::nfs41::mount=info"
 
 timeout 360 cargo test --locked --test lab_e2e \
   nfs_v41_pnfs_layout_recall_during_write_and_close \
@@ -50,6 +49,5 @@ if ! wait "$test_pid"; then
 fi
 test_pid=""
 cat "$test_log"
-grep -Fq 'pnfs_layout_recall_received' "$test_log"
-grep -Fq 'pnfs_layout_recall_returned' "$test_log"
+grep -Fq 'pnfs-layout-recall received=' "$test_log"
 echo "pnfs-layout-recall received=1 returned=1 write-serialized=1 close-ordered=1 checksum=ok"

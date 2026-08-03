@@ -286,7 +286,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(workflow.contains("NetApp pNFS layout recall during WRITE/CLOSE E2E"));
     assert!(recall_runner.contains("trap cleanup EXIT"));
     assert!(recall_runner.contains("trigger-layout-recall"));
-    assert!(recall_runner.contains("pnfs_layout_recall_received"));
+    assert!(recall_runner.contains("pnfs-layout-recall received="));
     assert!(recall_runner.contains("close-ordered=1 checksum=ok"));
     assert!(rust_test.contains("nfs_v41_pnfs_layout_recall_during_write_and_close"));
 

@@ -51,6 +51,13 @@ pub struct Nfs41ChannelLimits {
     pub effective_highest_slot_id: u32,
 }
 
+/// Redacted NFSv4.1 callback lifecycle counters for reliability diagnostics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nfs41CallbackStats {
+    pub layout_recalls_received: u64,
+    pub layout_returns_completed: u64,
+}
+
 /// Trait which defines the procedures that can be performed on an NFS mount.
 ///
 /// NFS version agnostic.  However, since NFSv4 introduces procedures that are not present in NFSv3, invoking those
@@ -88,6 +95,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Return NFSv4.1 fore-channel limits, or `None` for other protocol versions.
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
+        None
+    }
+
+    /// Return redacted callback counters, or `None` for other protocol versions.
+    async fn nfs41_callback_stats(&self) -> Option<Nfs41CallbackStats> {
         None
     }
 

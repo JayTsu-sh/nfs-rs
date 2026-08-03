@@ -661,6 +661,10 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
     let case_dir = format!("nfs-rs-pnfs-{run_id}");
     let file = format!("{case_dir}/recall-race.bin");
     let mount = parse_url_and_mount(&url).await?;
+    let baseline_callbacks = mount
+        .nfs41_callback_stats()
+        .await
+        .ok_or_else(|| io::Error::other("NFSv4.1 callback stats unavailable"))?;
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
@@ -686,6 +690,19 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
+        let callback_stats = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let stats = mount.nfs41_callback_stats().await.unwrap_or_default();
+                if stats.layout_recalls_received > baseline_callbacks.layout_recalls_received
+                    && stats.layout_returns_completed > baseline_callbacks.layout_returns_completed
+                {
+                    break stats;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("ONTAP did not complete CB_LAYOUTRECALL"))?;
         mount.close(created.fh).await?;
 
         let opened = mount.open_path(&file, OPEN_READ).await?;
@@ -695,6 +712,11 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
             actual == expected,
             "pNFS recall/write/close full-payload checksum mismatch",
         )?;
+        eprintln!(
+            "pnfs-layout-recall received={} returned={} status=ok",
+            callback_stats.layout_recalls_received - baseline_callbacks.layout_recalls_received,
+            callback_stats.layout_returns_completed - baseline_callbacks.layout_returns_completed,
+        );
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;

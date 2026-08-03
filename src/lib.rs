@@ -243,8 +243,8 @@ pub use error::{
 };
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, AclSupport, Attr, ExportEntry, FSInfo, FSStat, Mount,
-    NFSVersion, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes, Pathconf,
-    ReaddirEntry, ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
+    NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE,
+    ObjRes, Pathconf, ReaddirEntry, ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
