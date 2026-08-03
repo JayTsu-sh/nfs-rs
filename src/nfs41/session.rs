@@ -795,7 +795,9 @@ fn validate_channel_attrs(
         ("maxrequests", attrs.max_requests, offered.maxrequests),
     ];
     for (field, value, maximum) in values {
-        if (field != "headerpadsize" && value == 0) || value > maximum {
+        if (field != "headerpadsize" && field != "maxresponsesize_cached" && value == 0)
+            || value > maximum
+        {
             return Err(NfsError::Rpc(format!(
                 "invalid {name}-channel {field} {value}; offered range is 1..={maximum}"
             )));
@@ -978,6 +980,9 @@ mod tests {
         invalid = channel(1);
         invalid.max_cached_response_size = 65;
         assert!(validate_channel_attrs("fore", &invalid, &offered).is_err());
+        let mut no_reply_cache = channel(1);
+        no_reply_cache.max_cached_response_size = 0;
+        assert!(validate_channel_attrs("fore", &no_reply_cache, &offered).is_ok());
         invalid = channel(1);
         invalid.max_ops = 65;
         assert!(validate_channel_attrs("fore", &invalid, &offered).is_err());
