@@ -229,6 +229,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
     let recall_runner =
         fs::read_to_string(workspace_path("tests/lab/run-pnfs-layout-recall-e2e.sh"))
             .expect("pNFS layout recall runner must be readable");
+    let recall_proxy = fs::read_to_string(workspace_path(
+        "tests/lab/rpc-layout-recall-inject-proxy.py",
+    ))
+    .expect("pNFS layout recall proxy must be readable");
 
     for value in [
         "LAB_PNFS_MDS_DATA",
@@ -285,9 +289,11 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(rust_test.contains("nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range"));
     assert!(workflow.contains("NetApp pNFS layout recall during WRITE/CLOSE E2E"));
     assert!(recall_runner.contains("trap cleanup EXIT"));
-    assert!(recall_runner.contains("trigger-layout-recall"));
+    assert!(recall_runner.contains("rpc-layout-recall-inject-proxy.py"));
     assert!(recall_runner.contains("pnfs-layout-recall received="));
     assert!(recall_runner.contains("close-ordered=1 checksum=ok"));
+    assert!(recall_proxy.contains("CB_LAYOUTRECALL"));
+    assert!(recall_proxy.contains("layout-recall-reply-status="));
     assert!(rust_test.contains("nfs_v41_pnfs_layout_recall_during_write_and_close"));
 
     for path in [
@@ -303,6 +309,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
         preflight_runner,
         layoutcommit_runner,
         recall_runner,
+        recall_proxy,
     ] {
         assert!(
             !path.contains("Netapp1!"),
