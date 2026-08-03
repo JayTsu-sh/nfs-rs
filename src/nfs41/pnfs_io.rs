@@ -30,6 +30,13 @@ pub(crate) enum PnfsWriteOutcome {
     Attempted(Result<u32>),
 }
 
+struct PlannedDsWrite {
+    ds_fh: Bytes,
+    ds_addr: SocketAddr,
+    ds_offset: u64,
+    data: Bytes,
+}
+
 fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
     NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
         OperationOutcome::Uncertain,
@@ -49,6 +56,26 @@ fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment>
 }
 
 impl Mount41 {
+    async fn preflight_write_data_servers(
+        &self,
+        writes: &[PlannedDsWrite],
+        generation: u64,
+    ) -> Result<()> {
+        let addresses = writes
+            .iter()
+            .map(|write| write.ds_addr)
+            .filter(|address| *address != self.server_addr)
+            .collect::<HashSet<_>>();
+        futures::future::try_join_all(addresses.into_iter().map(|address| async move {
+            self.layout_manager
+                .get_data_server(address, &self.auth, &self.client_identity, generation)
+                .await
+                .map(|_| ())
+        }))
+        .await?;
+        Ok(())
+    }
+
     /// Get layout for a file, fetching from MDS if not cached.
     /// Returns None if pNFS layouts are unavailable (caller should fall back to MDS I/O).
     pub(crate) async fn get_or_fetch_layout(&self, fh: &Bytes, iomode: u32) -> Option<Layout> {
@@ -537,8 +564,9 @@ impl Mount41 {
             pattern_offset,
         );
 
-        // Issue parallel writes to data servers
-        let futures: Vec<_> = chunks
+        // Resolve the complete write plan before any DS mutation. Bytes::slice
+        // keeps stripe payloads zero-copy.
+        let writes = match chunks
             .iter()
             .map(|chunk| {
                 // fh_list is indexed by stripe position (ds_index)
@@ -563,18 +591,47 @@ impl Mount41 {
                 // Zero-copy slice of the write data for this stripe chunk
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
-                let ds_off = chunk.ds_offset;
+                Ok::<PlannedDsWrite, NfsError>(PlannedDsWrite {
+                    ds_fh: ds_fh_res?,
+                    ds_addr: ds_addr_res?,
+                    ds_offset: chunk.ds_offset,
+                    data: chunk_data,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(writes) => writes,
+            Err(error) => {
+                debug!(error = %error, "pNFS WRITE plan invalid before send; using MDS");
+                return PnfsWriteOutcome::NotAttempted;
+            }
+        };
+
+        // Phase 1: establish every required DS session before transmitting any
+        // WRITE. A failure here proves that this logical write made no DS
+        // mutation, so MDS fallback is safe.
+        if let Err(error) = self
+            .preflight_write_data_servers(&writes, layout.generation)
+            .await
+        {
+            debug!(error = %error, "pNFS DS preflight failed before send; using MDS");
+            return PnfsWriteOutcome::NotAttempted;
+        }
+
+        // Phase 2: after this boundary, any error is potentially post-send and
+        // must remain uncertain rather than falling back to MDS.
+        let futures: Vec<_> = writes
+            .into_iter()
+            .map(|write| {
                 async move {
-                    let ds_fh = ds_fh_res?;
-                    let ds_addr = ds_addr_res?;
                     let resp = self
                         .ds_write_chunk(
-                            ds_addr,
-                            &ds_fh,
+                            write.ds_addr,
+                            &write.ds_fh,
                             &io_stateid,
                             layout.generation,
-                            ds_off,
-                            chunk_data,
+                            write.ds_offset,
+                            write.data,
                         )
                         .await?;
                     // SEQUENCE=0, PUTFH=1, WRITE=2（两条路径布局一致）

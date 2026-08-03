@@ -218,6 +218,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
         .expect("pNFS fault runner must be readable");
     let fault_helper = fs::read_to_string(workspace_path("tests/lab/admin/nfsrs-lab-pnfs-fault"))
         .expect("pNFS fault helper must be readable");
+    let preflight_runner = fs::read_to_string(workspace_path(
+        "tests/lab/run-pnfs-preflight-fallback-e2e.sh",
+    ))
+    .expect("pNFS preflight runner must be readable");
 
     for value in [
         "LAB_PNFS_MDS_DATA",
@@ -258,6 +262,13 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(rust_test.contains("nfs_v41_pnfs_ds_reset_returns_uncertain"));
     assert!(rust_test.contains("VerifyThenResume"));
     assert!(rust_test.contains("pNFS checkpoint recovery full-payload checksum mismatch"));
+    assert!(workflow.contains("NetApp pNFS pre-WRITE DS failure fallback E2E"));
+    assert!(workflow.contains("tests/lab/run-pnfs-preflight-fallback-e2e.sh \"$RUN_ID\""));
+    assert!(preflight_runner.contains("trap cleanup EXIT"));
+    assert!(preflight_runner.contains("ds_write_sent=0 mds_fallback=1"));
+    assert!(preflight_runner.contains("maximum_connections > baseline_connections"));
+    assert!(rust_test.contains("nfs_v41_pnfs_ds_unreachable_before_write_falls_back_to_mds"));
+    assert!(rust_test.contains("pNFS preflight MDS fallback full-payload checksum mismatch"));
 
     for path in [
         common,
@@ -269,6 +280,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
         rust_test,
         fault_runner,
         fault_helper,
+        preflight_runner,
     ] {
         assert!(
             !path.contains("Netapp1!"),
