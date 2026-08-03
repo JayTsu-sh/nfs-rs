@@ -59,7 +59,11 @@ done
 [[ -e "$uncertain_file" ]] || { cat "$test_log" >&2; exit 1; }
 
 restore_fault
-wait "$test_pid"
+if ! wait "$test_pid"; then
+  test_pid=""
+  cat "$test_log" >&2
+  exit 1
+fi
 test_pid=""
 cat "$test_log"
 echo "pnfs-layoutcommit uncertain=1 dirty-retained=1 retry=1 restored=1 checksum=ok"
