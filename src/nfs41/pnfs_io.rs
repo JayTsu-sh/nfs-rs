@@ -115,6 +115,16 @@ impl Mount41 {
         iomode: u32,
         offset: u64,
     ) -> Option<Layout> {
+        self.fetch_layout(fh, iomode, offset, false).await
+    }
+
+    async fn fetch_layout(
+        &self,
+        fh: &Bytes,
+        iomode: u32,
+        offset: u64,
+        force_update: bool,
+    ) -> Option<Layout> {
         // RFC 5661 §18.35.3：server 未在 EXCHANGE_ID 中声明 USE_PNFS_MDS，
         // 整个 mount 禁用 pNFS，跳过 LAYOUTGET（省每文件一次注定失败的 RTT）
         if !self.session_holder.get().await.pnfs_mds() {
@@ -122,7 +132,9 @@ impl Mount41 {
         }
 
         // 1. Check cache
-        if let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await {
+        if !force_update
+            && let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await
+        {
             return Some(layout);
         }
 
@@ -133,11 +145,16 @@ impl Mount41 {
         } else {
             AccessMode::Write
         };
+        let cached = self.layout_manager.get_layout(fh).await;
         let sid = self
             .state
             .has_open(fh, access)
             .await
             .unwrap_or_else(StateId::anonymous);
+        let request_stateid = cached
+            .as_ref()
+            .map(|layout| layout.stateid)
+            .unwrap_or(sid.raw);
         let result = self
             .compound("layoutget", |b| {
                 b.require_generation(sid.generation).putfh(fh).layoutget(
@@ -147,7 +164,7 @@ impl Mount41 {
                     offset,
                     u64::MAX - offset,
                     0, // min_length
-                    &sid.raw,
+                    &request_stateid,
                     1024 * 1024, // max_count (1 MiB)
                 )
             })
@@ -160,14 +177,18 @@ impl Mount41 {
                 let mut data = op.data.clone();
                 let mut layout = super::layout::decode_layoutget_response(&mut data).ok()?;
                 layout.generation = resp.session_generation;
-                if self
-                    .layout_manager
-                    .store_layout_at(fh, resp.session_generation, layout.clone())
-                    .await
-                {
+                let accepted = if cached.is_some() {
+                    self.layout_manager.merge_layout(fh, layout.clone()).await;
+                    self.layout_manager.get_layout(fh).await.is_some()
+                } else {
+                    self.layout_manager
+                        .store_layout_at(fh, resp.session_generation, layout.clone())
+                        .await
+                };
+                if accepted {
                     // Only an accepted layout may populate generation-owned caches.
                     self.fetch_devices_for_layout(&layout).await;
-                    Some(layout)
+                    self.layout_manager.get_layout(fh).await
                 } else {
                     debug!(
                         response_generation = resp.session_generation,
@@ -841,8 +862,10 @@ impl Mount41 {
         if self.layout_manager.get_layout(fh).await.is_some()
             && self.layout_manager.layout_refresh_due(fh, offset).await
         {
-            self.layoutreturn_file(fh).await?;
-            self.layout_manager.record_layout_refresh(fh, offset).await;
+            self.flush_layoutcommit(fh).await?;
+            if self.fetch_layout(fh, 2, offset, true).await.is_some() {
+                self.layout_manager.record_layout_refresh(fh, offset).await;
+            }
         }
         Ok(())
     }

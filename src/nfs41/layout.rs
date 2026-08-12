@@ -93,6 +93,20 @@ pub(crate) struct Layout {
     pub segments: Vec<LayoutSegment>,
 }
 
+fn layout_segments_overlap(left: &LayoutSegment, right: &LayoutSegment) -> bool {
+    let left_end = if left.length == u64::MAX {
+        u64::MAX
+    } else {
+        left.offset.saturating_add(left.length)
+    };
+    let right_end = if right.length == u64::MAX {
+        u64::MAX
+    } else {
+        right.offset.saturating_add(right.length)
+    };
+    left.offset < right_end && right.offset < left_end
+}
+
 /// Resolved pNFS device: per-DS network addresses.
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceInfo {
@@ -301,6 +315,27 @@ impl LayoutManager {
                             .is_none_or(|end| offset < end))
             })
         })
+    }
+
+    pub async fn merge_layout(&self, fh: &Bytes, mut update: Layout) {
+        let mut layouts = self.layouts.write().await;
+        if update.generation != self.generation() {
+            return;
+        }
+        if let Some(current) = layouts.get_mut(fh) {
+            current.segments.retain(|old| {
+                !update
+                    .segments
+                    .iter()
+                    .any(|new| layout_segments_overlap(old, new))
+            });
+            current.segments.append(&mut update.segments);
+            current.segments.sort_by_key(|segment| segment.offset);
+            current.stateid = update.stateid;
+            current.return_on_close |= update.return_on_close;
+        } else {
+            layouts.insert(fh.clone(), update);
+        }
     }
 
     /// Remove the layout for a file.
@@ -1914,5 +1949,48 @@ mod tests {
         assert!(manager.get_layout_covering(&fh, 1024).await.is_some());
         assert!(manager.get_layout_covering(&fh, 3071).await.is_some());
         assert!(manager.get_layout_covering(&fh, 3072).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn layout_update_replaces_overlapping_segment_and_keeps_other_ranges() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"growing-multipart-file");
+        let segment = |offset, length, marker| LayoutSegment {
+            offset,
+            length,
+            iomode: IoMode::ReadWrite,
+            layout_type: LayoutType::NfsV41Files,
+            content: LayoutContent::Opaque(Bytes::from(vec![marker])),
+        };
+        manager
+            .store_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [1; 16],
+                    return_on_close: false,
+                    segments: vec![segment(0, 1024, 1), segment(2048, 1024, 2)],
+                },
+            )
+            .await;
+
+        manager
+            .merge_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [3; 16],
+                    return_on_close: true,
+                    segments: vec![segment(512, 2048, 3)],
+                },
+            )
+            .await;
+
+        let merged = manager.get_layout(&fh).await.unwrap();
+        assert_eq!(merged.stateid, [3; 16]);
+        assert!(merged.return_on_close);
+        assert_eq!(merged.segments.len(), 1);
+        assert_eq!(merged.segments[0].offset, 512);
+        assert_eq!(merged.segments[0].length, 2048);
     }
 }
