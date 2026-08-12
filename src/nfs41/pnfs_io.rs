@@ -78,7 +78,11 @@ async fn invalidate_layout_after_ds_error(
 fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment> {
     layout.segments.iter().find(|seg| {
         offset >= seg.offset
-            && (seg.length == 0xFFFF_FFFF_FFFF_FFFF || offset < seg.offset + seg.length)
+            && (seg.length == u64::MAX
+                || seg
+                    .offset
+                    .checked_add(seg.length)
+                    .is_none_or(|end| offset < end))
     })
 }
 
@@ -118,7 +122,7 @@ impl Mount41 {
         }
 
         // 1. Check cache
-        if let Some(layout) = self.layout_manager.get_layout(fh).await {
+        if let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await {
             return Some(layout);
         }
 
@@ -900,6 +904,24 @@ mod tests {
         assert!(find_covering_segment(&layout, 100).is_some());
         assert!(find_covering_segment(&layout, 599).is_some());
         assert!(find_covering_segment(&layout, 600).is_none());
+    }
+
+    #[test]
+    fn find_covering_segment_handles_a_range_ending_past_u64_max() {
+        let layout = Layout {
+            generation: 1,
+            stateid: [0; 16],
+            return_on_close: false,
+            segments: vec![LayoutSegment {
+                offset: u64::MAX - 10,
+                length: 20,
+                iomode: IoMode::ReadWrite,
+                layout_type: LayoutType::NfsV41Files,
+                content: LayoutContent::Opaque(Bytes::new()),
+            }],
+        };
+
+        assert!(find_covering_segment(&layout, u64::MAX).is_some());
     }
 
     #[test]

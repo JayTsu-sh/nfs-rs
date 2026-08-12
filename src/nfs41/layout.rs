@@ -287,6 +287,22 @@ impl LayoutManager {
             .cloned()
     }
 
+    /// Return a cached layout only when one of its segments covers `offset`.
+    /// A bounded segment must not suppress a LAYOUTGET for a later multipart
+    /// file range.
+    pub async fn get_layout_covering(&self, fh: &Bytes, offset: u64) -> Option<Layout> {
+        self.get_layout(fh).await.filter(|layout| {
+            layout.segments.iter().any(|segment| {
+                offset >= segment.offset
+                    && (segment.length == u64::MAX
+                        || segment
+                            .offset
+                            .checked_add(segment.length)
+                            .is_none_or(|end| offset < end))
+            })
+        })
+    }
+
     /// Remove the layout for a file.
     pub async fn remove_layout(&self, fh: &Bytes) -> Option<Layout> {
         let mut map = self.layouts.write().await;
@@ -1871,5 +1887,32 @@ mod tests {
                 .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn cached_layout_is_returned_only_for_a_covered_offset() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"multipart-file");
+        manager
+            .store_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [7; 16],
+                    return_on_close: false,
+                    segments: vec![LayoutSegment {
+                        offset: 1024,
+                        length: 2048,
+                        iomode: IoMode::ReadWrite,
+                        layout_type: LayoutType::NfsV41Files,
+                        content: LayoutContent::Opaque(Bytes::new()),
+                    }],
+                },
+            )
+            .await;
+
+        assert!(manager.get_layout_covering(&fh, 1024).await.is_some());
+        assert!(manager.get_layout_covering(&fh, 3071).await.is_some());
+        assert!(manager.get_layout_covering(&fh, 3072).await.is_none());
     }
 }
