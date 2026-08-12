@@ -151,6 +151,10 @@ pub(crate) struct LayoutManager {
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
     dirty: RwLock<HashMap<Bytes, DirtyRange>>,
+    /// Next sequential file offset at which the client proactively returns
+    /// and reacquires this file's layout. Entries are per file so a large-file
+    /// lifecycle transition never disturbs layouts for sibling files.
+    layout_refresh_offsets: RwLock<HashMap<Bytes, u64>>,
     /// Per-file I/O gates. WRITEs take a shared guard; recall/CLOSE take an
     /// exclusive guard so different files and same-file parallel WRITEs remain
     /// concurrent while layout lifecycle transitions are serialized.
@@ -165,6 +169,8 @@ pub(crate) struct LayoutManager {
     noresvport: bool,
     active_generation: AtomicU64,
 }
+
+pub(crate) const PNFS_LAYOUT_REFRESH_INTERVAL: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirtyRange {
@@ -181,6 +187,7 @@ impl LayoutManager {
             data_servers: RwLock::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
+            layout_refresh_offsets: RwLock::new(HashMap::new()),
             file_io_gates: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: RwLock::new(HashSet::new()),
@@ -202,6 +209,7 @@ impl LayoutManager {
         servers.clear();
         devices.clear();
         dirty.clear();
+        self.layout_refresh_offsets.write().await.clear();
     }
 
     pub fn generation(&self) -> u64 {
@@ -282,7 +290,29 @@ impl LayoutManager {
     /// Remove the layout for a file.
     pub async fn remove_layout(&self, fh: &Bytes) -> Option<Layout> {
         let mut map = self.layouts.write().await;
-        map.remove(fh)
+        let removed = map.remove(fh);
+        self.layout_refresh_offsets.write().await.remove(fh);
+        removed
+    }
+
+    pub async fn layout_refresh_due(&self, fh: &Bytes, offset: u64) -> bool {
+        let offsets = self.layout_refresh_offsets.read().await;
+        offset
+            >= offsets
+                .get(fh)
+                .copied()
+                .unwrap_or(PNFS_LAYOUT_REFRESH_INTERVAL)
+    }
+
+    pub async fn record_layout_refresh(&self, fh: &Bytes, offset: u64) {
+        let next = offset
+            .saturating_div(PNFS_LAYOUT_REFRESH_INTERVAL)
+            .saturating_add(1)
+            .saturating_mul(PNFS_LAYOUT_REFRESH_INTERVAL);
+        self.layout_refresh_offsets
+            .write()
+            .await
+            .insert(fh.clone(), next);
     }
 
     pub async fn all_layouts(&self) -> Vec<(Bytes, Layout)> {
@@ -304,6 +334,7 @@ impl LayoutManager {
         map.clear();
         devices.clear();
         dirty.clear();
+        self.layout_refresh_offsets.write().await.clear();
     }
 
     /// 记录一段已通过 layout 写入、待 LAYOUTCOMMIT 的范围；与已有范围 merge（min/max）。
@@ -353,6 +384,13 @@ impl LayoutManager {
             dirty.remove(fh);
         }
         unchanged
+    }
+
+    /// Discard dirty metadata that can no longer be committed with its
+    /// originating layout stateid. The caller must already be returning an
+    /// uncertain outcome that requires data verification before resuming.
+    pub async fn invalidate_dirty(&self, fh: &Bytes) {
+        self.dirty.write().await.remove(fh);
     }
 
     /// Test/teardown helper that removes a pending range immediately.
@@ -1753,5 +1791,85 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].ds_index, 0);
         assert_eq!(chunks[0].ds_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn layout_refresh_crossing_is_recorded_once_per_window() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"large-file");
+
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL - 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+                .await
+        );
+        manager
+            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL * 2)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn layout_refresh_offsets_are_independent_per_file() {
+        let manager = LayoutManager::new(true);
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        manager
+            .record_layout_refresh(&first, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+
+        assert!(
+            !manager
+                .layout_refresh_due(&first, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&second, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_layout_resets_its_refresh_lifecycle() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"reopened-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [9; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+        manager
+            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+
+        manager.remove_layout(&fh).await;
+
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
     }
 }

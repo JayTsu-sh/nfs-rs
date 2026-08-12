@@ -11,9 +11,10 @@ use std::net::SocketAddr;
 use bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, info};
 
+use super::Nfs4ErrorCode;
 use super::compound::CompoundResponse;
 use super::fastxdr::nfsstat4;
-use super::layout::{Layout, LayoutContent, LayoutSegment};
+use super::layout::{Layout, LayoutContent, LayoutManager, LayoutSegment};
 use super::mount::Mount41;
 use super::state::{AccessMode, StateId};
 use crate::error::{
@@ -62,6 +63,17 @@ where
         .collect()
 }
 
+async fn invalidate_layout_after_ds_error(
+    layout_manager: &LayoutManager,
+    fh: &Bytes,
+    error: &NfsError,
+) {
+    if matches!(error, NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)) {
+        layout_manager.remove_layout(fh).await;
+        layout_manager.invalidate_dirty(fh).await;
+    }
+}
+
 /// Find the layout segment covering a given file offset.
 fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment> {
     layout.segments.iter().find(|seg| {
@@ -93,7 +105,12 @@ impl Mount41 {
 
     /// Get layout for a file, fetching from MDS if not cached.
     /// Returns None if pNFS layouts are unavailable (caller should fall back to MDS I/O).
-    pub(crate) async fn get_or_fetch_layout(&self, fh: &Bytes, iomode: u32) -> Option<Layout> {
+    pub(crate) async fn get_or_fetch_layout(
+        &self,
+        fh: &Bytes,
+        iomode: u32,
+        offset: u64,
+    ) -> Option<Layout> {
         // RFC 5661 §18.35.3：server 未在 EXCHANGE_ID 中声明 USE_PNFS_MDS，
         // 整个 mount 禁用 pNFS，跳过 LAYOUTGET（省每文件一次注定失败的 RTT）
         if !self.session_holder.get().await.pnfs_mds() {
@@ -120,12 +137,12 @@ impl Mount41 {
         let result = self
             .compound("layoutget", |b| {
                 b.require_generation(sid.generation).putfh(fh).layoutget(
-                    false,                 // signal_layout_avail
-                    1,                     // LAYOUT4_NFSV4_1_FILES
-                    iomode,                // 1=READ, 2=RW
-                    0,                     // offset = whole file
-                    0xFFFF_FFFF_FFFF_FFFF, // length = whole file
-                    0,                     // min_length
+                    false,  // signal_layout_avail
+                    1,      // LAYOUT4_NFSV4_1_FILES
+                    iomode, // 1=READ, 2=RW
+                    offset,
+                    u64::MAX - offset,
+                    0, // min_length
                     &sid.raw,
                     1024 * 1024, // max_count (1 MiB)
                 )
@@ -354,7 +371,9 @@ impl Mount41 {
         offset: u64,
         count: u32,
     ) -> Option<Result<Bytes>> {
-        let layout = self.get_or_fetch_layout(fh, 1 /* IOMODE_READ */).await?;
+        let layout = self
+            .get_or_fetch_layout(fh, 1 /* IOMODE_READ */, offset)
+            .await?;
         let seg = find_covering_segment(&layout, offset)?;
         let (device_id, stripe_unit, is_dense, first_stripe_index, pattern_offset, fh_list) =
             match &seg.content {
@@ -513,7 +532,10 @@ impl Mount41 {
         offset: u64,
         data: Bytes,
     ) -> PnfsWriteOutcome {
-        let Some(layout) = self.get_or_fetch_layout(fh, 2 /* IOMODE_RW */).await else {
+        let Some(layout) = self
+            .get_or_fetch_layout(fh, 2 /* IOMODE_RW */, offset)
+            .await
+        else {
             return PnfsWriteOutcome::NotAttempted;
         };
         let Some(seg) = find_covering_segment(&layout, offset) else {
@@ -708,6 +730,7 @@ impl Mount41 {
                         .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
                         .await;
                 }
+                invalidate_layout_after_ds_error(&self.layout_manager, fh, &e).await;
                 // Preserve hot-path performance: aggregate diagnostic context
                 // is only materialized when the DS batch actually fails.
                 let active_session = self.session_holder.get().await;
@@ -800,6 +823,23 @@ impl Mount41 {
             Err(e) => return Err(e),
         }
         self.layout_manager.remove_layout(fh).await;
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_layout_for_write(&self, fh: &Bytes, offset: u64) -> Result<()> {
+        if self.layout_manager.get_layout(fh).await.is_none()
+            || !self.layout_manager.layout_refresh_due(fh, offset).await
+        {
+            return Ok(());
+        }
+
+        let _io_guard = self.layout_manager.write_file_io(fh).await;
+        if self.layout_manager.get_layout(fh).await.is_some()
+            && self.layout_manager.layout_refresh_due(fh, offset).await
+        {
+            self.layoutreturn_file(fh).await?;
+            self.layout_manager.record_layout_refresh(fh, offset).await;
+        }
         Ok(())
     }
 
@@ -923,6 +963,52 @@ mod tests {
         assert_eq!(outcome.operation_class, OperationClass::ReplaySensitive);
         assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
         assert_eq!(outcome.context().operation, "pnfs_write");
+    }
+
+    #[tokio::test]
+    async fn stale_ds_write_evicts_layout_and_invalidates_old_dirty_range() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"multipart-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [7; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+        manager.mark_dirty(&fh, 0, 4096).await;
+
+        invalidate_layout_after_ds_error(
+            &manager,
+            &fh,
+            &NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE),
+        )
+        .await;
+
+        assert!(manager.get_layout(&fh).await.is_none());
+        assert_eq!(manager.take_dirty(&fh).await, None);
+    }
+
+    #[tokio::test]
+    async fn transport_ds_write_error_retains_layout_for_verification() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"ordinary-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [8; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+
+        invalidate_layout_after_ds_error(
+            &manager,
+            &fh,
+            &NfsError::Rpc("connection reset after send".to_string()),
+        )
+        .await;
+
+        assert!(manager.get_layout(&fh).await.is_some());
     }
 
     #[tokio::test]

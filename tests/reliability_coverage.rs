@@ -247,6 +247,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(runner.contains("validate_export_path"));
     assert!(runner.contains("observed_connections > baseline_connections"));
     assert!(runner.contains("BLOCKED_CAPABILITY(netapp-pnfs-independent-ds)"));
+    assert!(runner.contains("nfs_v41_pnfs_multifile_active_layout_refresh"));
     assert!(runner.contains("trap cleanup EXIT"));
     assert!(workflow.contains("NetApp NFSv4.1 pNFS WRITE E2E"));
     assert!(workflow.contains("NetApp NFSv4.1 compatibility E2E"));
@@ -260,6 +261,8 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(cleanup.contains("nfs_v41_pnfs_cleanup_run"));
     assert!(capability.contains("BLOCKED_CAPABILITY(netapp-pnfs-data-lif)"));
     assert!(rust_test.contains("nfs_v41_pnfs_write_uses_independent_ds"));
+    assert!(rust_test.contains("nfs_v41_pnfs_multifile_active_layout_refresh"));
+    assert!(rust_test.contains("pnfs-active-refresh files=16"));
     assert!(rust_test.contains("pNFS full-payload checksum mismatch"));
     assert!(workflow.contains("NetApp pNFS DS reset uncertain-outcome E2E"));
     assert!(workflow.contains("tests/lab/run-pnfs-ds-reset-e2e.sh \"$RUN_ID\""));
@@ -298,15 +301,19 @@ fn netapp_pnfs_lab_contract_is_wired() {
 
     let pnfs_io = fs::read_to_string(workspace_path("src/nfs41/pnfs_io.rs"))
         .expect("pNFS I/O implementation must be readable");
+    let layout = fs::read_to_string(workspace_path("src/nfs41/layout.rs"))
+        .expect("pNFS layout implementation must be readable");
     for test in [
         "ds_batch_waits_for_success_when_failure_completes_first",
         "ds_batch_waits_for_failure_when_success_completes_first",
         "cancelling_ds_batch_drops_every_pending_write",
     ] {
-        assert!(pnfs_io.contains(test), "missing T15 CI test {test}");
+        assert!(pnfs_io.contains(test), "missing partial T15 CI test {test}");
     }
     assert!(pnfs_io.contains("match settle_ds_batch(futures).await"));
     assert!(pnfs_io.contains("RecoveryAction::VerifyThenResume"));
+    assert!(layout.contains("PNFS_LAYOUT_REFRESH_INTERVAL"));
+    assert!(pnfs_io.contains("refresh_layout_for_write"));
 
     for path in [
         common,
