@@ -54,6 +54,19 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use tokio::net::{TcpSocket, TcpStream};
 
+fn privileged_port_candidates(ports: &[u16], start: usize) -> Vec<u16> {
+    (0..ports.len())
+        .map(|offset| ports[(start + offset) % ports.len()])
+        .collect()
+}
+
+fn is_privileged_port_collision(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+    )
+}
+
 pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Result<TcpStream> {
     // Bind to a random privileged port (< 1024), required by some NFS servers.
     // Exclude well-known service ports to avoid conflicts.
@@ -158,12 +171,14 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     let available_ports: Vec<u16> = (1..1024u16)
         .filter(|p| !WELL_KNOWN_PORTS.contains(p))
         .collect();
-    // 外层循环：bind + connect 整体重试。
-    // Windows 上 SO_REUSEADDR 允许 bind() 成功即使端口已被占用（TIME_WAIT 或其他
-    // SO_REUSEADDR socket），冲突要到 connect() 时才以 WSAEADDRINUSE 暴露。
-    // 因此 connect() 失败时需要用新 socket + 新端口重试。
-    const MAX_CONNECT_ATTEMPTS: usize = 200;
-    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+    // Start at a random point, then visit every candidate exactly once. With
+    // SO_REUSEADDR, bind may succeed for a port already used by another
+    // outbound socket; Linux reports the duplicate four-tuple from connect as
+    // EADDRNOTAVAIL, while Windows may report EADDRINUSE.
+    let start = rand::random_range(0..available_ports.len());
+    let candidates = privileged_port_candidates(&available_ports, start);
+    let mut last_collision = None;
+    for (attempt, local_port) in candidates.iter().copied().enumerate() {
         let socket = if addr.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
@@ -172,16 +187,16 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
         // 允许 bind 到处于 TIME_WAIT 状态的端口，避免重复运行时端口耗尽
         socket.set_reuseaddr(true)?;
         let mut local_addr = local_addr_base;
-        let idx = rand::random_range(0..available_ports.len());
-        let local_port = available_ports[idx];
         local_addr.set_port(local_port);
         match socket.bind(local_addr) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(e) if is_privileged_port_collision(&e) => {
                 trace!(
                     local_port,
-                    "source port bind failed (AddrInUse), trying another"
+                    error = %e,
+                    "source port bind collision, trying another"
                 );
+                last_collision = Some(e);
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -205,27 +220,32 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
                 info!(addr = %addr, local_port = local_addr.port(), "TCP connection established");
                 return Ok(stream);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Windows: SO_REUSEADDR 让 bind() 成功了，但 connect() 时发现
-                // 4-tuple (local_port → remote_addr) 已被占用（TIME_WAIT 或并发 socket）。
-                // 换一个端口重试。
+            Err(e) if is_privileged_port_collision(&e) => {
                 debug!(
                     local_port,
                     addr = %addr,
                     attempt,
                     error = %e,
-                    "connect failed with AddrInUse after successful bind, retrying with different port"
+                    "connect found a privileged-port tuple collision, trying another port"
                 );
+                last_collision = Some(e);
                 continue;
             }
             Err(e) => return Err(e.into()),
         }
     }
-    warn!(addr = %addr, "exhausted all connect attempts ({MAX_CONNECT_ATTEMPTS}), all privileged source ports failed");
+    let attempted = candidates.len();
+    let last_collision = last_collision.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no privileged source-port candidate was available",
+        )
+    });
+    warn!(addr = %addr, attempted, error = %last_collision, "all privileged source ports failed");
     Err(NfsError::Io(std::io::Error::new(
-        std::io::ErrorKind::AddrInUse,
+        last_collision.kind(),
         format!(
-            "all privileged source ports (1-1023) failed to connect to {addr} after {MAX_CONNECT_ATTEMPTS} attempts"
+            "failed to connect to {addr} after trying {attempted} privileged source ports; last error: {last_collision}"
         ),
     )))
 }
@@ -557,7 +577,7 @@ fn nfs_error_msg(err: &NfsError) -> String {
 
 fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
     let mut unsupported_err = "".to_string();
-    let errs: Vec<NfsError> = errs
+    let mut errs: Vec<NfsError> = errs
         .into_iter()
         .filter_map(|err| {
             if matches!(&err, NfsError::Unsupported(_)) {
@@ -575,6 +595,9 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
         .collect();
     if errs.is_empty() {
         return NfsError::Unsupported(unsupported_err);
+    }
+    if errs.len() == 1 && unsupported_err.is_empty() {
+        return errs.remove(0);
     }
     let mut msg = nfs_error_msg(&errs[0]);
     for err in &errs[1..] {
@@ -1244,5 +1267,42 @@ mod tests {
             local_port
         );
         let _ = accept_handle.await.unwrap();
+    }
+
+    #[test]
+    fn privileged_port_candidates_visit_every_port_once_from_random_start() {
+        let ports = vec![2, 3, 4, 5];
+        assert_eq!(privileged_port_candidates(&ports, 2), vec![4, 5, 2, 3]);
+    }
+
+    #[test]
+    fn bind_and_connect_tuple_collisions_try_another_privileged_port() {
+        for kind in [
+            std::io::ErrorKind::AddrInUse,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(is_privileged_port_collision(&std::io::Error::from(kind)));
+        }
+        assert!(!is_privileged_port_collision(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+    }
+
+    #[tokio::test]
+    async fn nfs3_mount_preserves_the_last_address_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let error = parse_url_and_mount(&format!(
+            "nfs://127.0.0.1/export?version=3&nfsport={port}&mountport={port}&noresvport=true"
+        ))
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, NfsError::Io(ref error) if error.kind() == std::io::ErrorKind::ConnectionRefused),
+            "last endpoint error was hidden: {error:?}"
+        );
     }
 }
