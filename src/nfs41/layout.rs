@@ -301,12 +301,15 @@ impl LayoutManager {
         self.file_io_gate(fh).await.write_owned().await
     }
 
-    /// 把一个连接失败的 DS 地址记入负缓存（mount 生命周期内不再尝试）。
-    pub async fn mark_ds_unreachable(&self, addr: SocketAddr) {
+    async fn mark_ds_unreachable_at(&self, addr: SocketAddr, generation: u64) -> bool {
         let mut set = self.unreachable_ds.write().await;
-        if set.insert(addr) {
-            warn!(addr = %addr, "marking pNFS data server unreachable, affected files fall back to MDS I/O");
+        if generation != self.active_generation.load(Ordering::Acquire) {
+            return false;
         }
+        if set.insert(addr) {
+            warn!(addr = %addr, generation, "marking pNFS data server unreachable, affected files fall back to MDS I/O");
+        }
+        true
     }
 
     /// DS 地址是否已被标记为不可达。
@@ -600,12 +603,12 @@ impl LayoutManager {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 if should_negative_cache_ds_error(&e) {
-                    self.mark_ds_unreachable(addr).await;
+                    self.mark_ds_unreachable_at(addr, owner_generation).await;
                 }
                 return Err(e);
             }
             Err(_) => {
-                self.mark_ds_unreachable(addr).await;
+                self.mark_ds_unreachable_at(addr, owner_generation).await;
                 return Err(NfsError::Rpc(format!(
                     "pNFS data server {addr} connect timed out"
                 )));
@@ -1270,11 +1273,27 @@ mod tests {
         let mgr = LayoutManager::new(false);
         let addr: SocketAddr = "192.168.13.131:2049".parse().unwrap();
         assert!(!mgr.is_ds_unreachable(&addr).await);
-        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.mark_ds_unreachable_at(addr, mgr.generation()).await);
         assert!(mgr.is_ds_unreachable(&addr).await);
         // 重复标记幂等
-        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.mark_ds_unreachable_at(addr, mgr.generation()).await);
         assert!(mgr.is_ds_unreachable(&addr).await);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_poison_ds_reachability() {
+        let manager = LayoutManager::new(false);
+        let address: SocketAddr = "192.0.2.20:2049".parse().unwrap();
+        let old_generation = manager.generation();
+
+        manager.transition_to(old_generation + 1).await;
+
+        assert!(
+            !manager
+                .mark_ds_unreachable_at(address, old_generation)
+                .await
+        );
+        assert!(!manager.is_ds_unreachable(&address).await);
     }
 
     #[tokio::test]
