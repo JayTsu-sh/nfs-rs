@@ -266,17 +266,19 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
         ),
     )?;
     info!(nfsport, mountport, "ports resolved");
+    let mut last_error = None;
     for mut addr in addrs {
         addr.set_port(nfsport); // replace portmapper port with NFS port obtained above
         match mount_on_addr(&addr, args, &auth, mountport).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "mount attempt failed on address");
+                last_error = Some(e);
                 continue;
             }
         }
     }
-    Err(NfsError::Rpc("no valid socket address".to_string()))
+    Err(last_error.unwrap_or_else(|| NfsError::Rpc("no valid socket address".to_string())))
 }
 
 async fn mount_on_addr(
