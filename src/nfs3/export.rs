@@ -90,7 +90,7 @@ impl Mount {
         .encode(&mut buf);
         let mut bytes = self
             .rpc
-            .call(buf, super::NFS_RETRIES, super::METADATA_TIMEOUT)
+            .call(buf, super::NFS_REPLAY, super::METADATA_TIMEOUT)
             .await?;
         decode_exports(&mut bytes)
     }

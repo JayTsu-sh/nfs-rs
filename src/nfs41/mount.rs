@@ -36,6 +36,7 @@ const MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 1_250_000;
 static NEXT_MOUNT_ISSUER: AtomicU64 = AtomicU64::new(1);
 // Retry counts
 const NFS_RETRIES: usize = 10;
+const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
 // Equal-jitter exponential backoff for NFS4ERR_DELAY/GRACE retries.
 // Without jitter, concurrent workers (e.g. integrity-check parallel LOOKUPs)
 // resync to the same retry instant and sustain the thundering-herd that
@@ -139,7 +140,9 @@ async fn bind_connection(
             .call_during_reconnect(request, METADATA_TIMEOUT)
             .await?
     } else {
-        client.call(request, 1, METADATA_TIMEOUT).await?
+        client
+            .call(request, super::ONE_ATTEMPT, METADATA_TIMEOUT)
+            .await?
     };
     validate_bound_connection(response, session_id)
 }
@@ -315,7 +318,7 @@ impl Mount41 {
                         builder.encode_with_header(&auth, &mut buf);
                         slot.fence_on_drop();
                         let response = rpc
-                            .call(buf, 1, std::time::Duration::from_secs(10))
+                            .call(buf, super::ONE_ATTEMPT, std::time::Duration::from_secs(10))
                             .await
                             .and_then(CompoundResponse::decode);
                         match response {
@@ -443,10 +446,10 @@ impl Mount41 {
 
             let response_bytes = if let Some(ref data) = write_data {
                 self.rpc
-                    .call_with_data(buf, data.clone(), NFS_RETRIES, timeout)
+                    .call_with_data(buf, data.clone(), NFS_REPLAY, timeout)
                     .await
             } else {
-                self.rpc.call(buf, NFS_RETRIES, timeout).await
+                self.rpc.call(buf, NFS_REPLAY, timeout).await
             }
             .map_err(|error| sent_error(operation_class, &context, error))?;
             enforce_response_size(&sess, response_bytes.len())
@@ -608,7 +611,7 @@ impl Mount41 {
         let timeout = data_timeout(data_size);
         let response_bytes = ds
             .client
-            .call(buf, NFS_RETRIES, timeout)
+            .call(buf, NFS_REPLAY, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
         enforce_response_size(&ds.session, response_bytes.len())
@@ -692,7 +695,7 @@ impl Mount41 {
         let timeout = data_timeout(data.len());
         let response_bytes = ds
             .client
-            .call_with_data(buf, data, NFS_RETRIES, timeout)
+            .call_with_data(buf, data, NFS_REPLAY, timeout)
             .await
             .map_err(|error| sent_error(operation_class, &context, error))?;
         enforce_response_size(&ds.session, response_bytes.len())
@@ -1111,7 +1114,7 @@ async fn send_recall_return(
             }
             slot.fence_on_drop();
             let response = rpc
-                .call(buf, 1, METADATA_TIMEOUT)
+                .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
                 .await
                 .map_err(|error| sent_error(operation_class, &context, error))
                 .and_then(|bytes| {
@@ -1222,7 +1225,13 @@ async fn navigate_to_export(
     let mut buf = Vec::new();
     builder.encode_with_header(auth, &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
-    let response_bytes = rpc.call(buf, 2, std::time::Duration::from_secs(10)).await?;
+    let response_bytes = rpc
+        .call(
+            buf,
+            super::BOOTSTRAP_REPLAY,
+            std::time::Duration::from_secs(10),
+        )
+        .await?;
     enforce_response_size(session, response_bytes.len())?;
     let resp = CompoundResponse::decode(response_bytes)?;
     enforce_response_operations(session, &resp, request_op_count)?;
@@ -1292,7 +1301,13 @@ async fn get_fs_limits(
     let mut buf = Vec::new();
     builder.encode_with_header(auth, &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
-    let response_bytes = rpc.call(buf, 2, std::time::Duration::from_secs(10)).await?;
+    let response_bytes = rpc
+        .call(
+            buf,
+            super::BOOTSTRAP_REPLAY,
+            std::time::Duration::from_secs(10),
+        )
+        .await?;
     enforce_response_size(session, response_bytes.len())?;
     let resp = CompoundResponse::decode(response_bytes)?;
     enforce_response_operations(session, &resp, request_op_count)?;
@@ -1521,7 +1536,7 @@ impl crate::Mount for Mount41Wrapper {
         let mut buf = Vec::new();
         crate::nfs3::rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_NULL_PROC, &self.m.auth)
             .encode(&mut buf);
-        self.m.rpc.call(buf, NFS_RETRIES, METADATA_TIMEOUT).await?;
+        self.m.rpc.call(buf, NFS_REPLAY, METADATA_TIMEOUT).await?;
         Ok(())
     }
 
@@ -1580,7 +1595,12 @@ impl crate::Mount for Mount41Wrapper {
                 CompoundBuilder::new("destroy_session").destroy_session(current_sess.id());
             let mut buf = Vec::new();
             builder.encode_with_header(&self.m.auth, &mut buf);
-            if let Err(e) = self.m.rpc.call(buf, 1, METADATA_TIMEOUT).await {
+            if let Err(e) = self
+                .m
+                .rpc
+                .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+            {
                 debug!(error = %e, "DESTROY_SESSION failed (may already be destroyed)");
             }
         }
@@ -1588,7 +1608,11 @@ impl crate::Mount for Mount41Wrapper {
         let builder = CompoundBuilder::new("destroy_clientid").destroy_client_id(client_id);
         let mut buf = Vec::new();
         builder.encode_with_header(&self.m.auth, &mut buf);
-        let _ = self.m.rpc.call(buf, 1, METADATA_TIMEOUT).await;
+        let _ = self
+            .m
+            .rpc
+            .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
+            .await;
         Ok(())
     }
 

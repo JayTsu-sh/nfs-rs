@@ -160,7 +160,7 @@ impl LeaseRenewal {
                         let request_len = buf.len();
                         slot.fence_on_drop();
                         let result = rpc
-                            .call(buf, 1, Duration::from_secs(5))
+                            .call(buf, super::ONE_ATTEMPT, Duration::from_secs(5))
                             .await
                             .and_then(|bytes| {
                                 validate_renewal_wire_bounds(

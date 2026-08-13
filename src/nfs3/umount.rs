@@ -36,7 +36,7 @@ impl Mount {
         // 在共享 Client 场景下，提前 shutdown 会摧毁其他持有者正在使用的连接。
         let result = self
             .rpc
-            .call(buf, super::MOUNT_RETRIES, super::METADATA_TIMEOUT)
+            .call(buf, super::MOUNT_REPLAY, super::METADATA_TIMEOUT)
             .await;
         result.map(|_| ())
     }
