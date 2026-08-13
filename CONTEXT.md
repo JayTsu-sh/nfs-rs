@@ -21,6 +21,11 @@ without defining vendor-specific client behavior. FAS2750 is the NFSv4.0
 reference validation platform.
 _Avoid_: Supported server, ONTAP-only client
 
+**Metadata identity contract**:
+The shared NFSv4 owner domain, named identities, and numeric IDs that make
+UID/GID and ACL results comparable between a client and reference server.
+_Avoid_: AUTH_SYS identity, root-squash setting
+
 **Uncertain outcome**:
 A modifying operation whose request may have reached the server but whose
 result cannot be established safely after communication failure.
