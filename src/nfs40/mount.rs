@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::stream;
+use futures::stream::TryStreamExt as _;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,14 +9,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, OpenArgs, SetClientIdArgs, decode_commit_response,
-    decode_confirm_response, decode_lookup_response, decode_open_response, decode_read_response,
-    decode_setclientid_response, decode_stateid_response, decode_write_response,
-    open_succeeded_before_compound_failure,
+    CallbackAddress, CompoundBuilder, OpenArgs, SetClientIdArgs,
+    create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
+    decode_confirm_response, decode_create_response,
+    decode_getattr_response as decode_getattr_compound, decode_link_response,
+    decode_lookup_getattr_response, decode_open_response, decode_read_response,
+    decode_readdir_response, decode_readlink_response, decode_remove_response,
+    decode_rename_response, decode_setattr_response, decode_setclientid_response,
+    decode_stateid_response, decode_write_response, open_succeeded_before_compound_failure,
 };
 use super::state::{OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
+use crate::nfs4::attrs::{
+    decode_fattr4_envelope, decode_getattr_response, encode_setattr, fattr4_has,
+    standard_getattr_bitmap,
+};
 use crate::nfs4::compound::decode_navigation_response;
 use crate::rpc::auth::Auth;
 use crate::rpc::{self, ReplayPolicy};
@@ -33,6 +42,10 @@ struct Mount40 {
     issuer: u64,
     next_owner: AtomicU64,
     state: Arc<OpenState>,
+    dircount: u32,
+    maxcount: u32,
+    rsize: u32,
+    wsize: u32,
 }
 
 impl Debug for Mount40 {
@@ -103,6 +116,10 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         issuer: rand::random(),
         next_owner: AtomicU64::new(1),
         state: Arc::new(OpenState::default()),
+        dircount: args.dircount,
+        maxcount: args.maxcount,
+        rsize: args.rsize,
+        wsize: args.wsize,
     })
 }
 
@@ -167,114 +184,12 @@ async fn settled_call(
 }
 
 impl Mount40 {
-    async fn commit_verifier(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
-        let request = CompoundBuilder::new("commit")
-            .putfh(fh)
-            .commit(offset, count)
-            .encode_with_header(&self.auth);
-        let (class, ctx) = context("commit", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
-        decode_commit_response(response)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
-    }
-
-    async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
-        let rpc = self.rpc.clone();
-        let auth = self.auth.clone();
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            let mut lane = lane.lock().await;
-            let request = CompoundBuilder::new("close")
-                .putfh(&lane.fh)
-                .close(lane.next_seqid, &lane.stateid)
-                .encode_with_header(&auth);
-            let (class, ctx) = context(
-                "close",
-                lane.owner,
-                lane.next_seqid,
-                OperationClass::ReplaySensitive,
-            );
-            let response = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            lane.stateid = decode_stateid_response(response, 4, "CLOSE")
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            lane.next_seqid = lane.next_seqid.wrapping_add(1);
-            let owner = lane.owner;
-            let fh = lane.fh.clone();
-            drop(lane);
-            state.remove(owner, &fh).await;
-            Ok(())
-        })
-        .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))?
-    }
-}
-
-fn unsupported<T>(operation: &str) -> Result<T> {
-    Err(NfsError::Unsupported(format!(
-        "NFSv4.0 {operation} is not implemented in the minimal mount slice"
-    )))
-}
-
-fn verifier_changed_error() -> NfsError {
-    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
-        crate::error::OperationOutcome::Uncertain,
-        OperationClass::ReplaySensitive,
-        crate::error::RecoveryAction::VerifyThenResume,
-        RequestContext {
-            operation: "write_verifier".into(),
-            protocol: NFSVersion::NFSv4p0,
-            request_id: None,
-        },
-        NfsError::Rpc("NFSv4.0 WRITE verifier changed before COMMIT".into()),
-    )))
-}
-
-#[async_trait]
-impl Mount for Mount40 {
-    fn get_max_read_size(&self) -> u32 {
-        1_048_576
-    }
-    fn get_max_write_size(&self) -> u32 {
-        1_048_576
-    }
-    fn version(&self) -> NFSVersion {
-        NFSVersion::NFSv4p0
-    }
-    async fn getfh(&self) -> Bytes {
-        self.root_fh.clone()
-    }
-
-    async fn null(&self) -> Result<()> {
-        let mut request = Vec::new();
-        crate::nfs3::rpc_header(100003, 4, 0, &self.auth).encode(&mut request);
-        self.rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
-            .await?;
-        Ok(())
-    }
-
-    async fn umount(&self) -> Result<()> {
-        self.rpc.shutdown().await;
-        Ok(())
-    }
-
-    async fn access(&self, _fh: Bytes, _mode: u32) -> Result<u32> {
-        unsupported("ACCESS")
-    }
-    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
-        Ok(self.open_stateful(dir_fh, filename, access).await?.object)
-    }
-    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
-        Ok(self.open_path_stateful(path, access).await?.object)
-    }
-    async fn open_stateful(
+    async fn open_file(
         &self,
         dir_fh: Bytes,
         filename: &str,
         access: u32,
+        create: bool,
     ) -> Result<mount::OpenFile> {
         if !matches!(
             access,
@@ -293,7 +208,7 @@ impl Mount for Mount40 {
         let client_id = self.client_id;
         let issuer = self.issuer;
         tokio::spawn(async move {
-            let request = CompoundBuilder::new("open")
+            let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
                 .open(OpenArgs {
                     seqid: 0,
@@ -301,10 +216,12 @@ impl Mount for Mount40 {
                     client_id,
                     owner: owner_wire.as_bytes(),
                     filename: &filename,
+                    create,
                 })
                 .getfh()
                 .encode_with_header(&auth);
-            let (class, ctx) = context("open", owner, 0, OperationClass::ReplaySensitive);
+            let operation = if create { "create" } else { "open" };
+            let (class, ctx) = context(operation, owner, 0, OperationClass::ReplaySensitive);
             let response = rpc
                 .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                 .await
@@ -362,6 +279,401 @@ impl Mount for Mount40 {
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))?
     }
+
+    async fn commit_verifier(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
+        let request = CompoundBuilder::new("commit")
+            .putfh(fh)
+            .commit(offset, count)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("commit", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_commit_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+    }
+
+    async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let mut lane = lane.lock().await;
+            let request = CompoundBuilder::new("close")
+                .putfh(&lane.fh)
+                .close(lane.next_seqid, &lane.stateid)
+                .encode_with_header(&auth);
+            let (class, ctx) = context(
+                "close",
+                lane.owner,
+                lane.next_seqid,
+                OperationClass::ReplaySensitive,
+            );
+            let response = rpc
+                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            lane.stateid = decode_stateid_response(response, 4, "CLOSE")
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            lane.next_seqid = lane.next_seqid.wrapping_add(1);
+            let owner = lane.owner;
+            let fh = lane.fh.clone();
+            drop(lane);
+            state.remove(owner, &fh).await;
+            Ok(())
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))?
+    }
+
+    async fn readdir_payload(
+        &self,
+        fh: &Bytes,
+        cookie: u64,
+        verifier: &[u8; 8],
+        bitmap: &[u32],
+    ) -> Result<Bytes> {
+        let request = CompoundBuilder::new("readdir")
+            .putfh(fh)
+            .readdir(cookie, verifier, self.dircount, self.maxcount, bitmap)
+            .encode_with_header(&self.auth);
+        let payload = decode_readdir_response(
+            self.rpc
+                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                .await?,
+        )?;
+        validate_readdir_payload(payload, self.maxcount)
+    }
+
+    async fn query_fattrs(
+        &self,
+        fh: &Bytes,
+        bitmap: &[u32],
+        label: &str,
+    ) -> Result<(Vec<u32>, Bytes)> {
+        let request = CompoundBuilder::new(label)
+            .putfh(fh)
+            .getattr(bitmap)
+            .encode_with_header(&self.auth);
+        let mut data = decode_getattr_compound(
+            self.rpc
+                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                .await?,
+        )?;
+        decode_fattr4_envelope(&mut data, label)
+    }
+
+    async fn readdir_page(
+        &self,
+        fh: &Bytes,
+        cookie: u64,
+        verifier: &[u8; 8],
+    ) -> Result<(Vec<Result<mount::ReaddirEntry>>, u64, [u8; 8], bool)> {
+        let mut data = self
+            .readdir_payload(fh, cookie, verifier, &[1u32 << 20])
+            .await?;
+        let (verifier, entries, eof) = decode_directory_page(&mut data, cookie)?;
+        let last_cookie = entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.as_ref().ok().map(|entry| entry.cookie))
+            .unwrap_or(cookie);
+        Ok((
+            entries
+                .into_iter()
+                .map(|entry| {
+                    entry.map(|entry| mount::ReaddirEntry {
+                        fileid: entry.attr.fileid,
+                        file_name: entry.name,
+                    })
+                })
+                .collect(),
+            last_cookie,
+            verifier,
+            eof,
+        ))
+    }
+
+    async fn readdirplus_page(
+        &self,
+        fh: &Bytes,
+        cookie: u64,
+        verifier: &[u8; 8],
+    ) -> Result<(Vec<Result<mount::ReaddirplusEntry>>, u64, [u8; 8], bool)> {
+        let mut data = self
+            .readdir_payload(fh, cookie, verifier, &standard_getattr_bitmap())
+            .await?;
+        let (verifier, entries, eof) = decode_directory_page(&mut data, cookie)?;
+        let last_cookie = entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.as_ref().ok().map(|entry| entry.cookie))
+            .unwrap_or(cookie);
+        Ok((
+            entries
+                .into_iter()
+                .map(|entry| {
+                    entry.map(|entry| mount::ReaddirplusEntry {
+                        fileid: entry.attr.fileid,
+                        file_name: entry.name,
+                        handle: entry.attr.filehandle.clone(),
+                        attr: Some(entry.attr),
+                    })
+                })
+                .collect(),
+            last_cookie,
+            verifier,
+            eof,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct DirectoryEntry {
+    cookie: u64,
+    name: String,
+    attr: mount::Attr,
+}
+
+fn decode_directory_page(
+    data: &mut Bytes,
+    initial_cookie: u64,
+) -> Result<([u8; 8], Vec<Result<DirectoryEntry>>, bool)> {
+    if data.remaining() < 8 {
+        return Err(NfsError::Xdr("READDIR cookie verifier truncated".into()));
+    }
+    let mut verifier = [0; 8];
+    data.copy_to_slice(&mut verifier);
+    let mut entries = Vec::new();
+    let mut previous_cookie = initial_cookie;
+    loop {
+        if data.remaining() < 4 {
+            let error = NfsError::Xdr("READDIR entry discriminator truncated".into());
+            if entries.is_empty() {
+                return Err(error);
+            }
+            entries.push(Err(error));
+            return Ok((verifier, entries, true));
+        }
+        match data.get_u32() {
+            0 => break,
+            1 => {}
+            value => {
+                entries.push(Err(NfsError::Xdr(format!(
+                    "READDIR entry discriminator is {value}, expected 0 or 1"
+                ))));
+                return Ok((verifier, entries, true));
+            }
+        }
+        let decoded = decode_directory_entry(data, previous_cookie);
+        let cookie = match &decoded {
+            Ok(entry) => entry.cookie,
+            Err(_) => {
+                entries.push(decoded);
+                return Ok((verifier, entries, true));
+            }
+        };
+        previous_cookie = cookie;
+        entries.push(decoded);
+    }
+    if data.remaining() < 4 {
+        let error = NfsError::Xdr("READDIR eof flag truncated".into());
+        if entries.is_empty() {
+            return Err(error);
+        }
+        entries.push(Err(error));
+        return Ok((verifier, entries, true));
+    }
+    match data.get_u32() {
+        0 => Ok((verifier, entries, false)),
+        1 => Ok((verifier, entries, true)),
+        value => {
+            entries.push(Err(NfsError::Xdr(format!(
+                "READDIR eof flag is {value}, expected 0 or 1"
+            ))));
+            Ok((verifier, entries, true))
+        }
+    }
+}
+
+fn decode_directory_entry(data: &mut Bytes, previous_cookie: u64) -> Result<DirectoryEntry> {
+    if data.remaining() < 12 {
+        return Err(NfsError::Xdr("READDIR entry truncated".into()));
+    }
+    let cookie = data.get_u64();
+    if cookie == previous_cookie {
+        return Err(NfsError::Xdr("READDIR entry did not advance cookie".into()));
+    }
+    let name_len = data.get_u32() as usize;
+    let padded = name_len
+        .checked_add(3)
+        .ok_or_else(|| NfsError::Xdr("READDIR name length overflow".into()))?
+        & !3;
+    if data.remaining() < padded {
+        return Err(NfsError::Xdr("READDIR entry name truncated".into()));
+    }
+    let name = String::from_utf8(data.split_to(name_len).to_vec())
+        .map_err(|error| NfsError::Xdr(format!("READDIR entry name is not UTF-8: {error}")))?;
+    data.advance(padded - name_len);
+    let attr = decode_getattr_response(data)?;
+    Ok(DirectoryEntry { cookie, name, attr })
+}
+
+fn validate_readdir_payload(payload: Bytes, maxcount: u32) -> Result<Bytes> {
+    if payload.len() > maxcount as usize {
+        return Err(NfsError::Xdr(format!(
+            "READDIR payload {} exceeds requested maxcount {maxcount}",
+            payload.len()
+        )));
+    }
+    Ok(payload)
+}
+
+fn take_u64_attr(values: &mut Bytes, label: &str) -> Result<u64> {
+    if values.remaining() < 8 {
+        return Err(NfsError::Xdr(format!("{label} truncated")));
+    }
+    Ok(values.get_u64())
+}
+
+fn take_u32_attr(values: &mut Bytes, label: &str) -> Result<u32> {
+    if values.remaining() < 4 {
+        return Err(NfsError::Xdr(format!("{label} truncated")));
+    }
+    Ok(values.get_u32())
+}
+
+fn take_bool_attr(values: &mut Bytes, label: &str) -> Result<bool> {
+    match take_u32_attr(values, label)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(NfsError::Xdr(format!(
+            "{label} has invalid boolean value {value}"
+        ))),
+    }
+}
+
+fn ensure_attr_values_consumed(values: &Bytes, label: &str) -> Result<()> {
+    if values.has_remaining() {
+        return Err(NfsError::Xdr(format!(
+            "{label} has trailing attribute values"
+        )));
+    }
+    Ok(())
+}
+
+fn require_fattrs(bitmap: &[u32], required: &[u32], operation: &str) -> Result<()> {
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|attr| !fattr4_has(bitmap, *attr))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(NfsError::Unsupported(format!(
+            "NFSv4.0 {operation} server omitted required attributes {missing:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn unsupported<T>(operation: &str) -> Result<T> {
+    Err(NfsError::Unsupported(format!(
+        "NFSv4.0 {operation} is not implemented in the minimal mount slice"
+    )))
+}
+
+fn verifier_changed_error() -> NfsError {
+    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+        crate::error::OperationOutcome::Uncertain,
+        OperationClass::ReplaySensitive,
+        crate::error::RecoveryAction::VerifyThenResume,
+        RequestContext {
+            operation: "write_verifier".into(),
+            protocol: NFSVersion::NFSv4p0,
+            request_id: None,
+        },
+        NfsError::Rpc("NFSv4.0 WRITE verifier changed before COMMIT".into()),
+    )))
+}
+
+fn classify_create_compound_error(
+    response: &Bytes,
+    class: OperationClass,
+    ctx: RequestContext,
+    error: NfsError,
+) -> NfsError {
+    if create_succeeded_before_compound_failure(response.clone()) {
+        NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+            crate::error::OperationOutcome::Uncertain,
+            class,
+            crate::error::RecoveryAction::VerifyThenResume,
+            ctx,
+            error,
+        )))
+    } else {
+        classify_sent_nfs40_error(class, ctx, error)
+    }
+}
+
+#[async_trait]
+impl Mount for Mount40 {
+    fn get_max_read_size(&self) -> u32 {
+        self.rsize
+    }
+    fn get_max_write_size(&self) -> u32 {
+        self.wsize
+    }
+    fn version(&self) -> NFSVersion {
+        NFSVersion::NFSv4p0
+    }
+    async fn getfh(&self) -> Bytes {
+        self.root_fh.clone()
+    }
+
+    async fn null(&self) -> Result<()> {
+        let mut request = Vec::new();
+        crate::nfs3::rpc_header(100003, 4, 0, &self.auth).encode(&mut request);
+        self.rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        Ok(())
+    }
+
+    async fn umount(&self) -> Result<()> {
+        self.rpc.shutdown().await;
+        Ok(())
+    }
+
+    async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
+        const ACCESS4_ALL: u32 = 0x003f;
+        if mode & !ACCESS4_ALL != 0 {
+            return Err(NfsError::InvalidInput(format!(
+                "NFSv4 ACCESS mask contains unknown bits: {mode:#x}"
+            )));
+        }
+        let request = CompoundBuilder::new("access")
+            .putfh(&fh)
+            .access(mode)
+            .encode_with_header(&self.auth);
+        let response = self
+            .rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        let (_supported, granted) = decode_access_response(response)?;
+        Ok(granted)
+    }
+    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+        Ok(self.open_stateful(dir_fh, filename, access).await?.object)
+    }
+    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+        Ok(self.open_path_stateful(path, access).await?.object)
+    }
+    async fn open_stateful(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
+        self.open_file(dir_fh, filename, access, false).await
+    }
     async fn open_path_stateful(&self, path: &str, access: u32) -> Result<mount::OpenFile> {
         let (dir, name) = crate::split_path(path)?;
         let directory = self.lookup_path(&dir).await?;
@@ -412,88 +724,258 @@ impl Mount for Mount40 {
     }
     async fn create(
         &self,
-        _dir_fh: Bytes,
-        _filename: &str,
-        _mode: Option<u32>,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
-        unsupported("CREATE")
+        let opened = self
+            .open_file(dir_fh.clone(), filename, crate::OPEN_BOTH, true)
+            .await?;
+        let object = opened.object;
+        if let Some(mode) = mode
+            && let Err(error) = self
+                .setattr(
+                    object.fh.clone(),
+                    None,
+                    Some(mode),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        {
+            let _ = self.close(object.fh.clone()).await;
+            let _ = self.remove(dir_fh, filename).await;
+            return Err(error);
+        }
+        let attr = self.getattr(object.fh.clone()).await?;
+        Ok(mount::ObjRes {
+            fh: object.fh,
+            attr: Some(attr),
+        })
     }
-    async fn create_path(&self, _path: &str, _mode: Option<u32>) -> Result<mount::ObjRes> {
-        unsupported("CREATE")
+    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+        let (dir, name) = crate::split_path(path)?;
+        let parent = self.lookup_path(&dir).await?;
+        self.create(parent.fh, &name, mode).await
     }
     async fn fsinfo(&self) -> Result<mount::FSInfo> {
-        unsupported("FSINFO")
+        let bitmap = [
+            (1 << 5) | (1 << 6) | (1 << 15) | (1 << 26) | (1 << 27) | (1 << 30) | (1 << 31),
+            1 << 19,
+        ];
+        let (bitmap, mut values) = self.query_fattrs(&self.root_fh, &bitmap, "fsinfo").await?;
+        require_fattrs(&bitmap, &[5, 6, 15, 27, 30, 31, 51], "FSINFO")?;
+        let link = take_bool_attr(&mut values, "link_support")?;
+        let symlink = take_bool_attr(&mut values, "symlink_support")?;
+        let cansettime = take_bool_attr(&mut values, "cansettime")?;
+        let homogeneous = if fattr4_has(&bitmap, 26) {
+            take_bool_attr(&mut values, "homogeneous")?
+        } else {
+            false
+        };
+        let maxfilesize = take_u64_attr(&mut values, "maxfilesize")?;
+        let maxread = take_u64_attr(&mut values, "maxread")?;
+        let maxwrite = take_u64_attr(&mut values, "maxwrite")?;
+        if values.remaining() < 12 {
+            return Err(NfsError::Xdr("time_delta truncated".into()));
+        }
+        let seconds = values.get_i64();
+        if !(0..=u32::MAX as i64).contains(&seconds) {
+            return Err(NfsError::Xdr("time_delta seconds out of range".into()));
+        }
+        let time_delta = crate::Time {
+            seconds: seconds as u32,
+            nseconds: values.get_u32(),
+        };
+        ensure_attr_values_consumed(&values, "fsinfo")?;
+        let properties = u32::from(link)
+            | (u32::from(symlink) << 1)
+            | (u32::from(homogeneous) << 3)
+            | (u32::from(cansettime) << 4);
+        Ok(mount::FSInfo {
+            attr: None,
+            rtmax: maxread.min(self.rsize as u64) as u32,
+            rtpref: maxread.min(self.rsize as u64) as u32,
+            rtmult: 1,
+            wtmax: maxwrite.min(self.wsize as u64) as u32,
+            wtpref: maxwrite.min(self.wsize as u64) as u32,
+            wtmult: 1,
+            dtpref: 0,
+            maxfilesize,
+            time_delta,
+            properties,
+        })
     }
     async fn fsstat(&self) -> Result<mount::FSStat> {
-        unsupported("FSSTAT")
+        let bitmap = [
+            (1 << 21) | (1 << 22) | (1 << 23),
+            (1 << 10) | (1 << 11) | (1 << 12),
+        ];
+        let (bitmap, mut values) = self.query_fattrs(&self.root_fh, &bitmap, "fsstat").await?;
+        require_fattrs(&bitmap, &[21, 22, 23, 42, 43, 44], "FSSTAT")?;
+        let mut result = mount::FSStat::default();
+        for (attr, target) in [
+            (21, &mut result.afiles),
+            (22, &mut result.ffiles),
+            (23, &mut result.tfiles),
+            (42, &mut result.abytes),
+            (43, &mut result.fbytes),
+            (44, &mut result.tbytes),
+        ] {
+            if fattr4_has(&bitmap, attr) {
+                *target = take_u64_attr(&mut values, "fsstat value")?;
+            }
+        }
+        ensure_attr_values_consumed(&values, "fsstat")?;
+        Ok(result)
     }
-    async fn getattr(&self, _fh: Bytes) -> Result<mount::Attr> {
-        unsupported("GETATTR")
-    }
-    async fn setattr(
-        &self,
-        _fh: Bytes,
-        _guard_ctime: Option<crate::Time>,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<crate::Time>,
-        _mtime: Option<crate::Time>,
-    ) -> Result<()> {
-        unsupported("SETATTR")
-    }
-    async fn setattr_path(
-        &self,
-        _path: &str,
-        _specify_guard: bool,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<crate::Time>,
-        _mtime: Option<crate::Time>,
-    ) -> Result<()> {
-        unsupported("SETATTR")
-    }
-    async fn link(
-        &self,
-        _src_fh: Bytes,
-        _dst_dir_fh: Bytes,
-        _dst_filename: &str,
-    ) -> Result<mount::Attr> {
-        unsupported("LINK")
-    }
-    async fn link_path(&self, _src_path: &str, _dst_path: &str) -> Result<mount::Attr> {
-        unsupported("LINK")
-    }
-    async fn symlink_path(&self, _src_path: &str, _dst_path: &str) -> Result<mount::ObjRes> {
-        unsupported("SYMLINK")
-    }
-    async fn symlink(
-        &self,
-        _src_path: &str,
-        _dst_dir_fh: Bytes,
-        _dst_filename: &str,
-    ) -> Result<mount::ObjRes> {
-        unsupported("SYMLINK")
-    }
-    async fn readlink(&self, _fh: Bytes) -> Result<String> {
-        unsupported("READLINK")
-    }
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
-        let request = CompoundBuilder::new("lookup")
-            .putfh(&dir_fh)
-            .lookup(filename)
-            .getfh()
+    async fn getattr(&self, fh: Bytes) -> Result<mount::Attr> {
+        let bitmap = standard_getattr_bitmap();
+        let request = CompoundBuilder::new("getattr")
+            .putfh(&fh)
+            .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let response = self
             .rpc
             .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
+        let mut data = decode_getattr_compound(response)?;
+        decode_getattr_response(&mut data)
+    }
+    async fn setattr(
+        &self,
+        fh: Bytes,
+        guard_ctime: Option<crate::Time>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<()> {
+        if guard_ctime.is_some() {
+            return Err(NfsError::Unsupported(
+                "NFSv4.0 guarded SETATTR is not representable by RFC 7530 SETATTR".into(),
+            ));
+        }
+        let (bitmap, values) = encode_setattr(mode, uid, gid, size, atime, mtime);
+        if bitmap.is_empty() {
+            return Ok(());
+        }
+        let stateid = match self.state.for_fh(&fh, crate::OPEN_WRITE).await {
+            Some(lane) => lane.lock().await.stateid,
+            None => [0; 16],
+        };
+        let request = CompoundBuilder::new("setattr")
+            .putfh(&fh)
+            .setattr(&stateid, &bitmap, &values)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("setattr", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_setattr_response(response, &bitmap)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+    }
+    async fn setattr_path(
+        &self,
+        path: &str,
+        specify_guard: bool,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<crate::Time>,
+        mtime: Option<crate::Time>,
+    ) -> Result<()> {
+        let object = self.lookup_path(path).await?;
+        let guard = if specify_guard {
+            Some(self.getattr(object.fh.clone()).await?.ctime)
+        } else {
+            None
+        };
+        self.setattr(object.fh, guard, mode, uid, gid, size, atime, mtime)
+            .await
+    }
+    async fn link(
+        &self,
+        src_fh: Bytes,
+        dst_dir_fh: Bytes,
+        dst_filename: &str,
+    ) -> Result<mount::Attr> {
+        let request = CompoundBuilder::new("link")
+            .putfh(&src_fh)
+            .savefh()
+            .putfh(&dst_dir_fh)
+            .link(dst_filename)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("link", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_link_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        self.getattr(src_fh).await
+    }
+    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+        let source = self.lookup_path(src_path).await?;
+        let (dir, name) = crate::split_path(dst_path)?;
+        let parent = self.lookup_path(&dir).await?;
+        self.link(source.fh, parent.fh, &name).await
+    }
+    async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<mount::ObjRes> {
+        let (dir, name) = crate::split_path(dst_path)?;
+        let parent = self.lookup_path(&dir).await?;
+        self.symlink(src_path, parent.fh, &name).await
+    }
+    async fn symlink(
+        &self,
+        src_path: &str,
+        dst_dir_fh: Bytes,
+        dst_filename: &str,
+    ) -> Result<mount::ObjRes> {
+        let bitmap = standard_getattr_bitmap();
+        let request = CompoundBuilder::new("symlink")
+            .putfh(&dst_dir_fh)
+            .create_symlink(dst_filename, src_path)
+            .getfh()
+            .getattr(&bitmap)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("symlink", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let (fh, mut data) = decode_create_response(response.clone())
+            .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
         Ok(mount::ObjRes {
-            fh: decode_lookup_response(response)?,
-            attr: None,
+            fh,
+            attr: Some(decode_getattr_response(&mut data)?),
+        })
+    }
+    async fn readlink(&self, fh: Bytes) -> Result<String> {
+        let request = CompoundBuilder::new("readlink")
+            .putfh(&fh)
+            .readlink()
+            .encode_with_header(&self.auth);
+        decode_readlink_response(
+            self.rpc
+                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                .await?,
+        )
+    }
+    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+        let bitmap = standard_getattr_bitmap();
+        let request = CompoundBuilder::new("lookup")
+            .putfh(&dir_fh)
+            .lookup(filename)
+            .getfh()
+            .getattr(&bitmap)
+            .encode_with_header(&self.auth);
+        let response = self
+            .rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        let (fh, mut data) = decode_lookup_getattr_response(response)?;
+        Ok(mount::ObjRes {
+            fh,
+            attr: Some(decode_getattr_response(&mut data)?),
         })
     }
     async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
@@ -506,8 +988,25 @@ impl Mount for Mount40 {
         }
         Ok(object)
     }
-    async fn pathconf(&self, _fh: Bytes) -> Result<mount::Pathconf> {
-        unsupported("PATHCONF")
+    async fn pathconf(&self, fh: Bytes) -> Result<mount::Pathconf> {
+        let fh = if fh.is_empty() { &self.root_fh } else { &fh };
+        let requested = [
+            (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+            1 << 2,
+        ];
+        let (bitmap, mut values) = self.query_fattrs(fh, &requested, "pathconf").await?;
+        require_fattrs(&bitmap, &[16, 17, 18, 28, 29, 34], "PATHCONF")?;
+        let result = mount::Pathconf {
+            attr: None,
+            case_insensitive: take_bool_attr(&mut values, "case_insensitive")?,
+            case_preserving: take_bool_attr(&mut values, "case_preserving")?,
+            chown_restricted: take_bool_attr(&mut values, "chown_restricted")?,
+            linkmax: take_u32_attr(&mut values, "maxlink")?,
+            name_max: take_u32_attr(&mut values, "maxname")?,
+            no_trunc: take_bool_attr(&mut values, "no_trunc")?,
+        };
+        ensure_attr_values_consumed(&values, "pathconf")?;
+        Ok(result)
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
         let stateid = if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await {
@@ -594,41 +1093,119 @@ impl Mount for Mount40 {
         }
         Ok(count)
     }
-    async fn readdir(&self, _dir_fh: Bytes) -> mount::ReaddirStream<'_> {
-        Box::pin(stream::once(async { unsupported("READDIR") }))
+    async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
+        Box::pin(
+            stream::try_unfold(Some((dir_fh, 0, [0; 8])), move |state| async move {
+                let Some((fh, cookie, verifier)) = state else {
+                    return Ok(None);
+                };
+                let (entries, last_cookie, verifier, eof) =
+                    self.readdir_page(&fh, cookie, &verifier).await?;
+                if entries.is_empty() && !eof && last_cookie == cookie {
+                    return Err(NfsError::Xdr("READDIR page made no progress".into()));
+                }
+                let next = (!eof).then_some((fh, last_cookie, verifier));
+                Ok(Some((stream::iter(entries), next)))
+            })
+            .try_flatten(),
+        )
     }
-    async fn readdirplus(&self, _dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
-        Box::pin(stream::once(async { unsupported("READDIRPLUS") }))
+    async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
+        Box::pin(
+            stream::try_unfold(Some((dir_fh, 0, [0; 8])), move |state| async move {
+                let Some((fh, cookie, verifier)) = state else {
+                    return Ok(None);
+                };
+                let (entries, last_cookie, verifier, eof) =
+                    self.readdirplus_page(&fh, cookie, &verifier).await?;
+                if entries.is_empty() && !eof && last_cookie == cookie {
+                    return Err(NfsError::Xdr("READDIRPLUS page made no progress".into()));
+                }
+                let next = (!eof).then_some((fh, last_cookie, verifier));
+                Ok(Some((stream::iter(entries), next)))
+            })
+            .try_flatten(),
+        )
     }
-    async fn mkdir(&self, _dir_fh: Bytes, _dirname: &str, _mode: u32) -> Result<mount::ObjRes> {
-        unsupported("MKDIR")
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
+        let bitmap = standard_getattr_bitmap();
+        let request = CompoundBuilder::new("mkdir")
+            .putfh(&dir_fh)
+            .create_directory(dirname)
+            .getfh()
+            .getattr(&bitmap)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("mkdir", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let (fh, mut data) = decode_create_response(response.clone())
+            .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
+        let mut object = mount::ObjRes {
+            fh: fh.clone(),
+            attr: Some(decode_getattr_response(&mut data)?),
+        };
+        if let Err(error) = self
+            .setattr(fh, None, Some(mode), None, None, None, None, None)
+            .await
+        {
+            let _ = self.remove(dir_fh, dirname).await;
+            return Err(error);
+        }
+        if let Some(attr) = object.attr.as_mut() {
+            attr.file_mode = mode;
+        }
+        Ok(object)
     }
-    async fn mkdir_path(&self, _path: &str, _mode: u32) -> Result<mount::ObjRes> {
-        unsupported("MKDIR")
+    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+        let (dir, name) = crate::split_path(path)?;
+        let parent = self.lookup_path(&dir).await?;
+        self.mkdir(parent.fh, &name, mode).await
     }
-    async fn remove(&self, _dir_fh: Bytes, _filename: &str) -> Result<()> {
-        unsupported("REMOVE")
+    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+        let request = CompoundBuilder::new("remove")
+            .putfh(&dir_fh)
+            .remove(filename)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("remove", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_remove_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
-    async fn remove_path(&self, _path: &str) -> Result<()> {
-        unsupported("REMOVE")
+    async fn remove_path(&self, path: &str) -> Result<()> {
+        let (dir, name) = crate::split_path(path)?;
+        let parent = self.lookup_path(&dir).await?;
+        self.remove(parent.fh, &name).await
     }
-    async fn rmdir(&self, _dir_fh: Bytes, _dirname: &str) -> Result<()> {
-        unsupported("RMDIR")
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+        self.remove(dir_fh, dirname).await
     }
-    async fn rmdir_path(&self, _path: &str) -> Result<()> {
-        unsupported("RMDIR")
+    async fn rmdir_path(&self, path: &str) -> Result<()> {
+        self.remove_path(path).await
     }
-    async fn rename_path(&self, _from_path: &str, _to_path: &str) -> Result<()> {
-        unsupported("RENAME")
+    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+        let (from_dir, from_name) = crate::split_path(from_path)?;
+        let (to_dir, to_name) = crate::split_path(to_path)?;
+        let from_parent = self.lookup_path(&from_dir).await?;
+        let to_parent = self.lookup_path(&to_dir).await?;
+        self.rename(from_parent.fh, &from_name, to_parent.fh, &to_name)
+            .await
     }
     async fn rename(
         &self,
-        _from_dir_fh: Bytes,
-        _from_filename: &str,
-        _to_dir_fh: Bytes,
-        _to_filename: &str,
+        from_dir_fh: Bytes,
+        from_filename: &str,
+        to_dir_fh: Bytes,
+        to_filename: &str,
     ) -> Result<()> {
-        unsupported("RENAME")
+        let request = CompoundBuilder::new("rename")
+            .putfh(&from_dir_fh)
+            .savefh()
+            .putfh(&to_dir_fh)
+            .rename(from_filename, to_filename)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("rename", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_rename_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
     async fn exports(&self) -> Result<Vec<mount::ExportEntry>> {
         unsupported("EXPORTS")
@@ -690,6 +1267,10 @@ mod tests {
             issuer: 9,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
         })
     }
 
@@ -971,5 +1552,483 @@ mod tests {
             server.await.unwrap().unwrap(),
             "sent SETCLIENTID was not settled with confirm"
         );
+    }
+
+    fn directory_page(entry_cookie: u64, include_eof: bool) -> Bytes {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"verifier");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&entry_cookie.to_be_bytes());
+        xdr_opaque(&mut data, b"file");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(&42u64.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        if include_eof {
+            data.extend_from_slice(&1u32.to_be_bytes());
+        }
+        Bytes::from(data)
+    }
+
+    fn readdir_result(verifier: [u8; 8], cookie: u64, name: &[u8], eof: bool) -> Vec<u8> {
+        let mut page = Vec::new();
+        page.extend_from_slice(&verifier);
+        page.extend_from_slice(&1u32.to_be_bytes());
+        page.extend_from_slice(&cookie.to_be_bytes());
+        xdr_opaque(&mut page, name);
+        page.extend_from_slice(&1u32.to_be_bytes());
+        page.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        page.extend_from_slice(&8u32.to_be_bytes());
+        page.extend_from_slice(&(cookie + 100).to_be_bytes());
+        page.extend_from_slice(&0u32.to_be_bytes());
+        page.extend_from_slice(&u32::from(eof).to_be_bytes());
+        compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
+    }
+
+    #[tokio::test]
+    async fn public_readdir_stream_propagates_cookie_and_verifier_across_pages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &first,
+                &readdir_result(*b"firstver", 7, b"one", false),
+            )
+            .await?;
+            let second = read_record(&mut stream).await?;
+            let continuation = [7u64.to_be_bytes().as_slice(), b"firstver"].concat();
+            assert!(
+                second
+                    .windows(continuation.len())
+                    .any(|wire| wire == continuation)
+            );
+            reply(
+                &mut stream,
+                &second,
+                &readdir_result(*b"secondve", 11, b"two", true),
+            )
+            .await
+        });
+        let entries = mount
+            .readdir(Bytes::from_static(b"root"))
+            .await
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn readdir_page_decodes_cookie_name_and_fileid() {
+        let mut data = directory_page(7, true);
+        let (verifier, entries, eof) = decode_directory_page(&mut data, 0).unwrap();
+        assert_eq!(&verifier, b"verifier");
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].as_ref().unwrap();
+        assert_eq!(entry.cookie, 7);
+        assert_eq!(entry.name, "file");
+        assert_eq!(entry.attr.fileid, 42);
+        assert!(eof);
+    }
+
+    #[test]
+    fn readdir_page_rejects_non_advancing_cookie() {
+        let mut data = directory_page(7, true);
+        let (_, entries, _) = decode_directory_page(&mut data, 7).unwrap();
+        let error = entries[0].as_ref().unwrap_err();
+        assert!(error.to_string().contains("did not advance cookie"));
+    }
+
+    #[test]
+    fn readdir_page_rejects_missing_eof_flag() {
+        let mut data = directory_page(7, false);
+        let (_, entries, _) = decode_directory_page(&mut data, 0).unwrap();
+        let error = entries[1].as_ref().unwrap_err();
+        assert!(error.to_string().contains("eof flag truncated"));
+    }
+
+    #[test]
+    fn readdir_page_enforces_negotiated_maxcount() {
+        let error = validate_readdir_payload(Bytes::from_static(b"12345"), 4).unwrap_err();
+        assert!(error.to_string().contains("exceeds requested maxcount"));
+    }
+
+    #[test]
+    fn malformed_later_entry_preserves_prior_entry_result() {
+        let mut data = directory_page(7, true).to_vec();
+        data.truncate(data.len() - 8);
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&8u64.to_be_bytes());
+        data.extend_from_slice(&99u32.to_be_bytes());
+        let (_, entries, eof) = decode_directory_page(&mut Bytes::from(data), 0).unwrap();
+        assert_eq!(entries[0].as_ref().unwrap().name, "file");
+        assert!(entries[1].is_err());
+        assert!(eof);
+    }
+
+    #[test]
+    fn metadata_results_reject_missing_required_attributes() {
+        let error = require_fattrs(&[0], &[30], "FSINFO").unwrap_err();
+        assert!(matches!(error, NfsError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn guarded_setattr_is_explicitly_unsupported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let error = mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                Some(crate::Time::default()),
+                Some(0o600),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NfsError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_reply_loss_is_structured_as_uncertain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _request = read_record(&mut stream).await?;
+            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let error = mount
+            .remove(Bytes::from_static(b"root"), "victim")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_remove_after_send_is_settled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let change_info = [0u8; 20];
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("remove", &[(22, &[]), (28, &change_info)]),
+            )
+            .await
+        });
+        let task_mount = Arc::clone(&mount);
+        let task = tokio::spawn(async move {
+            task_mount
+                .remove(Bytes::from_static(b"root"), "victim")
+                .await
+        });
+        seen_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scripted_public_metadata_and_namespace_families_succeed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let access = read_record(&mut stream).await?;
+            let access_data = [0x3fu32.to_be_bytes(), 0x21u32.to_be_bytes()].concat();
+            reply(
+                &mut stream,
+                &access,
+                &compound_result("access", &[(22, &[]), (3, &access_data)]),
+            )
+            .await?;
+
+            let setattr = read_record(&mut stream).await?;
+            let attrsset = [1u32.to_be_bytes(), (1u32 << 4).to_be_bytes()].concat();
+            reply(
+                &mut stream,
+                &setattr,
+                &compound_result("setattr", &[(22, &[]), (34, &attrsset)]),
+            )
+            .await?;
+
+            let readlink = read_record(&mut stream).await?;
+            let mut target = Vec::new();
+            xdr_opaque(&mut target, b"target");
+            reply(
+                &mut stream,
+                &readlink,
+                &compound_result("readlink", &[(22, &[]), (27, &target)]),
+            )
+            .await?;
+
+            let rename = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &rename,
+                &compound_result("rename", &[(22, &[]), (32, &[]), (22, &[]), (29, &[0; 40])]),
+            )
+            .await?;
+
+            let link = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &link,
+                &compound_result("link", &[(22, &[]), (32, &[]), (22, &[]), (11, &[0; 20])]),
+            )
+            .await?;
+            let linked_getattr = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &linked_getattr,
+                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
+            )
+            .await?;
+
+            let remove = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &remove,
+                &compound_result("remove", &[(22, &[]), (28, &[0; 20])]),
+            )
+            .await
+        });
+
+        assert_eq!(
+            mount.access(Bytes::from_static(b"fh"), 0x21).await.unwrap(),
+            0x21
+        );
+        mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                None,
+                None,
+                None,
+                None,
+                Some(7),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mount.readlink(Bytes::from_static(b"fh")).await.unwrap(),
+            "target"
+        );
+        mount
+            .rename(
+                Bytes::from_static(b"from"),
+                "old",
+                Bytes::from_static(b"to"),
+                "new",
+            )
+            .await
+            .unwrap();
+        mount
+            .link(
+                Bytes::from_static(b"source"),
+                Bytes::from_static(b"target"),
+                "link",
+            )
+            .await
+            .unwrap();
+        mount
+            .remove(Bytes::from_static(b"root"), "file")
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    fn fattr_result(bitmap: &[u32], values: &[u8]) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
+        for word in bitmap {
+            result.extend_from_slice(&word.to_be_bytes());
+        }
+        xdr_opaque(&mut result, values);
+        result
+    }
+
+    #[tokio::test]
+    async fn scripted_public_getattr_and_filesystem_metadata_succeed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let getattr = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &getattr,
+                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
+            )
+            .await?;
+            let fsinfo = read_record(&mut stream).await?;
+            let bm = [
+                (1 << 5) | (1 << 6) | (1 << 15) | (1 << 27) | (1 << 30) | (1 << 31),
+                1 << 19,
+            ];
+            let values = [
+                1u32.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                u64::MAX.to_be_bytes().as_slice(),
+                65536u64.to_be_bytes().as_slice(),
+                32768u64.to_be_bytes().as_slice(),
+                0i64.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+            ]
+            .concat();
+            let data = fattr_result(&bm, &values);
+            reply(
+                &mut stream,
+                &fsinfo,
+                &compound_result("fsinfo", &[(22, &[]), (9, &data)]),
+            )
+            .await?;
+            let fsstat = read_record(&mut stream).await?;
+            let bm = [
+                (1 << 21) | (1 << 22) | (1 << 23),
+                (1 << 10) | (1 << 11) | (1 << 12),
+            ];
+            let values = (1u64..=6).flat_map(u64::to_be_bytes).collect::<Vec<_>>();
+            let data = fattr_result(&bm, &values);
+            reply(
+                &mut stream,
+                &fsstat,
+                &compound_result("fsstat", &[(22, &[]), (9, &data)]),
+            )
+            .await?;
+            let pathconf = read_record(&mut stream).await?;
+            let bm = [
+                (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+                1 << 2,
+            ];
+            let values = [
+                0u32.to_be_bytes(),
+                1u32.to_be_bytes(),
+                1u32.to_be_bytes(),
+                1024u32.to_be_bytes(),
+                255u32.to_be_bytes(),
+                1u32.to_be_bytes(),
+            ]
+            .concat();
+            let data = fattr_result(&bm, &values);
+            reply(
+                &mut stream,
+                &pathconf,
+                &compound_result("pathconf", &[(22, &[]), (9, &data)]),
+            )
+            .await
+        });
+        mount.getattr(Bytes::from_static(b"fh")).await.unwrap();
+        let info = mount.fsinfo().await.unwrap();
+        assert_eq!((info.rtmax, info.wtmax), (65536, 32768));
+        let stat = mount.fsstat().await.unwrap();
+        assert_eq!((stat.afiles, stat.tbytes), (1, 6));
+        let pathconf = mount.pathconf(Bytes::from_static(b"fh")).await.unwrap();
+        assert_eq!((pathconf.linkmax, pathconf.name_max), (1024, 255));
+        server.await.unwrap().unwrap();
+    }
+
+    fn create_object_result(tag: &str, fh_value: &[u8]) -> Vec<u8> {
+        let mut create = vec![0; 20];
+        create.extend_from_slice(&0u32.to_be_bytes());
+        let mut fh = Vec::new();
+        xdr_opaque(&mut fh, fh_value);
+        compound_result(tag, &[(22, &[]), (6, &create), (10, &fh), (9, &[0; 8])])
+    }
+
+    #[tokio::test]
+    async fn scripted_public_create_directory_and_symlink_succeed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let create = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &create,
+                &open_result(0, [0x31; 16], b"file-fh"),
+            )
+            .await?;
+            let getattr = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &getattr,
+                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
+            )
+            .await?;
+
+            let mkdir = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &mkdir,
+                &create_object_result("mkdir", b"dir-fh"),
+            )
+            .await?;
+            let setattr = read_record(&mut stream).await?;
+            let attrsset = [
+                2u32.to_be_bytes(),
+                0u32.to_be_bytes(),
+                (1u32 << 1).to_be_bytes(),
+            ]
+            .concat();
+            reply(
+                &mut stream,
+                &setattr,
+                &compound_result("setattr", &[(22, &[]), (34, &attrsset)]),
+            )
+            .await?;
+
+            let symlink = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &symlink,
+                &create_object_result("symlink", b"link-fh"),
+            )
+            .await
+        });
+        let file = mount
+            .create(Bytes::from_static(b"root"), "file", None)
+            .await
+            .unwrap();
+        assert_eq!(file.fh, Bytes::from_static(b"file-fh"));
+        let directory = mount
+            .mkdir(Bytes::from_static(b"root"), "dir", 0o755)
+            .await
+            .unwrap();
+        assert_eq!(directory.fh, Bytes::from_static(b"dir-fh"));
+        let symlink = mount
+            .symlink("target", Bytes::from_static(b"root"), "link")
+            .await
+            .unwrap();
+        assert_eq!(symlink.fh, Bytes::from_static(b"link-fh"));
+        server.await.unwrap().unwrap();
     }
 }

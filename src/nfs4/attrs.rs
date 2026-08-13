@@ -59,6 +59,54 @@ pub(crate) fn standard_getattr_bitmap() -> [u32; 2] {
     [word0, word1]
 }
 
+/// Encode the common RFC 7530 writable attributes in bitmap order.
+pub(crate) fn encode_setattr(
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+    atime: Option<Time>,
+    mtime: Option<Time>,
+) -> (Vec<u32>, Vec<u8>) {
+    let mut word0 = 0u32;
+    let mut word1 = 0u32;
+    let mut values = Vec::new();
+    if let Some(value) = size {
+        word0 |= 1 << 4;
+        values.extend_from_slice(&value.to_be_bytes());
+    }
+    if let Some(value) = mode {
+        word1 |= 1 << 1;
+        values.extend_from_slice(&value.to_be_bytes());
+    }
+    for (value, bit) in [(uid, 4u32), (gid, 5u32)] {
+        if let Some(value) = value {
+            word1 |= 1 << bit;
+            let value = value.to_string();
+            let bytes = value.as_bytes();
+            values.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            values.extend_from_slice(bytes);
+            values.resize(values.len() + (4 - bytes.len() % 4) % 4, 0);
+        }
+    }
+    for (value, bit) in [(atime, 16u32), (mtime, 22u32)] {
+        if let Some(value) = value {
+            word1 |= 1 << bit;
+            values.extend_from_slice(&1u32.to_be_bytes());
+            values.extend_from_slice(&(value.seconds as i64).to_be_bytes());
+            values.extend_from_slice(&value.nseconds.to_be_bytes());
+        }
+    }
+    let mask = if word1 != 0 {
+        vec![word0, word1]
+    } else if word0 != 0 {
+        vec![word0]
+    } else {
+        Vec::new()
+    };
+    (mask, values)
+}
+
 /// Check if a specific attribute bit is set in a bitmap.
 fn bitmap_has(bitmap: &[u32], attr_num: u32) -> bool {
     let word_idx = (attr_num / 32) as usize;
@@ -67,6 +115,30 @@ fn bitmap_has(bitmap: &[u32], attr_num: u32) -> bool {
         return false;
     }
     (bitmap[word_idx] & (1 << bit_idx)) != 0
+}
+
+/// Split an fattr4 into its returned bitmap and bounded attribute-value payload.
+pub(crate) fn decode_fattr4_envelope(data: &mut Bytes, label: &str) -> Result<(Vec<u32>, Bytes)> {
+    if data.remaining() < 4 {
+        return Err(NfsError::Xdr(format!("{label} bitmap length truncated")));
+    }
+    let count = data.get_u32() as usize;
+    if count > 16 || data.remaining() < count.saturating_mul(4) {
+        return Err(NfsError::Xdr(format!("{label} bitmap is invalid")));
+    }
+    let bitmap = (0..count).map(|_| data.get_u32()).collect();
+    if data.remaining() < 4 {
+        return Err(NfsError::Xdr(format!("{label} value length truncated")));
+    }
+    let length = data.get_u32() as usize;
+    if data.remaining() < length {
+        return Err(NfsError::Xdr(format!("{label} values truncated")));
+    }
+    Ok((bitmap, data.split_to(length)))
+}
+
+pub(crate) fn fattr4_has(bitmap: &[u32], attr_num: u32) -> bool {
+    bitmap_has(bitmap, attr_num)
 }
 
 /// Skip `n` bytes from the attribute values buffer with bounds checking.

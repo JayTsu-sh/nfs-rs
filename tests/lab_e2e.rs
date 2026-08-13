@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use nfs_rs::{Mount, MountLifecycleState, NFSVersion, OPEN_BOTH, OPEN_READ, parse_url_and_mount};
+use nfs_rs::{
+    Mount, MountLifecycleState, NFSVersion, NfsError, OPEN_BOTH, OPEN_READ, Time,
+    parse_url_and_mount,
+};
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
 const LAB_URLS_ENV: &str = "NFS_RS_LAB_URLS";
@@ -75,9 +78,194 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
     );
     for url in urls.split(',').filter(|url| !url.is_empty()) {
         let mount = parse_url_and_mount(url).await?;
+        let fsinfo = mount.fsinfo().await?;
+        ensure(
+            fsinfo.rtmax > 0 && fsinfo.wtmax > 0,
+            format!("NFSv4.0 FSINFO returned zero I/O limits through {url}"),
+        )?;
+        let fsstat = mount.fsstat().await?;
+        ensure(
+            fsstat.tbytes >= fsstat.fbytes && fsstat.fbytes >= fsstat.abytes,
+            format!("NFSv4.0 FSSTAT byte counters are inconsistent through {url}"),
+        )?;
+        match mount.pathconf(mount.getfh().await).await {
+            Ok(pathconf) => ensure(
+                pathconf.name_max > 0 && pathconf.linkmax > 0,
+                format!("NFSv4.0 PATHCONF returned zero limits through {url}"),
+            )?,
+            Err(NfsError::Unsupported(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let namespace_dir = "nfs-rs-v40-namespace-dir";
+        let _ = mount.rmdir_path(namespace_dir).await;
+        let created_dir = mount.mkdir_path(namespace_dir, 0o700).await?;
+        ensure(
+            created_dir
+                .attr
+                .as_ref()
+                .is_some_and(|attr| attr.file_mode == 0o700),
+            format!("NFSv4.0 MKDIR mode mismatch through {url}"),
+        )?;
+        ensure(
+            mount.lookup_path(namespace_dir).await?.fh == created_dir.fh,
+            format!("NFSv4.0 MKDIR lookup mismatch through {url}"),
+        )?;
+        mount.rmdir_path(namespace_dir).await?;
+        ensure(
+            mount.lookup_path(namespace_dir).await.is_err(),
+            format!("NFSv4.0 RMDIR left a residual directory through {url}"),
+        )?;
+        let namespace_file = "nfs-rs-v40-created.bin";
+        let _ = mount.remove_path(namespace_file).await;
+        let created_file = mount.create_path(namespace_file, Some(0o600)).await?;
+        ensure(
+            created_file
+                .attr
+                .as_ref()
+                .is_some_and(|attr| attr.file_mode == 0o600),
+            format!("NFSv4.0 CREATE mode mismatch through {url}"),
+        )?;
+        let timestamp = Time {
+            seconds: 1_700_000_000,
+            nseconds: 123_000_000,
+        };
+        mount
+            .setattr(
+                created_file.fh.clone(),
+                None,
+                None,
+                Some(0),
+                Some(0),
+                None,
+                Some(timestamp),
+                Some(timestamp),
+            )
+            .await?;
+        let metadata = mount.getattr(created_file.fh.clone()).await?;
+        ensure(
+            metadata.uid == 0
+                && metadata.gid == 0
+                && metadata.atime == timestamp
+                && metadata.mtime == timestamp,
+            format!("NFSv4.0 owner/timestamp SETATTR mismatch through {url}: {metadata:?}"),
+        )?;
+        let names = mount
+            .readdir(mount.getfh().await)
+            .await
+            .map_ok(|entry| entry.file_name)
+            .try_collect::<Vec<_>>()
+            .await?;
+        ensure(
+            names.iter().any(|name| name == namespace_file),
+            format!("NFSv4.0 READDIR omitted {namespace_file} through {url}"),
+        )?;
+        let entries = mount
+            .readdirplus(mount.getfh().await)
+            .await
+            .try_collect::<Vec<_>>()
+            .await?;
+        ensure(
+            entries.iter().any(|entry| {
+                entry.file_name == namespace_file
+                    && entry.attr.is_some()
+                    && !entry.handle.is_empty()
+            }),
+            format!("NFSv4.0 READDIRPLUS omitted detailed {namespace_file} through {url}"),
+        )?;
+        let created_payload = Bytes::from_static(b"created-through-common-mount-api");
+        ensure(
+            mount
+                .write(created_file.fh.clone(), 0, created_payload.clone())
+                .await?
+                == created_payload.len() as u32,
+            format!("NFSv4.0 CREATE write count mismatch through {url}"),
+        )?;
+        mount.close(created_file.fh).await?;
+        let reopened = mount.open_path(namespace_file, OPEN_READ).await?;
+        ensure(
+            mount
+                .read(reopened.fh.clone(), 0, created_payload.len() as u32)
+                .await?
+                == created_payload,
+            format!("NFSv4.0 CREATE payload mismatch through {url}"),
+        )?;
+        mount.close(reopened.fh).await?;
+        let renamed_file = "nfs-rs-v40-renamed.bin";
+        let hardlink_file = "nfs-rs-v40-hardlink.bin";
+        let symlink_file = "nfs-rs-v40-symlink";
+        for residual in [renamed_file, hardlink_file, symlink_file] {
+            let _ = mount.remove_path(residual).await;
+        }
+        mount.rename_path(namespace_file, renamed_file).await?;
+        ensure(
+            mount.lookup_path(namespace_file).await.is_err(),
+            format!("NFSv4.0 RENAME left the source through {url}"),
+        )?;
+        let renamed = mount.lookup_path(renamed_file).await?;
+        let linked_attr = mount.link_path(renamed_file, hardlink_file).await?;
+        ensure(
+            linked_attr.nlink >= 2 && mount.lookup_path(hardlink_file).await?.fh == renamed.fh,
+            format!("NFSv4.0 LINK identity mismatch through {url}"),
+        )?;
+        let symbolic = mount.symlink_path(renamed_file, symlink_file).await?;
+        ensure(
+            mount.readlink(symbolic.fh).await? == renamed_file,
+            format!("NFSv4.0 READLINK target mismatch through {url}"),
+        )?;
+        mount.remove_path(symlink_file).await?;
+        mount.remove_path(hardlink_file).await?;
+        mount.remove_path(renamed_file).await?;
+        ensure(
+            mount.lookup_path(renamed_file).await.is_err(),
+            format!("NFSv4.0 REMOVE left a residual file through {url}"),
+        )?;
         for (file, expected) in [(&small_file, &small), (&large_file, &large)] {
             let opened = mount.open_path_stateful(file, OPEN_BOTH).await?;
             let fh = opened.object.fh.clone();
+            let attr = mount.getattr(fh.clone()).await?;
+            ensure(
+                attr.filesize == expected.len() as u64,
+                format!("NFSv4.0 GETATTR size mismatch for {file} through {url}"),
+            )?;
+            let granted = mount.access(fh.clone(), 0x01).await?;
+            ensure(
+                granted & 0x01 != 0,
+                format!("NFSv4.0 ACCESS denied fixture read through {url}"),
+            )?;
+            let original_mode = attr.file_mode;
+            let test_mode = if original_mode & 0o100 != 0 {
+                original_mode & !0o100
+            } else {
+                original_mode | 0o100
+            };
+            mount
+                .setattr(
+                    fh.clone(),
+                    None,
+                    Some(test_mode),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            ensure(
+                mount.getattr(fh.clone()).await?.file_mode == test_mode,
+                format!("NFSv4.0 SETATTR mode mismatch through {url}"),
+            )?;
+            mount
+                .setattr(
+                    fh.clone(),
+                    None,
+                    Some(original_mode),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
             let original = read_all(mount.as_ref(), fh.clone(), expected.len()).await?;
             ensure(
                 original.len() == expected.len(),

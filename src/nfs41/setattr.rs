@@ -3,6 +3,7 @@ use bytes::Bytes;
 use super::mount::{Mount41, extract_stateid};
 use super::state::StateId;
 use crate::error::{NfsError, Result};
+use crate::nfs4::attrs::encode_setattr;
 
 impl Mount41 {
     #[allow(clippy::too_many_arguments)]
@@ -140,75 +141,4 @@ impl Mount41 {
         let obj = self.lookup_path(path).await?;
         self.commit(obj.fh, offset, count).await
     }
-}
-
-/// Encode setattr attributes into a bitmap + attr_vals pair.
-pub(super) fn encode_setattr(
-    mode: Option<u32>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    size: Option<u64>,
-    atime: Option<crate::Time>,
-    mtime: Option<crate::Time>,
-) -> (Vec<u32>, Vec<u8>) {
-    let mut word0: u32 = 0;
-    let mut word1: u32 = 0;
-    let mut vals = Vec::new();
-
-    // Attributes must be encoded in bitmap order (ascending attribute number).
-    // NFSv4.1 numbering: filehandle inserted at 19, shifting all subsequent attrs +1.
-    // size = attr #4 (word 0)
-    if let Some(s) = size {
-        word0 |= 1 << 4;
-        vals.extend_from_slice(&s.to_be_bytes());
-    }
-    // mode = attr #33 (word 1, bit 1)
-    if let Some(m) = mode {
-        word1 |= 1 << 1;
-        vals.extend_from_slice(&m.to_be_bytes());
-    }
-    // owner = attr #36 (word 1, bit 4)
-    if let Some(u) = uid {
-        word1 |= 1 << 4;
-        let s = u.to_string();
-        let bytes = s.as_bytes();
-        vals.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        vals.extend_from_slice(bytes);
-        let pad = (4 - bytes.len() % 4) % 4;
-        vals.extend(std::iter::repeat_n(0, pad));
-    }
-    // owner_group = attr #37 (word 1, bit 5)
-    if let Some(g) = gid {
-        word1 |= 1 << 5;
-        let s = g.to_string();
-        let bytes = s.as_bytes();
-        vals.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        vals.extend_from_slice(bytes);
-        let pad = (4 - bytes.len() % 4) % 4;
-        vals.extend(std::iter::repeat_n(0, pad));
-    }
-    // time_access_set = attr #48 (word 1, bit 16)
-    if let Some(t) = atime {
-        word1 |= 1 << 16;
-        // set_to_client_time4: SET_TO_CLIENT_TIME = 1
-        vals.extend_from_slice(&1u32.to_be_bytes());
-        vals.extend_from_slice(&(t.seconds as i64).to_be_bytes());
-        vals.extend_from_slice(&t.nseconds.to_be_bytes());
-    }
-    // time_modify_set = attr #54 (word 1, bit 22)
-    if let Some(t) = mtime {
-        word1 |= 1 << 22;
-        vals.extend_from_slice(&1u32.to_be_bytes());
-        vals.extend_from_slice(&(t.seconds as i64).to_be_bytes());
-        vals.extend_from_slice(&t.nseconds.to_be_bytes());
-    }
-
-    let attrmask = if word1 != 0 {
-        vec![word0, word1]
-    } else if word0 != 0 {
-        vec![word0]
-    } else {
-        vec![]
-    };
-    (attrmask, vals)
 }

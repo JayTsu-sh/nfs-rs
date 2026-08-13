@@ -9,11 +9,21 @@ use crate::{NfsError, Result};
 
 const OP_SETCLIENTID: u32 = 35;
 const OP_SETCLIENTID_CONFIRM: u32 = 36;
+const OP_SETATTR: u32 = 34;
 const OP_CLOSE: u32 = 4;
+const OP_CREATE: u32 = 6;
+const OP_ACCESS: u32 = 3;
 const OP_COMMIT: u32 = 5;
+const OP_GETATTR: u32 = 9;
+const OP_LINK: u32 = 11;
 const OP_OPEN: u32 = 18;
 const OP_OPEN_CONFIRM: u32 = 20;
 const OP_READ: u32 = 25;
+const OP_READDIR: u32 = 26;
+const OP_REMOVE: u32 = 28;
+const OP_RENAME: u32 = 29;
+const OP_SAVEFH: u32 = 32;
+const OP_READLINK: u32 = 27;
 const OP_WRITE: u32 = 38;
 pub(crate) const OPEN4_RESULT_CONFIRM: u32 = 0x0000_0002;
 
@@ -30,6 +40,7 @@ pub(crate) struct OpenArgs<'a> {
     pub client_id: u64,
     pub owner: &'a [u8],
     pub filename: &'a str,
+    pub create: bool,
 }
 
 pub(crate) struct CompoundBuilder {
@@ -102,7 +113,14 @@ impl CompoundBuilder {
         xdr_u32(&mut args, 0); // OPEN4_SHARE_DENY_NONE
         args.extend_from_slice(&open.client_id.to_be_bytes());
         xdr_opaque(&mut args, open.owner);
-        xdr_u32(&mut args, 0); // OPEN4_NOCREATE
+        if open.create {
+            xdr_u32(&mut args, 1); // OPEN4_CREATE
+            xdr_u32(&mut args, 0); // UNCHECKED4
+            xdr_u32(&mut args, 0); // empty createattrs bitmap
+            xdr_opaque(&mut args, &[]);
+        } else {
+            xdr_u32(&mut args, 0); // OPEN4_NOCREATE
+        }
         xdr_u32(&mut args, 0); // CLAIM_NULL
         xdr_opaque(&mut args, open.filename.as_bytes());
         self.inner = self.inner.operation(OP_OPEN, args);
@@ -165,6 +183,109 @@ impl CompoundBuilder {
 
     pub(crate) fn getfh(mut self) -> Self {
         self.inner = self.inner.getfh();
+        self
+    }
+
+    pub(crate) fn getattr(mut self, bitmap: &[u32]) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, bitmap.len() as u32);
+        for word in bitmap {
+            xdr_u32(&mut args, *word);
+        }
+        self.inner = self.inner.operation(OP_GETATTR, args);
+        self
+    }
+
+    pub(crate) fn access(mut self, requested: u32) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, requested);
+        self.inner = self.inner.operation(OP_ACCESS, args);
+        self
+    }
+
+    pub(crate) fn setattr(mut self, stateid: &[u8; 16], bitmap: &[u32], values: &[u8]) -> Self {
+        let mut args = Vec::new();
+        args.extend_from_slice(stateid);
+        xdr_u32(&mut args, bitmap.len() as u32);
+        for word in bitmap {
+            xdr_u32(&mut args, *word);
+        }
+        xdr_opaque(&mut args, values);
+        self.inner = self.inner.operation(OP_SETATTR, args);
+        self
+    }
+
+    pub(crate) fn create_directory(mut self, name: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, 2); // NF4DIR
+        xdr_opaque(&mut args, name.as_bytes());
+        xdr_u32(&mut args, 0); // empty createattrs bitmap
+        xdr_opaque(&mut args, &[]);
+        self.inner = self.inner.operation(OP_CREATE, args);
+        self
+    }
+
+    pub(crate) fn create_symlink(mut self, name: &str, target: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, 5); // NF4LNK
+        xdr_opaque(&mut args, target.as_bytes());
+        xdr_opaque(&mut args, name.as_bytes());
+        xdr_u32(&mut args, 0);
+        xdr_opaque(&mut args, &[]);
+        self.inner = self.inner.operation(OP_CREATE, args);
+        self
+    }
+
+    pub(crate) fn savefh(mut self) -> Self {
+        self.inner = self.inner.operation(OP_SAVEFH, Vec::new());
+        self
+    }
+
+    pub(crate) fn rename(mut self, from: &str, to: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_opaque(&mut args, from.as_bytes());
+        xdr_opaque(&mut args, to.as_bytes());
+        self.inner = self.inner.operation(OP_RENAME, args);
+        self
+    }
+
+    pub(crate) fn link(mut self, name: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_opaque(&mut args, name.as_bytes());
+        self.inner = self.inner.operation(OP_LINK, args);
+        self
+    }
+
+    pub(crate) fn readlink(mut self) -> Self {
+        self.inner = self.inner.operation(OP_READLINK, Vec::new());
+        self
+    }
+
+    pub(crate) fn readdir(
+        mut self,
+        cookie: u64,
+        verifier: &[u8; 8],
+        dircount: u32,
+        maxcount: u32,
+        bitmap: &[u32],
+    ) -> Self {
+        let mut args = Vec::new();
+        args.extend_from_slice(&cookie.to_be_bytes());
+        args.extend_from_slice(verifier);
+        xdr_u32(&mut args, dircount);
+        xdr_u32(&mut args, maxcount);
+        xdr_u32(&mut args, bitmap.len() as u32);
+        for word in bitmap {
+            xdr_u32(&mut args, *word);
+        }
+        self.inner = self.inner.operation(OP_READDIR, args);
+        self
+    }
+
+    pub(crate) fn remove(mut self, name: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_opaque(&mut args, name.as_bytes());
+        self.inner = self.inner.operation(OP_REMOVE, args);
         self
     }
 
@@ -327,17 +448,191 @@ pub(crate) fn open_succeeded_before_compound_failure(mut buf: Bytes) -> bool {
         && take_u32(&mut buf, "OPEN status").ok() == Some(0)
 }
 
-pub(crate) fn decode_lookup_response(buf: Bytes) -> Result<Bytes> {
-    let (count, mut buf) = response_ops(buf)?;
-    if count != 3 {
+pub(crate) fn create_succeeded_before_compound_failure(mut buf: Bytes) -> bool {
+    let Ok(overall) = take_u32(&mut buf, "COMPOUND status") else {
+        return false;
+    };
+    if overall == 0 || take_opaque(&mut buf, "COMPOUND tag").is_err() {
+        return false;
+    }
+    let Ok(count) = take_u32(&mut buf, "COMPOUND result count") else {
+        return false;
+    };
+    count >= 2
+        && take_u32(&mut buf, "PUTFH opcode").ok() == Some(OP_PUTFH)
+        && take_u32(&mut buf, "PUTFH status").ok() == Some(0)
+        && take_u32(&mut buf, "CREATE opcode").ok() == Some(OP_CREATE)
+        && take_u32(&mut buf, "CREATE status").ok() == Some(0)
+}
+
+pub(crate) fn decode_getattr_response(buf: Bytes) -> Result<Bytes> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
         return Err(NfsError::Xdr(format!(
-            "LOOKUP response has {count} operations, expected 3"
+            "GETATTR response has {count} operations, expected 2"
         )));
     }
-    expect_op(&mut buf, OP_PUTFH, "PUTFH")?;
-    expect_op(&mut buf, crate::nfs4::compound::OP_LOOKUP, "LOOKUP")?;
-    expect_op(&mut buf, OP_GETFH, "GETFH")?;
-    take_opaque(&mut buf, "GETFH filehandle")
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_GETATTR, "GETATTR")?;
+    Ok(ops)
+}
+
+pub(crate) fn decode_access_response(buf: Bytes) -> Result<(u32, u32)> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "ACCESS response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_ACCESS, "ACCESS")?;
+    let supported = take_u32(&mut ops, "ACCESS supported")?;
+    let access = take_u32(&mut ops, "ACCESS granted")?;
+    if access & !supported != 0 {
+        return Err(NfsError::Xdr(
+            "ACCESS granted bits exceed supported bits".to_string(),
+        ));
+    }
+    Ok((supported, access))
+}
+
+pub(crate) fn decode_setattr_response(buf: Bytes, requested: &[u32]) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "SETATTR response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_SETATTR, "SETATTR")?;
+    let words = take_u32(&mut ops, "SETATTR attrsset length")? as usize;
+    for index in 0..words {
+        let set = take_u32(&mut ops, "SETATTR attrsset word")?;
+        if set & !requested.get(index).copied().unwrap_or(0) != 0 {
+            return Err(NfsError::Xdr(
+                "SETATTR response reports an unrequested attribute".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_lookup_getattr_response(buf: Bytes) -> Result<(Bytes, Bytes)> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 4 {
+        return Err(NfsError::Xdr(format!(
+            "LOOKUP response has {count} operations, expected 4"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, crate::nfs4::compound::OP_LOOKUP, "LOOKUP")?;
+    expect_op(&mut ops, OP_GETFH, "GETFH")?;
+    let fh = take_opaque(&mut ops, "GETFH filehandle")?;
+    expect_op(&mut ops, OP_GETATTR, "GETATTR")?;
+    Ok((fh, ops))
+}
+
+pub(crate) fn decode_create_response(buf: Bytes) -> Result<(Bytes, Bytes)> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 4 {
+        return Err(NfsError::Xdr(format!(
+            "CREATE response has {count} operations, expected 4"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_CREATE, "CREATE")?;
+    if ops.remaining() < 20 {
+        return Err(NfsError::Xdr("CREATE change_info truncated".to_string()));
+    }
+    ops.advance(20);
+    skip_bitmap(&mut ops, "CREATE attrset")?;
+    expect_op(&mut ops, OP_GETFH, "GETFH")?;
+    let fh = take_opaque(&mut ops, "GETFH filehandle")?;
+    expect_op(&mut ops, OP_GETATTR, "GETATTR")?;
+    Ok((fh, ops))
+}
+
+pub(crate) fn decode_remove_response(buf: Bytes) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "REMOVE response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_REMOVE, "REMOVE")?;
+    if ops.remaining() < 20 {
+        return Err(NfsError::Xdr("REMOVE change_info truncated".to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<String> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "READLINK response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_READLINK, "READLINK")?;
+    let link = take_opaque(&mut ops, "READLINK target")?;
+    String::from_utf8(link.to_vec())
+        .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
+}
+
+pub(crate) fn decode_readdir_response(buf: Bytes) -> Result<Bytes> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "READDIR response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_READDIR, "READDIR")?;
+    Ok(ops)
+}
+
+pub(crate) fn decode_rename_response(buf: Bytes) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 4 {
+        return Err(NfsError::Xdr(format!(
+            "RENAME response has {count} operations, expected 4"
+        )));
+    }
+    for (opcode, name) in [
+        (OP_PUTFH, "PUTFH"),
+        (OP_SAVEFH, "SAVEFH"),
+        (OP_PUTFH, "PUTFH"),
+        (OP_RENAME, "RENAME"),
+    ] {
+        expect_op(&mut ops, opcode, name)?;
+    }
+    if ops.remaining() < 40 {
+        return Err(NfsError::Xdr("RENAME change_info truncated".to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_link_response(buf: Bytes) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 4 {
+        return Err(NfsError::Xdr(format!(
+            "LINK response has {count} operations, expected 4"
+        )));
+    }
+    for (opcode, name) in [
+        (OP_PUTFH, "PUTFH"),
+        (OP_SAVEFH, "SAVEFH"),
+        (OP_PUTFH, "PUTFH"),
+        (OP_LINK, "LINK"),
+    ] {
+        expect_op(&mut ops, opcode, name)?;
+    }
+    if ops.remaining() < 20 {
+        return Err(NfsError::Xdr("LINK change_info truncated".to_string()));
+    }
+    Ok(())
 }
 
 pub(crate) fn decode_stateid_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
@@ -419,6 +714,19 @@ mod tests {
         wire.extend_from_slice(&status.to_be_bytes());
         wire.extend_from_slice(data);
         Bytes::from(wire)
+    }
+
+    #[test]
+    fn create_success_before_later_compound_failure_is_detected() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&10006u32.to_be_bytes());
+        xdr_opaque(&mut wire, b"mkdir");
+        wire.extend_from_slice(&2u32.to_be_bytes());
+        for opcode in [OP_PUTFH, OP_CREATE] {
+            wire.extend_from_slice(&opcode.to_be_bytes());
+            wire.extend_from_slice(&0u32.to_be_bytes());
+        }
+        assert!(create_succeeded_before_compound_failure(Bytes::from(wire)));
     }
 
     #[test]
@@ -544,6 +852,272 @@ mod tests {
             .unwrap(),
             [0x44; 8]
         );
+    }
+
+    #[test]
+    fn access_decoder_rejects_grants_outside_supported_mask() {
+        let valid = [0x3fu32.to_be_bytes(), 0x05u32.to_be_bytes()].concat();
+        assert_eq!(
+            decode_access_response(compound_response(
+                "access",
+                &[(OP_PUTFH, &[]), (OP_ACCESS, &valid)]
+            ))
+            .unwrap(),
+            (0x3f, 0x05)
+        );
+
+        let invalid = [0x01u32.to_be_bytes(), 0x03u32.to_be_bytes()].concat();
+        assert!(matches!(
+            decode_access_response(compound_response(
+                "access",
+                &[(OP_PUTFH, &[]), (OP_ACCESS, &invalid)]
+            )),
+            Err(NfsError::Xdr(_))
+        ));
+    }
+
+    #[test]
+    fn namespace_opcodes_match_rfc7530_registry() {
+        let request = CompoundBuilder::new("namespace")
+            .putfh(b"source")
+            .savefh()
+            .putfh(b"target")
+            .link("hardlink")
+            .encode_body();
+        let mut expected = Vec::new();
+        xdr_opaque(&mut expected, b"namespace");
+        expected.extend_from_slice(&0u32.to_be_bytes());
+        expected.extend_from_slice(&4u32.to_be_bytes());
+        expected.extend_from_slice(&22u32.to_be_bytes());
+        xdr_opaque(&mut expected, b"source");
+        expected.extend_from_slice(&32u32.to_be_bytes());
+        expected.extend_from_slice(&22u32.to_be_bytes());
+        xdr_opaque(&mut expected, b"target");
+        expected.extend_from_slice(&11u32.to_be_bytes());
+        xdr_opaque(&mut expected, b"hardlink");
+        assert_eq!(request, expected);
+    }
+
+    #[test]
+    fn namespace_and_metadata_result_decoders_accept_rfc7530_shapes() {
+        let getattr = [0u32.to_be_bytes(), 0u32.to_be_bytes()].concat();
+        assert_eq!(
+            decode_getattr_response(compound_response(
+                "getattr",
+                &[(OP_PUTFH, &[]), (OP_GETATTR, &getattr)]
+            ))
+            .unwrap(),
+            Bytes::from(getattr)
+        );
+
+        let attrsset = [1u32.to_be_bytes(), (1u32 << 4).to_be_bytes()].concat();
+        decode_setattr_response(
+            compound_response("setattr", &[(OP_PUTFH, &[]), (OP_SETATTR, &attrsset)]),
+            &[1 << 4],
+        )
+        .unwrap();
+
+        let change = [0u8; 20];
+        decode_remove_response(compound_response(
+            "remove",
+            &[(OP_PUTFH, &[]), (OP_REMOVE, &change)],
+        ))
+        .unwrap();
+        decode_link_response(compound_response(
+            "link",
+            &[
+                (OP_PUTFH, &[]),
+                (OP_SAVEFH, &[]),
+                (OP_PUTFH, &[]),
+                (OP_LINK, &change),
+            ],
+        ))
+        .unwrap();
+        let rename_changes = [0u8; 40];
+        decode_rename_response(compound_response(
+            "rename",
+            &[
+                (OP_PUTFH, &[]),
+                (OP_SAVEFH, &[]),
+                (OP_PUTFH, &[]),
+                (OP_RENAME, &rename_changes),
+            ],
+        ))
+        .unwrap();
+
+        let mut target = Vec::new();
+        xdr_opaque(&mut target, b"target");
+        assert_eq!(
+            decode_readlink_response(compound_response(
+                "readlink",
+                &[(OP_PUTFH, &[]), (OP_READLINK, &target)]
+            ))
+            .unwrap(),
+            "target"
+        );
+
+        let directory = [0x5au8; 16];
+        assert_eq!(
+            decode_readdir_response(compound_response(
+                "readdir",
+                &[(OP_PUTFH, &[]), (OP_READDIR, &directory)]
+            ))
+            .unwrap(),
+            Bytes::copy_from_slice(&directory)
+        );
+
+        let mut create = vec![0; 20];
+        create.extend_from_slice(&0u32.to_be_bytes());
+        let mut fh = Vec::new();
+        xdr_opaque(&mut fh, b"created");
+        let getattr = [0u8; 8];
+        let (actual_fh, actual_attrs) = decode_create_response(compound_response(
+            "create",
+            &[
+                (OP_PUTFH, &[]),
+                (OP_CREATE, &create),
+                (OP_GETFH, &fh),
+                (OP_GETATTR, &getattr),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(actual_fh, Bytes::from_static(b"created"));
+        assert_eq!(actual_attrs, Bytes::copy_from_slice(&getattr));
+    }
+
+    fn operation_arguments(body: &[u8], index: usize) -> (u32, Bytes) {
+        let mut data = Bytes::copy_from_slice(body);
+        let _tag = take_opaque(&mut data, "tag").unwrap();
+        assert_eq!(data.get_u32(), 0);
+        let count = data.get_u32() as usize;
+        assert!(index < count);
+        assert_eq!(index, 0, "test helper only selects the first operation");
+        (data.get_u32(), data)
+    }
+
+    #[test]
+    fn metadata_operation_arguments_match_rfc7530_vectors() {
+        let cases = [
+            (
+                CompoundBuilder::new("access").access(0x21).encode_body(),
+                OP_ACCESS,
+                0x21u32.to_be_bytes().to_vec(),
+            ),
+            (
+                CompoundBuilder::new("getattr")
+                    .getattr(&[0x12, 0x34])
+                    .encode_body(),
+                OP_GETATTR,
+                [
+                    2u32.to_be_bytes().as_slice(),
+                    0x12u32.to_be_bytes().as_slice(),
+                    0x34u32.to_be_bytes().as_slice(),
+                ]
+                .concat(),
+            ),
+            (
+                CompoundBuilder::new("remove").remove("file").encode_body(),
+                OP_REMOVE,
+                [4u32.to_be_bytes().as_slice(), b"file"].concat(),
+            ),
+            (
+                CompoundBuilder::new("readlink").readlink().encode_body(),
+                OP_READLINK,
+                Vec::new(),
+            ),
+        ];
+        for (body, expected_opcode, expected_args) in cases {
+            let (opcode, args) = operation_arguments(&body, 0);
+            assert_eq!(opcode, expected_opcode);
+            assert_eq!(args, Bytes::from(expected_args));
+        }
+
+        let setattr = CompoundBuilder::new("setattr")
+            .setattr(&[0x11; 16], &[1 << 4], &[0x22; 8])
+            .encode_body();
+        let (opcode, args) = operation_arguments(&setattr, 0);
+        assert_eq!(opcode, OP_SETATTR);
+        assert_eq!(&args[..16], &[0x11; 16]);
+        assert_eq!(
+            &args[16..],
+            &[
+                1u32.to_be_bytes().as_slice(),
+                (1u32 << 4).to_be_bytes().as_slice(),
+                8u32.to_be_bytes().as_slice(),
+                &[0x22; 8]
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn namespace_operation_arguments_match_rfc7530_vectors() {
+        let cases = [
+            (
+                CompoundBuilder::new("mkdir")
+                    .create_directory("dir")
+                    .encode_body(),
+                OP_CREATE,
+                2,
+            ),
+            (
+                CompoundBuilder::new("symlink")
+                    .create_symlink("name", "target")
+                    .encode_body(),
+                OP_CREATE,
+                5,
+            ),
+            (
+                CompoundBuilder::new("rename")
+                    .rename("old", "new")
+                    .encode_body(),
+                OP_RENAME,
+                3,
+            ),
+            (
+                CompoundBuilder::new("link").link("name").encode_body(),
+                OP_LINK,
+                4,
+            ),
+            (
+                CompoundBuilder::new("readdir")
+                    .readdir(7, b"verifier", 8192, 32768, &[1 << 20])
+                    .encode_body(),
+                OP_READDIR,
+                0,
+            ),
+        ];
+        for (body, expected_opcode, expected_first) in cases {
+            let (opcode, mut args) = operation_arguments(&body, 0);
+            assert_eq!(opcode, expected_opcode);
+            assert_eq!(args.get_u32(), expected_first);
+        }
+    }
+
+    #[test]
+    fn open_create_arguments_use_unchecked4_and_claim_null() {
+        let body = CompoundBuilder::new("create")
+            .open(OpenArgs {
+                seqid: 3,
+                share_access: 3,
+                client_id: 9,
+                owner: b"owner",
+                filename: "file",
+                create: true,
+            })
+            .encode_body();
+        let (opcode, args) = operation_arguments(&body, 0);
+        assert_eq!(opcode, OP_OPEN);
+        assert!(args.windows(16).any(|wire| {
+            wire == [
+                1u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+            ]
+            .concat()
+        }));
+        assert!(args.ends_with(&[4u32.to_be_bytes().as_slice(), b"file"].concat()));
     }
 
     fn compound_response(tag: &str, ops: &[(u32, &[u8])]) -> Bytes {
