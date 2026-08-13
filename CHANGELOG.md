@@ -7,6 +7,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-13
+
+### Added
+
+- Add NFSv4.1 pNFS file-layout I/O with multi-file distribution, striped
+  writes, incremental layout acquisition, and proactive layout refresh during
+  large writes.
+- Add explicit uncertain-outcome reporting for operations whose completion
+  cannot be determined safely after a transport failure.
+
+### Fixed
+
+- Harden NFSv4.1 session, slot, lease, callback, reconnect, layout recall,
+  dirty-range, and partial pNFS data-server failure handling.
+- Singleflight concurrent cold connections to the same pNFS data server and
+  fence cached reachability by session generation.
+- Retry concurrent reserved-source-port tuple collisions for NFSv3 and
+  NFSv4.1 connections while preserving the final concrete endpoint error.
+
+### Testing
+
+- Add scripted reliability coverage and physical NetApp NFSv4.1/pNFS nightly
+  validation.
+
 ## [0.3.1] - 2026-07-30
 
 ### Fixed
@@ -29,6 +53,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/JayTsu-sh/nfs-rs/releases/tag/v0.3.0
