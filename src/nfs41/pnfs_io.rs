@@ -13,7 +13,6 @@ use tracing::{debug, info};
 
 use super::Nfs4ErrorCode;
 use super::compound::CompoundResponse;
-use super::fastxdr::nfsstat4;
 #[cfg(test)]
 use super::layout::LayoutManager;
 use super::layout::{IoMode, Layout, LayoutContent, LayoutSegment};
@@ -23,6 +22,7 @@ use crate::error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, Result,
 };
+use crate::nfs4::fastxdr::nfsstat4;
 
 /// Whether pNFS WRITE transmitted a DS mutation.
 ///

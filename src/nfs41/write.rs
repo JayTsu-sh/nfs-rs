@@ -1,7 +1,6 @@
 use bytes::{Buf, Bytes};
 use tracing::{debug, warn};
 
-use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::callback::RecallNotification;
 use super::compound::OpenArgs;
 use super::mount::{Mount41, decode_fh, extract_open_delegation, extract_stateid};
@@ -10,6 +9,7 @@ use super::setattr::encode_setattr;
 use super::state::{AccessMode, StateId};
 use crate::error::{NfsError, Result};
 use crate::mount;
+use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
 
 impl Mount41 {
     pub(crate) async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {

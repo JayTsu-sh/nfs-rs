@@ -31,7 +31,7 @@ impl Mount41 {
             .results
             .get(2)
             .ok_or_else(|| NfsError::Xdr("SETATTR response missing op at index 2".to_string()))?;
-        if !matches!(setattr_op.status, super::fastxdr::nfsstat4::NFS4_OK) {
+        if !matches!(setattr_op.status, crate::nfs4::fastxdr::nfsstat4::NFS4_OK) {
             return Err(NfsError::Nfs4(setattr_op.status));
         }
         Ok(())

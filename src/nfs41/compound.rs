@@ -16,10 +16,10 @@
 
 use bytes::{Buf, Bytes};
 
-use super::fastxdr::*;
 use super::{NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION, NFS41_MINOR_VERSION};
 use crate::error::{NfsError, Result};
 use crate::nfs3::rpc_header;
+use crate::nfs4::fastxdr::*;
 use crate::rpc::auth::Auth;
 
 // ─── Protocol safety limits for server-provided lengths ──────────────────────
@@ -1552,7 +1552,7 @@ fn skip_open_delegation(buf: &mut Bytes) -> Result<()> {
                 return Err(NfsError::Xdr("delegation recall truncated".to_string()));
             }
             buf.advance(4); // recall
-            let _ace = super::acl::decode_nfsace4(buf)?;
+            let _ace = crate::nfs4::acl::decode_nfsace4(buf)?;
         }
         2 => {
             // OPEN_DELEGATE_WRITE: stateid(16) + recall(4) + space_limit(12) + nfsace4
@@ -1562,7 +1562,7 @@ fn skip_open_delegation(buf: &mut Bytes) -> Result<()> {
             }
             buf.advance(4); // recall
             skip_space_limit(buf)?;
-            let _ace = super::acl::decode_nfsace4(buf)?;
+            let _ace = crate::nfs4::acl::decode_nfsace4(buf)?;
         }
         3 => {
             // OPEN_DELEGATE_NONE_EXT: why_no_delegation4 union

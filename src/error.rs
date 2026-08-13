@@ -140,7 +140,7 @@ pub enum NfsError {
 
     /// NFS4 protocol error (nfsstat4).
     #[error("NFS4 error: {0}")]
-    Nfs4(crate::nfs41::Nfs4ErrorCode),
+    Nfs4(crate::nfs4::Nfs4ErrorCode),
 
     /// MOUNT protocol error (mount_mountstat3).
     #[error("Mount error: {0}")]
@@ -185,7 +185,7 @@ impl NfsError {
         matches!(
             self,
             NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_EXIST)
-                | NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_EXIST)
+                | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_EXIST)
         )
     }
 
@@ -194,7 +194,7 @@ impl NfsError {
         matches!(
             self,
             NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT)
-                | NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_NOENT)
+                | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOENT)
         )
     }
 
@@ -226,8 +226,8 @@ pub(crate) fn classify_sent_nfs41_error(
         NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
     ) || matches!(
         &source,
-        NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP)
-            | NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY)
+        NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP)
+            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY)
     );
     if !lacks_authoritative_result {
         return source;
@@ -288,14 +288,14 @@ mod tests {
 
     #[test]
     fn nfs4_error_display() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_PERM);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM);
         assert!(err.to_string().contains("NFS4 error"));
         assert!(err.to_string().contains("permission denied"));
     }
 
     #[test]
     fn nfs4_error_kind_is_other() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_STALE);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE);
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 
@@ -376,13 +376,13 @@ mod tests {
 
     #[test]
     fn is_exist_nfs4() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_EXIST);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_EXIST);
         assert!(err.is_exist());
     }
 
     #[test]
     fn is_exist_false_for_other() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_NOENT);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOENT);
         assert!(!err.is_exist());
     }
 
@@ -394,13 +394,13 @@ mod tests {
 
     #[test]
     fn is_not_found_nfs4() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_NOENT);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOENT);
         assert!(err.is_not_found());
     }
 
     #[test]
     fn is_not_found_false_for_exist() {
-        let err = NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_EXIST);
+        let err = NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_EXIST);
         assert!(!err.is_not_found());
     }
 
@@ -468,8 +468,8 @@ mod tests {
     #[test]
     fn replay_protocol_errors_have_operation_aware_outcomes() {
         for code in [
-            crate::nfs41::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP,
-            crate::nfs41::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY,
+            crate::nfs4::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP,
+            crate::nfs4::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY,
         ] {
             let read = classify_sent_nfs41_error(
                 OperationClass::ReadOnly,
@@ -498,12 +498,12 @@ mod tests {
         let error = classify_sent_nfs41_error(
             OperationClass::ReplaySensitive,
             context(),
-            NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_ACCESS),
+            NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS),
         );
         assert!(error.operation_outcome().is_none());
         assert!(matches!(
             error,
-            NfsError::Nfs4(crate::nfs41::Nfs4ErrorCode::NFS4ERR_ACCESS)
+            NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS)
         ));
     }
 

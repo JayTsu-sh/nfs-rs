@@ -1,10 +1,10 @@
 use bytes::{Buf, Bytes};
 use futures::stream::TryStreamExt as _;
 
-use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::mount::{Mount41, decode_string_from_bytes};
 use crate::error::{NfsError, Result};
 use crate::mount;
+use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
 
 impl Mount41 {
     pub(crate) async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {

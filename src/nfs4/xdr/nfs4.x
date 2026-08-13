@@ -104,6 +104,7 @@ typedef unsigned int bitmap4<>;
  * Status Codes (RFC 5661 §15.1)
  * ================================================================ */
 
+/* Common NFSv4.0 status registry (RFC 7530 section 13) begins here. */
 enum nfsstat4 {
     NFS4_OK                             = 0,
     NFS4ERR_PERM                        = 1,
@@ -170,6 +171,7 @@ enum nfsstat4 {
     NFS4ERR_FILE_OPEN                   = 10046,
     NFS4ERR_ADMIN_REVOKED               = 10047,
     NFS4ERR_CB_PATH_DOWN                = 10048,
+    /* NFSv4.1 status extensions (RFC 5661 section 15.1). */
     NFS4ERR_BADIOMODE                   = 10049,
     NFS4ERR_BADLAYOUT                   = 10050,
     NFS4ERR_BAD_SESSION_DIGEST          = 10051,

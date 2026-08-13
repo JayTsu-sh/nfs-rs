@@ -13,9 +13,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::compound::{CompoundBuilder, CompoundResponse, OpNum};
-use super::fastxdr::nfsstat4;
 use super::session::{SequenceResult, SessionHolder, validate_sequence_result};
 use crate::error::{NfsError, Result};
+use crate::nfs4::fastxdr::nfsstat4;
 use crate::rpc;
 use crate::rpc::auth::Auth;
 

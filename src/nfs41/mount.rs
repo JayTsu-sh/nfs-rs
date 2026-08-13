@@ -14,7 +14,6 @@ use tracing::{debug, info, warn};
 
 use super::callback::{CallbackState, RecallNotification};
 use super::compound::{CompoundBuilder, CompoundResponse};
-use super::fastxdr::nfsstat4;
 use super::layout::{DsConnection, LayoutManager};
 use super::lease::{LeaseHealth, LeaseRenewal};
 use super::session::{ClientIdentity, Session, SessionHolder, validate_sequence_result};
@@ -25,6 +24,7 @@ use crate::error::{
     RequestContext, Result, classify_sent_nfs41_error,
 };
 use crate::mount::{self, NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits};
+use crate::nfs4::fastxdr::nfsstat4;
 use crate::rpc;
 use crate::rpc::auth::Auth;
 

@@ -1,27 +1,26 @@
-//! NFSv4.1 fattr4 bitmap and attribute decoding.
+//! NFSv4 fattr4 bitmap and common attribute decoding.
 //!
 //! NFSv4 attributes are encoded as a bitmap (which attributes are present)
 //! followed by a variable-length opaque blob containing the attribute values
-//! in bitmap order. See RFC 5661 §5.7, RFC 8881 §5.7.
-//!
-//! **Important**: NFSv4.1 (RFC 5661) inserted FATTR4_FILEHANDLE at position 19,
-//! shifting fileid to 20 and all subsequent attrs by +1 compared to NFSv4.0 (RFC 7530).
+//! in bitmap order. The common numbering, including FILEHANDLE=19 and
+//! FILEID=20, is defined by RFC 7530 §5.8 and retained by later minor versions.
 
 use bytes::{Buf, Bytes};
 
 use super::acl::{decode_acl, skip_acl};
+use super::attrnum;
 use crate::Time;
 use crate::error::{NfsError, Result};
 use crate::mount::Attr;
 
-// ─── NFSv4.1 attribute numbers (RFC 5661 §5.8 / RFC 8881 §5.8) ─────────────
+// ─── Common NFSv4 attribute numbers (RFC 7530 §5.8) ────────────────────────
 // Attribute number = bit position in the bitmap. Word 0 = bits 0-31, Word 1 = bits 32-63.
 //
 // Word 0: 0=supported_attrs, 1=type, 2=fh_expire_type, 3=change, 4=size,
 //   5=link_support, 6=symlink_support, 7=named_attr, 8=fsid, 9=unique_handles,
 //   10=lease_time, 11=rdattr_error, 12=acl, 13=aclsupport, 14=archive,
 //   15=cansettime, 16=case_insensitive, 17=case_preserving, 18=chown_restricted,
-//   19=FILEHANDLE (new in v4.1), 20=fileid, 21=files_avail, 22=files_free,
+//   19=FILEHANDLE, 20=fileid, 21=files_avail, 22=files_free,
 //   23=files_total, 24=fs_locations, 25=hidden, 26=homogeneous,
 //   27=maxfilesize, 28=maxlink, 29=maxname, 30=maxread, 31=maxwrite
 //
@@ -34,7 +33,7 @@ use crate::mount::Attr;
 
 /// Standard bitmap for GETATTR to populate crate::Attr fields.
 ///
-/// NFSv4.1 attribute numbers (RFC 5661 §5.8):
+/// Common NFSv4 attribute numbers (RFC 7530 §5.8):
 ///   type(1), size(4), fsid(8), ACL(12), filehandle(19), fileid(20),
 ///   mode(33), numlinks(35), owner(36), owner_group(37),
 ///   rawdev(41), space_used(45), time_access(47),
@@ -43,9 +42,9 @@ pub(crate) fn standard_getattr_bitmap() -> [u32; 2] {
     let word0: u32 = (1 << 1)  | // type
         (1 << 4)  | // size
         (1 << 8)  | // fsid
-        (1 << 12) | // ACL
-        (1 << 19) | // filehandle (NFSv4.1)
-        (1 << 20); // fileid
+        (1 << attrnum::ACL) | // ACL
+        (1 << attrnum::FILEHANDLE) | // filehandle
+        (1 << attrnum::FILEID); // fileid
 
     let word1: u32 = (1 << 1)  | // mode (attr 33)
         (1 << 3)  | // numlinks (attr 35)
@@ -187,7 +186,7 @@ fn skip_fs_locations(vals: &mut Bytes) -> Result<()> {
 /// Attributes are decoded in bitmap order (lowest bit number first).
 /// Unhandled attributes are skipped so that the buffer stays aligned.
 ///
-/// Uses NFSv4.1 attribute numbering (RFC 5661): FILEHANDLE=19, fileid=20,
+/// Uses common NFSv4 attribute numbering (RFC 7530): FILEHANDLE=19, fileid=20,
 /// mode=33, numlinks=35, owner=36, etc.
 pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<Attr> {
     let mut attr = Attr::default();
@@ -260,11 +259,11 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
         }
     }
     // Attr 12: ACL — decode into Attr
-    if bitmap_has(bitmap, 12) {
+    if bitmap_has(bitmap, attrnum::ACL) {
         attr.acl = Some(decode_acl(vals)?);
     }
     // Attr 13: aclsupport (uint32)
-    if bitmap_has(bitmap, 13) {
+    if bitmap_has(bitmap, attrnum::ACLSUPPORT) {
         skip_fixed(vals, 4, "aclsupport")?;
     }
     // Attr 14: archive (bool)
@@ -287,12 +286,12 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
     if bitmap_has(bitmap, 18) {
         skip_fixed(vals, 4, "chown_restricted")?;
     }
-    // Attr 19: filehandle (nfs_fh4 = opaque<>, variable-length) — NEW in NFSv4.1
-    if bitmap_has(bitmap, 19) {
+    // Attr 19: filehandle (nfs_fh4 = opaque<>, variable-length)
+    if bitmap_has(bitmap, attrnum::FILEHANDLE) {
         attr.filehandle = decode_opaque(vals, "filehandle")?;
     }
     // Attr 20: fileid (uint64)
-    if bitmap_has(bitmap, 20) {
+    if bitmap_has(bitmap, attrnum::FILEID) {
         if vals.remaining() < 8 {
             return Err(NfsError::Xdr("fattr4 fileid truncated".to_string()));
         }
@@ -350,7 +349,7 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
         let _ = decode_utf8str(vals)?;
     }
     // Attr 33: mode (mode4 = uint32)
-    if bitmap_has(bitmap, 33) {
+    if bitmap_has(bitmap, attrnum::MODE) {
         if vals.remaining() < 4 {
             return Err(NfsError::Xdr("fattr4 mode truncated".to_string()));
         }
@@ -607,14 +606,14 @@ mod tests {
     #[test]
     fn standard_bitmap_has_expected_bits() {
         let bm = standard_getattr_bitmap();
-        // Word 0 (NFSv4.1 numbering)
+        // Word 0 (common RFC 7530 numbering)
         assert!(bitmap_has(&bm, 1)); // type
         assert!(bitmap_has(&bm, 4)); // size
         assert!(bitmap_has(&bm, 8)); // fsid
         assert!(bitmap_has(&bm, 12)); // ACL
-        assert!(bitmap_has(&bm, 19)); // filehandle (NFSv4.1)
+        assert!(bitmap_has(&bm, 19)); // filehandle
         assert!(bitmap_has(&bm, 20)); // fileid
-        // Word 1 (NFSv4.1 numbering, shifted +1 from v4.0)
+        // Word 1 (common RFC 7530 numbering)
         assert!(bitmap_has(&bm, 33)); // mode
         assert!(bitmap_has(&bm, 35)); // numlinks
         assert!(bitmap_has(&bm, 36)); // owner
@@ -705,7 +704,7 @@ mod tests {
 
     #[test]
     fn decode_fattr4_size_and_fileid() {
-        // NFSv4.1: bit 4 (size) + bit 20 (fileid) in word 0
+        // RFC 7530: bit 4 (size) + bit 20 (fileid) in word 0
         let bitmap = [(1u32 << 4) | (1 << 20)];
         let mut vals = Vec::new();
         vals.extend_from_slice(&12345u64.to_be_bytes()); // size
@@ -718,7 +717,7 @@ mod tests {
 
     #[test]
     fn decode_fattr4_mode_and_nlinks() {
-        // NFSv4.1: word1 bit 1 (mode=33) + bit 3 (numlinks=35)
+        // RFC 7530: word1 bit 1 (mode=33) + bit 3 (numlinks=35)
         let bitmap = [0u32, (1 << 1) | (1 << 3)];
         let mut vals = Vec::new();
         vals.extend_from_slice(&0o755u32.to_be_bytes()); // mode
@@ -731,7 +730,7 @@ mod tests {
 
     #[test]
     fn decode_fattr4_time_access() {
-        // NFSv4.1: word1 bit 15 = time_access (attr 47)
+        // RFC 7530: word1 bit 15 = time_access (attr 47)
         let bitmap = [0u32, 1 << 15];
         let mut vals = Vec::new();
         vals.extend_from_slice(&1700000000i64.to_be_bytes()); // seconds
@@ -771,7 +770,7 @@ mod tests {
 
     #[test]
     fn decode_nfsv41_readdirplus_response() {
-        // Captured from NFSv4.1 server. The bitmap uses NFSv4.1 numbering:
+        // Captured from an NFSv4.1 server using the common RFC 7530 bitmap numbering:
         //   word0: type(1), size(4), fsid(8), acl(12), filehandle(19)
         //   word1: no_trunc(34), numlinks(35), owner(36), space_total(44),
         //          time_delta(51), time_metadata(52)
