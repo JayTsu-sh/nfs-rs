@@ -3,10 +3,9 @@ use tracing::{debug, warn};
 
 use super::compound::OpResponse;
 use super::mount::{Mount41, decode_fh};
-use super::setattr::encode_setattr;
 use crate::error::Result;
 use crate::mount;
-use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
+use crate::nfs4::attrs::{decode_getattr_response, encode_setattr, standard_getattr_bitmap};
 
 /// Parse change_info4 from an operation result.
 /// Returns (atomic, before_changeid, after_changeid).
