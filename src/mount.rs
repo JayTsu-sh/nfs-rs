@@ -58,6 +58,90 @@ pub struct Nfs41CallbackStats {
     pub layout_returns_completed: u64,
 }
 
+/// Protocol-neutral features exposed by a mounted client.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MountCapabilities {
+    pub acl: bool,
+    pub named_attributes: bool,
+    pub locks: bool,
+    pub callbacks: bool,
+    pub delegation_retention: bool,
+    pub pnfs: bool,
+    pub session_diagnostics: bool,
+}
+
+/// High-level lifecycle state of a mount.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MountLifecycleState {
+    #[default]
+    Ready,
+    Reconnecting,
+    Suspect,
+    Recovering,
+    Reclaiming,
+    LostState,
+    Closing,
+    Closed,
+}
+
+/// Protocol-neutral mount health. Stateful engines may override the defaults.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MountHealth {
+    pub lifecycle: MountLifecycleState,
+    pub generation: u64,
+    pub lease_healthy: Option<bool>,
+    pub callback_healthy: Option<bool>,
+}
+
+/// Redacted callback counters shared by NFSv4 client engines.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CallbackStats {
+    pub recalls_received: u64,
+    pub returns_completed: u64,
+    pub returns_failed: u64,
+}
+
+/// An opened object plus protocol-owned state hidden from callers.
+#[derive(Debug, PartialEq)]
+pub struct OpenFile {
+    pub object: ObjRes,
+    state: Option<Bytes>,
+}
+
+/// A byte-range lock together with everything required to release it safely.
+#[derive(Debug, Eq, PartialEq)]
+pub struct LockToken {
+    pub(crate) fh: Bytes,
+    pub(crate) stateid: Bytes,
+    pub(crate) lock_type: u32,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) issuer: u64,
+    pub(crate) generation: u64,
+}
+
+impl LockToken {
+    pub(crate) fn new(
+        fh: Bytes,
+        stateid: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+        issuer: u64,
+        generation: u64,
+    ) -> Self {
+        Self {
+            fh,
+            stateid,
+            lock_type,
+            offset,
+            length,
+            issuer,
+            generation,
+        }
+    }
+}
+
 /// Trait which defines the procedures that can be performed on an NFS mount.
 ///
 /// NFS version agnostic.  However, since NFSv4 introduces procedures that are not present in NFSv3, invoking those
@@ -68,6 +152,26 @@ pub struct Nfs41CallbackStats {
 /// [`parse_url_and_mount`](crate::parse_url_and_mount) to obtain fresh handles.
 #[async_trait]
 pub trait Mount: std::fmt::Debug + Send + Sync {
+    /// Return features implemented by this mounted client.
+    fn capabilities(&self) -> MountCapabilities {
+        MountCapabilities::default()
+    }
+
+    /// Return a redacted, protocol-neutral lifecycle snapshot.
+    fn health(&self) -> MountHealth {
+        MountHealth::default()
+    }
+
+    /// Return protocol-neutral callback counters.
+    async fn callback_stats(&self) -> CallbackStats {
+        let stats = self.nfs41_callback_stats().await.unwrap_or_default();
+        CallbackStats {
+            recalls_received: stats.layout_recalls_received,
+            returns_completed: stats.layout_returns_completed,
+            returns_failed: 0,
+        }
+    }
+
     /// Utility function get_max_read_size returns maximum read chunk size.
     ///
     /// # Example
@@ -164,11 +268,34 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.lookup_path(path).await
     }
 
+    /// Stateful form of [`Mount::open`]. Future protocol engines can attach
+    /// owner state without exposing wire stateids in the public API.
+    async fn open_stateful(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<OpenFile> {
+        Ok(OpenFile {
+            object: self.open(dir_fh, filename, access).await?,
+            state: None,
+        })
+    }
+
+    /// Stateful form of [`Mount::open_path`].
+    async fn open_path_stateful(&self, path: &str, access: u32) -> Result<OpenFile> {
+        Ok(OpenFile {
+            object: self.open_path(path, access).await?,
+            state: None,
+        })
+    }
+
     /// Procedure CLOSE releases share reservations for a file (NFSv4).
     /// For NFSv3 this is a no-op since NFSv3 is stateless.
     /// The file handle should have been obtained via [`Mount::open`] or [`Mount::open_path`].
     async fn close(&self, _fh: Bytes) -> Result<()> {
         Ok(()) // Default: no-op for stateless protocols (NFSv3)
+    }
+
+    /// Close an object returned by a stateful open operation.
+    async fn close_stateful(&self, file: OpenFile) -> Result<()> {
+        let _protocol_state = file.state;
+        self.close(file.object.fh).await
     }
 
     /// Procedure COMMIT forces or flushes data to stable storage that was previously written with a WRITE procedure
@@ -249,6 +376,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes>;
 
     /// Procedure DELEGPURGE purges delegations (NFSv4 only; returns Unsupported on NFSv3).
+    #[deprecated(note = "delegation lifecycle is managed internally by the mount")]
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {
         Err(NfsError::Unsupported(
             "DELEGPURGE requires NFSv4".to_string(),
@@ -256,6 +384,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Procedure DELEGRETURN returns a delegation (NFSv4 only; returns Unsupported on NFSv3).
+    #[deprecated(note = "delegation lifecycle is managed internally by the mount")]
     async fn delegreturn(&self, _stateid: u64) -> Result<()> {
         Err(NfsError::Unsupported(
             "DELEGRETURN requires NFSv4".to_string(),
@@ -278,6 +407,30 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         _length: u64,
     ) -> Result<()> {
         Err(NfsError::Unsupported("LOCKU requires NFSv4".to_string()))
+    }
+
+    /// Typed LOCK API that preserves the release parameters in one token.
+    async fn lock_stateful(
+        &self,
+        fh: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<LockToken> {
+        let stateid = self.lock(fh.clone(), lock_type, offset, length).await?;
+        Ok(LockToken::new(fh, stateid, lock_type, offset, length, 0, 0))
+    }
+
+    /// Release a lock using the opaque token returned by [`Mount::lock_stateful`].
+    async fn unlock_stateful(&self, token: LockToken) -> Result<()> {
+        self.locku(
+            token.fh,
+            token.stateid,
+            token.lock_type,
+            token.offset,
+            token.length,
+        )
+        .await
     }
 
     /// Retrieve the NFSv4 ACL for a file (NFSv4 only; returns Unsupported on NFSv3).
@@ -1056,11 +1209,13 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::delegpurge`]
+    #[allow(deprecated)]
     fn sync_delegpurge(&self, clientid: u64) -> Result<()> {
         block_on_compat(self.delegpurge(clientid))
     }
 
     /// Blocking version of [`Mount::delegreturn`]
+    #[allow(deprecated)]
     fn sync_delegreturn(&self, stateid: u64) -> Result<()> {
         block_on_compat(self.delegreturn(stateid))
     }
@@ -1300,10 +1455,14 @@ pub struct ExportEntry {
     pub groups: Vec<String>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NFSVersion {
     Unknown,
     NFSv3,
+    NFSv4p0,
+    /// Compatibility spelling retained for callers of releases before 0.5.0.
+    /// URL parsing intentionally does not map the ambiguous selector `4` here.
+    #[deprecated(note = "use NFSVersion::NFSv4p0 and the exact URL selector version=4.0")]
     NFSv4,
     NFSv4p1,
     NFSv4p2,
@@ -1313,7 +1472,7 @@ impl From<&str> for NFSVersion {
     fn from(val: &str) -> Self {
         match val {
             "3" => NFSVersion::NFSv3,
-            "4" => NFSVersion::NFSv4,
+            "4.0" => NFSVersion::NFSv4p0,
             "4.1" => NFSVersion::NFSv4p1,
             "4.2" => NFSVersion::NFSv4p2,
             _ => NFSVersion::Unknown,

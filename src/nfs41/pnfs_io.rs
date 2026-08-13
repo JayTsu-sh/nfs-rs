@@ -759,9 +759,8 @@ impl Mount41 {
                 let active_session = self.session_holder.get().await;
                 let context = RequestContext {
                     operation: "pnfs_write".to_string(),
-                    session_id: *active_session.id(),
-                    slot_id: 0,
-                    sequence_id: 0,
+                    protocol: crate::NFSVersion::NFSv4p1,
+                    request_id: Some(crate::error::RequestId::nfs41(*active_session.id(), 0, 0)),
                 };
                 return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
                     context,
@@ -807,9 +806,8 @@ impl Mount41 {
             let active_session = self.session_holder.get().await;
             let context = RequestContext {
                 operation: "pnfs_write".to_string(),
-                session_id: *active_session.id(),
-                slot_id: 0,
-                sequence_id: 0,
+                protocol: crate::NFSVersion::NFSv4p1,
+                request_id: Some(crate::error::RequestId::nfs41(*active_session.id(), 0, 0)),
             };
             debug!(
                 diagnostic,
@@ -1048,9 +1046,8 @@ mod tests {
     fn attempted_ds_error_is_uncertain_and_requires_verification() {
         let context = RequestContext {
             operation: "pnfs_write".to_string(),
-            session_id: [7; 16],
-            slot_id: 0,
-            sequence_id: 0,
+            protocol: crate::NFSVersion::NFSv4p1,
+            request_id: Some(crate::error::RequestId::nfs41([7; 16], 0, 0)),
         };
         let error = uncertain_pnfs_write(
             context,

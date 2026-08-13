@@ -8,6 +8,7 @@ validate_run_id "$run_id"
 urls=(
   "nfs://$LAB_SOURCE_DATA$LAB_NFS3_EXPORT/ci/$run_id?version=3&noresvport=true"
   "nfs://$LAB_DEST_DATA$LAB_NFS3_EXPORT/ci/$run_id?version=3&noresvport=true"
+  "nfs://$LAB_SOURCE_DATA$LAB_NFS3_EXPORT/ci/$run_id?version=4.0,3&noresvport=true"
   "nfs://$LAB_SOURCE_DATA$LAB_NFS41_EXPORT/ci/$run_id?version=4.1&noresvport=true"
   "nfs://$LAB_DEST_DATA$LAB_NFS41_EXPORT/ci/$run_id?version=4.1&noresvport=true"
 )

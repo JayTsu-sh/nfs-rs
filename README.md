@@ -76,9 +76,10 @@ Supported arguments:
   Unix and 65534 on Windows.
 - `gid=<integer>` — GID sent to the server. It defaults to the process GID on
   Unix and 65534 on Windows.
-- `version=<3|4|4.1|4.2>` — preferred protocol version or a comma-separated
-  preference list such as `4.1,3`. The default is `4.1,3`. Versions 4.0 and
-  4.2 are not currently implemented.
+- `version=<3|4.0|4.1|4.2>` — preferred protocol version or a comma-separated
+  preference list such as `4.1,4.0,3`. The default is `3`. The exact `4.0`
+  selector is recognized but not yet implemented; ambiguous `4` is rejected.
+  Version 4.2 is also not currently implemented.
 - `nfsport=<port>` — NFS service port. This bypasses portmapper discovery.
 - `mountport=<port>` — MOUNT protocol port for NFSv3.
 - `readdir-buffer=<count>` or `<dircount>,<maxcount>` — response buffer limits

@@ -259,12 +259,13 @@ mod shared;
 
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
-    RequestContext, Result,
+    RequestContext, RequestId, Result,
 };
 pub use mount::{
-    AceFlags, AceMask, AceType, Acl, AclSupport, Attr, ExportEntry, FSInfo, FSStat, Mount,
-    NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE,
-    ObjRes, Pathconf, ReaddirEntry, ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
+    AceFlags, AceMask, AceType, Acl, AclSupport, Attr, CallbackStats, ExportEntry, FSInfo, FSStat,
+    LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState, NFSVersion,
+    Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes,
+    OpenFile, Pathconf, ReaddirEntry, ReaddirStream, ReaddirplusEntry, ReaddirplusStream,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
@@ -338,7 +339,7 @@ struct MountArgs {
 ///
 /// ```no_run
 /// async fn example() {
-///     let mount = nfs_rs::parse_url_and_mount("nfs://127.0.0.1/some/export?version=4.1,4,3").await.unwrap();
+///     let mount = nfs_rs::parse_url_and_mount("nfs://127.0.0.1/some/export?version=4.1,4.0,3").await.unwrap();
 ///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
@@ -540,6 +541,10 @@ async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
         let res: Result<Box<dyn Mount>> = match version {
             NFSVersion::NFSv3 => nfs3::mount(&args).await,
             NFSVersion::NFSv4p1 => nfs41::mount::mount(&args).await,
+            NFSVersion::NFSv4p0 => Err(NfsError::Unsupported(
+                "NFSv4.0 is not supported".to_string(),
+            )),
+            #[allow(deprecated)]
             NFSVersion::NFSv4 => Err(NfsError::Unsupported(
                 "NFSv4.0 is not supported".to_string(),
             )),
@@ -585,7 +590,7 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
                 if unsupported_err.is_empty() {
                     unsupported_err = msg;
                 } else if unsupported_err != msg {
-                    unsupported_err = "NFSv4 and NFSv4.2 are not supported".to_string();
+                    unsupported_err = "NFSv4.0 and NFSv4.2 are not supported".to_string();
                 }
                 None
             } else {
@@ -676,6 +681,24 @@ mod tests {
         let err = res.unwrap_err();
         assert!(
             matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad NFS version")
+        );
+    }
+
+    #[test]
+    fn parse_url_requires_exact_nfsv40_minor_version() {
+        let exact = parse_url("nfs://127.0.0.1/export?version=4.0").unwrap();
+        assert_eq!(exact.versions, vec![NFSVersion::NFSv4p0]);
+
+        let ambiguous = parse_url("nfs://127.0.0.1/export?version=4").unwrap_err();
+        assert!(matches!(ambiguous, NfsError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn parse_url_preserves_explicit_version_fallback_order() {
+        let args = parse_url("nfs://127.0.0.1/export?version=4.1,4.0,3").unwrap();
+        assert_eq!(
+            args.versions,
+            vec![NFSVersion::NFSv4p1, NFSVersion::NFSv4p0, NFSVersion::NFSv3]
         );
     }
 
@@ -796,12 +819,12 @@ mod tests {
 
     #[test]
     fn parse_url_with_uid_and_gid_and_multi_version() {
-        let res = parse_url("nfs://localhost/some/export/path?version=4.1,4,3&uid=616&gid=666");
+        let res = parse_url("nfs://localhost/some/export/path?version=4.1,4.0,3&uid=616&gid=666");
         assert!(res.is_ok(), "err = {}", res.unwrap_err());
         let args = res.unwrap();
         assert_eq!(
             args.versions,
-            vec![NFSVersion::NFSv4p1, NFSVersion::NFSv4, NFSVersion::NFSv3]
+            vec![NFSVersion::NFSv4p1, NFSVersion::NFSv4p0, NFSVersion::NFSv3]
         );
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 0);
@@ -963,9 +986,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_with_only_v4() {
+    async fn mount_with_only_v4_0() {
         let args = MountArgs {
-            versions: vec![NFSVersion::NFSv4],
+            versions: vec![NFSVersion::NFSv4p0],
             host: Default::default(),
             mountport: Default::default(),
             nfsport: Default::default(),
@@ -1009,9 +1032,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_with_only_v4_and_v4_2() {
+    async fn mount_with_only_v4_0_and_v4_2() {
         let args = MountArgs {
-            versions: vec![NFSVersion::NFSv4, NFSVersion::NFSv4p2],
+            versions: vec![NFSVersion::NFSv4p0, NFSVersion::NFSv4p2],
             host: Default::default(),
             mountport: Default::default(),
             nfsport: Default::default(),
@@ -1029,7 +1052,7 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(
-            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported")
+            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.0 and NFSv4.2 are not supported")
         );
     }
 
@@ -1071,7 +1094,7 @@ mod tests {
         ];
         let err = squash_mount_errors(errs);
         assert!(
-            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4 and NFSv4.2 are not supported")
+            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.0 and NFSv4.2 are not supported")
         );
     }
 
@@ -1096,7 +1119,7 @@ mod tests {
         ];
         let err = squash_mount_errors(errs);
         assert!(
-            matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4 and NFSv4.2 are not supported")
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - NFSv4.0 and NFSv4.2 are not supported")
         );
     }
 
@@ -1123,7 +1146,7 @@ mod tests {
         ];
         let err = squash_mount_errors(errs);
         assert!(
-            matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 and NFSv4.2 are not supported")
+            matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4.0 and NFSv4.2 are not supported")
         );
     }
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
-use nfs_rs::{Mount, NFSVersion, OPEN_BOTH, OPEN_READ, parse_url_and_mount};
+use nfs_rs::{Mount, MountLifecycleState, NFSVersion, OPEN_BOTH, OPEN_READ, parse_url_and_mount};
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
 const LAB_URLS_ENV: &str = "NFS_RS_LAB_URLS";
@@ -215,6 +215,32 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             mount.version()
         ),
     )?;
+    let capabilities = mount.capabilities();
+    let health = mount.health();
+    ensure(
+        health.lifecycle == MountLifecycleState::Ready,
+        format!("{url}: newly mounted client is not ready: {health:?}"),
+    )?;
+    let callback_stats = mount.callback_stats().await;
+    if expected_version == NFSVersion::NFSv4p1 {
+        ensure(
+            capabilities.locks && capabilities.callbacks && capabilities.session_diagnostics,
+            format!("{url}: NFSv4.1 common capabilities are incomplete: {capabilities:?}"),
+        )?;
+        ensure(
+            health.lease_healthy == Some(true) && health.callback_healthy.is_none(),
+            format!("{url}: NFSv4.1 health is incomplete: {health:?}"),
+        )?;
+    } else {
+        ensure(
+            capabilities == Default::default(),
+            format!("{url}: NFSv3 advertised stateful capabilities: {capabilities:?}"),
+        )?;
+        ensure(
+            callback_stats == Default::default(),
+            format!("{url}: NFSv3 reported callback activity: {callback_stats:?}"),
+        )?;
+    }
 
     cleanup_case(mount.as_ref()).await;
     let result = async {
@@ -226,6 +252,12 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         mount.mkdir_path(CASE_DIR, 0o755).await?;
         let created = mount.create_path(ORIGINAL_FILE, Some(0o640)).await?;
         let expected = payload();
+        if expected_version == NFSVersion::NFSv4p1 {
+            let lock = mount
+                .lock_stateful(created.fh.clone(), 2, 0, expected.len() as u64)
+                .await?;
+            mount.unlock_stateful(lock).await?;
+        }
         write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
         mount.close(created.fh).await?;
 
@@ -257,9 +289,9 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             format!("{url}: mode mismatch after setattr: {:o}", attr.file_mode),
         )?;
 
-        let opened = mount.open_path(ORIGINAL_FILE, OPEN_READ).await?;
-        let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
-        mount.close(opened.fh).await?;
+        let opened = mount.open_path_stateful(ORIGINAL_FILE, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.object.fh.clone(), expected.len()).await?;
+        mount.close_stateful(opened).await?;
         ensure(
             actual == expected,
             format!("{url}: read data differs from written payload"),
