@@ -108,6 +108,19 @@ pub struct OpenFile {
     state: Option<Bytes>,
 }
 
+impl OpenFile {
+    pub(crate) fn with_protocol_state(object: ObjRes, state: Bytes) -> Self {
+        Self {
+            object,
+            state: Some(state),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (ObjRes, Option<Bytes>) {
+        (self.object, self.state)
+    }
+}
+
 /// A byte-range lock together with everything required to release it safely.
 #[derive(Debug, Eq, PartialEq)]
 pub struct LockToken {

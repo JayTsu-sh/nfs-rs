@@ -1,0 +1,134 @@
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
+
+#[derive(Debug)]
+pub(crate) struct OwnerLane {
+    pub owner: u64,
+    pub next_seqid: u32,
+    pub stateid: [u8; 16],
+    pub fh: Bytes,
+    pub access: u32,
+    pub write_verifier: Option<[u8; 8]>,
+}
+
+#[derive(Default)]
+pub(crate) struct OpenState {
+    lanes: RwLock<HashMap<u64, Arc<Mutex<OwnerLane>>>>,
+    by_fh: RwLock<HashMap<Bytes, Vec<u64>>>,
+}
+
+impl OpenState {
+    pub(crate) async fn register(&self, lane: OwnerLane) -> Arc<Mutex<OwnerLane>> {
+        let owner = lane.owner;
+        let fh = lane.fh.clone();
+        let lane = Arc::new(Mutex::new(lane));
+        self.lanes.write().await.insert(owner, Arc::clone(&lane));
+        self.by_fh.write().await.entry(fh).or_default().push(owner);
+        lane
+    }
+
+    pub(crate) async fn by_owner(&self, owner: u64) -> Option<Arc<Mutex<OwnerLane>>> {
+        self.lanes.read().await.get(&owner).cloned()
+    }
+
+    pub(crate) async fn for_fh(
+        &self,
+        fh: &Bytes,
+        required_access: u32,
+    ) -> Option<Arc<Mutex<OwnerLane>>> {
+        let owners = self.by_fh.read().await.get(fh)?.clone();
+        for owner in owners.into_iter().rev() {
+            let lane = self.by_owner(owner).await?;
+            if lane.lock().await.access & required_access != 0 {
+                return Some(lane);
+            }
+        }
+        None
+    }
+
+    pub(crate) async fn remove(&self, owner: u64, fh: &Bytes) {
+        self.lanes.write().await.remove(&owner);
+        let mut by_fh = self.by_fh.write().await;
+        if let Some(owners) = by_fh.get_mut(fh) {
+            owners.retain(|candidate| *candidate != owner);
+            if owners.is_empty() {
+                by_fh.remove(fh);
+            }
+        }
+    }
+}
+
+pub(crate) fn encode_owner(issuer: u64, owner: u64) -> Bytes {
+    Bytes::copy_from_slice(&[issuer.to_be_bytes(), owner.to_be_bytes()].concat())
+}
+
+pub(crate) fn decode_owner(state: &Bytes) -> Option<(u64, u64)> {
+    if state.len() != 16 {
+        return None;
+    }
+    let mut issuer = [0; 8];
+    issuer.copy_from_slice(&state[..8]);
+    let mut owner = [0; 8];
+    owner.copy_from_slice(&state[8..]);
+    Some((u64::from_be_bytes(issuer), u64::from_be_bytes(owner)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_file_keeps_independent_owner_lanes() {
+        let state = OpenState::default();
+        for owner in [11, 12] {
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid: 1,
+                    stateid: [owner as u8; 16],
+                    fh: Bytes::from_static(b"fh"),
+                    access: if owner == 11 {
+                        crate::OPEN_READ
+                    } else {
+                        crate::OPEN_WRITE
+                    },
+                    write_verifier: None,
+                })
+                .await;
+        }
+        assert_eq!(
+            state.by_owner(11).await.unwrap().lock().await.stateid,
+            [11; 16]
+        );
+        assert_eq!(
+            state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_WRITE)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .owner,
+            12
+        );
+        state.remove(12, &Bytes::from_static(b"fh")).await;
+        assert_eq!(
+            state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .owner,
+            11
+        );
+    }
+
+    #[test]
+    fn opaque_public_state_only_identifies_the_owner() {
+        let encoded = encode_owner(9, 0x0102_0304_0506_0708);
+        assert_eq!(decode_owner(&encoded), Some((9, 0x0102_0304_0506_0708)));
+        assert_eq!(decode_owner(&Bytes::from_static(b"bad")), None);
+    }
+}

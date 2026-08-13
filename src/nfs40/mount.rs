@@ -3,13 +3,18 @@ use bytes::Bytes;
 use futures::stream;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, SetClientIdArgs, decode_confirm_response,
-    decode_setclientid_response,
+    CallbackAddress, CompoundBuilder, OpenArgs, SetClientIdArgs, decode_commit_response,
+    decode_confirm_response, decode_lookup_response, decode_open_response, decode_read_response,
+    decode_setclientid_response, decode_stateid_response, decode_write_response,
+    open_succeeded_before_compound_failure,
 };
-use crate::error::{NfsError, Result};
+use super::state::{OpenState, OwnerLane, decode_owner, encode_owner};
+use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
 use crate::nfs4::compound::decode_navigation_response;
 use crate::rpc::auth::Auth;
@@ -24,6 +29,10 @@ struct Mount40 {
     rpc: rpc::Client,
     auth: Auth,
     root_fh: Bytes,
+    client_id: u64,
+    issuer: u64,
+    next_owner: AtomicU64,
+    state: Arc<OpenState>,
 }
 
 impl Debug for Mount40 {
@@ -64,7 +73,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let identity_auth = auth.clone();
     let identity =
         tokio::spawn(async move { establish_identity(&identity_rpc, &identity_auth).await });
-    identity
+    let client_id = identity
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 identity task failed: {error}")))??;
 
@@ -86,10 +95,18 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
 
-    Ok(Mount40 { rpc, auth, root_fh })
+    Ok(Mount40 {
+        rpc,
+        auth,
+        root_fh,
+        client_id,
+        issuer: rand::random(),
+        next_owner: AtomicU64::new(1),
+        state: Arc::new(OpenState::default()),
+    })
 }
 
-async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<()> {
+async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
     let verifier: [u8; 8] = rand::random();
     let owner = format!("nfs-rs-v4.0-{:016x}", rand::random::<u64>());
     let identity_request = CompoundBuilder::new("identity")
@@ -115,12 +132,103 @@ async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<()> {
         .call(confirm_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
         .await?;
     decode_confirm_response(confirm_response)?;
-    Ok(())
+    Ok(client_id)
+}
+
+fn context(
+    operation: &str,
+    owner: u64,
+    seqid: u32,
+    class: OperationClass,
+) -> (OperationClass, RequestContext) {
+    (
+        class,
+        RequestContext {
+            operation: operation.to_string(),
+            protocol: NFSVersion::NFSv4p0,
+            request_id: Some(crate::error::RequestId::nfs40(owner, seqid)),
+        },
+    )
+}
+
+async fn settled_call(
+    rpc: rpc::Client,
+    request: Vec<u8>,
+    class: OperationClass,
+    ctx: RequestContext,
+) -> Result<Bytes> {
+    tokio::spawn(async move {
+        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+            .await
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+    })
+    .await
+    .map_err(|error| NfsError::Rpc(format!("NFSv4.0 settlement task failed: {error}")))?
+}
+
+impl Mount40 {
+    async fn commit_verifier(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
+        let request = CompoundBuilder::new("commit")
+            .putfh(fh)
+            .commit(offset, count)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context("commit", 0, 0, OperationClass::ReplaySensitive);
+        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        decode_commit_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+    }
+
+    async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let mut lane = lane.lock().await;
+            let request = CompoundBuilder::new("close")
+                .putfh(&lane.fh)
+                .close(lane.next_seqid, &lane.stateid)
+                .encode_with_header(&auth);
+            let (class, ctx) = context(
+                "close",
+                lane.owner,
+                lane.next_seqid,
+                OperationClass::ReplaySensitive,
+            );
+            let response = rpc
+                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            lane.stateid = decode_stateid_response(response, 4, "CLOSE")
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            lane.next_seqid = lane.next_seqid.wrapping_add(1);
+            let owner = lane.owner;
+            let fh = lane.fh.clone();
+            drop(lane);
+            state.remove(owner, &fh).await;
+            Ok(())
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))?
+    }
 }
 
 fn unsupported<T>(operation: &str) -> Result<T> {
     Err(NfsError::Unsupported(format!(
         "NFSv4.0 {operation} is not implemented in the minimal mount slice"
+    )))
+}
+
+fn verifier_changed_error() -> NfsError {
+    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+        crate::error::OperationOutcome::Uncertain,
+        OperationClass::ReplaySensitive,
+        crate::error::RecoveryAction::VerifyThenResume,
+        RequestContext {
+            operation: "write_verifier".into(),
+            protocol: NFSVersion::NFSv4p0,
+            request_id: None,
+        },
+        NfsError::Rpc("NFSv4.0 WRITE verifier changed before COMMIT".into()),
     )))
 }
 
@@ -156,8 +264,151 @@ impl Mount for Mount40 {
     async fn access(&self, _fh: Bytes, _mode: u32) -> Result<u32> {
         unsupported("ACCESS")
     }
-    async fn commit(&self, _fh: Bytes, _offset: u64, _count: u32) -> Result<()> {
-        unsupported("COMMIT")
+    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+        Ok(self.open_stateful(dir_fh, filename, access).await?.object)
+    }
+    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+        Ok(self.open_path_stateful(path, access).await?.object)
+    }
+    async fn open_stateful(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
+        if !matches!(
+            access,
+            crate::OPEN_READ | crate::OPEN_WRITE | crate::OPEN_BOTH
+        ) {
+            return Err(NfsError::InvalidInput(format!(
+                "invalid OPEN access {access}"
+            )));
+        }
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        let owner_wire = format!("nfs-rs-{:016x}-{owner:016x}", self.issuer);
+        let filename = filename.to_string();
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let state = Arc::clone(&self.state);
+        let client_id = self.client_id;
+        let issuer = self.issuer;
+        tokio::spawn(async move {
+            let request = CompoundBuilder::new("open")
+                .putfh(&dir_fh)
+                .open(OpenArgs {
+                    seqid: 0,
+                    share_access: access,
+                    client_id,
+                    owner: owner_wire.as_bytes(),
+                    filename: &filename,
+                })
+                .getfh()
+                .encode_with_header(&auth);
+            let (class, ctx) = context("open", owner, 0, OperationClass::ReplaySensitive);
+            let response = rpc
+                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let partial_success = open_succeeded_before_compound_failure(response.clone());
+            let (opened, fh) = decode_open_response(response).map_err(|error| {
+                if partial_success {
+                    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+                        crate::error::OperationOutcome::Uncertain,
+                        class,
+                        crate::error::RecoveryAction::VerifyThenResume,
+                        ctx.clone(),
+                        error,
+                    )))
+                } else {
+                    classify_sent_nfs40_error(class, ctx, error)
+                }
+            })?;
+            let mut next_seqid = 1;
+            let mut stateid = opened.stateid;
+            if opened.confirm_required {
+                let request = CompoundBuilder::new("open_confirm")
+                    .putfh(&fh)
+                    .open_confirm(&stateid, next_seqid)
+                    .encode_with_header(&auth);
+                let (class, ctx) = context(
+                    "open_confirm",
+                    owner,
+                    next_seqid,
+                    OperationClass::ReplaySensitive,
+                );
+                let response = rpc
+                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                stateid = decode_stateid_response(response, 20, "OPEN_CONFIRM")
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                next_seqid += 1;
+            }
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid,
+                    stateid,
+                    fh: fh.clone(),
+                    access,
+                    write_verifier: None,
+                })
+                .await;
+            Ok(mount::OpenFile::with_protocol_state(
+                mount::ObjRes { fh, attr: None },
+                encode_owner(issuer, owner),
+            ))
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))?
+    }
+    async fn open_path_stateful(&self, path: &str, access: u32) -> Result<mount::OpenFile> {
+        let (dir, name) = crate::split_path(path)?;
+        let directory = self.lookup_path(&dir).await?;
+        self.open_stateful(directory.fh, &name, access).await
+    }
+    async fn close(&self, fh: Bytes) -> Result<()> {
+        let lane = self
+            .state
+            .for_fh(&fh, crate::OPEN_BOTH)
+            .await
+            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 CLOSE requires an open file".into()))?;
+        self.close_lane(lane).await
+    }
+    async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
+        let (object, protocol_state) = file.into_parts();
+        let state = protocol_state
+            .ok_or_else(|| NfsError::InvalidInput("open file has no NFSv4.0 owner state".into()))?;
+        let (issuer, owner) = decode_owner(&state)
+            .ok_or_else(|| NfsError::InvalidInput("invalid NFSv4.0 open state".into()))?;
+        if issuer != self.issuer {
+            return Err(NfsError::InvalidInput(
+                "open file belongs to another mount generation".into(),
+            ));
+        }
+        let lane = self.state.by_owner(owner).await.ok_or_else(|| {
+            NfsError::InvalidInput("NFSv4.0 open state is closed or stale".into())
+        })?;
+        if lane.lock().await.fh != object.fh {
+            return Err(NfsError::InvalidInput(
+                "NFSv4.0 open state filehandle mismatch".into(),
+            ));
+        }
+        self.close_lane(lane).await
+    }
+    async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
+        let verifier = self.commit_verifier(&fh, offset, count).await?;
+        if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_WRITE).await {
+            let mut lane = lane.lock().await;
+            if lane
+                .write_verifier
+                .is_some_and(|expected| expected != verifier)
+            {
+                return Err(verifier_changed_error());
+            }
+            lane.write_verifier = None;
+        }
+        Ok(())
     }
     async fn create(
         &self,
@@ -230,20 +481,118 @@ impl Mount for Mount40 {
     async fn readlink(&self, _fh: Bytes) -> Result<String> {
         unsupported("READLINK")
     }
-    async fn lookup(&self, _dir_fh: Bytes, _filename: &str) -> Result<mount::ObjRes> {
-        unsupported("LOOKUP")
+    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+        let request = CompoundBuilder::new("lookup")
+            .putfh(&dir_fh)
+            .lookup(filename)
+            .getfh()
+            .encode_with_header(&self.auth);
+        let response = self
+            .rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        Ok(mount::ObjRes {
+            fh: decode_lookup_response(response)?,
+            attr: None,
+        })
     }
-    async fn lookup_path(&self, _path: &str) -> Result<mount::ObjRes> {
-        unsupported("LOOKUP")
+    async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
+        let mut object = mount::ObjRes {
+            fh: self.root_fh.clone(),
+            attr: None,
+        };
+        for component in path.split('/').filter(|part| !part.is_empty()) {
+            object = self.lookup(object.fh, component).await?;
+        }
+        Ok(object)
     }
     async fn pathconf(&self, _fh: Bytes) -> Result<mount::Pathconf> {
         unsupported("PATHCONF")
     }
-    async fn read(&self, _fh: Bytes, _offset: u64, _count: u32) -> Result<Bytes> {
-        unsupported("READ")
+    async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        let stateid = if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await {
+            lane.lock().await.stateid
+        } else {
+            [0; 16]
+        };
+        let request = CompoundBuilder::new("read")
+            .putfh(&fh)
+            .read(&stateid, offset, count)
+            .encode_with_header(&self.auth);
+        let response = self
+            .rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        decode_read_response(response)
     }
-    async fn write(&self, _fh: Bytes, _offset: u64, _data: Bytes) -> Result<u32> {
-        unsupported("WRITE")
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        if data.len() > u32::MAX as usize {
+            return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
+        }
+        let lane = self
+            .state
+            .for_fh(&fh, crate::OPEN_WRITE)
+            .await
+            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let lane_for_settlement = Arc::clone(&lane);
+        let fh_for_settlement = fh.clone();
+        let settled = tokio::spawn(async move {
+            // The lane guard spans request construction through reply decoding.
+            // CLOSE takes the same guard, so cancellation cannot reorder CLOSE
+            // ahead of a detached WRITE settlement.
+            let guard = lane_for_settlement.lock().await;
+            let request = CompoundBuilder::new("write")
+                .putfh(&fh_for_settlement)
+                .write_header(&guard.stateid, offset, 2, data.len() as u32)
+                .encode_with_header(&auth);
+            let (class, ctx) = context(
+                "write",
+                guard.owner,
+                guard.next_seqid,
+                OperationClass::ReplaySensitive,
+            );
+            let response = rpc
+                .call_with_data(
+                    request,
+                    data.clone(),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                )
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let (count, committed, verifier) = decode_write_response(response)
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            if committed != 2 {
+                let commit_request = CompoundBuilder::new("commit")
+                    .putfh(&fh_for_settlement)
+                    .commit(offset, count)
+                    .encode_with_header(&auth);
+                let (commit_class, commit_ctx) =
+                    context("commit", guard.owner, 0, OperationClass::ReplaySensitive);
+                let commit_response = rpc
+                    .call(commit_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        classify_sent_nfs40_error(commit_class, commit_ctx.clone(), error)
+                    })?;
+                let committed_verifier = decode_commit_response(commit_response)
+                    .map_err(|error| classify_sent_nfs40_error(commit_class, commit_ctx, error))?;
+                if committed_verifier != verifier {
+                    return Err(verifier_changed_error());
+                }
+            }
+            drop(guard);
+            Ok::<_, NfsError>((count, data))
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 write task failed: {error}")))??;
+        let (count, data) = settled;
+        if count > data.len() as u32 {
+            return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
+        }
+        Ok(count)
     }
     async fn readdir(&self, _dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         Box::pin(stream::once(async { unsupported("READDIR") }))
@@ -330,6 +679,157 @@ mod tests {
             .write_u32(0x8000_0000 | response.len() as u32)
             .await?;
         stream.write_all(&response).await
+    }
+
+    fn direct_mount(rpc: rpc::Client) -> Arc<Mount40> {
+        Arc::new(Mount40 {
+            rpc,
+            auth: Auth::new_null(),
+            root_fh: Bytes::from_static(b"root"),
+            client_id: 7,
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state: Arc::new(OpenState::default()),
+        })
+    }
+
+    fn open_result(flags: u32, stateid: [u8; 16], fh: &[u8]) -> Vec<u8> {
+        let mut open = Vec::new();
+        open.extend_from_slice(&stateid);
+        open.extend_from_slice(&[0; 20]);
+        open.extend_from_slice(&flags.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        let mut getfh = Vec::new();
+        xdr_opaque(&mut getfh, fh);
+        compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
+    }
+
+    async fn connected_direct_mount(listener: &TcpListener) -> Arc<Mount40> {
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        direct_mount(rpc::Client::new(mux, None))
+    }
+
+    #[tokio::test]
+    async fn cancelled_open_after_send_finishes_owner_state_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            tokio::task::yield_now().await;
+            reply(
+                &mut stream,
+                &request,
+                &open_result(0, [0x51; 16], b"opened-fh"),
+            )
+            .await
+        });
+        let for_task = Arc::clone(&mount);
+        let task = tokio::spawn(async move {
+            for_task
+                .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+                .await
+        });
+        seen_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        server.await.unwrap().unwrap();
+        for _ in 0..20 {
+            if mount
+                .state
+                .for_fh(&Bytes::from_static(b"opened-fh"), crate::OPEN_BOTH)
+                .await
+                .is_some()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("detached OPEN reply did not register owner state");
+    }
+
+    #[tokio::test]
+    async fn open_reply_loss_is_structured_as_uncertain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _request = read_record(&mut stream).await?;
+            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let error = mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_open_compound_is_structured_as_uncertain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let mut partial = compound_result("open", &[(22, &[]), (18, &[])]);
+            partial[..4].copy_from_slice(&10006u32.to_be_bytes()); // NFS4ERR_SERVERFAULT after OPEN
+            reply(&mut stream, &request, &partial).await
+        });
+        let error = mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn conditional_open_confirm_uses_next_seqid_and_returned_stateid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result(2, [0x61; 16], b"confirmed-fh"),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            let expected = [[0x61; 16].as_slice(), 1u32.to_be_bytes().as_slice()].concat();
+            assert!(confirm.windows(expected.len()).any(|wire| wire == expected));
+            let data = [0x62; 16];
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("open_confirm", &[(22, &[]), (20, &data)]),
+            )
+            .await
+        });
+        let opened = mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+            .await
+            .unwrap();
+        let owner = decode_owner(&opened.into_parts().1.unwrap()).unwrap().1;
+        let lane = mount.state.by_owner(owner).await.unwrap();
+        assert_eq!(lane.lock().await.stateid, [0x62; 16]);
+        assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
