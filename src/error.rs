@@ -250,6 +250,35 @@ pub(crate) fn classify_sent_nfs41_error(
     )))
 }
 
+pub(crate) fn classify_sent_nfs40_error(
+    operation_class: OperationClass,
+    context: RequestContext,
+    source: NfsError,
+) -> NfsError {
+    let lacks_authoritative_result = matches!(
+        &source,
+        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
+    );
+    if !lacks_authoritative_result {
+        return source;
+    }
+    let (outcome, recovery) = match operation_class {
+        OperationClass::ReadOnly => (OperationOutcome::SafeToRetry, RecoveryAction::Retry),
+        OperationClass::SessionControl => (OperationOutcome::Uncertain, RecoveryAction::Remount),
+        OperationClass::ReplaySensitive => (
+            OperationOutcome::Uncertain,
+            RecoveryAction::VerifyThenResume,
+        ),
+    };
+    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+        outcome,
+        operation_class,
+        recovery,
+        context,
+        source,
+    )))
+}
+
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, NfsError>;
 

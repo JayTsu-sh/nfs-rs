@@ -9,6 +9,7 @@ use crate::rpc::auth::Auth;
 
 pub(crate) const OP_GETFH: u32 = 10;
 pub(crate) const OP_LOOKUP: u32 = 15;
+pub(crate) const OP_PUTFH: u32 = 22;
 pub(crate) const OP_PUTROOTFH: u32 = 24;
 
 pub(crate) fn xdr_u32(buf: &mut Vec<u8>, value: u32) {
@@ -43,6 +44,12 @@ impl CompoundBuilder {
 
     pub(crate) fn putrootfh(self) -> Self {
         self.operation(OP_PUTROOTFH, Vec::new())
+    }
+
+    pub(crate) fn putfh(self, fh: &[u8]) -> Self {
+        let mut args = Vec::new();
+        xdr_opaque(&mut args, fh);
+        self.operation(OP_PUTFH, args)
     }
 
     pub(crate) fn lookup(self, name: &str) -> Self {

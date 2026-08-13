@@ -55,6 +55,73 @@ async fn nfs_v40_mount_null_and_traversal_on_both_lifs() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires the writable NetApp NFSv4.0 reference fixture"]
+async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?;
+    let small_file =
+        env::var("NFS_RS_LAB_V40_SMALL_FILE").unwrap_or_else(|_| "nfs-rs-small.bin".to_string());
+    let large_file =
+        env::var("NFS_RS_LAB_V40_LARGE_FILE").unwrap_or_else(|_| "nfs-rs-large.bin".to_string());
+    let small = Bytes::from(
+        (0..64)
+            .map(|index| ((index * 13 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let large = Bytes::from(
+        (0..(4 * 1024 * 1024 + 37))
+            .map(|index| ((index * 17 + 29) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    for url in urls.split(',').filter(|url| !url.is_empty()) {
+        let mount = parse_url_and_mount(url).await?;
+        for (file, expected) in [(&small_file, &small), (&large_file, &large)] {
+            let opened = mount.open_path_stateful(file, OPEN_BOTH).await?;
+            let fh = opened.object.fh.clone();
+            let original = read_all(mount.as_ref(), fh.clone(), expected.len()).await?;
+            ensure(
+                original.len() == expected.len(),
+                format!("NFSv4.0 fixture {file} has the wrong bounded size"),
+            )?;
+            let mut written = 0usize;
+            while written < expected.len() {
+                let end = (written + mount.get_max_write_size() as usize).min(expected.len());
+                let count = mount
+                    .write(fh.clone(), written as u64, expected.slice(written..end))
+                    .await? as usize;
+                ensure(
+                    count != 0 && count <= end - written,
+                    "invalid NFSv4.0 WRITE count",
+                )?;
+                written += count;
+            }
+            mount.commit(fh.clone(), 0, written as u32).await?;
+            let actual = read_all(mount.as_ref(), fh, expected.len()).await?;
+            ensure(
+                actual == *expected,
+                format!("NFSv4.0 payload mismatch through {url}"),
+            )?;
+            let mut restored = 0usize;
+            while restored < original.len() {
+                let end = (restored + mount.get_max_write_size() as usize).min(original.len());
+                restored += mount
+                    .write(
+                        opened.object.fh.clone(),
+                        restored as u64,
+                        original.slice(restored..end),
+                    )
+                    .await? as usize;
+            }
+            mount
+                .commit(opened.object.fh.clone(), 0, restored as u32)
+                .await?;
+            mount.close_stateful(opened).await?;
+        }
+        mount.umount().await?;
+    }
+    Ok(())
+}
+
 fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     if condition {
         Ok(())
