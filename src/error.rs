@@ -14,6 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::mount::NFSVersion;
 use thiserror::Error;
 
 /// Retry/recovery safety of an NFS operation after an authoritative result is unavailable.
@@ -45,13 +46,48 @@ pub enum RecoveryAction {
     DoNotRetry,
 }
 
-/// Bounded request identity. It deliberately excludes file handles and payload bytes.
+/// Opaque, bounded request identity. It deliberately excludes file handles and payload bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestId {
+    kind: RequestIdKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RequestIdKind {
+    #[allow(dead_code)]
+    Nfs40Owner { owner: u64, sequence_id: u32 },
+    Nfs41Session {
+        session_id: [u8; 16],
+        slot_id: u32,
+        sequence_id: u32,
+    },
+}
+
+impl RequestId {
+    pub(crate) fn nfs41(session_id: [u8; 16], slot_id: u32, sequence_id: u32) -> Self {
+        Self {
+            kind: RequestIdKind::Nfs41Session {
+                session_id,
+                slot_id,
+                sequence_id,
+            },
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn nfs40(owner: u64, sequence_id: u32) -> Self {
+        Self {
+            kind: RequestIdKind::Nfs40Owner { owner, sequence_id },
+        }
+    }
+}
+
+/// Protocol-neutral context for classifying a request with an uncertain outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestContext {
     pub operation: String,
-    pub session_id: [u8; 16],
-    pub slot_id: u32,
-    pub sequence_id: u32,
+    pub protocol: NFSVersion,
+    pub request_id: Option<RequestId>,
 }
 
 /// Structured disposition for an operation whose normal result was not returned.
@@ -387,9 +423,8 @@ mod tests {
     fn context() -> RequestContext {
         RequestContext {
             operation: "write".to_string(),
-            session_id: [7; 16],
-            slot_id: 3,
-            sequence_id: 9,
+            protocol: NFSVersion::NFSv4p1,
+            request_id: Some(RequestId::nfs41([7; 16], 3, 9)),
         }
     }
 

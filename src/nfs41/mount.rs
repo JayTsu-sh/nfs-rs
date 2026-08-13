@@ -7,6 +7,7 @@
 //! 4. GETATTR to query rsize/wsize limits
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
 use tracing::{debug, info, warn};
@@ -15,7 +16,7 @@ use super::callback::{CallbackState, RecallNotification};
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::fastxdr::nfsstat4;
 use super::layout::{DsConnection, LayoutManager};
-use super::lease::LeaseRenewal;
+use super::lease::{LeaseHealth, LeaseRenewal};
 use super::session::{ClientIdentity, Session, SessionHolder, validate_sequence_result};
 use super::state::StateManager;
 use super::{NFS4_DEFAULT_PORT, NFS4_NULL_PROC, NFS4_PROGRAM, NFS4_VERSION};
@@ -32,6 +33,7 @@ const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Base timeout for data operations, scaled by payload size.
 const DATA_TIMEOUT_BASE_SECS: u64 = 10;
 const MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 1_250_000;
+static NEXT_MOUNT_ISSUER: AtomicU64 = AtomicU64::new(1);
 // Retry counts
 const NFS_RETRIES: usize = 10;
 // Equal-jitter exponential backoff for NFS4ERR_DELAY/GRACE retries.
@@ -150,9 +152,12 @@ fn request_context(
 ) -> RequestContext {
     RequestContext {
         operation: tag.chars().take(64).collect(),
-        session_id: *session_id,
-        slot_id,
-        sequence_id,
+        protocol: NFSVersion::NFSv4p1,
+        request_id: Some(crate::error::RequestId::nfs41(
+            *session_id,
+            slot_id,
+            sequence_id,
+        )),
     }
 }
 
@@ -740,6 +745,7 @@ impl Mount41 {
 #[derive(Debug)]
 pub(crate) struct Mount41Wrapper {
     m: Mount41,
+    issuer: u64,
 }
 
 impl std::fmt::Debug for Mount41 {
@@ -900,7 +906,10 @@ async fn mount_on_addr(
         wsize,
     };
 
-    Ok(Box::new(Mount41Wrapper { m }))
+    Ok(Box::new(Mount41Wrapper {
+        m,
+        issuer: NEXT_MOUNT_ISSUER.fetch_add(1, Ordering::Relaxed),
+    }))
 }
 
 /// Background task that processes recall notifications (delegation + pNFS layout).
@@ -1439,6 +1448,37 @@ fn effective_wsize(
 
 #[async_trait::async_trait]
 impl crate::Mount for Mount41Wrapper {
+    fn capabilities(&self) -> crate::MountCapabilities {
+        crate::MountCapabilities {
+            acl: true,
+            // Server-effective named attributes are not negotiated yet.
+            named_attributes: false,
+            locks: true,
+            callbacks: true,
+            delegation_retention: self.m.retain_delegations,
+            // pNFS is negotiated per session; the synchronous capability
+            // snapshot stays conservative until that state is cached here.
+            pnfs: false,
+            session_diagnostics: true,
+        }
+    }
+
+    fn health(&self) -> crate::MountHealth {
+        let lease_healthy = self.m.lease_renewal.health() == LeaseHealth::Healthy;
+        crate::MountHealth {
+            lifecycle: if lease_healthy {
+                crate::MountLifecycleState::Ready
+            } else {
+                crate::MountLifecycleState::Recovering
+            },
+            lease_healthy: Some(lease_healthy),
+            // The current callback executor exposes counters but no liveness
+            // signal. Unknown is safer than reporting a synthetic healthy state.
+            callback_healthy: None,
+            ..crate::MountHealth::default()
+        }
+    }
+
     fn get_max_read_size(&self) -> u32 {
         self.m.rsize
     }
@@ -1720,6 +1760,57 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn lock(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<Bytes> {
         self.m.lock(fh, lock_type, offset, length).await
+    }
+    async fn lock_stateful(
+        &self,
+        fh: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<crate::LockToken> {
+        let generation = self.m.session_holder.get().await.generation();
+        let stateid = self.m.lock(fh.clone(), lock_type, offset, length).await?;
+        if self.m.session_holder.get().await.generation() != generation {
+            return Err(NfsError::OperationOutcome(Box::new(
+                OperationOutcomeError::new(
+                    OperationOutcome::Uncertain,
+                    OperationClass::ReplaySensitive,
+                    RecoveryAction::Reopen,
+                    RequestContext {
+                        operation: "lock".to_string(),
+                        protocol: NFSVersion::NFSv4p1,
+                        request_id: None,
+                    },
+                    NfsError::Rpc("session generation changed while acquiring lock".to_string()),
+                ),
+            )));
+        }
+        Ok(crate::LockToken::new(
+            fh,
+            stateid,
+            lock_type,
+            offset,
+            length,
+            self.issuer,
+            generation,
+        ))
+    }
+    async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
+        let generation = self.m.session_holder.get().await.generation();
+        if token.issuer != self.issuer || token.generation != generation {
+            return Err(NfsError::InvalidInput(
+                "lock token belongs to another mount or recovery generation".to_string(),
+            ));
+        }
+        self.m
+            .locku(
+                token.fh,
+                token.stateid,
+                token.lock_type,
+                token.offset,
+                token.length,
+            )
+            .await
     }
     async fn locku(
         &self,
