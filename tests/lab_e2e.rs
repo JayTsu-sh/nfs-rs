@@ -8,6 +8,7 @@ use nfs_rs::{Mount, MountLifecycleState, NFSVersion, OPEN_BOTH, OPEN_READ, parse
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
 const LAB_URLS_ENV: &str = "NFS_RS_LAB_URLS";
+const LAB_V40_URLS_ENV: &str = "NFS_RS_LAB_V40_URLS";
 const CASE_DIR: &str = "nfs-rs-e2e";
 const ORIGINAL_FILE: &str = "nfs-rs-e2e/payload.bin";
 const RENAMED_FILE: &str = "nfs-rs-e2e/renamed.bin";
@@ -21,6 +22,38 @@ const CALLBACK_FILE: &str = "callback-recall.bin";
 const PNFS_PAYLOAD_SIZE: usize = 8 * 1024 * 1024 + 37;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+#[ignore = "requires the NetApp NFSv4.0 reference fixture"]
+async fn nfs_v40_mount_null_and_traversal_on_both_lifs() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?;
+    let urls = urls
+        .split(',')
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    ensure(
+        urls.len() == 2,
+        "NFSv4.0 validation requires exactly two LIF URLs",
+    )?;
+    for url in urls {
+        ensure(
+            url.contains("version=4.0"),
+            format!("not an exact v4.0 URL: {url}"),
+        )?;
+        let mount = parse_url_and_mount(url).await?;
+        ensure(
+            mount.version() == NFSVersion::NFSv4p0,
+            "wrong selected protocol",
+        )?;
+        ensure(
+            !mount.getfh().await.is_empty(),
+            "export traversal returned an empty filehandle",
+        )?;
+        mount.null().await?;
+        mount.umount().await?;
+    }
+    Ok(())
+}
 
 fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     if condition {

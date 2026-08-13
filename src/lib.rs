@@ -254,6 +254,7 @@ pub mod error;
 mod mount;
 mod nfs3;
 mod nfs4;
+mod nfs40;
 mod nfs41;
 mod rpc;
 mod shared;
@@ -542,9 +543,7 @@ async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
         let res: Result<Box<dyn Mount>> = match version {
             NFSVersion::NFSv3 => nfs3::mount(&args).await,
             NFSVersion::NFSv4p1 => nfs41::mount::mount(&args).await,
-            NFSVersion::NFSv4p0 => Err(NfsError::Unsupported(
-                "NFSv4.0 is not supported".to_string(),
-            )),
+            NFSVersion::NFSv4p0 => nfs40::mount(&args).await,
             #[allow(deprecated)]
             NFSVersion::NFSv4 => Err(NfsError::Unsupported(
                 "NFSv4.0 is not supported".to_string(),
@@ -987,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_with_only_v4_0() {
+    async fn mount_with_only_v4_0_attempts_the_protocol_engine() {
         let args = MountArgs {
             versions: vec![NFSVersion::NFSv4p0],
             host: Default::default(),
@@ -1006,7 +1005,7 @@ mod tests {
         let res = mount(args).await;
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.0 is not supported"));
+        assert!(!matches!(&err, NfsError::Unsupported(_)));
     }
 
     #[tokio::test]
@@ -1033,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mount_with_only_v4_0_and_v4_2() {
+    async fn mount_with_v4_0_then_v4_2_attempts_v4_0_before_unsupported_fallback() {
         let args = MountArgs {
             versions: vec![NFSVersion::NFSv4p0, NFSVersion::NFSv4p2],
             host: Default::default(),
@@ -1052,9 +1051,7 @@ mod tests {
         let res = mount(args).await;
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert!(
-            matches!(&err, NfsError::Unsupported(msg) if msg == "NFSv4.0 and NFSv4.2 are not supported")
-        );
+        assert!(matches!(&err, NfsError::Rpc(msg) if msg.contains("NFSv4.2 is not supported")));
     }
 
     #[test]
