@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NFSv4.0 lifecycle prototype — throwaway</title>
+<style>
+body{font:16px system-ui;margin:0;background:#f5f7f8;color:#172126}main{max-width:1050px;margin:auto;padding:32px}h1{margin-bottom:6px}.note{color:#526269}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:white;border:1px solid #dce3e6;border-radius:12px;padding:20px;margin:18px 0}dl{display:grid;grid-template-columns:180px 1fr;gap:8px}dt{color:#526269}dd{margin:0;font-family:ui-monospace,monospace}button{padding:9px 12px;margin:4px;border:1px solid #13756d;background:#fff;border-radius:7px;color:#075a54;cursor:pointer}button.primary{background:#13756d;color:#fff}.bad{color:#a33232}.good{color:#08734f}.tabs button.active{background:#dcefeb}.steps button:disabled{opacity:.4}.log{max-height:220px;overflow:auto;font-family:ui-monospace,monospace;font-size:13px}.tag{display:inline-block;background:#fff1c7;padding:3px 8px;border-radius:10px}@media(max-width:750px){.grid{grid-template-columns:1fr}}
+</style>
+<main>
+<h1>NFSv4.0 stateful lifecycle</h1>
+<p class="note"><strong>THROWAWAY LOGIC PROTOTYPE.</strong> Question: can a distinct minor-version-0 engine represent client confirmation, owner sequencing, stateids, reconnect, ambiguous WRITE and cleanup without any NFSv4.1 session, slot or SEQUENCE state?</p>
+<section class="card"><h2>Current state</h2><div id="state"></div><p id="change"></p></section>
+<section class="card"><h2>Free play</h2><div id="actions"></div></section>
+<section class="card"><h2>Guided walkthroughs</h2><div class="tabs" id="tabs"></div><div id="scenario"></div></section>
+<section class="card"><h2>Transition log</h2><div class="log" id="log"></div></section>
+</main>
+<script>
+// Pure, portable state machine. No DOM access belongs in this module.
+const Lifecycle = (() => {
+  const initial = () => ({transport:"disconnected", identity:"none", epoch:0, clientId:null,
+    owner:{seqid:0,pending:null}, file:{state:"absent",stateid:null,dirty:false}, outcome:"known", cleanup:"none", error:null});
+  const reject=(s,m)=>({...s,error:m});
+  function reduce(s,a){
+    s={...s,error:null,owner:{...s.owner},file:{...s.file}};
+    switch(a.type){
+      case "reset": return initial();
+      case "connect": return s.transport==="disconnected"?{...s,transport:"connected"}:reject(s,"Transport is already connected.");
+      case "setclientid": return s.transport==="connected"&&s.identity==="none"?{...s,identity:"unconfirmed",clientId:"server-clientid",epoch:s.epoch+1}:reject(s,"SETCLIENTID requires a connected, uninitialized identity.");
+      case "confirm": return s.identity==="unconfirmed"?{...s,identity:"confirmed"}:reject(s,"SETCLIENTID_CONFIRM requires the returned verifier.");
+      case "open": return s.identity==="confirmed"&&s.transport==="connected"&&s.file.state==="absent"?{...s,owner:{seqid:s.owner.seqid+1,pending:null},file:{state:"open",stateid:`stateid@epoch-${s.epoch}`,dirty:false}}:reject(s,"OPEN requires confirmed identity and no existing open state.");
+      case "write": return s.file.state==="open"&&s.transport==="connected"?{...s,file:{...s.file,dirty:true},outcome:"known"}:reject(s,"WRITE requires live transport and open state.");
+      case "lostWriteReply": return s.file.state==="open"&&s.transport==="connected"?{...s,transport:"disconnected",file:{...s.file,dirty:true},outcome:"uncertain"}:reject(s,"No in-flight WRITE can lose its reply now.");
+      case "reconnect": return s.transport==="disconnected"&&s.identity!=="none"?{...s,transport:"connected"}:reject(s,"Reconnect preserves the confirmed client epoch; initialize first.");
+      case "verify": return s.outcome==="uncertain"&&s.transport==="connected"?{...s,outcome:"known"}:reject(s,"Verification is only required for an uncertain result after reconnect.");
+      case "close": return s.file.state==="open"&&s.transport==="connected"&&s.outcome==="known"?{...s,owner:{seqid:s.owner.seqid+1,pending:null},file:{state:"closed",stateid:null,dirty:false}}:reject(s,"CLOSE cannot pass an unresolved outcome or missing transport.");
+      case "cleanup": return s.file.state==="closed"&&s.transport==="connected"?{...s,transport:"disconnected",identity:"none",clientId:null,cleanup:"complete"}:reject(s,"Cleanup requires known closed state.");
+      default:return reject(s,"Unknown action.");
+    }
+  }
+  return {initial,reduce};
+})();
+
+const actionDefs=[
+ ["connect","Connect TCP"],["setclientid","SETCLIENTID"],["confirm","Confirm client ID"],["open","OPEN file"],
+ ["write","WRITE succeeds"],["lostWriteReply","Lose WRITE reply"],["reconnect","Reconnect TCP"],["verify","Verify uncertain WRITE"],
+ ["close","CLOSE file"],["cleanup","Clean mount state"],["reset","Reset"]];
+const scenarios=[
+ {name:"Happy lifecycle",about:"Establish identity, mutate one file, close it, then clean up.",steps:["connect","setclientid","confirm","open","write","close","cleanup"]},
+ {name:"Reply loss",about:"A sent WRITE loses its reply. Reconnect keeps the client epoch, but CLOSE waits until authoritative verification resolves the uncertain outcome.",steps:["connect","setclientid","confirm","open","lostWriteReply","reconnect","verify","close","cleanup"]},
+ {name:"Illegal early OPEN",about:"Try OPEN before SETCLIENTID_CONFIRM. The engine rejects it without inventing session state.",steps:["connect","setclientid","open","confirm","open"]}
+];
+let state=Lifecycle.initial(),history=[],active=0,step=0;
+function dispatch(type){const before=state;state=Lifecycle.reduce(state,{type});history.unshift(`${type}: ${state.error||"accepted"}`);document.querySelector("#change").className=state.error?"bad":"good";document.querySelector("#change").textContent=state.error?`Rejected: ${state.error}`:`Accepted: ${type}`;render();}
+function fields(){return [["Transport",state.transport],["Client identity",state.identity],["Client epoch",state.epoch],["Client ID",state.clientId||"—"],["Open-owner seqid",state.owner.seqid],["File state",state.file.state],["Stateid",state.file.stateid||"—"],["Dirty data",String(state.file.dirty)],["Operation outcome",state.outcome],["Cleanup",state.cleanup],["NFSv4.1 session/slot",state.session||"absent by design"]];}
+function render(){document.querySelector("#state").innerHTML=`<dl>${fields().map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;document.querySelector("#actions").innerHTML=actionDefs.map(([a,l])=>`<button onclick="dispatch('${a}')">${l}</button>`).join("");document.querySelector("#tabs").innerHTML=scenarios.map((s,i)=>`<button class="${i===active?'active':''}" onclick="start(${i})">${s.name}</button>`).join("");const sc=scenarios[active];document.querySelector("#scenario").innerHTML=`<p>${sc.about}</p><div class="steps">${sc.steps.map((a,i)=>`<button ${i!==step?'disabled':''} onclick="walk('${a}')">${i+1}. ${actionDefs.find(x=>x[0]===a)[1]}</button>`).join("")}</div>`;document.querySelector("#log").innerHTML=history.map(x=>`<div>${x}</div>`).join("")||"No actions yet.";}
+function start(i){active=i;step=0;state=Lifecycle.initial();history=[];document.querySelector("#change").textContent="Scenario reset.";render();}
+function walk(a){dispatch(a);step++;render();}
+start(0);
+</script>
+</html>
