@@ -1,10 +1,11 @@
-//! NFSv4.1 ACL (Access Control List) encode/decode.
+//! Common NFSv4 ACL (Access Control List) encode/decode.
 //!
 //! NFSv4 ACLs are carried as FATTR4_ACL (attribute #12) inside GETATTR/SETATTR,
 //! not as separate RPC procedures. See RFC 7530 §6.2.
 
 use bytes::{Buf, Bytes};
 
+use super::attrnum;
 use super::attrs::{decode_getattr_envelope, decode_utf8str};
 use crate::error::{NfsError, Result};
 use crate::mount::{AceFlags, AceMask, AceType, Acl, AclSupport, NfsAce};
@@ -130,8 +131,8 @@ fn encode_acl(acl: &Acl, buf: &mut Vec<u8>) {
 
 /// Encode an ACL into (attrmask, attr_vals) for use in SETATTR.
 /// Sets bit 12 (FATTR4_ACL) in word 0 of the bitmap.
-pub(super) fn encode_setattr_acl(acl: &Acl) -> (Vec<u32>, Vec<u8>) {
-    let word0: u32 = 1 << 12; // FATTR4_ACL
+pub(crate) fn encode_setattr_acl(acl: &Acl) -> (Vec<u32>, Vec<u8>) {
+    let word0: u32 = 1 << attrnum::ACL;
     let mut vals = Vec::new();
     encode_acl(acl, &mut vals);
     (vec![word0], vals)
@@ -140,17 +141,17 @@ pub(super) fn encode_setattr_acl(acl: &Acl) -> (Vec<u32>, Vec<u8>) {
 // ─── GETATTR response decoders ─────────────────────────────────────────────────
 
 /// Parse a GETATTR response that requested FATTR4_ACL (bit 12) and decode the ACL.
-pub(super) fn decode_getattr_acl(data: &mut Bytes) -> Result<Acl> {
+pub(crate) fn decode_getattr_acl(data: &mut Bytes) -> Result<Acl> {
     let (bitmap, mut vals) = decode_getattr_envelope(data)?;
     let word0 = bitmap.first().copied().unwrap_or(0);
-    if word0 & (1 << 12) == 0 {
+    if word0 & (1 << attrnum::ACL) == 0 {
         return Err(NfsError::Xdr(
             "server did not return FATTR4_ACL".to_string(),
         ));
     }
     // Guard: attributes are encoded in bit-number order. If any bits below 12 are set,
     // their values precede the ACL data in attr_vals and would cause a misparse.
-    if word0 & ((1 << 12) - 1) != 0 {
+    if word0 & ((1 << attrnum::ACL) - 1) != 0 {
         return Err(NfsError::Xdr(
             "server returned unexpected attributes before FATTR4_ACL".to_string(),
         ));
@@ -159,16 +160,16 @@ pub(super) fn decode_getattr_acl(data: &mut Bytes) -> Result<Acl> {
 }
 
 /// Parse a GETATTR response that requested FATTR4_ACLSUPPORT (bit 13).
-pub(super) fn decode_getattr_aclsupport(data: &mut Bytes) -> Result<AclSupport> {
+pub(crate) fn decode_getattr_aclsupport(data: &mut Bytes) -> Result<AclSupport> {
     let (bitmap, mut vals) = decode_getattr_envelope(data)?;
     let word0 = bitmap.first().copied().unwrap_or(0);
-    if word0 & (1 << 13) == 0 {
+    if word0 & (1 << attrnum::ACLSUPPORT) == 0 {
         return Err(NfsError::Xdr(
             "server did not return FATTR4_ACLSUPPORT".to_string(),
         ));
     }
     // Guard: if any bits below 13 are set, their values precede ACLSUPPORT data.
-    if word0 & ((1 << 13) - 1) != 0 {
+    if word0 & ((1 << attrnum::ACLSUPPORT) - 1) != 0 {
         return Err(NfsError::Xdr(
             "server returned unexpected attributes before FATTR4_ACLSUPPORT".to_string(),
         ));
@@ -220,6 +221,24 @@ mod tests {
         let decoded = decode_nfsace4(&mut bytes).unwrap();
         assert_eq!(decoded, ace);
         assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn rfc7530_nfsace4_literal_decodes_and_reencodes_exactly() {
+        let wire: &[u8] = &[
+            0, 0, 0, 0, // ACE4_ACCESS_ALLOWED_ACE_TYPE
+            0, 0, 0, 0, // flags
+            0, 0, 0, 1, // ACE4_READ_DATA
+            0, 0, 0, 6, b'O', b'W', b'N', b'E', b'R', b'@', 0, 0,
+        ];
+        let mut input = Bytes::from_static(wire);
+        let ace = decode_nfsace4(&mut input).expect("RFC 7530 nfsace4 literal must decode");
+        assert_eq!(ace.ace_type, AceType::AccessAllowed);
+        assert_eq!(ace.flags, AceFlags(0));
+        assert_eq!(ace.access_mask, AceMask(AceMask::READ_DATA));
+        assert_eq!(ace.who, "OWNER@");
+        assert!(input.is_empty());
+        assert_eq!(encode_one_ace(&ace), wire);
     }
 
     #[test]

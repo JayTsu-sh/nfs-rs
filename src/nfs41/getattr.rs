@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
-use super::attrs::{decode_getattr_response, standard_getattr_bitmap};
 use super::mount::Mount41;
 use crate::error::Result;
 use crate::mount;
+use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
 
 impl Mount41 {
     pub(crate) async fn getattr(&self, fh: Bytes) -> Result<mount::Attr> {

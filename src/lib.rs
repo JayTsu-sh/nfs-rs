@@ -253,6 +253,7 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
 pub mod error;
 mod mount;
 mod nfs3;
+mod nfs4;
 mod nfs41;
 mod rpc;
 mod shared;
@@ -271,7 +272,7 @@ pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
 pub use nfs3::ErrorCode as Nfs3ErrorCode;
 pub use nfs3::MountErrorCode as Nfs3MountErrorCode;
-pub use nfs41::Nfs4ErrorCode;
+pub use nfs4::Nfs4ErrorCode;
 // Decoder wrappers exposed solely for `benches/`. Not part of the stable API;
 // `#[doc(hidden)]` keeps it out of rustdoc. Internal XDR types stay private —
 // only `bytes::Bytes` and the public `NfsError` cross the boundary.

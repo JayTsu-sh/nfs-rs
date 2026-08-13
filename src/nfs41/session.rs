@@ -106,7 +106,7 @@ pub(crate) fn validate_sequence_result(
     expected_slot_id: u32,
 ) -> Result<SequenceResult> {
     if op.opcode != super::compound::OpNum::Sequence as u32
-        || op.status != super::fastxdr::nfsstat4::NFS4_OK
+        || op.status != crate::nfs4::fastxdr::nfsstat4::NFS4_OK
     {
         return Err(NfsError::Xdr(
             "response does not contain a successful SEQUENCE result".to_string(),
@@ -491,7 +491,7 @@ impl Session {
                         info!("RECLAIM_COMPLETE successful, session ready");
                         return Ok(session);
                     }
-                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_DELAY))
+                    Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_DELAY))
                         if attempt < DELAY_RETRY_MAX =>
                     {
                         let delay_ms = delay_with_jitter_ms(attempt);
@@ -503,7 +503,7 @@ impl Session {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
-                    Err(NfsError::Nfs4(super::fastxdr::nfsstat4::NFS4ERR_GRACE))
+                    Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_GRACE))
                         if attempt < DELAY_RETRY_MAX =>
                     {
                         // RFC 5661 §8.4.2.1: server is in grace period, wait and retry
@@ -1192,7 +1192,7 @@ mod tests {
         data.extend_from_slice(&0u32.to_be_bytes());
         super::super::compound::OpResponse {
             opcode: super::super::compound::OpNum::Sequence as u32,
-            status: super::super::fastxdr::nfsstat4::NFS4_OK,
+            status: crate::nfs4::fastxdr::nfsstat4::NFS4_OK,
             data: Bytes::from(data),
         }
     }

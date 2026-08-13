@@ -13,37 +13,7 @@ use bytes::Bytes;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-/// Opaque NFSv4 stateid (16 bytes: seqid u32 + other [u8;12]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct StateId {
-    pub raw: [u8; 16],
-    pub generation: u64,
-}
-
-impl StateId {
-    /// Anonymous stateid (all-zeros) — used for operations that don't require OPEN.
-    pub fn anonymous() -> Self {
-        Self {
-            raw: [0u8; 16],
-            generation: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn from_bytes(bytes: &[u8; 16]) -> Self {
-        Self {
-            raw: *bytes,
-            generation: 1,
-        }
-    }
-
-    pub fn from_bytes_at(bytes: &[u8; 16], generation: u64) -> Self {
-        Self {
-            raw: *bytes,
-            generation,
-        }
-    }
-}
+pub(crate) use crate::nfs4::stateid::StateId;
 
 /// Access mode for OPEN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

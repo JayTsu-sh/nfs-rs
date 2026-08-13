@@ -27,8 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     fs::write(out_dir.join("mount_xdr.rs"), mount_code)?;
 
-    // NFSv4.1 XDR types (RFC 5661)
-    let nfs4_xdr = fs::read_to_string("src/nfs41/xdr/nfs4.x")?;
+    // NFSv4 common XDR types plus explicit NFSv4.1 extensions.
+    let nfs4_xdr = fs::read_to_string("src/nfs4/xdr/nfs4.x")?;
     let nfs4_code = fastxdr::Generator::default().generate(&nfs4_xdr)?;
     let nfs4_code = nfs4_code.replacen("mod xdr {", "pub mod xdr {", 1);
     // Add Copy+Clone to nfsstat4 enum (simple discriminant-only enum).
@@ -67,6 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=src/nfs3/xdr/nfs.x");
     println!("cargo:rerun-if-changed=src/nfs3/xdr/mount.x");
-    println!("cargo:rerun-if-changed=src/nfs41/xdr/nfs4.x");
+    println!("cargo:rerun-if-changed=src/nfs4/xdr/nfs4.x");
     Ok(())
 }
