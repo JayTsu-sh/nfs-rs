@@ -30,6 +30,23 @@ const DS_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// DS 连接 + 会话建立的整体超时（不可达地址快速失败并拉黑）。
 const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+type DataServerInitKey = (u64, SocketAddr);
+type DataServerInitGate = Mutex<()>;
+
+fn should_negative_cache_ds_error(error: &NfsError) -> bool {
+    matches!(
+        error,
+        NfsError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::TimedOut
+            )
+    )
+}
+
 /// pNFS layout types.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +74,17 @@ pub(crate) struct LayoutSegment {
     pub layout_type: LayoutType,
     /// For LAYOUT4_NFSV4_1_FILES: the nfsv4_1_file_layout4 content
     pub content: LayoutContent,
+}
+
+impl LayoutSegment {
+    pub(crate) fn covers(&self, offset: u64) -> bool {
+        offset >= self.offset
+            && (self.length == u64::MAX
+                || self
+                    .offset
+                    .checked_add(self.length)
+                    .is_none_or(|end| offset < end))
+    }
 }
 
 /// Decoded layout content (type-specific).
@@ -91,6 +119,20 @@ pub(crate) struct Layout {
     pub stateid: [u8; 16],
     pub return_on_close: bool,
     pub segments: Vec<LayoutSegment>,
+}
+
+fn layout_segments_overlap(left: &LayoutSegment, right: &LayoutSegment) -> bool {
+    let left_end = if left.length == u64::MAX {
+        u64::MAX
+    } else {
+        left.offset.saturating_add(left.length)
+    };
+    let right_end = if right.length == u64::MAX {
+        u64::MAX
+    } else {
+        right.offset.saturating_add(right.length)
+    };
+    left.offset < right_end && right.offset < left_end
 }
 
 /// Resolved pNFS device: per-DS network addresses.
@@ -146,11 +188,18 @@ pub(crate) struct LayoutManager {
     layouts: RwLock<HashMap<Bytes, Layout>>,
     /// Cached connections to data servers (each with its own session).
     data_servers: RwLock<HashMap<SocketAddr, DsConnection>>,
+    /// Singleflight gates for first-use DS session establishment. The key
+    /// includes the MDS generation so recovery never waits behind stale work.
+    data_server_init_gates: Mutex<HashMap<DataServerInitKey, std::sync::Weak<DataServerInitGate>>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
     dirty: RwLock<HashMap<Bytes, DirtyRange>>,
+    /// Next sequential file offset at which the client proactively returns
+    /// and reacquires this file's layout. Entries are per file so a large-file
+    /// lifecycle transition never disturbs layouts for sibling files.
+    layout_refresh_offsets: RwLock<HashMap<Bytes, u64>>,
     /// Per-file I/O gates. WRITEs take a shared guard; recall/CLOSE take an
     /// exclusive guard so different files and same-file parallel WRITEs remain
     /// concurrent while layout lifecycle transitions are serialized.
@@ -166,6 +215,8 @@ pub(crate) struct LayoutManager {
     active_generation: AtomicU64,
 }
 
+pub(crate) const PNFS_LAYOUT_REFRESH_INTERVAL: u64 = 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirtyRange {
     pub generation: u64,
@@ -179,8 +230,10 @@ impl LayoutManager {
         Self {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
+            data_server_init_gates: Mutex::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
+            layout_refresh_offsets: RwLock::new(HashMap::new()),
             file_io_gates: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: RwLock::new(HashSet::new()),
@@ -200,12 +253,33 @@ impl LayoutManager {
         let mut dirty = self.dirty.write().await;
         layouts.clear();
         servers.clear();
+        self.data_server_init_gates.lock().await.clear();
         devices.clear();
         dirty.clear();
+        self.unreachable_ds.write().await.clear();
+        self.layout_refresh_offsets.write().await.clear();
     }
 
     pub fn generation(&self) -> u64 {
         self.active_generation.load(Ordering::Acquire)
+    }
+
+    async fn data_server_init_gate(
+        &self,
+        addr: SocketAddr,
+        generation: u64,
+    ) -> Arc<DataServerInitGate> {
+        let mut gates = self.data_server_init_gates.lock().await;
+        if let Some(gate) = gates
+            .get(&(generation, addr))
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert((generation, addr), Arc::downgrade(&gate));
+        gate
     }
 
     async fn file_io_gate(&self, fh: &Bytes) -> Arc<RwLock<()>> {
@@ -227,12 +301,15 @@ impl LayoutManager {
         self.file_io_gate(fh).await.write_owned().await
     }
 
-    /// 把一个连接失败的 DS 地址记入负缓存（mount 生命周期内不再尝试）。
-    pub async fn mark_ds_unreachable(&self, addr: SocketAddr) {
+    async fn mark_ds_unreachable_at(&self, addr: SocketAddr, generation: u64) -> bool {
         let mut set = self.unreachable_ds.write().await;
-        if set.insert(addr) {
-            warn!(addr = %addr, "marking pNFS data server unreachable, affected files fall back to MDS I/O");
+        if generation != self.active_generation.load(Ordering::Acquire) {
+            return false;
         }
+        if set.insert(addr) {
+            warn!(addr = %addr, generation, "marking pNFS data server unreachable, affected files fall back to MDS I/O");
+        }
+        true
     }
 
     /// DS 地址是否已被标记为不可达。
@@ -279,10 +356,62 @@ impl LayoutManager {
             .cloned()
     }
 
+    /// Return a cached layout only when one of its segments covers `offset`.
+    /// A bounded segment must not suppress a LAYOUTGET for a later multipart
+    /// file range.
+    pub async fn get_layout_covering(&self, fh: &Bytes, offset: u64) -> Option<Layout> {
+        self.get_layout(fh)
+            .await
+            .filter(|layout| layout.segments.iter().any(|segment| segment.covers(offset)))
+    }
+
+    pub async fn merge_layout(&self, fh: &Bytes, mut update: Layout) {
+        let mut layouts = self.layouts.write().await;
+        if update.generation != self.generation() {
+            return;
+        }
+        if let Some(current) = layouts.get_mut(fh) {
+            current.segments.retain(|old| {
+                !update
+                    .segments
+                    .iter()
+                    .any(|new| layout_segments_overlap(old, new))
+            });
+            current.segments.append(&mut update.segments);
+            current.segments.sort_by_key(|segment| segment.offset);
+            current.stateid = update.stateid;
+            current.return_on_close |= update.return_on_close;
+        } else {
+            layouts.insert(fh.clone(), update);
+        }
+    }
+
     /// Remove the layout for a file.
     pub async fn remove_layout(&self, fh: &Bytes) -> Option<Layout> {
         let mut map = self.layouts.write().await;
-        map.remove(fh)
+        let removed = map.remove(fh);
+        self.layout_refresh_offsets.write().await.remove(fh);
+        removed
+    }
+
+    pub async fn layout_refresh_due(&self, fh: &Bytes, offset: u64) -> bool {
+        let offsets = self.layout_refresh_offsets.read().await;
+        offset
+            >= offsets
+                .get(fh)
+                .copied()
+                .unwrap_or(PNFS_LAYOUT_REFRESH_INTERVAL)
+    }
+
+    pub async fn record_layout_refresh(&self, fh: &Bytes, offset: u64) {
+        let next = offset
+            .saturating_div(PNFS_LAYOUT_REFRESH_INTERVAL)
+            .saturating_add(1)
+            .saturating_mul(PNFS_LAYOUT_REFRESH_INTERVAL);
+        self.layout_refresh_offsets
+            .write()
+            .await
+            .insert(fh.clone(), next);
     }
 
     pub async fn all_layouts(&self) -> Vec<(Bytes, Layout)> {
@@ -304,6 +433,7 @@ impl LayoutManager {
         map.clear();
         devices.clear();
         dirty.clear();
+        self.layout_refresh_offsets.write().await.clear();
     }
 
     /// 记录一段已通过 layout 写入、待 LAYOUTCOMMIT 的范围；与已有范围 merge（min/max）。
@@ -355,6 +485,13 @@ impl LayoutManager {
         unchanged
     }
 
+    /// Discard dirty metadata that can no longer be committed with its
+    /// originating layout stateid. The caller must already be returning an
+    /// uncertain outcome that requires data verification before resuming.
+    pub async fn invalidate_dirty(&self, fh: &Bytes) {
+        self.dirty.write().await.remove(fh);
+    }
+
     /// Test/teardown helper that removes a pending range immediately.
     #[cfg(test)]
     pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
@@ -399,8 +536,8 @@ impl LayoutManager {
 
     /// Get or create a connection (with session) to a data server.
     ///
-    /// 连接或建会话失败（含超时）时将地址记入不可达负缓存，调用方
-    /// 回退 MDS I/O；mount 生命周期内不再尝试该地址。
+    /// 明确的 endpoint 连接失败（含超时）会进入不可达负缓存；NFS/RPC
+    /// session 协议错误不会污染地址可达性。
     pub async fn get_data_server(
         &self,
         addr: SocketAddr,
@@ -423,13 +560,32 @@ impl LayoutManager {
                 return Ok(conn.clone());
             }
         }
+        let init_gate = self.data_server_init_gate(addr, owner_generation).await;
+        let _init_guard = init_gate.lock().await;
+        if owner_generation != self.generation() {
+            return Err(NfsError::Rpc(
+                "refusing data-server initialization for stale MDS generation".to_string(),
+            ));
+        }
+        // A same-address waiter may have populated the cache while this task
+        // waited for the singleflight leader.
+        {
+            let servers = self.data_servers.read().await;
+            if let Some(conn) = servers
+                .get(&addr)
+                .filter(|conn| conn.owner_generation == owner_generation)
+            {
+                return Ok(conn.clone());
+            }
+        }
         if self.is_ds_unreachable(&addr).await {
             return Err(NfsError::Rpc(format!(
                 "pNFS data server {addr} marked unreachable"
             )));
         }
-        // TCP connect + session establishment OUTSIDE any lock —
-        // can be slow without stalling other I/O.
+        // TCP connect + session establishment holds only this address and
+        // generation's singleflight gate, so other DS endpoints remain fully
+        // concurrent while same-DS cold-start waiters share one session.
         // 整体包超时：server 可能下发不可达网段的 DS 地址（SYN 黑洞时
         // 系统级 connect 超时可达 20s+），失败后拉黑避免每次 I/O 重付。
         let connect_and_establish = async {
@@ -446,17 +602,20 @@ impl LayoutManager {
         let conn = match tokio::time::timeout(DS_CONNECT_TIMEOUT, connect_and_establish).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                self.mark_ds_unreachable(addr).await;
+                if should_negative_cache_ds_error(&e) {
+                    self.mark_ds_unreachable_at(addr, owner_generation).await;
+                }
                 return Err(e);
             }
             Err(_) => {
-                self.mark_ds_unreachable(addr).await;
+                self.mark_ds_unreachable_at(addr, owner_generation).await;
                 return Err(NfsError::Rpc(format!(
                     "pNFS data server {addr} connect timed out"
                 )));
             }
         };
-        // Acquire write lock and re-check (another task may have connected concurrently)
+        // The per-address initialization gate makes this the only publisher
+        // for this DS and generation.
         let mut servers = self.data_servers.write().await;
         if self.generation() != owner_generation {
             drop(servers);
@@ -465,18 +624,6 @@ impl LayoutManager {
             return Err(NfsError::Rpc(
                 "discarding data-server connection from stale MDS generation".to_string(),
             ));
-        }
-        if let Some(existing) = servers
-            .get(&addr)
-            .filter(|existing| existing.owner_generation == owner_generation)
-        {
-            // Race: another task already connected; destroy the duplicate
-            // session best-effort and use the existing connection
-            let existing = existing.clone();
-            drop(servers);
-            let auth = auth.clone();
-            tokio::spawn(async move { conn.destroy(&auth).await });
-            return Ok(existing);
         }
         servers.insert(addr, conn.clone());
         info!(addr = %addr, "connected to pNFS data server (session established)");
@@ -1126,11 +1273,81 @@ mod tests {
         let mgr = LayoutManager::new(false);
         let addr: SocketAddr = "192.168.13.131:2049".parse().unwrap();
         assert!(!mgr.is_ds_unreachable(&addr).await);
-        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.mark_ds_unreachable_at(addr, mgr.generation()).await);
         assert!(mgr.is_ds_unreachable(&addr).await);
         // 重复标记幂等
-        mgr.mark_ds_unreachable(addr).await;
+        assert!(mgr.mark_ds_unreachable_at(addr, mgr.generation()).await);
         assert!(mgr.is_ds_unreachable(&addr).await);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_poison_ds_reachability() {
+        let manager = LayoutManager::new(false);
+        let address: SocketAddr = "192.0.2.20:2049".parse().unwrap();
+        let old_generation = manager.generation();
+
+        manager.transition_to(old_generation + 1).await;
+
+        assert!(
+            !manager
+                .mark_ds_unreachable_at(address, old_generation)
+                .await
+        );
+        assert!(!manager.is_ds_unreachable(&address).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_start_for_one_ds_is_singleflight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let manager = Arc::new(LayoutManager::new(true));
+        let address: SocketAddr = "192.0.2.10:2049".parse().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..16 {
+            let manager = Arc::clone(&manager);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.spawn(async move {
+                let gate = manager.data_server_init_gate(address, 1).await;
+                let _guard = gate.lock().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn session_protocol_errors_do_not_poison_ds_reachability() {
+        assert!(!should_negative_cache_ds_error(&NfsError::Nfs4(
+            crate::Nfs4ErrorCode::NFS4ERR_BADSESSION,
+        )));
+        assert!(!should_negative_cache_ds_error(&NfsError::Rpc(
+            "CREATE_SESSION sequence race".to_string(),
+        )));
+    }
+
+    #[test]
+    fn endpoint_connectivity_errors_are_negative_cached() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(should_negative_cache_ds_error(&NfsError::Io(
+                std::io::Error::from(kind),
+            )));
+        }
     }
 
     #[tokio::test]
@@ -1753,5 +1970,155 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].ds_index, 0);
         assert_eq!(chunks[0].ds_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn layout_refresh_crossing_is_recorded_once_per_window() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"large-file");
+
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL - 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+                .await
+        );
+        manager
+            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL * 2)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn layout_refresh_offsets_are_independent_per_file() {
+        let manager = LayoutManager::new(true);
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        manager
+            .record_layout_refresh(&first, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+
+        assert!(
+            !manager
+                .layout_refresh_due(&first, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+        assert!(
+            manager
+                .layout_refresh_due(&second, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_layout_resets_its_refresh_lifecycle() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"reopened-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [9; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+        manager
+            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
+            .await;
+        assert!(
+            !manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+
+        manager.remove_layout(&fh).await;
+
+        assert!(
+            manager
+                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_layout_is_returned_only_for_a_covered_offset() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"multipart-file");
+        manager
+            .store_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [7; 16],
+                    return_on_close: false,
+                    segments: vec![LayoutSegment {
+                        offset: 1024,
+                        length: 2048,
+                        iomode: IoMode::ReadWrite,
+                        layout_type: LayoutType::NfsV41Files,
+                        content: LayoutContent::Opaque(Bytes::new()),
+                    }],
+                },
+            )
+            .await;
+
+        assert!(manager.get_layout_covering(&fh, 1024).await.is_some());
+        assert!(manager.get_layout_covering(&fh, 3071).await.is_some());
+        assert!(manager.get_layout_covering(&fh, 3072).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn layout_update_replaces_overlapping_segment_and_keeps_other_ranges() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"growing-multipart-file");
+        let segment = |offset, length, marker| LayoutSegment {
+            offset,
+            length,
+            iomode: IoMode::ReadWrite,
+            layout_type: LayoutType::NfsV41Files,
+            content: LayoutContent::Opaque(Bytes::from(vec![marker])),
+        };
+        manager
+            .store_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [1; 16],
+                    return_on_close: false,
+                    segments: vec![segment(0, 1024, 1), segment(2048, 1024, 2)],
+                },
+            )
+            .await;
+
+        manager
+            .merge_layout(
+                &fh,
+                Layout {
+                    generation: manager.generation(),
+                    stateid: [3; 16],
+                    return_on_close: true,
+                    segments: vec![segment(512, 2048, 3)],
+                },
+            )
+            .await;
+
+        let merged = manager.get_layout(&fh).await.unwrap();
+        assert_eq!(merged.stateid, [3; 16]);
+        assert!(merged.return_on_close);
+        assert_eq!(merged.segments.len(), 1);
+        assert_eq!(merged.segments[0].offset, 512);
+        assert_eq!(merged.segments[0].length, 2048);
     }
 }

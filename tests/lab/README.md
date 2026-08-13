@@ -30,6 +30,10 @@ pNFS configuration, installed fault tools, repository-owned lab commands, and
 the `ci-runner` sudo allow-list. Nightly uploads its output as an artifact. It
 must not change service or network state.
 
+The pNFS runner also creates 16 files whose writes cross the 1 GiB layout
+refresh boundary. This validates independent per-file layout renewal plus
+LAYOUTCOMMIT/LAYOUTRETURN cleanup in the real NetApp lab.
+
 `run-e2e.sh` mounts the isolated run directory on both source and destination
 over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,
 directory and file creation, chunked write/commit/read, attributes, READDIR,

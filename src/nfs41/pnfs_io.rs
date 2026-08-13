@@ -5,14 +5,18 @@
 //! parallel. If pNFS is unavailable or fails, callers fall back to MDS I/O.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, info};
 
+use super::Nfs4ErrorCode;
 use super::compound::CompoundResponse;
 use super::fastxdr::nfsstat4;
-use super::layout::{Layout, LayoutContent, LayoutSegment};
+#[cfg(test)]
+use super::layout::LayoutManager;
+use super::layout::{IoMode, Layout, LayoutContent, LayoutSegment};
 use super::mount::Mount41;
 use super::state::{AccessMode, StateId};
 use crate::error::{
@@ -31,10 +35,34 @@ pub(crate) enum PnfsWriteOutcome {
 }
 
 struct PlannedDsWrite {
+    stripe_index: usize,
     ds_fh: Bytes,
     ds_addr: SocketAddr,
     ds_offset: u64,
     data: Bytes,
+}
+
+struct DsWriteCompletion<T> {
+    stripe_index: usize,
+    ds_addr: SocketAddr,
+    result: Result<T>,
+}
+
+fn ds_batch_diagnostic<T>(completions: &[DsWriteCompletion<T>]) -> String {
+    completions
+        .iter()
+        .map(|completion| match &completion.result {
+            Ok(_) => format!(
+                "stripe={} ds={} attempted=true outcome=success",
+                completion.stripe_index, completion.ds_addr
+            ),
+            Err(error) => format!(
+                "stripe={} ds={} attempted=true outcome=error error={error}",
+                completion.stripe_index, completion.ds_addr
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
@@ -47,12 +75,44 @@ fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
     )))
 }
 
+/// Wait for every request in an already-issued DS batch before reporting its
+/// aggregate result. Unlike `try_join_all`, an early error cannot cancel a
+/// sibling WRITE whose request may already be on the wire. Errors are selected
+/// in plan order, so diagnostics do not depend on network completion order.
+async fn settle_ds_batch<T, F>(futures: Vec<(usize, SocketAddr, F)>) -> Vec<DsWriteCompletion<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    futures::future::join_all(futures.into_iter().map(
+        |(stripe_index, ds_addr, future)| async move {
+            DsWriteCompletion {
+                stripe_index,
+                ds_addr,
+                result: future.await,
+            }
+        },
+    ))
+    .await
+}
+
+#[cfg(test)]
+async fn invalidate_layout_after_ds_error(
+    layout_manager: &LayoutManager,
+    fh: &Bytes,
+    error: &NfsError,
+) {
+    if matches!(error, NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)) {
+        layout_manager.remove_layout(fh).await;
+        layout_manager.invalidate_dirty(fh).await;
+    }
+}
+
 /// Find the layout segment covering a given file offset.
 fn find_covering_segment(layout: &Layout, offset: u64) -> Option<&LayoutSegment> {
-    layout.segments.iter().find(|seg| {
-        offset >= seg.offset
-            && (seg.length == 0xFFFF_FFFF_FFFF_FFFF || offset < seg.offset + seg.length)
-    })
+    layout
+        .segments
+        .iter()
+        .find(|segment| segment.covers(offset))
 }
 
 impl Mount41 {
@@ -78,7 +138,22 @@ impl Mount41 {
 
     /// Get layout for a file, fetching from MDS if not cached.
     /// Returns None if pNFS layouts are unavailable (caller should fall back to MDS I/O).
-    pub(crate) async fn get_or_fetch_layout(&self, fh: &Bytes, iomode: u32) -> Option<Layout> {
+    pub(crate) async fn get_or_fetch_layout(
+        &self,
+        fh: &Bytes,
+        iomode: IoMode,
+        offset: u64,
+    ) -> Option<Layout> {
+        self.fetch_layout(fh, iomode, offset, false).await
+    }
+
+    async fn fetch_layout(
+        &self,
+        fh: &Bytes,
+        iomode: IoMode,
+        offset: u64,
+        force_update: bool,
+    ) -> Option<Layout> {
         // RFC 5661 §18.35.3：server 未在 EXCHANGE_ID 中声明 USE_PNFS_MDS，
         // 整个 mount 禁用 pNFS，跳过 LAYOUTGET（省每文件一次注定失败的 RTT）
         if !self.session_holder.get().await.pnfs_mds() {
@@ -86,32 +161,38 @@ impl Mount41 {
         }
 
         // 1. Check cache
-        if let Some(layout) = self.layout_manager.get_layout(fh).await {
+        if !force_update
+            && let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await
+        {
             return Some(layout);
         }
 
         // 2. LAYOUTGET to MDS: COMPOUND(SEQUENCE, PUTFH, LAYOUTGET)
         // iomode 1=READ, 2=RW — use matching access mode to avoid NFS4ERR_OPENMODE.
-        let access = if iomode == 1 {
-            AccessMode::Read
-        } else {
-            AccessMode::Write
+        let access = match iomode {
+            IoMode::Read => AccessMode::Read,
+            IoMode::ReadWrite => AccessMode::Write,
         };
+        let cached = self.layout_manager.get_layout(fh).await;
         let sid = self
             .state
             .has_open(fh, access)
             .await
             .unwrap_or_else(StateId::anonymous);
+        let request_stateid = cached
+            .as_ref()
+            .map(|layout| layout.stateid)
+            .unwrap_or(sid.raw);
         let result = self
             .compound("layoutget", |b| {
                 b.require_generation(sid.generation).putfh(fh).layoutget(
-                    false,                 // signal_layout_avail
-                    1,                     // LAYOUT4_NFSV4_1_FILES
-                    iomode,                // 1=READ, 2=RW
-                    0,                     // offset = whole file
-                    0xFFFF_FFFF_FFFF_FFFF, // length = whole file
-                    0,                     // min_length
-                    &sid.raw,
+                    false, // signal_layout_avail
+                    1,     // LAYOUT4_NFSV4_1_FILES
+                    iomode as u32,
+                    offset,
+                    u64::MAX - offset,
+                    0, // min_length
+                    &request_stateid,
                     1024 * 1024, // max_count (1 MiB)
                 )
             })
@@ -124,14 +205,18 @@ impl Mount41 {
                 let mut data = op.data.clone();
                 let mut layout = super::layout::decode_layoutget_response(&mut data).ok()?;
                 layout.generation = resp.session_generation;
-                if self
-                    .layout_manager
-                    .store_layout_at(fh, resp.session_generation, layout.clone())
-                    .await
-                {
+                let accepted = if cached.is_some() {
+                    self.layout_manager.merge_layout(fh, layout.clone()).await;
+                    self.layout_manager.get_layout(fh).await.is_some()
+                } else {
+                    self.layout_manager
+                        .store_layout_at(fh, resp.session_generation, layout.clone())
+                        .await
+                };
+                if accepted {
                     // Only an accepted layout may populate generation-owned caches.
                     self.fetch_devices_for_layout(&layout).await;
-                    Some(layout)
+                    self.layout_manager.get_layout(fh).await
                 } else {
                     debug!(
                         response_generation = resp.session_generation,
@@ -339,7 +424,7 @@ impl Mount41 {
         offset: u64,
         count: u32,
     ) -> Option<Result<Bytes>> {
-        let layout = self.get_or_fetch_layout(fh, 1 /* IOMODE_READ */).await?;
+        let layout = self.get_or_fetch_layout(fh, IoMode::Read, offset).await?;
         let seg = find_covering_segment(&layout, offset)?;
         let (device_id, stripe_unit, is_dense, first_stripe_index, pattern_offset, fh_list) =
             match &seg.content {
@@ -498,7 +583,10 @@ impl Mount41 {
         offset: u64,
         data: Bytes,
     ) -> PnfsWriteOutcome {
-        let Some(layout) = self.get_or_fetch_layout(fh, 2 /* IOMODE_RW */).await else {
+        let Some(layout) = self
+            .get_or_fetch_layout(fh, IoMode::ReadWrite, offset)
+            .await
+        else {
             return PnfsWriteOutcome::NotAttempted;
         };
         let Some(seg) = find_covering_segment(&layout, offset) else {
@@ -568,7 +656,8 @@ impl Mount41 {
         // keeps stripe payloads zero-copy.
         let writes = match chunks
             .iter()
-            .map(|chunk| {
+            .enumerate()
+            .map(|(stripe_index, chunk)| {
                 // fh_list is indexed by stripe position (ds_index)
                 // ds_addrs is indexed by physical DS (needs stripe_indices indirection)
                 let ds_fh_res = fh_list
@@ -592,6 +681,7 @@ impl Mount41 {
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
                 Ok::<PlannedDsWrite, NfsError>(PlannedDsWrite {
+                    stripe_index,
                     ds_fh: ds_fh_res?,
                     ds_addr: ds_addr_res?,
                     ds_offset: chunk.ds_offset,
@@ -623,7 +713,9 @@ impl Mount41 {
         let futures: Vec<_> = writes
             .into_iter()
             .map(|write| {
-                async move {
+                let stripe_index = write.stripe_index;
+                let ds_addr = write.ds_addr;
+                let future = async move {
                     let resp = self
                         .ds_write_chunk(
                             write.ds_addr,
@@ -647,54 +739,23 @@ impl Mount41 {
                     d.advance(8);
                     // needs_commit=true if DS downgraded write stability
                     Ok::<(u32, bool), NfsError>((written, committed != 2 /* FILE_SYNC4 */))
-                }
+                };
+                (stripe_index, ds_addr, future)
             })
             .collect();
 
-        match futures::future::try_join_all(futures).await {
-            Ok(results) => {
-                if layout.generation != self.layout_manager.generation() {
-                    // This is aggregate pNFS batch context, so slot/sequence are
-                    // intentionally zero rather than claiming one DS request.
-                    let active_session = self.session_holder.get().await;
-                    let context = RequestContext {
-                        operation: "pnfs_write".to_string(),
-                        session_id: *active_session.id(),
-                        slot_id: 0,
-                        sequence_id: 0,
-                    };
-                    return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
-                        context,
-                        NfsError::Rpc(
-                            "pNFS WRITE outcome crossed a session generation boundary".to_string(),
-                        ),
-                    )));
-                }
-                let total: u32 = results.iter().map(|(n, _)| n).sum();
-                let needs_commit = results.iter().any(|(_, c)| *c);
-                // RFC 5661 §18.42.3：LAYOUTCOMMIT 不必每次 WRITE 后发，只需在
-                // LAYOUTRETURN/CLOSE 前提交。这里仅累积 dirty 范围，由
-                // flush_layoutcommit 在 close/layoutreturn 时一次性发送，
-                // 避免每个 wsize 块一次串行 MDS RTT。
-                if data_len > 0 {
-                    self.layout_manager
-                        .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
-                        .await;
-                }
-                // RFC 5661 §18.32.3: if any DS downgraded write stability, COMMIT to MDS.
-                if needs_commit {
-                    let _ = self.commit(fh.clone(), offset, total).await;
-                }
-                PnfsWriteOutcome::Attempted(Ok(total))
-            }
-            Err(e) => {
-                if data_len > 0 {
-                    self.layout_manager
-                        .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
-                        .await;
-                }
-                // Preserve hot-path performance: aggregate diagnostic context
-                // is only materialized when the DS batch actually fails.
+        let completions = settle_ds_batch(futures).await;
+        if completions
+            .iter()
+            .all(|completion| completion.result.is_ok())
+        {
+            let results: Vec<_> = completions
+                .into_iter()
+                .filter_map(|completion| completion.result.ok())
+                .collect();
+            if layout.generation != self.layout_manager.generation() {
+                // This is aggregate pNFS batch context, so slot/sequence are
+                // intentionally zero rather than claiming one DS request.
                 let active_session = self.session_holder.get().await;
                 let context = RequestContext {
                     operation: "pnfs_write".to_string(),
@@ -702,9 +763,62 @@ impl Mount41 {
                     slot_id: 0,
                     sequence_id: 0,
                 };
-                debug!(error = %e, "pNFS write result is uncertain; refusing MDS fallback");
-                PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(context, e)))
+                return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
+                    context,
+                    NfsError::Rpc(
+                        "pNFS WRITE outcome crossed a session generation boundary".to_string(),
+                    ),
+                )));
             }
+            let total: u32 = results.iter().map(|(n, _)| n).sum();
+            let needs_commit = results.iter().any(|(_, c)| *c);
+            // RFC 5661 §18.42.3：LAYOUTCOMMIT 不必每次 WRITE 后发，只需在
+            // LAYOUTRETURN/CLOSE 前提交。这里仅累积 dirty 范围，由
+            // flush_layoutcommit 在 close/layoutreturn 时一次性发送，
+            // 避免每个 wsize 块一次串行 MDS RTT。
+            if data_len > 0 {
+                self.layout_manager
+                    .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
+                    .await;
+            }
+            // RFC 5661 §18.32.3: if any DS downgraded write stability, COMMIT to MDS.
+            if needs_commit {
+                let _ = self.commit(fh.clone(), offset, total).await;
+            }
+            PnfsWriteOutcome::Attempted(Ok(total))
+        } else {
+            if data_len > 0 {
+                self.layout_manager
+                    .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
+                    .await;
+            }
+            if completions.iter().any(|completion| {
+                matches!(
+                    completion.result,
+                    Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE))
+                )
+            }) {
+                self.layout_manager.remove_layout(fh).await;
+                self.layout_manager.invalidate_dirty(fh).await;
+            }
+            let diagnostic = ds_batch_diagnostic(&completions);
+            // Preserve hot-path performance: aggregate diagnostic context
+            // is only materialized when the DS batch actually fails.
+            let active_session = self.session_holder.get().await;
+            let context = RequestContext {
+                operation: "pnfs_write".to_string(),
+                session_id: *active_session.id(),
+                slot_id: 0,
+                sequence_id: 0,
+            };
+            debug!(
+                diagnostic,
+                "pNFS write result is uncertain; refusing MDS fallback"
+            );
+            PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
+                context,
+                NfsError::Rpc(format!("pNFS DS WRITE results: {diagnostic}")),
+            )))
         }
     }
 
@@ -769,7 +883,7 @@ impl Mount41 {
                 b.putfh(fh).layoutreturn(
                     false, // reclaim
                     1,     // LAYOUT4_NFSV4_1_FILES
-                    iomode,
+                    iomode as u32,
                     1,                     // LAYOUTRETURN4_FILE
                     0,                     // offset = whole file
                     0xFFFF_FFFF_FFFF_FFFF, // length = whole file
@@ -788,6 +902,29 @@ impl Mount41 {
         Ok(())
     }
 
+    pub(crate) async fn refresh_layout_for_write(&self, fh: &Bytes, offset: u64) -> Result<()> {
+        if self.layout_manager.get_layout(fh).await.is_none()
+            || !self.layout_manager.layout_refresh_due(fh, offset).await
+        {
+            return Ok(());
+        }
+
+        let _io_guard = self.layout_manager.write_file_io(fh).await;
+        if self.layout_manager.get_layout(fh).await.is_some()
+            && self.layout_manager.layout_refresh_due(fh, offset).await
+        {
+            self.flush_layoutcommit(fh).await?;
+            if self
+                .fetch_layout(fh, IoMode::ReadWrite, offset, true)
+                .await
+                .is_some()
+            {
+                self.layout_manager.record_layout_refresh(fh, offset).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Return all cached layouts to the server (used during umount).
     pub(crate) async fn layoutreturn_all(&self) -> Result<()> {
         let layouts = self.layout_manager.all_layouts().await;
@@ -803,6 +940,11 @@ impl Mount41 {
 mod tests {
     use super::*;
     use crate::nfs41::layout::{IoMode, Layout, LayoutContent, LayoutSegment, LayoutType};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type TestDsFuture = Pin<Box<dyn Future<Output = Result<u32>> + Send>>;
 
     #[test]
     fn find_covering_segment_whole_file() {
@@ -840,6 +982,24 @@ mod tests {
         assert!(find_covering_segment(&layout, 100).is_some());
         assert!(find_covering_segment(&layout, 599).is_some());
         assert!(find_covering_segment(&layout, 600).is_none());
+    }
+
+    #[test]
+    fn find_covering_segment_handles_a_range_ending_past_u64_max() {
+        let layout = Layout {
+            generation: 1,
+            stateid: [0; 16],
+            return_on_close: false,
+            segments: vec![LayoutSegment {
+                offset: u64::MAX - 10,
+                length: 20,
+                iomode: IoMode::ReadWrite,
+                layout_type: LayoutType::NfsV41Files,
+                content: LayoutContent::Opaque(Bytes::new()),
+            }],
+        };
+
+        assert!(find_covering_segment(&layout, u64::MAX).is_some());
     }
 
     #[test]
@@ -903,5 +1063,172 @@ mod tests {
         assert_eq!(outcome.operation_class, OperationClass::ReplaySensitive);
         assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
         assert_eq!(outcome.context().operation, "pnfs_write");
+    }
+
+    #[tokio::test]
+    async fn stale_ds_write_evicts_layout_and_invalidates_old_dirty_range() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"multipart-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [7; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+        manager.mark_dirty(&fh, 0, 4096).await;
+
+        invalidate_layout_after_ds_error(
+            &manager,
+            &fh,
+            &NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE),
+        )
+        .await;
+
+        assert!(manager.get_layout(&fh).await.is_none());
+        assert_eq!(manager.take_dirty(&fh).await, None);
+    }
+
+    #[tokio::test]
+    async fn transport_ds_write_error_retains_layout_for_verification() {
+        let manager = LayoutManager::new(true);
+        let fh = Bytes::from_static(b"ordinary-file");
+        let layout = Layout {
+            generation: manager.generation(),
+            stateid: [8; 16],
+            return_on_close: false,
+            segments: vec![],
+        };
+        manager.store_layout(&fh, layout).await;
+
+        invalidate_layout_after_ds_error(
+            &manager,
+            &fh,
+            &NfsError::Rpc("connection reset after send".to_string()),
+        )
+        .await;
+
+        assert!(manager.get_layout(&fh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn ds_batch_waits_for_success_when_failure_completes_first() {
+        let (failure_seen_tx, failure_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_success_tx, release_success_rx) = tokio::sync::oneshot::channel();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let success_count_task = Arc::clone(&success_count);
+        let futures: Vec<(usize, SocketAddr, TestDsFuture)> = vec![
+            (
+                0,
+                "192.0.2.10:2049".parse().unwrap(),
+                Box::pin(async move {
+                    let _ = failure_seen_tx.send(());
+                    Err(NfsError::Rpc("DS 0 failed".to_string()))
+                }),
+            ),
+            (
+                1,
+                "192.0.2.11:2049".parse().unwrap(),
+                Box::pin(async move {
+                    let _ = release_success_rx.await;
+                    success_count_task.fetch_add(1, Ordering::SeqCst);
+                    Ok(17)
+                }),
+            ),
+        ];
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        assert!(failure_seen_rx.await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(
+            !batch.is_finished(),
+            "early DS failure cancelled a sibling WRITE"
+        );
+        assert_eq!(success_count.load(Ordering::SeqCst), 0);
+        assert!(release_success_tx.send(()).is_ok());
+        let completions = batch.await.unwrap();
+        assert!(
+            matches!(completions[0].result, Err(NfsError::Rpc(ref message)) if message == "DS 0 failed")
+        );
+        assert!(matches!(completions[1].result, Ok(17)));
+        let diagnostic = ds_batch_diagnostic(&completions);
+        assert_eq!(
+            diagnostic,
+            "stripe=0 ds=192.0.2.10:2049 attempted=true outcome=error error=RPC error: DS 0 failed; stripe=1 ds=192.0.2.11:2049 attempted=true outcome=success"
+        );
+        assert!(!diagnostic.contains("file-handle"));
+        assert!(!diagnostic.contains("payload"));
+        assert_eq!(success_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ds_batch_waits_for_failure_when_success_completes_first() {
+        let (success_seen_tx, success_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_failure_tx, release_failure_rx) = tokio::sync::oneshot::channel();
+        let futures: Vec<(usize, SocketAddr, TestDsFuture)> = vec![
+            (
+                0,
+                "192.0.2.10:2049".parse().unwrap(),
+                Box::pin(async move {
+                    let _ = success_seen_tx.send(());
+                    Ok(23)
+                }),
+            ),
+            (
+                1,
+                "192.0.2.11:2049".parse().unwrap(),
+                Box::pin(async move {
+                    let _ = release_failure_rx.await;
+                    Err(NfsError::Rpc("DS 1 failed".to_string()))
+                }),
+            ),
+        ];
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        assert!(success_seen_rx.await.is_ok());
+        tokio::task::yield_now().await;
+        assert!(
+            !batch.is_finished(),
+            "successful stripe hid a pending DS WRITE"
+        );
+        assert!(release_failure_tx.send(()).is_ok());
+        let completions = batch.await.unwrap();
+        assert!(matches!(completions[0].result, Ok(23)));
+        assert!(
+            matches!(completions[1].result, Err(NfsError::Rpc(ref message)) if message == "DS 1 failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_ds_batch_drops_every_pending_write() {
+        struct DropCount(Arc<AtomicUsize>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let futures: Vec<(usize, SocketAddr, TestDsFuture)> = (0..2)
+            .map(|stripe_index| {
+                let started = Arc::clone(&started);
+                let guard = DropCount(Arc::clone(&dropped));
+                let future = Box::pin(async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<u32>>().await
+                }) as TestDsFuture;
+                (stripe_index, "192.0.2.10:2049".parse().unwrap(), future)
+            })
+            .collect();
+
+        let batch = tokio::spawn(settle_ds_batch(futures));
+        while started.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+        batch.abort();
+        let _ = batch.await;
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 }

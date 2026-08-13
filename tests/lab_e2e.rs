@@ -55,6 +55,26 @@ fn validated_pnfs_run_id() -> TestResult<String> {
     Ok(run_id)
 }
 
+fn pnfs_payload_size() -> TestResult<usize> {
+    match env::var("NFS_RS_LAB_PNFS_PAYLOAD_SIZE") {
+        Ok(value) => {
+            let size = value.parse::<usize>()?;
+            ensure(size > 0, "pNFS payload size must be greater than zero")?;
+            Ok(size)
+        }
+        Err(env::VarError::NotPresent) => Ok(PNFS_PAYLOAD_SIZE),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn pnfs_pattern(offset: usize, length: usize) -> Bytes {
+    Bytes::from(
+        (offset..offset + length)
+            .map(|index| ((index * 29 + 43) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+}
+
 async fn cleanup_pnfs_case(mount: &dyn Mount, case_dir: &str, file: &str) {
     let _ = mount.remove_path(file).await;
     let _ = mount.rmdir_path(case_dir).await;
@@ -377,7 +397,7 @@ async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
         mount.mkdir_path(&case_dir, 0o700).await?;
         let created = mount.create_path(&file, Some(0o600)).await?;
         let expected = Bytes::from(
-            (0..PNFS_PAYLOAD_SIZE)
+            (0..pnfs_payload_size()?)
                 .map(|index| ((index * 29 + 43) % 251) as u8)
                 .collect::<Vec<_>>(),
         );
@@ -399,6 +419,59 @@ async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
     .await;
 
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
+    let unmount_result = mount.umount().await;
+    result?;
+    unmount_result?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a NetApp multi-node pNFS FlexGroup lab"]
+async fn nfs_v41_pnfs_multifile_active_layout_refresh() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_PNFS_URL")?;
+    let run_id = validated_pnfs_run_id()?;
+    let case_dir = format!("nfs-rs-pnfs-{run_id}");
+    let mount = parse_url_and_mount(&url).await?;
+    let _ = mount.rmdir_path(&case_dir).await;
+
+    let result = async {
+        mount.mkdir_path(&case_dir, 0o700).await?;
+        for index in 0..16usize {
+            let file = format!("{case_dir}/refresh-{index:02}.bin");
+            let created = mount.create_path(&file, Some(0o600)).await?;
+            let head = pnfs_pattern(index * 64 * 1024, 64 * 1024);
+            let tail = pnfs_pattern((index + 32) * 64 * 1024, 64 * 1024);
+            mount.write(created.fh.clone(), 0, head.clone()).await?;
+            mount
+                .write(created.fh.clone(), 1024 * 1024 * 1024, tail.clone())
+                .await?;
+            mount.close(created.fh).await?;
+
+            let opened = mount.open_path(&file, OPEN_READ).await?;
+            ensure(
+                mount.read(opened.fh.clone(), 0, head.len() as u32).await? == head,
+                format!("active refresh head mismatch for file {index}"),
+            )?;
+            ensure(
+                mount
+                    .read(opened.fh.clone(), 1024 * 1024 * 1024, tail.len() as u32)
+                    .await?
+                    == tail,
+                format!("active refresh tail mismatch for file {index}"),
+            )?;
+            mount.close(opened.fh).await?;
+            mount.remove_path(&file).await?;
+        }
+        eprintln!("pnfs-active-refresh files=16 sparse-boundary=1GiB checksum=ok");
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+
+    let _ = mount.rmdir_path(&case_dir).await;
     let unmount_result = mount.umount().await;
     result?;
     unmount_result?;

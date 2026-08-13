@@ -13,6 +13,7 @@ use crate::mount;
 
 impl Mount41 {
     pub(crate) async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        self.refresh_layout_for_write(&fh, offset).await?;
         let _io_guard = self.layout_manager.read_file_io(&fh).await;
         // Try pNFS parallel write first
         match self.pnfs_write(&fh, offset, data.clone()).await {
