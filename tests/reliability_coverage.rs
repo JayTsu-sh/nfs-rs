@@ -310,7 +310,10 @@ fn netapp_pnfs_lab_contract_is_wired() {
     ] {
         assert!(pnfs_io.contains(test), "missing partial T15 CI test {test}");
     }
-    assert!(pnfs_io.contains("match settle_ds_batch(futures).await"));
+    assert!(pnfs_io.contains("let completions = settle_ds_batch(futures).await"));
+    assert!(pnfs_io.contains("ds_batch_diagnostic(&completions)"));
+    assert!(pnfs_io.contains("attempted=true outcome=success"));
+    assert!(pnfs_io.contains("attempted=true outcome=error"));
     assert!(pnfs_io.contains("RecoveryAction::VerifyThenResume"));
     assert!(layout.contains("PNFS_LAYOUT_REFRESH_INTERVAL"));
     assert!(pnfs_io.contains("refresh_layout_for_write"));

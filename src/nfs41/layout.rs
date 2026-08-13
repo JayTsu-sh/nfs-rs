@@ -59,6 +59,17 @@ pub(crate) struct LayoutSegment {
     pub content: LayoutContent,
 }
 
+impl LayoutSegment {
+    pub(crate) fn covers(&self, offset: u64) -> bool {
+        offset >= self.offset
+            && (self.length == u64::MAX
+                || self
+                    .offset
+                    .checked_add(self.length)
+                    .is_none_or(|end| offset < end))
+    }
+}
+
 /// Decoded layout content (type-specific).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Protocol enum: all variants/fields used during decode + future extensions
@@ -305,16 +316,9 @@ impl LayoutManager {
     /// A bounded segment must not suppress a LAYOUTGET for a later multipart
     /// file range.
     pub async fn get_layout_covering(&self, fh: &Bytes, offset: u64) -> Option<Layout> {
-        self.get_layout(fh).await.filter(|layout| {
-            layout.segments.iter().any(|segment| {
-                offset >= segment.offset
-                    && (segment.length == u64::MAX
-                        || segment
-                            .offset
-                            .checked_add(segment.length)
-                            .is_none_or(|end| offset < end))
-            })
-        })
+        self.get_layout(fh)
+            .await
+            .filter(|layout| layout.segments.iter().any(|segment| segment.covers(offset)))
     }
 
     pub async fn merge_layout(&self, fh: &Bytes, mut update: Layout) {
