@@ -30,6 +30,23 @@ const DS_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// DS 连接 + 会话建立的整体超时（不可达地址快速失败并拉黑）。
 const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+type DataServerInitKey = (u64, SocketAddr);
+type DataServerInitGate = Mutex<()>;
+
+fn should_negative_cache_ds_error(error: &NfsError) -> bool {
+    matches!(
+        error,
+        NfsError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::TimedOut
+            )
+    )
+}
+
 /// pNFS layout types.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,6 +188,9 @@ pub(crate) struct LayoutManager {
     layouts: RwLock<HashMap<Bytes, Layout>>,
     /// Cached connections to data servers (each with its own session).
     data_servers: RwLock<HashMap<SocketAddr, DsConnection>>,
+    /// Singleflight gates for first-use DS session establishment. The key
+    /// includes the MDS generation so recovery never waits behind stale work.
+    data_server_init_gates: Mutex<HashMap<DataServerInitKey, std::sync::Weak<DataServerInitGate>>>,
     /// Cached device info indexed by device ID.
     device_cache: RwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
@@ -210,6 +230,7 @@ impl LayoutManager {
         Self {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
+            data_server_init_gates: Mutex::new(HashMap::new()),
             device_cache: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
             layout_refresh_offsets: RwLock::new(HashMap::new()),
@@ -232,13 +253,33 @@ impl LayoutManager {
         let mut dirty = self.dirty.write().await;
         layouts.clear();
         servers.clear();
+        self.data_server_init_gates.lock().await.clear();
         devices.clear();
         dirty.clear();
+        self.unreachable_ds.write().await.clear();
         self.layout_refresh_offsets.write().await.clear();
     }
 
     pub fn generation(&self) -> u64 {
         self.active_generation.load(Ordering::Acquire)
+    }
+
+    async fn data_server_init_gate(
+        &self,
+        addr: SocketAddr,
+        generation: u64,
+    ) -> Arc<DataServerInitGate> {
+        let mut gates = self.data_server_init_gates.lock().await;
+        if let Some(gate) = gates
+            .get(&(generation, addr))
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert((generation, addr), Arc::downgrade(&gate));
+        gate
     }
 
     async fn file_io_gate(&self, fh: &Bytes) -> Arc<RwLock<()>> {
@@ -492,8 +533,8 @@ impl LayoutManager {
 
     /// Get or create a connection (with session) to a data server.
     ///
-    /// 连接或建会话失败（含超时）时将地址记入不可达负缓存，调用方
-    /// 回退 MDS I/O；mount 生命周期内不再尝试该地址。
+    /// 明确的 endpoint 连接失败（含超时）会进入不可达负缓存；NFS/RPC
+    /// session 协议错误不会污染地址可达性。
     pub async fn get_data_server(
         &self,
         addr: SocketAddr,
@@ -516,13 +557,32 @@ impl LayoutManager {
                 return Ok(conn.clone());
             }
         }
+        let init_gate = self.data_server_init_gate(addr, owner_generation).await;
+        let _init_guard = init_gate.lock().await;
+        if owner_generation != self.generation() {
+            return Err(NfsError::Rpc(
+                "refusing data-server initialization for stale MDS generation".to_string(),
+            ));
+        }
+        // A same-address waiter may have populated the cache while this task
+        // waited for the singleflight leader.
+        {
+            let servers = self.data_servers.read().await;
+            if let Some(conn) = servers
+                .get(&addr)
+                .filter(|conn| conn.owner_generation == owner_generation)
+            {
+                return Ok(conn.clone());
+            }
+        }
         if self.is_ds_unreachable(&addr).await {
             return Err(NfsError::Rpc(format!(
                 "pNFS data server {addr} marked unreachable"
             )));
         }
-        // TCP connect + session establishment OUTSIDE any lock —
-        // can be slow without stalling other I/O.
+        // TCP connect + session establishment holds only this address and
+        // generation's singleflight gate, so other DS endpoints remain fully
+        // concurrent while same-DS cold-start waiters share one session.
         // 整体包超时：server 可能下发不可达网段的 DS 地址（SYN 黑洞时
         // 系统级 connect 超时可达 20s+），失败后拉黑避免每次 I/O 重付。
         let connect_and_establish = async {
@@ -539,7 +599,9 @@ impl LayoutManager {
         let conn = match tokio::time::timeout(DS_CONNECT_TIMEOUT, connect_and_establish).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
-                self.mark_ds_unreachable(addr).await;
+                if should_negative_cache_ds_error(&e) {
+                    self.mark_ds_unreachable(addr).await;
+                }
                 return Err(e);
             }
             Err(_) => {
@@ -549,7 +611,8 @@ impl LayoutManager {
                 )));
             }
         };
-        // Acquire write lock and re-check (another task may have connected concurrently)
+        // The per-address initialization gate makes this the only publisher
+        // for this DS and generation.
         let mut servers = self.data_servers.write().await;
         if self.generation() != owner_generation {
             drop(servers);
@@ -558,18 +621,6 @@ impl LayoutManager {
             return Err(NfsError::Rpc(
                 "discarding data-server connection from stale MDS generation".to_string(),
             ));
-        }
-        if let Some(existing) = servers
-            .get(&addr)
-            .filter(|existing| existing.owner_generation == owner_generation)
-        {
-            // Race: another task already connected; destroy the duplicate
-            // session best-effort and use the existing connection
-            let existing = existing.clone();
-            drop(servers);
-            let auth = auth.clone();
-            tokio::spawn(async move { conn.destroy(&auth).await });
-            return Ok(existing);
         }
         servers.insert(addr, conn.clone());
         info!(addr = %addr, "connected to pNFS data server (session established)");
@@ -1224,6 +1275,60 @@ mod tests {
         // 重复标记幂等
         mgr.mark_ds_unreachable(addr).await;
         assert!(mgr.is_ds_unreachable(&addr).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_start_for_one_ds_is_singleflight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let manager = Arc::new(LayoutManager::new(true));
+        let address: SocketAddr = "192.0.2.10:2049".parse().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..16 {
+            let manager = Arc::clone(&manager);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.spawn(async move {
+                let gate = manager.data_server_init_gate(address, 1).await;
+                let _guard = gate.lock().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn session_protocol_errors_do_not_poison_ds_reachability() {
+        assert!(!should_negative_cache_ds_error(&NfsError::Nfs4(
+            crate::Nfs4ErrorCode::NFS4ERR_BADSESSION,
+        )));
+        assert!(!should_negative_cache_ds_error(&NfsError::Rpc(
+            "CREATE_SESSION sequence race".to_string(),
+        )));
+    }
+
+    #[test]
+    fn endpoint_connectivity_errors_are_negative_cached() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(should_negative_cache_ds_error(&NfsError::Io(
+                std::io::Error::from(kind),
+            )));
+        }
     }
 
     #[tokio::test]
