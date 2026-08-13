@@ -171,14 +171,21 @@ impl DsConnection {
         let builder = CompoundBuilder::new("ds_destroy_session").destroy_session(self.session.id());
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
-        if let Err(e) = self.client.call(buf, 1, DS_TEARDOWN_TIMEOUT).await {
+        if let Err(e) = self
+            .client
+            .call(buf, super::ONE_ATTEMPT, DS_TEARDOWN_TIMEOUT)
+            .await
+        {
             debug!(error = %e, "DS DESTROY_SESSION failed (may already be destroyed)");
         }
         let builder =
             CompoundBuilder::new("ds_destroy_clientid").destroy_client_id(self.session.client_id());
         let mut buf = Vec::new();
         builder.encode_with_header(auth, &mut buf);
-        let _ = self.client.call(buf, 1, DS_TEARDOWN_TIMEOUT).await;
+        let _ = self
+            .client
+            .call(buf, super::ONE_ATTEMPT, DS_TEARDOWN_TIMEOUT)
+            .await;
     }
 }
 

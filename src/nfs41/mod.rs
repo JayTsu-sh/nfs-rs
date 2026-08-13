@@ -37,6 +37,9 @@ pub(crate) const NFS4_COMPOUND_PROC: u32 = 1;
 pub(crate) const NFS4_NULL_PROC: u32 = 0;
 /// Default NFS port for v4.x (no portmapper needed)
 pub(crate) const NFS4_DEFAULT_PORT: u16 = 2049;
+pub(crate) const ONE_ATTEMPT: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::ONE_ATTEMPT;
+pub(crate) const BOOTSTRAP_REPLAY: crate::rpc::ReplayPolicy =
+    crate::rpc::ReplayPolicy::byte_identical(2);
 
 #[cfg(test)]
 mod tests {

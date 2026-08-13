@@ -49,6 +49,32 @@ const IPPROTO_TCP: u32 = 6;
 /// Timeout for portmap queries (lightweight metadata operations).
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Controls whether the RPC transport may retransmit the exact logical request.
+///
+/// A retransmission receives a fresh transport XID, but its encoded RPC body and
+/// optional zero-copy payload remain byte-identical. Protocol engines must opt in
+/// explicitly because only they know whether replay is safe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReplayPolicy {
+    max_attempts: usize,
+}
+
+impl ReplayPolicy {
+    pub(crate) const ONE_ATTEMPT: Self = Self { max_attempts: 1 };
+
+    pub(crate) const fn byte_identical(max_attempts: usize) -> Self {
+        assert!(
+            max_attempts > 1,
+            "byte-identical RPC replay requires at least 2 attempts"
+        );
+        Self { max_attempts }
+    }
+
+    const fn max_attempts(self) -> usize {
+        self.max_attempts
+    }
+}
+
 enum PortmapProc2 {
     Null = 0,
     GetPort = 3,
@@ -119,7 +145,13 @@ async fn portmap_calls(
         &Auth::new_null(),
     )
     .encode(&mut buf);
-    client.call(buf, max_retries, METADATA_TIMEOUT).await?;
+    client
+        .call(
+            buf,
+            ReplayPolicy::byte_identical(max_retries),
+            METADATA_TIMEOUT,
+        )
+        .await?;
 
     // PORTMAP GETPORT
     let args = GETPORT2args {
@@ -138,7 +170,13 @@ async fn portmap_calls(
     };
     let mut buf = Vec::<u8>::new();
     args.encode(&mut buf);
-    let res = client.call(buf, max_retries, METADATA_TIMEOUT).await?;
+    let res = client
+        .call(
+            buf,
+            ReplayPolicy::byte_identical(max_retries),
+            METADATA_TIMEOUT,
+        )
+        .await?;
     Ok(BigEndian::read_u32(&res[..4]) as u16)
 }
 
@@ -711,10 +749,10 @@ impl Client {
     pub(crate) async fn call(
         &self,
         msg_body: Vec<u8>,
-        max_retries: usize,
+        replay_policy: ReplayPolicy,
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
-        self.call_with_data(msg_body, Bytes::new(), max_retries, timeout)
+        self.call_with_data(msg_body, Bytes::new(), replay_policy, timeout)
             .await
     }
 
@@ -725,10 +763,10 @@ impl Client {
         &self,
         msg_body: Vec<u8>,
         data: Bytes,
-        max_retries: usize,
+        replay_policy: ReplayPolicy,
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
-        self.call_with_data_inner(msg_body, data, max_retries, timeout, false)
+        self.call_with_data_inner(msg_body, data, replay_policy, timeout, false)
             .await
     }
 
@@ -737,25 +775,33 @@ impl Client {
         msg_body: Vec<u8>,
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
-        self.call_with_data_inner(msg_body, Bytes::new(), 1, timeout, true)
-            .await
+        self.call_with_data_inner(
+            msg_body,
+            Bytes::new(),
+            ReplayPolicy::ONE_ATTEMPT,
+            timeout,
+            true,
+        )
+        .await
     }
 
     async fn call_with_data_inner(
         &self,
         mut msg_body: Vec<u8>,
         data: Bytes,
-        max_retries: usize,
+        replay_policy: ReplayPolicy,
         timeout: std::time::Duration,
         bypass_readiness: bool,
     ) -> Result<Bytes> {
         const SIZE_HDR_BIT: u32 = 0x80000000;
         const PREFIX_LEN: usize = 12;
 
-        let mut num_retries = 0usize;
+        let max_attempts = replay_policy.max_attempts();
+        let mut attempt = 0usize;
+        let mut last_error = None;
         let start = tokio::time::Instant::now();
-        // Total retry budget: 3x the per-call timeout, so we fail fast instead of
-        // accumulating max_retries * timeout worth of delay.
+        // Total replay budget: 3x the per-attempt timeout, so we fail fast instead
+        // of accumulating max_attempts * timeout worth of delay.
         let max_total = timeout.saturating_mul(3);
 
         // Determine mux from the program field in msg_body (offset 4, big-endian u32).
@@ -777,7 +823,7 @@ impl Client {
         // msg_body[4..8] = xid, written per retry below
         BigEndian::write_u32(&mut msg_body[8..12], MessageType::Request as u32);
 
-        while num_retries < max_retries {
+        while attempt < max_attempts {
             // Bail out if total elapsed time exceeds the budget.
             if start.elapsed() > max_total {
                 break;
@@ -789,8 +835,9 @@ impl Client {
 
             debug!(
                 xid,
-                attempt = num_retries + 1,
-                max_retries,
+                attempt = attempt + 1,
+                max_attempts,
+                ?replay_policy,
                 program,
                 "sending RPC request"
             );
@@ -821,33 +868,43 @@ impl Client {
                         _ => (false, false),
                     };
                     if is_conn_error {
+                        attempt += 1;
+                        if attempt >= max_attempts {
+                            last_error = Some(e);
+                            continue;
+                        }
                         // Connection dead — reconnect then retry.
                         warn!(
                             xid,
-                            attempt = num_retries + 1,
-                            max_retries,
+                            attempt,
+                            max_attempts,
                             error = %e,
                             "RPC call failed (connection error), reconnecting"
                         );
                         let jitter = rand::random_range(0..50u64);
-                        let backoff = std::cmp::min(100u64 << num_retries, 2000) + jitter;
+                        let backoff = std::cmp::min(100u64 << (attempt - 1), 2000) + jitter;
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
                         if let Err(reconn_err) = mux.reconnect(r#gen).await {
                             warn!(error = %reconn_err, "reconnect failed, will retry");
                         }
-                        num_retries += 1;
+                        last_error = Some(e);
                         continue;
                     } else if is_timeout {
+                        attempt += 1;
+                        if attempt >= max_attempts {
+                            last_error = Some(e);
+                            continue;
+                        }
                         // Timeout — server may be slow but connection could still be alive.
                         // Retry without reconnect to avoid killing other in-flight requests.
                         warn!(
                             xid,
-                            attempt = num_retries + 1,
-                            max_retries,
+                            attempt,
+                            max_attempts,
                             error = %e,
                             "RPC call timed out, retrying without reconnect"
                         );
-                        num_retries += 1;
+                        last_error = Some(e);
                         continue;
                     } else {
                         error!(xid, error = %e, "RPC call failed with non-retryable error");
@@ -857,15 +914,18 @@ impl Client {
             }
         }
         error!(
-            max_retries,
+            max_attempts,
+            ?replay_policy,
             elapsed_ms = start.elapsed().as_millis() as u64,
             program,
             "RPC retries exhausted, giving up"
         );
-        Err(NfsError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            "unable to reconnect to NFS server",
-        )))
+        Err(last_error.unwrap_or_else(|| {
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "RPC total attempt budget exhausted",
+            ))
+        }))
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -1245,7 +1305,7 @@ mod tests {
             .call_with_data(
                 body,
                 payload.clone(),
-                2,
+                ReplayPolicy::byte_identical(2),
                 std::time::Duration::from_millis(20),
             )
             .await
@@ -1265,6 +1325,131 @@ mod tests {
         assert_eq!(&first[first.len() - payload.len()..], payload.as_ref());
         assert_eq!(&second[second.len() - payload.len()..], payload.as_ref());
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_attempt_does_not_retransmit_and_preserves_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_test_record(&mut stream).await?;
+            let second = tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                read_test_record(&mut stream),
+            )
+            .await;
+            Ok::<(Vec<u8>, bool), std::io::Error>((first, second.is_ok()))
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(mux, None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+
+        let err = client
+            .call(
+                body,
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .expect_err("an unanswered one-attempt call must time out");
+        assert!(
+            matches!(err, NfsError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut),
+            "one-attempt call must preserve its authoritative timeout: {err}"
+        );
+
+        let (first, saw_second) = server.await.unwrap().unwrap();
+        assert!(!first.is_empty());
+        assert!(!saw_second, "one-attempt policy must not retransmit");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_attempt_connection_failure_does_not_reconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await?;
+            let first = read_test_record(&mut first_stream).await?;
+            drop(first_stream);
+            let reconnected =
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok();
+            Ok::<(Vec<u8>, bool), std::io::Error>((first, reconnected))
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(mux, None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        let err = client
+            .call(
+                body,
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("closed connection must fail the call");
+        assert!(matches!(err, NfsError::Io(_)));
+
+        let (first, reconnected) = server.await.unwrap().unwrap();
+        assert!(!first.is_empty());
+        assert!(!reconnected, "one-attempt policy must not reconnect");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn byte_identical_replay_reconnects_once_after_connection_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await?;
+            let first = read_test_record(&mut first_stream).await?;
+            drop(first_stream);
+
+            let (mut second_stream, _) = listener.accept().await?;
+            let second = read_test_record(&mut second_stream).await?;
+            let xid = BigEndian::read_u32(&second[0..4]);
+            write_test_rpc_reply(&mut second_stream, xid, b"after-reconnect").await?;
+            Ok::<(Vec<u8>, Vec<u8>), std::io::Error>((first, second))
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(mux, None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        let response = client
+            .call(
+                body,
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"after-reconnect"[..]);
+
+        let (first, second) = server.await.unwrap().unwrap();
+        assert_ne!(&first[0..4], &second[0..4], "attempts need fresh XIDs");
+        assert_eq!(&first[4..], &second[4..], "logical request must be stable");
+        client.shutdown().await;
+    }
+
+    #[test]
+    #[should_panic(expected = "requires at least 2 attempts")]
+    fn byte_identical_replay_requires_multiple_attempts() {
+        let _ = ReplayPolicy::byte_identical(1);
     }
 
     #[tokio::test]
@@ -1291,7 +1476,11 @@ mod tests {
         let call_client = client.clone();
         let call = tokio::spawn(async move {
             call_client
-                .call(body, 1, std::time::Duration::from_secs(30))
+                .call(
+                    body,
+                    ReplayPolicy::ONE_ATTEMPT,
+                    std::time::Duration::from_secs(30),
+                )
                 .await
         });
         received_rx.await.unwrap();

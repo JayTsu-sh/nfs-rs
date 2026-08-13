@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{METADATA_TIMEOUT, MOUNT_RETRIES};
+use super::{METADATA_TIMEOUT, MOUNT_REPLAY, MOUNT_RETRIES};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use tracing::{debug, info, warn};
@@ -315,7 +315,7 @@ async fn mount_on_addr(
     .encode(&mut buf);
     encode_dirpath(&mut buf, dir.trim_end_matches('/'));
     // Mount phase: use small retry count for fast failure detection.
-    let mut bytes = client.call(buf, MOUNT_RETRIES, METADATA_TIMEOUT).await?;
+    let mut bytes = client.call(buf, MOUNT_REPLAY, METADATA_TIMEOUT).await?;
     let status =
         mount_mountstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
     match status {
@@ -403,6 +403,12 @@ async fn query_exports_on_addr(
         auth,
     )
     .encode(&mut buf);
-    let mut bytes = client.call(buf, max_retries, METADATA_TIMEOUT).await?;
+    let mut bytes = client
+        .call(
+            buf,
+            crate::rpc::ReplayPolicy::byte_identical(max_retries),
+            METADATA_TIMEOUT,
+        )
+        .await?;
     decode_exports(&mut bytes)
 }

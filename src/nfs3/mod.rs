@@ -219,6 +219,9 @@ fn xdr_string(buf: &mut Vec<u8>, s: &str) {
 const MOUNT_RETRIES: usize = 2;
 // Post-mount NFS operations use a higher retry count for resilience.
 const NFS_RETRIES: usize = 10;
+const MOUNT_REPLAY: crate::rpc::ReplayPolicy =
+    crate::rpc::ReplayPolicy::byte_identical(MOUNT_RETRIES);
+const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
 // Timeout for metadata operations (LOOKUP, GETATTR, READDIR, etc.).
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Base timeout for data operations (READ, WRITE). Scaled up for large payloads.
@@ -249,7 +252,14 @@ macro_rules! nfs3_call {
             let mut buf = Vec::<u8>::new();
             self.pack_nfs3(NFSProc3::$proc, &args, &mut buf);
             tracing::debug!(proc = stringify!($proc), "NFS3 call");
-            let mut bytes = self.rpc.call(buf, NFS_RETRIES, METADATA_TIMEOUT).await?;
+            let mut bytes = self
+                .rpc
+                .call(
+                    buf,
+                    NFS_REPLAY,
+                    METADATA_TIMEOUT,
+                )
+                .await?;
             let status = nfsstat3::try_from(&mut bytes)
                 .map_err(|e| NfsError::Xdr(e.to_string()))?;
             match status {
@@ -296,7 +306,7 @@ impl Mount {
         let mut buf = Vec::<u8>::new();
         self.pack_nfs3(NFSProc3::Null, &args, &mut buf);
         tracing::debug!(proc = "Null", "NFS3 call");
-        let _ = self.rpc.call(buf, NFS_RETRIES, METADATA_TIMEOUT).await?;
+        let _ = self.rpc.call(buf, NFS_REPLAY, METADATA_TIMEOUT).await?;
         tracing::trace!(proc = "Null", "NFS3 call succeeded");
         Ok(())
     }
@@ -317,7 +327,7 @@ impl Mount {
         let mut buf = Vec::<u8>::new();
         self.pack_nfs3(NFSProc3::Read, &args, &mut buf);
         tracing::debug!(proc = "Read", "NFS3 call");
-        let mut bytes = self.rpc.call(buf, NFS_RETRIES, timeout).await?;
+        let mut bytes = self.rpc.call(buf, NFS_REPLAY, timeout).await?;
         let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
         match status {
             nfsstat3::NFS3_OK => {
@@ -354,7 +364,7 @@ impl Mount {
         tracing::debug!(proc = "Write", data_len = data.len(), "NFS3 call");
         let mut bytes = self
             .rpc
-            .call_with_data(buf, data, NFS_RETRIES, timeout)
+            .call_with_data(buf, data, NFS_REPLAY, timeout)
             .await?;
         let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
         match status {

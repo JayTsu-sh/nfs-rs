@@ -680,7 +680,7 @@ async fn send_compound(
 ) -> Result<CompoundResponse> {
     let mut buf = Vec::new();
     builder.encode_with_header(auth, &mut buf);
-    let response_bytes = rpc.call(buf, 2, timeout).await?;
+    let response_bytes = rpc.call(buf, super::BOOTSTRAP_REPLAY, timeout).await?;
     CompoundResponse::decode(response_bytes)
 }
 
@@ -705,7 +705,7 @@ async fn send_compound_on_session(
             session.max_request_size()
         )));
     }
-    let response_bytes = rpc.call(buf, 2, timeout).await?;
+    let response_bytes = rpc.call(buf, super::BOOTSTRAP_REPLAY, timeout).await?;
     let response_size = response_bytes
         .len()
         .checked_add(24)
