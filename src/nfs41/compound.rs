@@ -19,6 +19,9 @@ use bytes::{Buf, Bytes};
 use super::{NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION, NFS41_MINOR_VERSION};
 use crate::error::{NfsError, Result};
 use crate::nfs3::rpc_header;
+use crate::nfs4::compound::{
+    OP_GETFH, OP_LOOKUP, OP_PUTROOTFH, xdr_opaque as xdr_var_bytes, xdr_u32,
+};
 use crate::nfs4::fastxdr::*;
 use crate::rpc::auth::Auth;
 
@@ -38,13 +41,13 @@ pub(crate) enum OpNum {
     Commit = 5,
     Create = 6,
     GetAttr = 9,
-    GetFh = 10,
+    GetFh = OP_GETFH,
     Link = 11,
-    Lookup = 15,
+    Lookup = OP_LOOKUP,
     Lookupp = 16,
     Open = 18,
     PutFh = 22,
-    PutRootFh = 24,
+    PutRootFh = OP_PUTROOTFH,
     Read = 25,
     ReadDir = 26,
     ReadLink = 27,
@@ -139,10 +142,6 @@ impl From<OperationClass> for crate::error::OperationClass {
 
 // ─── XDR encoding helpers (same pattern as nfs3) ─────────────────────────────
 
-fn xdr_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_be_bytes());
-}
-
 fn xdr_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
@@ -153,19 +152,6 @@ fn xdr_i64(buf: &mut Vec<u8>, v: i64) {
 
 fn xdr_bool(buf: &mut Vec<u8>, v: bool) {
     xdr_u32(buf, if v { 1 } else { 0 });
-}
-
-fn xdr_fixed_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    buf.extend_from_slice(data);
-    let pad = (4 - data.len() % 4) % 4;
-    for _ in 0..pad {
-        buf.push(0);
-    }
-}
-
-fn xdr_var_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    xdr_u32(buf, data.len() as u32);
-    xdr_fixed_bytes(buf, data);
 }
 
 fn xdr_string(buf: &mut Vec<u8>, s: &str) {

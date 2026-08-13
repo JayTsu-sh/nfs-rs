@@ -2,6 +2,7 @@
 
 pub(crate) mod acl;
 pub(crate) mod attrs;
+pub(crate) mod compound;
 pub(crate) mod fastxdr;
 pub(crate) mod stateid;
 
