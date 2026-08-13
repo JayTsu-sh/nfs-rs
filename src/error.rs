@@ -142,6 +142,15 @@ pub enum NfsError {
     #[error("NFS4 error: {0}")]
     Nfs4(crate::nfs4::Nfs4ErrorCode),
 
+    /// NFSv4 byte-range lock conflict, including the server-reported range.
+    #[error("NFS4 lock denied: type {lock_type}, offset {offset}, length {length}")]
+    LockDenied {
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+        owner: bytes::Bytes,
+    },
+
     /// MOUNT protocol error (mount_mountstat3).
     #[error("Mount error: {0}")]
     Mount(crate::nfs3::MountErrorCode),
@@ -205,6 +214,7 @@ impl NfsError {
             NfsError::Io(io) => io.kind(),
             NfsError::Nfs3(_) => std::io::ErrorKind::Other,
             NfsError::Nfs4(_) => std::io::ErrorKind::Other,
+            NfsError::LockDenied { .. } => std::io::ErrorKind::WouldBlock,
             NfsError::Mount(_) => std::io::ErrorKind::Other,
             NfsError::Rpc(_) => std::io::ErrorKind::Other,
             NfsError::Xdr(_) => std::io::ErrorKind::Other,
@@ -289,6 +299,9 @@ impl From<NfsError> for std::io::Error {
             NfsError::Io(io) => io,
             NfsError::Nfs3(code) => std::io::Error::other(code),
             NfsError::Nfs4(code) => std::io::Error::other(code),
+            error @ NfsError::LockDenied { .. } => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, error)
+            }
             NfsError::Mount(code) => std::io::Error::other(code),
             NfsError::Rpc(msg) => std::io::Error::other(msg),
             NfsError::Xdr(msg) => std::io::Error::other(msg),

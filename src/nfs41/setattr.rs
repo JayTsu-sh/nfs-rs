@@ -128,6 +128,30 @@ impl Mount41 {
         Ok(())
     }
 
+    pub(crate) async fn lock_test(
+        &self,
+        fh: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCKT requires type 1/2 and non-zero length".to_string(),
+            ));
+        }
+        let client_id = self.session_holder.get().await.client_id();
+        let resp = self
+            .compound("lockt", |b| {
+                b.putfh(&fh)
+                    .lockt(lock_type, offset, length, b"nfs-rs-lockt", client_id)
+            })
+            .await?;
+        resp.op_ok(1)?;
+        resp.op_ok(2)?;
+        Ok(())
+    }
+
     pub(crate) async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         let resp = self
             .compound("commit", |b| b.putfh(&fh).commit(offset, count))

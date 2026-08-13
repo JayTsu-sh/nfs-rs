@@ -119,6 +119,10 @@ impl OpenFile {
     pub(crate) fn into_parts(self) -> (ObjRes, Option<Bytes>) {
         (self.object, self.state)
     }
+
+    pub(crate) fn protocol_state(&self) -> Option<&Bytes> {
+        self.state.as_ref()
+    }
 }
 
 /// A byte-range lock together with everything required to release it safely.
@@ -404,10 +408,25 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         ))
     }
 
-    /// Procedure LOCK acquires a byte-range lock (NFSv4 only; returns Unsupported on NFSv3).
+    /// Procedure LOCK acquires a byte-range lock (NFSv4.0/NFSv4.1 only; Unsupported on NFSv3).
     /// lock_type: 1=READ, 2=WRITE. Returns the lock stateid on success.
     async fn lock(&self, _fh: Bytes, _lock_type: u32, _offset: u64, _length: u64) -> Result<Bytes> {
-        Err(NfsError::Unsupported("LOCK requires NFSv4".to_string()))
+        Err(NfsError::Unsupported(
+            "LOCK requires NFSv4.0 or NFSv4.1".to_string(),
+        ))
+    }
+
+    /// Test whether a byte range can be locked without acquiring it (NFSv4.0/NFSv4.1 LOCKT).
+    async fn lock_test(
+        &self,
+        _fh: Bytes,
+        _lock_type: u32,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<()> {
+        Err(NfsError::Unsupported(
+            "LOCKT requires NFSv4.0 or NFSv4.1".to_string(),
+        ))
     }
 
     /// Procedure LOCKU releases a byte-range lock (NFSv4 only; returns Unsupported on NFSv3).
@@ -432,6 +451,18 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ) -> Result<LockToken> {
         let stateid = self.lock(fh.clone(), lock_type, offset, length).await?;
         Ok(LockToken::new(fh, stateid, lock_type, offset, length, 0, 0))
+    }
+
+    /// Acquire a typed lock through a specific independent open-owner.
+    async fn lock_open_stateful(
+        &self,
+        opened: &OpenFile,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<LockToken> {
+        self.lock_stateful(opened.object.fh.clone(), lock_type, offset, length)
+            .await
     }
 
     /// Release a lock using the opaque token returned by [`Mount::lock_stateful`].

@@ -570,6 +570,7 @@ fn nfs_error_msg(err: &NfsError) -> String {
         NfsError::Io(e) => e.to_string(),
         NfsError::Nfs3(c) => c.to_string(),
         NfsError::Nfs4(c) => c.to_string(),
+        NfsError::LockDenied { .. } => err.to_string(),
         NfsError::Mount(c) => c.to_string(),
         NfsError::Rpc(s)
         | NfsError::Xdr(s)

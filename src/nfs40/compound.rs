@@ -16,6 +16,10 @@ const OP_ACCESS: u32 = 3;
 const OP_COMMIT: u32 = 5;
 const OP_GETATTR: u32 = 9;
 const OP_LINK: u32 = 11;
+const OP_LOCK: u32 = 12;
+const OP_LOCKT: u32 = 13;
+const OP_LOCKU: u32 = 14;
+const OP_RELEASE_LOCKOWNER: u32 = 39;
 const OP_OPEN: u32 = 18;
 const OP_OPEN_CONFIRM: u32 = 20;
 const OP_READ: u32 = 25;
@@ -25,6 +29,8 @@ const OP_RENAME: u32 = 29;
 const OP_SAVEFH: u32 = 32;
 const OP_READLINK: u32 = 27;
 const OP_WRITE: u32 = 38;
+const NFS4ERR_DENIED: u32 = 10010;
+const MAX_LOCK_OWNER_LEN: usize = 1024;
 pub(crate) const OPEN4_RESULT_CONFIRM: u32 = 0x0000_0002;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +47,18 @@ pub(crate) struct OpenArgs<'a> {
     pub owner: &'a [u8],
     pub filename: &'a str,
     pub create: bool,
+}
+
+pub(crate) struct NewLockArgs<'a> {
+    pub lock_type: u32,
+    pub reclaim: bool,
+    pub offset: u64,
+    pub length: u64,
+    pub open_seqid: u32,
+    pub open_stateid: &'a [u8; 16],
+    pub lock_seqid: u32,
+    pub client_id: u64,
+    pub owner: &'a [u8],
 }
 
 pub(crate) struct CompoundBuilder {
@@ -141,6 +159,66 @@ impl CompoundBuilder {
         args.extend_from_slice(&offset.to_be_bytes());
         xdr_u32(&mut args, count);
         self.inner = self.inner.operation(OP_READ, args);
+        self
+    }
+
+    pub(crate) fn lock_new(mut self, lock: NewLockArgs<'_>) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, lock.lock_type);
+        xdr_u32(&mut args, u32::from(lock.reclaim));
+        args.extend_from_slice(&lock.offset.to_be_bytes());
+        args.extend_from_slice(&lock.length.to_be_bytes());
+        xdr_u32(&mut args, 1);
+        xdr_u32(&mut args, lock.open_seqid);
+        args.extend_from_slice(lock.open_stateid);
+        xdr_u32(&mut args, lock.lock_seqid);
+        args.extend_from_slice(&lock.client_id.to_be_bytes());
+        xdr_opaque(&mut args, lock.owner);
+        self.inner = self.inner.operation(OP_LOCK, args);
+        self
+    }
+
+    pub(crate) fn lockt(
+        mut self,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+        client_id: u64,
+        owner: &[u8],
+    ) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, lock_type);
+        args.extend_from_slice(&offset.to_be_bytes());
+        args.extend_from_slice(&length.to_be_bytes());
+        args.extend_from_slice(&client_id.to_be_bytes());
+        xdr_opaque(&mut args, owner);
+        self.inner = self.inner.operation(OP_LOCKT, args);
+        self
+    }
+
+    pub(crate) fn locku(
+        mut self,
+        lock_type: u32,
+        seqid: u32,
+        stateid: &[u8; 16],
+        offset: u64,
+        length: u64,
+    ) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, lock_type);
+        xdr_u32(&mut args, seqid);
+        args.extend_from_slice(stateid);
+        args.extend_from_slice(&offset.to_be_bytes());
+        args.extend_from_slice(&length.to_be_bytes());
+        self.inner = self.inner.operation(OP_LOCKU, args);
+        self
+    }
+
+    pub(crate) fn release_lockowner(mut self, client_id: u64, owner: &[u8]) -> Self {
+        let mut args = Vec::new();
+        args.extend_from_slice(&client_id.to_be_bytes());
+        xdr_opaque(&mut args, owner);
+        self.inner = self.inner.operation(OP_RELEASE_LOCKOWNER, args);
         self
     }
 
@@ -635,6 +713,79 @@ pub(crate) fn decode_link_response(buf: Bytes) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn decode_lock_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
+    decode_lock_denied_result(buf.clone(), opcode, name)?;
+    decode_stateid_response(buf, opcode, name)
+}
+
+pub(crate) fn decode_lockt_response(buf: Bytes) -> Result<()> {
+    decode_lock_denied_result(buf.clone(), OP_LOCKT, "LOCKT")?;
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "LOCKT response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut ops, OP_LOCKT, "LOCKT")
+}
+
+fn decode_lock_denied_result(mut buf: Bytes, opcode: u32, name: &str) -> Result<()> {
+    let overall = take_u32(&mut buf, "COMPOUND status")?;
+    if overall != NFS4ERR_DENIED {
+        return Ok(());
+    }
+    let _tag = take_opaque(&mut buf, "COMPOUND tag")?;
+    let count = take_u32(&mut buf, "COMPOUND result count")?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "{name} denied response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut buf, OP_PUTFH, "PUTFH")?;
+    let actual = take_u32(&mut buf, &format!("{name} opcode"))?;
+    if actual != opcode {
+        return Err(NfsError::Xdr(format!(
+            "expected {name} opcode {opcode}, got {actual}"
+        )));
+    }
+    let status = take_u32(&mut buf, &format!("{name} status"))?;
+    if status != NFS4ERR_DENIED {
+        return Err(NfsError::Xdr(format!(
+            "{name} status {status} does not match denied COMPOUND status"
+        )));
+    }
+    if buf.remaining() < 28 {
+        return Err(NfsError::Xdr(format!("{name} denied range truncated")));
+    }
+    let offset = buf.get_u64();
+    let length = buf.get_u64();
+    let lock_type = buf.get_u32();
+    buf.advance(8); // conflicting owner clientid
+    let owner = take_opaque(&mut buf, &format!("{name} denied owner"))?;
+    if owner.len() > MAX_LOCK_OWNER_LEN {
+        return Err(NfsError::Xdr(format!(
+            "{name} denied owner exceeds {MAX_LOCK_OWNER_LEN} bytes"
+        )));
+    }
+    Err(NfsError::LockDenied {
+        lock_type,
+        offset,
+        length,
+        owner,
+    })
+}
+
+pub(crate) fn decode_release_lockowner_response(buf: Bytes) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 1 {
+        return Err(NfsError::Xdr(format!(
+            "RELEASE_LOCKOWNER response has {count} operations, expected 1"
+        )));
+    }
+    expect_op(&mut ops, OP_RELEASE_LOCKOWNER, "RELEASE_LOCKOWNER")
+}
+
 pub(crate) fn decode_stateid_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
     let (count, mut buf) = response_ops(buf)?;
     if count != 2 {
@@ -1120,6 +1271,189 @@ mod tests {
         assert!(args.ends_with(&[4u32.to_be_bytes().as_slice(), b"file"].concat()));
     }
 
+    #[test]
+    fn lock_operation_arguments_match_rfc7530_vectors() {
+        let new = CompoundBuilder::new("lock")
+            .lock_new(NewLockArgs {
+                lock_type: 2,
+                reclaim: false,
+                offset: 7,
+                length: 11,
+                open_seqid: 3,
+                open_stateid: &[0x41; 16],
+                lock_seqid: 0,
+                client_id: 9,
+                owner: b"owner",
+            })
+            .encode_body();
+        let (opcode, args) = operation_arguments(&new, 0);
+        assert_eq!(opcode, OP_LOCK);
+        assert_eq!(
+            args,
+            [
+                2u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                7u64.to_be_bytes().as_slice(),
+                11u64.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                3u32.to_be_bytes().as_slice(),
+                &[0x41; 16],
+                0u32.to_be_bytes().as_slice(),
+                9u64.to_be_bytes().as_slice(),
+                5u32.to_be_bytes().as_slice(),
+                b"owner",
+                &[0, 0, 0],
+            ]
+            .concat()
+        );
+
+        let test = CompoundBuilder::new("lockt")
+            .lockt(2, 19, 23, 9, b"tester")
+            .encode_body();
+        let (opcode, args) = operation_arguments(&test, 0);
+        assert_eq!(opcode, OP_LOCKT);
+        assert_eq!(
+            args,
+            [
+                2u32.to_be_bytes().as_slice(),
+                19u64.to_be_bytes().as_slice(),
+                23u64.to_be_bytes().as_slice(),
+                9u64.to_be_bytes().as_slice(),
+                6u32.to_be_bytes().as_slice(),
+                b"tester",
+                &[0, 0],
+            ]
+            .concat()
+        );
+        let unlock = CompoundBuilder::new("locku")
+            .locku(2, 5, &[0x43; 16], 29, 31)
+            .encode_body();
+        let (opcode, args) = operation_arguments(&unlock, 0);
+        assert_eq!(opcode, OP_LOCKU);
+        assert_eq!(
+            args,
+            [
+                2u32.to_be_bytes().as_slice(),
+                5u32.to_be_bytes().as_slice(),
+                &[0x43; 16],
+                29u64.to_be_bytes().as_slice(),
+                31u64.to_be_bytes().as_slice(),
+            ]
+            .concat()
+        );
+        let release = CompoundBuilder::new("release")
+            .release_lockowner(9, b"owner")
+            .encode_body();
+        assert_eq!(operation_arguments(&release, 0).0, OP_RELEASE_LOCKOWNER);
+    }
+
+    #[test]
+    fn lock_and_locku_results_preserve_full_stateid() {
+        assert_eq!(
+            decode_lock_response(
+                compound_response("lock", &[(OP_PUTFH, &[]), (OP_LOCK, &[0x51; 16])]),
+                OP_LOCK,
+                "LOCK"
+            )
+            .unwrap(),
+            [0x51; 16]
+        );
+        assert_eq!(
+            decode_lock_response(
+                compound_response("locku", &[(OP_PUTFH, &[]), (OP_LOCKU, &[0x52; 16])]),
+                OP_LOCKU,
+                "LOCKU"
+            )
+            .unwrap(),
+            [0x52; 16]
+        );
+    }
+
+    #[test]
+    fn lock_denied_result_is_validated_before_reporting_conflict() {
+        let mut denied = Vec::new();
+        denied.extend_from_slice(&7u64.to_be_bytes());
+        denied.extend_from_slice(&11u64.to_be_bytes());
+        denied.extend_from_slice(&2u32.to_be_bytes());
+        denied.extend_from_slice(&9u64.to_be_bytes());
+        xdr_opaque(&mut denied, b"conflicting-owner");
+
+        let response = failed_compound_response(
+            "lock",
+            10010,
+            &[(OP_PUTFH, 0, &[]), (OP_LOCK, 10010, &denied)],
+        );
+        assert!(matches!(
+            decode_lock_response(response, OP_LOCK, "LOCK"),
+            Err(NfsError::LockDenied {
+                lock_type: 2,
+                offset: 7,
+                length: 11,
+                ..
+            })
+        ));
+
+        let truncated = failed_compound_response(
+            "lock",
+            10010,
+            &[(OP_PUTFH, 0, &[]), (OP_LOCK, 10010, &denied[..27])],
+        );
+        assert!(matches!(
+            decode_lock_response(truncated, OP_LOCK, "LOCK"),
+            Err(NfsError::Xdr(_))
+        ));
+
+        let lockt = failed_compound_response(
+            "lockt",
+            10010,
+            &[(OP_PUTFH, 0, &[]), (OP_LOCKT, 10010, &denied)],
+        );
+        assert!(matches!(
+            decode_lockt_response(lockt),
+            Err(NfsError::LockDenied {
+                lock_type: 2,
+                offset: 7,
+                length: 11,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lock_result_decoders_reject_truncated_success_arms() {
+        for (opcode, name) in [(OP_LOCK, "LOCK"), (OP_LOCKU, "LOCKU")] {
+            let response = compound_response(name, &[(OP_PUTFH, &[]), (opcode, &[0x51; 15])]);
+            assert!(matches!(
+                decode_lock_response(response, opcode, name),
+                Err(NfsError::Xdr(_))
+            ));
+        }
+
+        let mut truncated =
+            compound_response("lockt", &[(OP_PUTFH, &[]), (OP_LOCKT, &[])]).to_vec();
+        truncated.truncate(truncated.len() - 1);
+        assert!(matches!(
+            decode_lockt_response(Bytes::from(truncated)),
+            Err(NfsError::Xdr(_))
+        ));
+    }
+
+    #[test]
+    fn release_lockowner_result_is_bounded() {
+        decode_release_lockowner_response(compound_response(
+            "release-lockowner",
+            &[(OP_RELEASE_LOCKOWNER, &[])],
+        ))
+        .unwrap();
+        assert!(
+            decode_release_lockowner_response(compound_response(
+                "release-lockowner",
+                &[(OP_RELEASE_LOCKOWNER, &[]), (OP_PUTFH, &[])],
+            ))
+            .is_err()
+        );
+    }
+
     fn compound_response(tag: &str, ops: &[(u32, &[u8])]) -> Bytes {
         let mut wire = Vec::new();
         wire.extend_from_slice(&0u32.to_be_bytes());
@@ -1128,6 +1462,19 @@ mod tests {
         for (opcode, data) in ops {
             wire.extend_from_slice(&opcode.to_be_bytes());
             wire.extend_from_slice(&0u32.to_be_bytes());
+            wire.extend_from_slice(data);
+        }
+        Bytes::from(wire)
+    }
+
+    fn failed_compound_response(tag: &str, status: u32, ops: &[(u32, u32, &[u8])]) -> Bytes {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&status.to_be_bytes());
+        xdr_opaque(&mut wire, tag.as_bytes());
+        wire.extend_from_slice(&(ops.len() as u32).to_be_bytes());
+        for (opcode, op_status, data) in ops {
+            wire.extend_from_slice(&opcode.to_be_bytes());
+            wire.extend_from_slice(&op_status.to_be_bytes());
             wire.extend_from_slice(data);
         }
         Bytes::from(wire)
