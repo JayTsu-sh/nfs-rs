@@ -470,6 +470,7 @@ impl Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
+        self.lease.record_activity();
         Ok(Bytes::copy_from_slice(&stateid))
     }
 
@@ -497,7 +498,7 @@ impl Mount40 {
         let state = Arc::clone(&self.state);
         let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
-        tokio::spawn(async move {
+        let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
                 .open(OpenArgs {
@@ -561,13 +562,15 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
-            Ok(mount::OpenFile::with_protocol_state(
+            Ok::<_, NfsError>(mount::OpenFile::with_protocol_state(
                 mount::ObjRes { fh, attr: None },
                 encode_owner(issuer, owner),
             ))
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))??;
+        self.lease.record_activity();
+        Ok(opened)
     }
 
     async fn commit_verifier(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
@@ -576,9 +579,13 @@ impl Mount40 {
             .commit(offset, count)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("commit", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
-        decode_commit_response(response)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
+        let verifier = decode_commit_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        self.lease.record_activity();
+        Ok(verifier)
     }
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
@@ -608,10 +615,12 @@ impl Mount40 {
             let fh = lane.fh.clone();
             drop(lane);
             state.remove(owner, &fh).await;
-            Ok(())
+            Ok::<_, NfsError>(())
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))??;
+        self.lease.record_activity();
+        Ok(())
     }
 
     async fn readdir_payload(
@@ -626,8 +635,7 @@ impl Mount40 {
             .readdir(cookie, verifier, self.dircount, self.maxcount, bitmap)
             .encode_with_header(&self.auth);
         let payload = decode_readdir_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )?;
         validate_readdir_payload(payload, self.maxcount)
@@ -644,8 +652,7 @@ impl Mount40 {
             .getattr(bitmap)
             .encode_with_header(&self.auth);
         let mut data = decode_getattr_compound(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )?;
         decode_fattr4_envelope(&mut data, label)
@@ -903,6 +910,30 @@ fn classify_create_compound_error(
     }
 }
 
+impl Mount40 {
+    async fn activity_call(
+        &self,
+        request: Vec<u8>,
+        replay: ReplayPolicy,
+        timeout: Duration,
+    ) -> Result<Bytes> {
+        let response = self.rpc.call(request, replay, timeout).await?;
+        self.lease.record_activity();
+        Ok(response)
+    }
+
+    async fn activity_settled_call(
+        &self,
+        request: Vec<u8>,
+        class: OperationClass,
+        context: RequestContext,
+    ) -> Result<Bytes> {
+        let response = settled_call(self.rpc.clone(), request, class, context).await?;
+        self.lease.record_activity();
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl Mount for Mount40 {
     fn health(&self) -> crate::MountHealth {
@@ -924,8 +955,7 @@ impl Mount for Mount40 {
     async fn null(&self) -> Result<()> {
         let mut request = Vec::new();
         crate::nfs3::rpc_header(100003, 4, 0, &self.auth).encode(&mut request);
-        self.rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+        self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         Ok(())
     }
@@ -952,8 +982,7 @@ impl Mount for Mount40 {
             .access(mode)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let (_supported, granted) = decode_access_response(response)?;
         Ok(granted)
@@ -1150,8 +1179,7 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let mut data = decode_getattr_compound(response)?;
         decode_getattr_response(&mut data)
@@ -1185,7 +1213,9 @@ impl Mount for Mount40 {
             .setattr(&stateid, &bitmap, &values)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("setattr", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_setattr_response(response, &bitmap)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
@@ -1245,8 +1275,7 @@ impl Mount for Mount40 {
             )
             .encode_with_header(&self.auth);
         decode_lockt_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )
     }
@@ -1383,7 +1412,9 @@ impl Mount for Mount40 {
             Ok(())
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))??;
+        self.lease.record_activity();
+        Ok(())
     }
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
         if token.issuer != self.issuer || token.generation != self.lease.generation() {
@@ -1413,7 +1444,9 @@ impl Mount for Mount40 {
             .link(dst_filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("link", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_link_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
         self.getattr(src_fh).await
@@ -1443,7 +1476,9 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("symlink", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         let (fh, mut data) = decode_create_response(response.clone())
             .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
         Ok(mount::ObjRes {
@@ -1457,8 +1492,7 @@ impl Mount for Mount40 {
             .readlink()
             .encode_with_header(&self.auth);
         decode_readlink_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )
     }
@@ -1471,8 +1505,7 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let (fh, mut data) = decode_lookup_getattr_response(response)?;
         Ok(mount::ObjRes {
@@ -1522,8 +1555,7 @@ impl Mount for Mount40 {
             .read(&stateid, offset, count)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         decode_read_response(response)
     }
@@ -1595,6 +1627,7 @@ impl Mount for Mount40 {
         if count > data.len() as u32 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
+        self.lease.record_activity();
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -1640,7 +1673,9 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("mkdir", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         let (fh, mut data) = decode_create_response(response.clone())
             .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
         let mut object = mount::ObjRes {
@@ -1670,7 +1705,9 @@ impl Mount for Mount40 {
             .remove(filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("remove", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_remove_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
@@ -1707,7 +1744,9 @@ impl Mount for Mount40 {
             .rename(from_filename, to_filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("rename", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_rename_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
@@ -2080,6 +2119,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_foreground_activity_extends_an_in_flight_renew_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let _ = renew_sent_tx.send(());
+            let null = read_record(&mut stream).await?;
+            reply(&mut stream, &null, &[]).await?;
+            let _ = settle_rx.await;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        renew_sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        mount.null().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_ne!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState,
+            "successful foreground activity did not extend the lease deadline"
+        );
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn expired_renewal_loses_generation_and_gates_stateful_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
@@ -2273,6 +2348,15 @@ mod tests {
                 length: 11,
             })
             .await;
+        let original_lock_token = crate::LockToken::new(
+            Bytes::from_static(b"fh"),
+            Bytes::from_static(&[0x72; 16]),
+            2,
+            7,
+            11,
+            mount.issuer,
+            mount.lease.generation(),
+        );
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let identity = read_record(&mut stream).await?;
@@ -2315,6 +2399,20 @@ mod tests {
                 &reclaim_lock,
                 &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x82; 16])]),
             )
+            .await?;
+            let locku = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x83; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
             .await
         });
         let identity = ClientIdentity {
@@ -2340,8 +2438,12 @@ mod tests {
             mount.state.by_owner(71).await.unwrap().lock().await.stateid,
             [0x81; 16]
         );
-        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
+        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_some());
         assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_some());
+        mount.lease.mark_ready();
+        mount.unlock_stateful(original_lock_token).await.unwrap();
+        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
+        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_none());
         server.await.unwrap().unwrap();
     }
 

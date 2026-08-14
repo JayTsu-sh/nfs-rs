@@ -29,6 +29,7 @@ pub(crate) struct LockLane {
 #[derive(Default)]
 pub(crate) struct LockState {
     lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
+    aliases: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
 }
 
 impl LockState {
@@ -40,11 +41,28 @@ impl LockState {
     }
 
     pub(crate) async fn by_stateid(&self, stateid: &[u8; 16]) -> Option<Arc<Mutex<LockLane>>> {
-        self.lanes.read().await.get(stateid).cloned()
+        if let Some(lane) = self.lanes.read().await.get(stateid).cloned() {
+            return Some(lane);
+        }
+        self.aliases.read().await.get(stateid).cloned()
     }
 
     pub(crate) async fn remove(&self, stateid: &[u8; 16]) {
-        self.lanes.write().await.remove(stateid);
+        let lane = if let Some(lane) = self.lanes.write().await.remove(stateid) {
+            lane
+        } else if let Some(lane) = self.aliases.write().await.remove(stateid) {
+            lane
+        } else {
+            return;
+        };
+        self.lanes
+            .write()
+            .await
+            .retain(|_, candidate| !Arc::ptr_eq(candidate, &lane));
+        self.aliases
+            .write()
+            .await
+            .retain(|_, candidate| !Arc::ptr_eq(candidate, &lane));
     }
 
     pub(crate) async fn has_fh(&self, fh: &Bytes) -> bool {
@@ -88,11 +106,13 @@ impl LockState {
     ) {
         let mut lanes = self.lanes.write().await;
         lanes.remove(&old_stateid);
-        lanes.insert(new_stateid, lane);
+        lanes.insert(new_stateid, Arc::clone(&lane));
+        self.aliases.write().await.insert(old_stateid, lane);
     }
 
     pub(crate) async fn clear(&self) {
         self.lanes.write().await.clear();
+        self.aliases.write().await.clear();
     }
 }
 

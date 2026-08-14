@@ -15,6 +15,7 @@ use crate::rpc::{self, ReplayPolicy};
 
 const RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RENEW_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const RENEW_FORCE_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn renewal_delay(interval: Duration, sample: u16) -> Duration {
     let per_mille = 900 + u32::from(sample) % 201;
@@ -27,16 +28,20 @@ pub(crate) struct LeaseState {
     healthy: AtomicBool,
     lease_seconds: u32,
     renewals: AtomicU64,
+    deadline: watch::Sender<tokio::time::Instant>,
 }
 
 impl LeaseState {
     pub(crate) fn ready(generation: u64, lease_seconds: u32) -> Arc<Self> {
+        let lease_duration = Duration::from_secs(u64::from(lease_seconds));
+        let (deadline, _) = watch::channel(tokio::time::Instant::now() + lease_duration);
         Arc::new(Self {
             lifecycle: AtomicU8::new(MountLifecycleState::Ready as u8),
             generation: AtomicU64::new(generation),
             healthy: AtomicBool::new(true),
             lease_seconds,
             renewals: AtomicU64::new(0),
+            deadline,
         })
     }
 
@@ -105,11 +110,18 @@ impl LeaseState {
         )))
     }
 
-    fn mark_ready(&self) {
+    pub(crate) fn mark_ready(&self) {
+        self.record_activity();
         self.renewals.fetch_add(1, Ordering::AcqRel);
         self.healthy.store(true, Ordering::Release);
         self.lifecycle
             .store(MountLifecycleState::Ready as u8, Ordering::Release);
+    }
+
+    pub(crate) fn record_activity(&self) {
+        let lease_duration = Duration::from_secs(u64::from(self.lease_seconds));
+        self.deadline
+            .send_replace(tokio::time::Instant::now() + lease_duration);
     }
 
     fn mark_suspect(&self) {
@@ -157,6 +169,7 @@ impl LeaseState {
 pub(crate) struct LeaseRenewal {
     handle: Mutex<Option<JoinHandle<()>>>,
     stop: watch::Sender<bool>,
+    rpc: rpc::Client,
 }
 
 pub(crate) type RecoveryHandler =
@@ -172,9 +185,9 @@ impl LeaseRenewal {
         recovery: Option<RecoveryHandler>,
     ) -> Self {
         let (stop, mut stopping) = watch::channel(false);
+        let renewal_rpc = rpc.clone();
+        let mut deadline = state.deadline.subscribe();
         let handle = tokio::spawn(async move {
-            let lease_duration = Duration::from_secs(u64::from(state.lease_seconds));
-            let mut expires_at = tokio::time::Instant::now() + lease_duration;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(renewal_delay(interval, rand::random())) => {}
@@ -194,7 +207,8 @@ impl LeaseRenewal {
                     request_id: None,
                 };
                 let renew = async {
-                    rpc.call(request, ReplayPolicy::byte_identical(2), RENEW_TIMEOUT)
+                    renewal_rpc
+                        .call(request, ReplayPolicy::byte_identical(2), RENEW_TIMEOUT)
                         .await
                         .map_err(|error| {
                             classify_sent_nfs40_error(
@@ -206,19 +220,26 @@ impl LeaseRenewal {
                         .and_then(decode_renew_response)
                 };
                 tokio::pin!(renew);
-                let result = tokio::select! {
-                    result = &mut renew => result,
-                    _ = tokio::time::sleep_until(expires_at) => {
-                        // Fence state at the conservative deadline, but retain
-                        // the sent RPC until it settles instead of cancelling it.
-                        state.mark_lost();
-                        let _ = renew.await;
-                        return;
+                let result = loop {
+                    let expires_at = *deadline.borrow();
+                    tokio::select! {
+                        result = &mut renew => break result,
+                        _ = tokio::time::sleep_until(expires_at) => {
+                            // Fence state at the conservative deadline, but retain
+                            // the sent RPC until it settles instead of cancelling it.
+                            state.mark_lost();
+                            let _ = renew.await;
+                            return;
+                        }
+                        changed = deadline.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
                     }
                 };
                 match result {
                     Ok(()) => {
-                        expires_at = tokio::time::Instant::now() + lease_duration;
                         state.mark_ready();
                     }
                     Err(NfsError::Nfs4(
@@ -228,7 +249,6 @@ impl LeaseRenewal {
                         if let Some(recover) = &recovery {
                             state.mark_recovering();
                             if recover().await.is_ok() {
-                                expires_at = tokio::time::Instant::now() + lease_duration;
                                 state.mark_ready();
                             }
                         } else {
@@ -236,7 +256,7 @@ impl LeaseRenewal {
                         }
                     }
                     Err(_) => {
-                        if tokio::time::Instant::now() >= expires_at {
+                        if tokio::time::Instant::now() >= *deadline.borrow() {
                             state.mark_lost();
                             return;
                         }
@@ -251,6 +271,7 @@ impl LeaseRenewal {
         Self {
             handle: Mutex::new(Some(handle)),
             stop,
+            rpc,
         }
     }
 
@@ -268,8 +289,16 @@ impl LeaseRenewal {
             .await
             .is_err()
         {
-            handle.abort();
-            let _ = handle.await;
+            // Closing the transport gives every pending call an explicit
+            // failure result; abort is only a last bound after that settlement.
+            self.rpc.shutdown().await;
+            if tokio::time::timeout(RENEW_FORCE_SETTLE_TIMEOUT, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
     }
 }
