@@ -110,6 +110,34 @@ impl LeaseState {
         )))
     }
 
+    pub(crate) fn begin_stateful(&self, operation: &str) -> crate::Result<u64> {
+        loop {
+            let before = self.generation();
+            self.gate_stateful(operation)?;
+            let after = self.generation();
+            if before == after {
+                return Ok(after);
+            }
+        }
+    }
+
+    pub(crate) fn finish_stateful(&self, generation: u64, operation: &str) -> crate::Result<()> {
+        if self.validate_stateful(generation, operation).is_ok() {
+            self.record_activity();
+            return Ok(());
+        }
+        self.gate_stateful(operation)
+    }
+
+    pub(crate) fn validate_stateful(&self, generation: u64, operation: &str) -> crate::Result<()> {
+        if self.generation() == generation && self.health().lifecycle == MountLifecycleState::Ready
+        {
+            Ok(())
+        } else {
+            self.gate_stateful(operation)
+        }
+    }
+
     pub(crate) fn mark_ready(&self) {
         self.record_activity();
         self.renewals.fetch_add(1, Ordering::AcqRel);
@@ -160,9 +188,9 @@ impl LeaseState {
 
     pub(crate) fn mark_lost(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
         self.lifecycle
             .store(MountLifecycleState::LostState as u8, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 

@@ -429,13 +429,14 @@ impl Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        self.lease.gate_stateful("lock")?;
+        let expected_generation = self.lease.begin_stateful("lock")?;
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let client_id = self.client_id.load(Ordering::Acquire);
         let locks = Arc::clone(&self.locks);
+        let lease = Arc::clone(&self.lease);
         let stateid = tokio::spawn(async move {
             let mut open = open_lane.lock().await;
             let open_owner = open.owner;
@@ -463,6 +464,7 @@ impl Mount40 {
                 open.next_seqid = open.next_seqid.wrapping_add(1);
             }
             let stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            lease.finish_stateful(expected_generation, "lock")?;
             locks
                 .register(LockLane {
                     owner,
@@ -480,7 +482,6 @@ impl Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
-        self.lease.record_activity();
         Ok(Bytes::copy_from_slice(&stateid))
     }
 
@@ -491,7 +492,7 @@ impl Mount40 {
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
-        self.lease.gate_stateful("open")?;
+        let expected_generation = self.lease.begin_stateful("open")?;
         if !matches!(
             access,
             crate::OPEN_READ | crate::OPEN_WRITE | crate::OPEN_BOTH
@@ -508,6 +509,7 @@ impl Mount40 {
         let state = Arc::clone(&self.state);
         let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
+        let lease = Arc::clone(&self.lease);
         let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
@@ -562,6 +564,7 @@ impl Mount40 {
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
             }
+            lease.finish_stateful(expected_generation, "open")?;
             state
                 .register(OwnerLane {
                     owner,
@@ -579,7 +582,6 @@ impl Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))??;
-        self.lease.record_activity();
         Ok(opened)
     }
 
@@ -594,11 +596,11 @@ impl Mount40 {
             .await?;
         let verifier = decode_commit_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-        self.lease.record_activity();
         Ok(verifier)
     }
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
+        let expected_generation = self.lease.begin_stateful("close")?;
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
@@ -629,7 +631,7 @@ impl Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))??;
-        self.lease.record_activity();
+        self.lease.finish_stateful(expected_generation, "close")?;
         Ok(())
     }
 
@@ -928,7 +930,6 @@ impl Mount40 {
         timeout: Duration,
     ) -> Result<Bytes> {
         let response = self.rpc.call(request, replay, timeout).await?;
-        self.lease.record_activity();
         Ok(response)
     }
 
@@ -939,7 +940,6 @@ impl Mount40 {
         context: RequestContext,
     ) -> Result<Bytes> {
         let response = settled_call(self.rpc.clone(), request, class, context).await?;
-        self.lease.record_activity();
         Ok(response)
     }
 }
@@ -1017,7 +1017,6 @@ impl Mount for Mount40 {
         self.open_stateful(directory.fh, &name, access).await
     }
     async fn close(&self, fh: Bytes) -> Result<()> {
-        self.lease.gate_stateful("close")?;
         if self.locks.has_fh(&fh).await {
             return Err(NfsError::InvalidInput(
                 "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
@@ -1031,7 +1030,6 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
-        self.lease.gate_stateful("close")?;
         let (object, protocol_state) = file.into_parts();
         if self.locks.has_fh(&object.fh).await {
             return Err(NfsError::InvalidInput(
@@ -1058,9 +1056,18 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
-        self.lease.gate_stateful("commit")?;
+        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
+        let expected_generation = if lane.is_some() {
+            Some(self.lease.begin_stateful("commit")?)
+        } else {
+            None
+        };
         let verifier = self.commit_verifier(&fh, offset, count).await?;
-        if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_WRITE).await {
+        if let Some(expected_generation) = expected_generation {
+            self.lease
+                .validate_stateful(expected_generation, "commit")?;
+        }
+        if let Some(lane) = lane {
             let mut lane = lane.lock().await;
             if lane
                 .write_verifier
@@ -1354,7 +1361,7 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        self.lease.gate_stateful("locku")?;
+        let expected_generation = self.lease.begin_stateful("locku")?;
         if lock_stateid.len() != 16 {
             return Err(NfsError::InvalidInput(
                 "lock_stateid must be 16 bytes".into(),
@@ -1423,7 +1430,7 @@ impl Mount for Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))??;
-        self.lease.record_activity();
+        self.lease.finish_stateful(expected_generation, "locku")?;
         Ok(())
     }
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
@@ -1554,11 +1561,12 @@ impl Mount for Mount40 {
         Ok(result)
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
-        self.lease.gate_stateful("read")?;
-        let stateid = if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await {
-            lane.lock().await.stateid
+        let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
+        let (stateid, expected_generation) = if let Some(lane) = lane {
+            let generation = self.lease.begin_stateful("read")?;
+            (lane.lock().await.stateid, Some(generation))
         } else {
-            [0; 16]
+            ([0; 16], None)
         };
         let request = CompoundBuilder::new("read")
             .putfh(&fh)
@@ -1567,10 +1575,14 @@ impl Mount for Mount40 {
         let response = self
             .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
-        decode_read_response(response)
+        let data = decode_read_response(response)?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, "read")?;
+        }
+        Ok(data)
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.lease.gate_stateful("write")?;
+        let expected_generation = self.lease.begin_stateful("write")?;
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
         }
@@ -1637,7 +1649,7 @@ impl Mount for Mount40 {
         if count > data.len() as u32 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
-        self.lease.record_activity();
+        self.lease.finish_stateful(expected_generation, "write")?;
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -2138,7 +2150,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_foreground_activity_extends_an_in_flight_renew_deadline() {
+    async fn successful_stateid_activity_extends_an_in_flight_renew_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        register_scripted_open(&mount, 81, b"fh").await;
+        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let _ = renew_sent_tx.send(());
+            let read = read_record(&mut stream).await?;
+            let mut read_data = Vec::new();
+            read_data.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut read_data, b"x");
+            reply(
+                &mut stream,
+                &read,
+                &compound_result("read", &[(22, &[]), (25, &read_data)]),
+            )
+            .await?;
+            let _ = settle_rx.await;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        renew_sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
+            Bytes::from_static(b"x")
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_ne!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState,
+            "successful foreground activity did not extend the lease deadline"
+        );
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_stateless_activity_does_not_extend_the_lease_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
             .await
@@ -2162,12 +2222,16 @@ mod tests {
         renew_sent_rx.await.unwrap();
         tokio::time::sleep(Duration::from_millis(700)).await;
         mount.null().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_ne!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::LostState,
-            "successful foreground activity did not extend the lease deadline"
-        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stateless NULL incorrectly extended the lease deadline");
         let _ = settle_tx.send(());
         mount.umount().await.unwrap();
         server.await.unwrap().unwrap();
@@ -2181,6 +2245,7 @@ mod tests {
             .unwrap();
         let mount =
             direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        register_scripted_open(&mount, 82, b"fh").await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let renew = read_record(&mut stream).await?;
@@ -2263,6 +2328,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(mount.health().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn late_lock_result_cannot_publish_across_a_generation_fence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 83, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("lock", &[(22, &[]), (12, &[0x8a; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock = tokio::spawn(async move {
+            for_lock
+                .lock_stateful(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost();
+        let _ = reply_tx.send(());
+        let error = lock.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            crate::RecoveryAction::Reopen
+        );
+        assert!(mount.locks.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
