@@ -1042,8 +1042,28 @@ impl Mount40 {
 
 #[async_trait]
 impl Mount for Mount40 {
+    fn capabilities(&self) -> crate::MountCapabilities {
+        crate::MountCapabilities {
+            acl: true,
+            named_attributes: false,
+            locks: true,
+            callbacks: true,
+            delegation_retention: self.callback_state.is_some(),
+            pnfs: false,
+            session_diagnostics: false,
+        }
+    }
+
     fn health(&self) -> crate::MountHealth {
-        self.lease.health()
+        let mut health = self.lease.health();
+        health.callback_healthy = self.callback_state.as_ref().map(|state| state.healthy());
+        health
+    }
+
+    async fn callback_stats(&self) -> crate::CallbackStats {
+        self.callback_state
+            .as_ref()
+            .map_or_else(crate::CallbackStats::default, |state| state.stats())
     }
     fn get_max_read_size(&self) -> u32 {
         self.rsize

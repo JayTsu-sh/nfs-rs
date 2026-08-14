@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,10 @@ pub(crate) struct CallbackState {
     generation: AtomicU64,
     recall_tx: mpsc::Sender<RecallNotification>,
     open_publications: AtomicUsize,
+    recalls_received: AtomicU64,
+    returns_completed: AtomicU64,
+    returns_failed: AtomicU64,
+    healthy: AtomicBool,
 }
 
 pub(crate) struct OpenPublication {
@@ -96,6 +100,10 @@ impl CallbackService {
             generation: AtomicU64::new(0),
             recall_tx,
             open_publications: AtomicUsize::new(0),
+            recalls_received: AtomicU64::new(0),
+            returns_completed: AtomicU64::new(0),
+            returns_failed: AtomicU64::new(0),
+            healthy: AtomicBool::new(true),
         });
         let service_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -136,6 +144,18 @@ impl CallbackService {
 }
 
 impl CallbackState {
+    pub(crate) fn stats(&self) -> crate::CallbackStats {
+        crate::CallbackStats {
+            recalls_received: self.recalls_received.load(Ordering::Relaxed),
+            returns_completed: self.returns_completed.load(Ordering::Relaxed),
+            returns_failed: self.returns_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
     pub(crate) fn begin_open_publication(self: &Arc<Self>) -> OpenPublication {
         self.open_publications.fetch_add(1, Ordering::AcqRel);
         OpenPublication {
@@ -230,6 +250,12 @@ impl CallbackWorker {
                     continue;
                 }
                 let returned = settle_recall(&rpc, &auth, &recall).await.is_ok();
+                if returned {
+                    state.returns_completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    state.returns_failed.fetch_add(1, Ordering::Relaxed);
+                    state.healthy.store(false, Ordering::Release);
+                }
                 let _ =
                     state.finish_recall(&recall.fh, &recall.stateid, recall.generation, returned);
             }
@@ -502,6 +528,7 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                         }) {
                             Ok(()) => {
                                 record.recalling = true;
+                                state.recalls_received.fetch_add(1, Ordering::Relaxed);
                                 0
                             }
                             Err(_) => 10008,
@@ -928,6 +955,14 @@ mod tests {
         assert_eq!(recall.stateid, [0x44; 16]);
         assert_eq!(recall.generation, 7);
         assert!(recalls.try_recv().is_err());
+        assert_eq!(
+            service.state().stats(),
+            crate::CallbackStats {
+                recalls_received: 1,
+                returns_completed: 0,
+                returns_failed: 0,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1072,5 +1107,14 @@ mod tests {
         assert_eq!(round_trip(&mut callback, &call).await, expected);
         assert_eq!(round_trip(&mut callback, &call).await, expected);
         server.await.unwrap();
+        assert_eq!(
+            state.stats(),
+            crate::CallbackStats {
+                recalls_received: 1,
+                returns_completed: 1,
+                returns_failed: 0,
+            }
+        );
+        assert!(state.healthy());
     }
 }
