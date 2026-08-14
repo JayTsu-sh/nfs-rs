@@ -198,6 +198,22 @@ async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
             "NFS40_CALLBACK_FAULT_OUTCOME=GRANTED_CALLBACK_UNREACHABLE url={}",
             urls[primary]
         );
+        if let Ok(trigger) = env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_TRIGGER") {
+            std::fs::write(trigger, b"trigger recall")?;
+            let conflicting = tokio::time::timeout(
+                Duration::from_secs(90),
+                contender.open_path(&filename, OPEN_BOTH),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::other("conflicting OPEN did not recover after callback fault")
+            })??;
+            contender.close(conflicting.fh).await?;
+            ensure(
+                mount.callback_stats().await.recalls_received > 0,
+                "restored callback did not deliver the pending recall",
+            )?;
+        }
     }
     let expected = Bytes::from_static(b"ordinary-io-survives-callback-loss");
     write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;

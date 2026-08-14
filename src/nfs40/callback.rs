@@ -58,7 +58,7 @@ pub(crate) struct CallbackState {
     returns_failed: AtomicU64,
     service_healthy: AtomicBool,
     worker_healthy: AtomicBool,
-    io_gates: Mutex<HashMap<Bytes, Weak<tokio::sync::RwLock<()>>>>,
+    io_gates: Mutex<HashMap<Bytes, Weak<RwLock<()>>>>,
     replies: Mutex<VecDeque<ReplayEntry>>,
 }
 
@@ -1147,14 +1147,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cb_null_round_trips_over_the_published_listener() {
+    async fn rfc7531_cb_null_golden_vector_round_trips() {
         let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
             .await
             .unwrap();
         let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
             .await
             .unwrap();
-        let words = round_trip(&mut stream, &cb_null_call(0x1020_3040)).await;
+        let call = [0x1020_3040, 0, 2, CB_PROGRAM, 1, 0, 0, 0, 0, 0];
+        let words = round_trip(&mut stream, &call).await;
         assert_eq!(words, [0x1020_3040, 1, 0, 0, 0, 0]);
     }
 
@@ -1297,14 +1298,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_cb_compound_echoes_tag_and_rejects_other_minor_versions() {
+    async fn rfc7531_cb_compound_golden_vector_and_minor_version_rejection() {
         let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
             .await
             .unwrap();
         let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
             .await
             .unwrap();
-        for (minor, expected_status) in [(0, 0), (1, 10021)] {
+        let golden = [
+            11,
+            0,
+            2,
+            CB_PROGRAM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            3,
+            u32::from_be_bytes(*b"tag\0"),
+            0,
+            1,
+            0,
+        ];
+        assert_eq!(
+            round_trip(&mut stream, &golden).await,
+            [11, 1, 0, 0, 0, 0, 0, 3, u32::from_be_bytes(*b"tag\0"), 0]
+        );
+        for (minor, expected_status) in [(1, 10021)] {
             let mut call = cb_null_call(11 + minor);
             call[5] = 1;
             call.extend_from_slice(&[3, u32::from_be_bytes(*b"tag\0"), minor, 1, 0]);
@@ -1344,16 +1366,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cb_getattr_rejects_a_file_without_a_write_delegation() {
+    async fn rfc7531_cb_getattr_golden_vector_rejects_a_missing_delegation() {
         let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
             .await
             .unwrap();
         let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
             .await
             .unwrap();
-        let mut call = cb_null_call(19);
-        call[5] = 1;
-        call.extend_from_slice(&[
+        let call = [
+            19,
+            0,
+            2,
+            CB_PROGRAM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
             0, // empty tag
             0, // minor version
             1, // callback ident
@@ -1363,7 +1393,7 @@ mod tests {
             u32::from_be_bytes(*b"fh\0\0"),
             1,    // bitmap word count
             0x18, // change + size
-        ]);
+        ];
         assert_eq!(
             round_trip(&mut stream, &call).await,
             [19, 1, 0, 0, 0, 0, 10001, 0, 1, 3, 10001]
@@ -1371,16 +1401,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cb_recall_rejects_a_file_without_a_delegation() {
+    async fn rfc7531_cb_recall_golden_vector_rejects_a_missing_delegation() {
         let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
             .await
             .unwrap();
         let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
             .await
             .unwrap();
-        let mut call = cb_null_call(23);
-        call[5] = 1;
-        call.extend_from_slice(&[
+        let call = [
+            23,
+            0,
+            2,
+            CB_PROGRAM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
             0, // empty tag
             0, // minor version
             1, // callback ident
@@ -1393,7 +1431,7 @@ mod tests {
             0, // truncate
             2, // filehandle length
             u32::from_be_bytes(*b"fh\0\0"),
-        ]);
+        ];
         assert_eq!(
             round_trip(&mut stream, &call).await,
             [23, 1, 0, 0, 0, 0, 10001, 0, 1, 4, 10001]

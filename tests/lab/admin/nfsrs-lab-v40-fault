@@ -62,9 +62,15 @@ case "$action" in
     fi
     nft add table inet "$table"
     nft "add chain inet $table input { type filter hook input priority -10; policy accept; }"
-    nft add rule inet "$table" input ip saddr "$target_ip" tcp flags \& syn == syn drop
+    nft add rule inet "$table" input ip saddr "$target_ip" tcp flags \& syn == syn counter drop
     printf '%s %s callback\n' "$run_id" "$target_ip" >"$state_file"
     echo "isolated inbound callback SYN packets from $target_ip for $run_id"
+    ;;
+  callback-evidence)
+    [[ -e "$state_file" ]] || exit 1
+    read_owner
+    [[ "$owner_run" == "$run_id" && "$owner_mode" == callback ]] || exit 1
+    nft list chain inet "$table" input | grep -Eq 'counter packets [1-9][0-9]*'
     ;;
   restore)
     [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
