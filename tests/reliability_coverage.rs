@@ -197,6 +197,45 @@ fn nfsv40_experimental_release_contract_is_complete() {
 }
 
 #[test]
+fn nfsv40_release_evidence_is_typed_hashed_and_fail_closed() {
+    let recorder = fs::read_to_string(workspace_path("tests/lab/record-nfsv40-evidence.sh"))
+        .expect("NFSv4.0 evidence recorder readable");
+    let collector = fs::read_to_string(workspace_path(
+        "tests/lab/collect-nfsv40-release-evidence.sh",
+    ))
+    .expect("NFSv4.0 evidence collector readable");
+    let release = include_str!("../.github/workflows/release-validation.yml");
+    let nightly = include_str!("../.github/workflows/nightly.yml");
+
+    for required in [
+        "started_at_utc",
+        "finished_at_utc",
+        "outcome",
+        "exit_code",
+        "command",
+        "sha256",
+    ] {
+        assert!(recorder.contains(required), "recorder lacks {required}");
+    }
+    for evidence in [
+        "semantic",
+        "callback-fault",
+        "lease-fault",
+        "performance",
+        "cleanup",
+    ] {
+        let invocation = format!("record-nfsv40-evidence.sh \"$evidence_dir\" {evidence}");
+        assert!(
+            release.contains(&invocation) && nightly.contains(&invocation),
+            "workflows do not record {evidence} evidence"
+        );
+        assert!(collector.contains(evidence), "collector lacks {evidence}");
+    }
+    assert!(collector.contains("missing required NFSv4.0 evidence"));
+    assert!(collector.contains("SHA256SUMS"));
+}
+
+#[test]
 fn nfsv40_performance_gate_covers_four_workload_quadrants() {
     let baseline: Value = serde_json::from_slice(
         &fs::read(workspace_path("tests/lab/nfsv40-performance-baseline.json"))

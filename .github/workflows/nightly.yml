@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 120
     env:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      NFS_RS_LAB_V40_EVIDENCE_DIR: ${{ runner.temp }}/nfsv40-evidence-records
     steps:
       - uses: actions/checkout@v5
       - run: tests/lab/health-check.sh
@@ -61,11 +62,25 @@ jobs:
         run: cargo test --locked --test reliability_coverage -- --nocapture
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.0 mount and traversal E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
+        run: |
+          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
+          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" semantic flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
       - name: NetApp NFSv4.0 callback fault E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$RUN_ID"
+        run: |
+          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
+          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" callback-fault flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.0 performance matrix
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-performance.sh "$RUN_ID"
+        run: |
+          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
+          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" performance flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-performance.sh "$RUN_ID"
+      - name: NetApp NFSv4.0 below/above lease partition E2E
+        run: |
+          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
+          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" lease-fault flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
+      - name: Record NetApp NFSv4.0 cleanup evidence
+        run: |
+          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
+          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" cleanup sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
       - name: Collect NFSv4.0 release evidence
         if: always()
         run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" "$RUNNER_TEMP/nfsv40-release-evidence"
@@ -75,8 +90,6 @@ jobs:
         with:
           name: nfsv40-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nfsv40-release-evidence
-      - name: NetApp NFSv4.0 below/above lease partition E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 negotiated channel limits E2E
