@@ -42,7 +42,6 @@ struct Mount40 {
     root_fh: Bytes,
     client_id: u64,
     issuer: u64,
-    generation: u64,
     next_owner: AtomicU64,
     state: Arc<OpenState>,
     locks: Arc<LockState>,
@@ -116,6 +115,14 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let lease_time = query_lease_time(&rpc, &auth, &root_fh).await?;
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
+    let reconnect_lease = Arc::clone(&lease);
+    rpc.set_reconnect_handler(move |_client, _generation| {
+        let lease = Arc::clone(&reconnect_lease);
+        async move {
+            lease.mark_reconnecting();
+            Ok(())
+        }
+    })?;
     let renewal = LeaseRenewal::start(
         rpc.clone(),
         auth.clone(),
@@ -130,7 +137,6 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         root_fh,
         client_id,
         issuer: rand::random(),
-        generation,
         next_owner: AtomicU64::new(1),
         state: Arc::new(OpenState::default()),
         locks: Arc::new(LockState::default()),
@@ -248,6 +254,7 @@ impl Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
+        self.lease.gate_stateful("lock")?;
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
         let rpc = self.rpc.clone();
@@ -306,6 +313,7 @@ impl Mount40 {
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
+        self.lease.gate_stateful("open")?;
         if !matches!(
             access,
             crate::OPEN_READ | crate::OPEN_WRITE | crate::OPEN_BOTH
@@ -756,7 +764,12 @@ impl Mount for Mount40 {
     }
 
     async fn umount(&self) -> Result<()> {
+        self.lease.mark_closing();
+        if let Some(renewal) = &self._renewal {
+            renewal.stop();
+        }
         self.rpc.shutdown().await;
+        self.lease.mark_closed();
         Ok(())
     }
 
@@ -798,6 +811,7 @@ impl Mount for Mount40 {
         self.open_stateful(directory.fh, &name, access).await
     }
     async fn close(&self, fh: Bytes) -> Result<()> {
+        self.lease.gate_stateful("close")?;
         if self.locks.has_fh(&fh).await {
             return Err(NfsError::InvalidInput(
                 "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
@@ -811,6 +825,7 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
+        self.lease.gate_stateful("close")?;
         let (object, protocol_state) = file.into_parts();
         if self.locks.has_fh(&object.fh).await {
             return Err(NfsError::InvalidInput(
@@ -837,6 +852,7 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
+        self.lease.gate_stateful("commit")?;
         let verifier = self.commit_verifier(&fh, offset, count).await?;
         if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_WRITE).await {
             let mut lane = lane.lock().await;
@@ -1082,7 +1098,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.generation,
+            self.lease.generation(),
         ))
     }
     async fn lock_open_stateful(
@@ -1121,7 +1137,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.generation,
+            self.lease.generation(),
         ))
     }
     async fn locku(
@@ -1132,6 +1148,7 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<()> {
+        self.lease.gate_stateful("locku")?;
         if lock_stateid.len() != 16 {
             return Err(NfsError::InvalidInput(
                 "lock_stateid must be 16 bytes".into(),
@@ -1202,7 +1219,7 @@ impl Mount for Mount40 {
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))?
     }
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
-        if token.issuer != self.issuer || token.generation != self.generation {
+        if token.issuer != self.issuer || token.generation != self.lease.generation() {
             return Err(NfsError::InvalidInput(
                 "lock token belongs to another mount generation".into(),
             ));
@@ -1327,6 +1344,7 @@ impl Mount for Mount40 {
         Ok(result)
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        self.lease.gate_stateful("read")?;
         let stateid = if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await {
             lane.lock().await.stateid
         } else {
@@ -1343,6 +1361,7 @@ impl Mount for Mount40 {
         decode_read_response(response)
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        self.lease.gate_stateful("write")?;
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
         }
@@ -1614,7 +1633,6 @@ mod tests {
             root_fh: Bytes::from_static(b"root"),
             client_id: 7,
             issuer: 9,
-            generation: 1,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
             locks: Arc::new(LockState::default()),
@@ -1629,6 +1647,15 @@ mod tests {
 
     fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
         let lease = LeaseState::ready(1, 60);
+        let reconnect_lease = Arc::clone(&lease);
+        rpc.set_reconnect_handler(move |_client, _generation| {
+            let lease = Arc::clone(&reconnect_lease);
+            async move {
+                lease.mark_reconnecting();
+                Ok(())
+            }
+        })
+        .unwrap();
         let renewal = LeaseRenewal::start(
             rpc.clone(),
             Auth::new_null(),
@@ -1642,7 +1669,6 @@ mod tests {
             root_fh: Bytes::from_static(b"root"),
             client_id: 7,
             issuer: 9,
-            generation: 1,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
             locks: Arc::new(LockState::default()),
@@ -1703,7 +1729,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoritative_renewal_failure_marks_public_health_suspect() {
+    async fn renewal_reconnects_with_byte_identical_request_and_preserves_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await?;
+            let original = read_record(&mut first).await?;
+            socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await?;
+            let replay = read_record(&mut second).await?;
+            assert_eq!(&original[4..], &replay[4..]);
+            reply(
+                &mut second,
+                &replay,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            let health = mount.health();
+            if health.lease_renewals == 1 {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
+                assert_eq!(health.generation, 1);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("replayed RENEW did not restore healthy lease state");
+    }
+
+    #[tokio::test]
+    async fn expired_renewal_loses_generation_and_gates_stateful_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
             .await
@@ -1725,12 +1788,49 @@ mod tests {
         for _ in 0..100 {
             let health = mount.health();
             if health.lease_healthy == Some(false) {
-                assert_eq!(health.lifecycle, crate::MountLifecycleState::Suspect);
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::LostState);
+                assert_eq!(health.generation, 2);
+                let error = mount
+                    .read(Bytes::from_static(b"fh"), 0, 1)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.operation_outcome().unwrap().recovery,
+                    crate::RecoveryAction::Reopen
+                );
+                let stale = crate::LockToken::new(
+                    Bytes::from_static(b"fh"),
+                    Bytes::from_static(&[0x31; 16]),
+                    2,
+                    0,
+                    1,
+                    mount.issuer,
+                    1,
+                );
+                assert!(mount.unlock_stateful(stale).await.is_err());
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        panic!("failed RENEW was not reflected in public health");
+        panic!("expired RENEW was not reflected in public health");
+    }
+
+    #[tokio::test]
+    async fn public_umount_stops_renewal_and_reports_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        mount.umount().await.unwrap();
+        let health = mount.health();
+        assert_eq!(health.lifecycle, crate::MountLifecycleState::Closed);
+        assert_eq!(health.lease_healthy, Some(false));
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 1).await.is_err());
+        accepted.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2772,7 +2872,7 @@ mod tests {
             0,
             1,
             mount.issuer,
-            mount.generation + 1,
+            mount.lease.generation() + 1,
         );
         assert!(mount.unlock_stateful(stale).await.is_err());
     }

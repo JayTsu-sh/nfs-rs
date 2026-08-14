@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 
 use super::compound::{CompoundBuilder, decode_renew_response};
 use crate::error::{NfsError, OperationClass, RequestContext, classify_sent_nfs40_error};
+use crate::error::{OperationOutcome, OperationOutcomeError, RecoveryAction};
 use crate::mount::{MountHealth, MountLifecycleState, NFSVersion};
 use crate::rpc::auth::Auth;
 use crate::rpc::{self, ReplayPolicy};
@@ -43,6 +44,18 @@ impl LeaseState {
                 value if value == MountLifecycleState::Suspect as u8 => {
                     MountLifecycleState::Suspect
                 }
+                value if value == MountLifecycleState::Reconnecting as u8 => {
+                    MountLifecycleState::Reconnecting
+                }
+                value if value == MountLifecycleState::Recovering as u8 => {
+                    MountLifecycleState::Recovering
+                }
+                value if value == MountLifecycleState::Reclaiming as u8 => {
+                    MountLifecycleState::Reclaiming
+                }
+                value if value == MountLifecycleState::LostState as u8 => {
+                    MountLifecycleState::LostState
+                }
                 value if value == MountLifecycleState::Closing as u8 => {
                     MountLifecycleState::Closing
                 }
@@ -57,6 +70,38 @@ impl LeaseState {
         }
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn gate_stateful(&self, operation: &str) -> crate::Result<()> {
+        let health = self.health();
+        if health.lifecycle == MountLifecycleState::Ready {
+            return Ok(());
+        }
+        let recovery = if health.lifecycle == MountLifecycleState::LostState {
+            RecoveryAction::Reopen
+        } else {
+            RecoveryAction::VerifyThenResume
+        };
+        Err(NfsError::OperationOutcome(Box::new(
+            OperationOutcomeError::new(
+                OperationOutcome::Uncertain,
+                OperationClass::ReplaySensitive,
+                recovery,
+                RequestContext {
+                    operation: operation.into(),
+                    protocol: NFSVersion::NFSv4p0,
+                    request_id: None,
+                },
+                NfsError::Rpc(format!(
+                    "NFSv4.0 state-dependent operation gated while mount is {:?}",
+                    health.lifecycle
+                )),
+            ),
+        )))
+    }
+
     fn mark_ready(&self) {
         self.renewals.fetch_add(1, Ordering::AcqRel);
         self.healthy.store(true, Ordering::Release);
@@ -68,6 +113,30 @@ impl LeaseState {
         self.healthy.store(false, Ordering::Release);
         self.lifecycle
             .store(MountLifecycleState::Suspect as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_reconnecting(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.lifecycle
+            .store(MountLifecycleState::Reconnecting as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_closing(&self) {
+        self.lifecycle
+            .store(MountLifecycleState::Closing as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_closed(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.lifecycle
+            .store(MountLifecycleState::Closed as u8, Ordering::Release);
+    }
+
+    fn mark_lost(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.lifecycle
+            .store(MountLifecycleState::LostState as u8, Ordering::Release);
     }
 }
 
@@ -95,7 +164,7 @@ impl LeaseRenewal {
                     request_id: None,
                 };
                 let result = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, RENEW_TIMEOUT)
+                    .call(request, ReplayPolicy::byte_identical(2), RENEW_TIMEOUT)
                     .await
                     .map_err(|error| {
                         classify_sent_nfs40_error(OperationClass::SessionControl, context, error)
@@ -103,6 +172,10 @@ impl LeaseRenewal {
                     .and_then(decode_renew_response);
                 match result {
                     Ok(()) => state.mark_ready(),
+                    Err(NfsError::Nfs4(
+                        crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+                        | crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID,
+                    )) => state.mark_lost(),
                     Err(NfsError::Nfs4(_)) | Err(NfsError::OperationOutcome(_)) => {
                         state.mark_suspect()
                     }
@@ -112,11 +185,15 @@ impl LeaseRenewal {
         });
         Self { handle }
     }
+
+    pub(crate) fn stop(&self) {
+        self.handle.abort();
+    }
 }
 
 impl Drop for LeaseRenewal {
     fn drop(&mut self) {
-        self.handle.abort();
+        self.stop();
     }
 }
 
