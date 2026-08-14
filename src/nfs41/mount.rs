@@ -1785,6 +1785,9 @@ impl crate::Mount for Mount41Wrapper {
     async fn lock(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<Bytes> {
         self.m.lock(fh, lock_type, offset, length).await
     }
+    async fn lock_test(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
+        self.m.lock_test(fh, lock_type, offset, length).await
+    }
     async fn lock_stateful(
         &self,
         fh: Bytes,

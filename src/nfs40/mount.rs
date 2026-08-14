@@ -9,16 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, OpenArgs, SetClientIdArgs,
+    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
     decode_confirm_response, decode_create_response,
-    decode_getattr_response as decode_getattr_compound, decode_link_response,
-    decode_lookup_getattr_response, decode_open_response, decode_read_response,
-    decode_readdir_response, decode_readlink_response, decode_remove_response,
-    decode_rename_response, decode_setattr_response, decode_setclientid_response,
-    decode_stateid_response, decode_write_response, open_succeeded_before_compound_failure,
+    decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
+    decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
+    decode_read_response, decode_readdir_response, decode_readlink_response,
+    decode_release_lockowner_response, decode_remove_response, decode_rename_response,
+    decode_setattr_response, decode_setclientid_response, decode_stateid_response,
+    decode_write_response, open_succeeded_before_compound_failure,
 };
-use super::state::{OpenState, OwnerLane, decode_owner, encode_owner};
+use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
 use crate::nfs4::attrs::{
@@ -40,8 +41,10 @@ struct Mount40 {
     root_fh: Bytes,
     client_id: u64,
     issuer: u64,
+    generation: u64,
     next_owner: AtomicU64,
     state: Arc<OpenState>,
+    locks: Arc<LockState>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
@@ -114,8 +117,10 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         root_fh,
         client_id,
         issuer: rand::random(),
+        generation: 1,
         next_owner: AtomicU64::new(1),
         state: Arc::new(OpenState::default()),
+        locks: Arc::new(LockState::default()),
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
@@ -168,6 +173,17 @@ fn context(
     )
 }
 
+fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
+    match result {
+        Ok(_) | Err(NfsError::LockDenied { .. }) => true,
+        Err(NfsError::Nfs4(status)) => !matches!(
+            *status as u32,
+            10022 | 10023 | 10025 | 10026 | 10036 | 10018 | 10020 | 10019
+        ),
+        Err(_) => false,
+    }
+}
+
 async fn settled_call(
     rpc: rpc::Client,
     request: Vec<u8>,
@@ -184,6 +200,65 @@ async fn settled_call(
 }
 
 impl Mount40 {
+    async fn acquire_lock(
+        &self,
+        open_lane: Arc<tokio::sync::Mutex<OwnerLane>>,
+        fh: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes> {
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let client_id = self.client_id;
+        let locks = Arc::clone(&self.locks);
+        let stateid = tokio::spawn(async move {
+            let mut open = open_lane.lock().await;
+            let request = CompoundBuilder::new("lock")
+                .putfh(&fh)
+                .lock_new(NewLockArgs {
+                    lock_type,
+                    reclaim: false,
+                    offset,
+                    length,
+                    open_seqid: open.next_seqid,
+                    open_stateid: &open.stateid,
+                    lock_seqid: 0,
+                    client_id,
+                    owner: &owner_wire,
+                })
+                .encode_with_header(&auth);
+            let (class, ctx) = context("lock", owner, 0, OperationClass::ReplaySensitive);
+            let response = rpc
+                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let decoded = decode_lock_response(response, 12, "LOCK");
+            if consumes_owner_seqid(&decoded) {
+                open.next_seqid = open.next_seqid.wrapping_add(1);
+            }
+            let stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            locks
+                .register(LockLane {
+                    owner,
+                    owner_wire,
+                    next_seqid: 1,
+                    stateid,
+                    fh,
+                    lock_type,
+                    offset,
+                    length,
+                })
+                .await;
+            Ok::<_, NfsError>(stateid)
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
+        Ok(Bytes::copy_from_slice(&stateid))
+    }
+
     async fn open_file(
         &self,
         dir_fh: Bytes,
@@ -680,6 +755,11 @@ impl Mount for Mount40 {
         self.open_stateful(directory.fh, &name, access).await
     }
     async fn close(&self, fh: Bytes) -> Result<()> {
+        if self.locks.has_fh(&fh).await {
+            return Err(NfsError::InvalidInput(
+                "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
+            ));
+        }
         let lane = self
             .state
             .for_fh(&fh, crate::OPEN_BOTH)
@@ -689,6 +769,11 @@ impl Mount for Mount40 {
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
         let (object, protocol_state) = file.into_parts();
+        if self.locks.has_fh(&object.fh).await {
+            return Err(NfsError::InvalidInput(
+                "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
+            ));
+        }
         let state = protocol_state
             .ok_or_else(|| NfsError::InvalidInput("open file has no NFSv4.0 owner state".into()))?;
         let (issuer, owner) = decode_owner(&state)
@@ -897,6 +982,196 @@ impl Mount for Mount40 {
         };
         self.setattr(object.fh, guard, mode, uid, gid, size, atime, mtime)
             .await
+    }
+    async fn lock(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<Bytes> {
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCK requires type 1/2 and non-zero length".into(),
+            ));
+        }
+        let access = if lock_type == 1 {
+            crate::OPEN_READ
+        } else {
+            crate::OPEN_WRITE
+        };
+        let open_lane = self.state.for_fh(&fh, access).await.ok_or_else(|| {
+            NfsError::InvalidInput("NFSv4.0 LOCK requires a compatible open file".into())
+        })?;
+        self.acquire_lock(open_lane, fh, lock_type, offset, length)
+            .await
+    }
+    async fn lock_test(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCKT requires type 1/2 and non-zero length".into(),
+            ));
+        }
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        let owner_wire = format!("nfs-rs-lockt-{:016x}-{owner:016x}", self.issuer);
+        let request = CompoundBuilder::new("lockt")
+            .putfh(&fh)
+            .lockt(
+                lock_type,
+                offset,
+                length,
+                self.client_id,
+                owner_wire.as_bytes(),
+            )
+            .encode_with_header(&self.auth);
+        decode_lockt_response(
+            self.rpc
+                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                .await?,
+        )
+    }
+    async fn lock_stateful(
+        &self,
+        fh: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<crate::LockToken> {
+        let stateid = self.lock(fh.clone(), lock_type, offset, length).await?;
+        Ok(crate::LockToken::new(
+            fh,
+            stateid,
+            lock_type,
+            offset,
+            length,
+            self.issuer,
+            self.generation,
+        ))
+    }
+    async fn lock_open_stateful(
+        &self,
+        opened: &mount::OpenFile,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<crate::LockToken> {
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCK requires type 1/2 and non-zero length".into(),
+            ));
+        }
+        let (issuer, owner) = opened
+            .protocol_state()
+            .and_then(decode_owner)
+            .ok_or_else(|| {
+                NfsError::InvalidInput("open token has no NFSv4.0 owner state".into())
+            })?;
+        if issuer != self.issuer {
+            return Err(NfsError::InvalidInput(
+                "open token belongs to another mount generation".into(),
+            ));
+        }
+        let lane = self.state.by_owner(owner).await.ok_or_else(|| {
+            NfsError::InvalidInput("open token is stale or already closed".into())
+        })?;
+        let stateid = self
+            .acquire_lock(lane, opened.object.fh.clone(), lock_type, offset, length)
+            .await?;
+        Ok(crate::LockToken::new(
+            opened.object.fh.clone(),
+            stateid,
+            lock_type,
+            offset,
+            length,
+            self.issuer,
+            self.generation,
+        ))
+    }
+    async fn locku(
+        &self,
+        fh: Bytes,
+        lock_stateid: Bytes,
+        lock_type: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        if lock_stateid.len() != 16 {
+            return Err(NfsError::InvalidInput(
+                "lock_stateid must be 16 bytes".into(),
+            ));
+        }
+        let mut stateid = [0; 16];
+        stateid.copy_from_slice(&lock_stateid);
+        let lane = self.locks.by_stateid(&stateid).await.ok_or_else(|| {
+            NfsError::InvalidInput("NFSv4.0 lock state is unknown or already released".into())
+        })?;
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let locks = Arc::clone(&self.locks);
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let mut lane = lane.lock().await;
+            if lane.fh != fh
+                || lane.lock_type != lock_type
+                || lane.offset != offset
+                || lane.length != length
+            {
+                return Err(NfsError::InvalidInput(
+                    "LOCKU parameters do not match the acquired lock".into(),
+                ));
+            }
+            let request = CompoundBuilder::new("locku")
+                .putfh(&fh)
+                .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
+                .encode_with_header(&auth);
+            let (class, ctx) = context(
+                "locku",
+                lane.owner,
+                lane.next_seqid,
+                OperationClass::ReplaySensitive,
+            );
+            let response = rpc
+                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let old_stateid = lane.stateid;
+            let owner = lane.owner;
+            let owner_wire = lane.owner_wire.clone();
+            let decoded = decode_lock_response(response, 14, "LOCKU");
+            if consumes_owner_seqid(&decoded) {
+                lane.next_seqid = lane.next_seqid.wrapping_add(1);
+            }
+            lane.stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            drop(lane);
+            locks.remove(&old_stateid).await;
+            let cleanup = CompoundBuilder::new("release-lockowner")
+                .release_lockowner(client_id, &owner_wire)
+                .encode_with_header(&auth);
+            let (class, ctx) = context(
+                "release_lockowner",
+                owner,
+                0,
+                OperationClass::ReplaySensitive,
+            );
+            let response = rpc
+                .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            decode_release_lockowner_response(response)
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))?
+    }
+    async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
+        if token.issuer != self.issuer || token.generation != self.generation {
+            return Err(NfsError::InvalidInput(
+                "lock token belongs to another mount generation".into(),
+            ));
+        }
+        self.locku(
+            token.fh,
+            token.stateid,
+            token.lock_type,
+            token.offset,
+            token.length,
+        )
+        .await
     }
     async fn link(
         &self,
@@ -1242,6 +1517,37 @@ mod tests {
         result
     }
 
+    fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
+        let mut denied = Vec::new();
+        denied.extend_from_slice(&7u64.to_be_bytes());
+        denied.extend_from_slice(&11u64.to_be_bytes());
+        denied.extend_from_slice(&2u32.to_be_bytes());
+        denied.extend_from_slice(&99u64.to_be_bytes());
+        xdr_opaque(&mut denied, b"holder");
+        let mut result = Vec::new();
+        result.extend_from_slice(&10010u32.to_be_bytes());
+        xdr_opaque(&mut result, tag.as_bytes());
+        result.extend_from_slice(&2u32.to_be_bytes());
+        result.extend_from_slice(&22u32.to_be_bytes());
+        result.extend_from_slice(&0u32.to_be_bytes());
+        result.extend_from_slice(&opcode.to_be_bytes());
+        result.extend_from_slice(&10010u32.to_be_bytes());
+        result.extend_from_slice(&denied);
+        result
+    }
+
+    fn failed_lock_result(tag: &str, opcode: u32, status: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&status.to_be_bytes());
+        xdr_opaque(&mut result, tag.as_bytes());
+        result.extend_from_slice(&2u32.to_be_bytes());
+        result.extend_from_slice(&22u32.to_be_bytes());
+        result.extend_from_slice(&0u32.to_be_bytes());
+        result.extend_from_slice(&opcode.to_be_bytes());
+        result.extend_from_slice(&status.to_be_bytes());
+        result
+    }
+
     async fn reply(stream: &mut TcpStream, request: &[u8], payload: &[u8]) -> std::io::Result<()> {
         let xid = u32::from_be_bytes(request[0..4].try_into().unwrap());
         let mut response = Vec::new();
@@ -1265,8 +1571,10 @@ mod tests {
             root_fh: Bytes::from_static(b"root"),
             client_id: 7,
             issuer: 9,
+            generation: 1,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
+            locks: Arc::new(LockState::default()),
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -2029,6 +2337,453 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(symlink.fh, Bytes::from_static(b"link-fh"));
+        server.await.unwrap().unwrap();
+    }
+
+    async fn register_scripted_open(mount: &Mount40, owner: u64, fh: &'static [u8]) {
+        mount
+            .state
+            .register(OwnerLane {
+                owner,
+                next_seqid: 1,
+                stateid: [0x61; 16],
+                fh: Bytes::from_static(fh),
+                access: crate::OPEN_BOTH,
+                write_verifier: None,
+            })
+            .await;
+    }
+
+    async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) {
+        mount
+            .locks
+            .register(LockLane {
+                owner,
+                owner_wire: Bytes::from(format!("scripted-lock-{owner}")),
+                next_seqid: 1,
+                stateid,
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 2,
+                offset: 0,
+                length: 1,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn public_typed_lock_blocks_close_until_exact_unlock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 41, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x71; 16])]),
+            )
+            .await?;
+            let unlock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &unlock,
+                &compound_result("locku", &[(22, &[]), (14, &[0x72; 16])]),
+            )
+            .await?;
+            let cleanup = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &cleanup,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let token = mount
+            .lock_stateful(Bytes::from_static(b"fh"), 2, 7, 11)
+            .await
+            .unwrap();
+        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
+        assert!(error.to_string().contains("outstanding locks"));
+        mount.unlock_stateful(token).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_reply_loss_is_uncertain_and_does_not_register_protection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 42, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _ = read_record(&mut stream).await?;
+            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let error = mount
+            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_lock_after_send_finishes_owner_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 43, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("lock", &[(22, &[]), (12, &[0x73; 16])]),
+            )
+            .await
+        });
+        let task_mount = Arc::clone(&mount);
+        let task =
+            tokio::spawn(async move { task_mount.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        server.await.unwrap().unwrap();
+        for _ in 0..20 {
+            if mount.locks.has_fh(&Bytes::from_static(b"fh")).await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("detached LOCK reply did not register protection");
+    }
+
+    #[tokio::test]
+    async fn locku_reply_loss_is_uncertain_and_retains_local_protection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 61, [0x91; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _ = read_record(&mut stream).await?;
+            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let error = mount
+            .locku(
+                Bytes::from_static(b"fh"),
+                Bytes::from_static(&[0x91; 16]),
+                2,
+                0,
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
+        assert!(mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_locku_error_consumes_owner_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 63, [0x94; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            reply(&mut stream, &first, &failed_lock_result("locku", 14, 22)).await?;
+            let second = read_record(&mut stream).await?;
+            let expected = [
+                2u32.to_be_bytes().as_slice(),
+                2u32.to_be_bytes().as_slice(),
+                &[0x94; 16],
+            ]
+            .concat();
+            assert!(second.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("locku", &[(22, &[]), (14, &[0x95; 16])]),
+            )
+            .await?;
+            let cleanup = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &cleanup,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let args = || {
+            (
+                Bytes::from_static(b"fh"),
+                Bytes::from_static(&[0x94; 16]),
+                2,
+                0,
+                1,
+            )
+        };
+        let (fh, stateid, kind, offset, length) = args();
+        assert!(matches!(
+            mount.locku(fh, stateid, kind, offset, length).await,
+            Err(NfsError::Nfs4(_))
+        ));
+        let (fh, stateid, kind, offset, length) = args();
+        mount
+            .locku(fh, stateid, kind, offset, length)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_locku_after_send_finishes_release_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 62, [0x92; 16]).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("locku", &[(22, &[]), (14, &[0x93; 16])]),
+            )
+            .await?;
+            let cleanup = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &cleanup,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let task_mount = Arc::clone(&mount);
+        let task = tokio::spawn(async move {
+            task_mount
+                .locku(
+                    Bytes::from_static(b"fh"),
+                    Bytes::from_static(&[0x92; 16]),
+                    2,
+                    0,
+                    1,
+                )
+                .await
+        });
+        seen_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        server.await.unwrap().unwrap();
+        for _ in 0..20 {
+            if !mount.locks.has_fh(&Bytes::from_static(b"fh")).await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("detached LOCKU reply did not remove released protection");
+    }
+
+    #[tokio::test]
+    async fn typed_lock_rejects_foreign_or_mismatched_tokens_without_rpc() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let foreign = crate::LockToken::new(
+            Bytes::from_static(b"fh"),
+            Bytes::from_static(&[0x21; 16]),
+            2,
+            0,
+            1,
+            mount.issuer ^ 1,
+            1,
+        );
+        assert!(mount.unlock_stateful(foreign).await.is_err());
+        let unknown = crate::LockToken::new(
+            Bytes::from_static(b"fh"),
+            Bytes::from_static(&[0x22; 16]),
+            2,
+            0,
+            1,
+            mount.issuer,
+            1,
+        );
+        assert!(mount.unlock_stateful(unknown).await.is_err());
+        let stale = crate::LockToken::new(
+            Bytes::from_static(b"fh"),
+            Bytes::from_static(&[0x23; 16]),
+            2,
+            0,
+            1,
+            mount.issuer,
+            mount.generation + 1,
+        );
+        assert!(mount.unlock_stateful(stale).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn scripted_public_lock_conflict_exposes_denied_range() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 50, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            reply(&mut stream, &request, &denied_lock_result("lock", 12)).await?;
+            let next = read_record(&mut stream).await?;
+            let expected = [
+                1u32.to_be_bytes().as_slice(),
+                2u32.to_be_bytes().as_slice(),
+                &[0x61; 16],
+            ]
+            .concat();
+            assert!(next.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &next,
+                &compound_result("lock", &[(22, &[]), (12, &[0xb1; 16])]),
+            )
+            .await
+        });
+        assert!(matches!(
+            mount.lock(Bytes::from_static(b"fh"), 2, 0, 1).await,
+            Err(NfsError::LockDenied {
+                lock_type: 2,
+                offset: 7,
+                length: 11,
+                ..
+            })
+        ));
+        mount
+            .lock(Bytes::from_static(b"fh"), 2, 2, 1)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_opens_of_same_file_lock_without_global_serialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 54, b"fh").await;
+        register_scripted_open(&mount, 55, b"fh").await;
+        let opened_a = mount::OpenFile::with_protocol_state(
+            mount::ObjRes {
+                fh: Bytes::from_static(b"fh"),
+                attr: None,
+            },
+            encode_owner(mount.issuer, 54),
+        );
+        let opened_b = mount::OpenFile::with_protocol_state(
+            mount::ObjRes {
+                fh: Bytes::from_static(b"fh"),
+                attr: None,
+            },
+            encode_owner(mount.issuer, 55),
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let second =
+                tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream)).await??;
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("lock", &[(22, &[]), (12, &[0xa1; 16])]),
+            )
+            .await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("lock", &[(22, &[]), (12, &[0xa2; 16])]),
+            )
+            .await
+        });
+        let (a, b) = tokio::join!(
+            mount.lock_open_stateful(&opened_a, 2, 0, 1),
+            mount.lock_open_stateful(&opened_b, 2, 2, 1),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_open_owners_send_locks_without_global_serialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 51, b"fh-a").await;
+        register_scripted_open(&mount, 52, b"fh-b").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let second =
+                tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream)).await??;
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("lock", &[(22, &[]), (12, &[0x81; 16])]),
+            )
+            .await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("lock", &[(22, &[]), (12, &[0x82; 16])]),
+            )
+            .await
+        });
+        let (a, b) = tokio::join!(
+            mount.lock(Bytes::from_static(b"fh-a"), 2, 0, 1),
+            mount.lock(Bytes::from_static(b"fh-b"), 2, 0, 1),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_open_owner_serializes_lock_seqid_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 53, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err()
+            );
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("lock", &[(22, &[]), (12, &[0x83; 16])]),
+            )
+            .await?;
+            let second = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("lock", &[(22, &[]), (12, &[0x84; 16])]),
+            )
+            .await
+        });
+        let (a, b) = tokio::join!(
+            mount.lock(Bytes::from_static(b"fh"), 2, 0, 1),
+            mount.lock(Bytes::from_static(b"fh"), 2, 2, 1),
+        );
+        assert!(a.is_ok() && b.is_ok());
         server.await.unwrap().unwrap();
     }
 }

@@ -219,9 +219,33 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             mount.lookup_path(renamed_file).await.is_err(),
             format!("NFSv4.0 REMOVE left a residual file through {url}"),
         )?;
+        let small_open = mount.open_path_stateful(&small_file, OPEN_BOTH).await?;
+        let large_open = mount.open_path_stateful(&large_file, OPEN_BOTH).await?;
+        let (small_lock, large_lock) = tokio::try_join!(
+            mount.lock_open_stateful(&small_open, 2, 0, 1),
+            mount.lock_open_stateful(&large_open, 2, 0, 1),
+        )?;
+        mount.unlock_stateful(small_lock).await?;
+        mount.unlock_stateful(large_lock).await?;
+        mount.close_stateful(small_open).await?;
+        mount.close_stateful(large_open).await?;
         for (file, expected) in [(&small_file, &small), (&large_file, &large)] {
             let opened = mount.open_path_stateful(file, OPEN_BOTH).await?;
             let fh = opened.object.fh.clone();
+            let lock = mount
+                .lock_stateful(fh.clone(), 2, 0, expected.len() as u64)
+                .await?;
+            let conflict = mount
+                .lock_test(fh.clone(), 2, 0, expected.len() as u64)
+                .await;
+            ensure(
+                matches!(conflict, Err(NfsError::LockDenied { .. })),
+                format!("NFSv4.0 LOCKT did not report the held range through {url}: {conflict:?}"),
+            )?;
+            mount.unlock_stateful(lock).await?;
+            mount
+                .lock_test(fh.clone(), 2, 0, expected.len() as u64)
+                .await?;
             let attr = mount.getattr(fh.clone()).await?;
             ensure(
                 attr.filesize == expected.len() as u64,

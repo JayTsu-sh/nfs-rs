@@ -13,6 +13,56 @@ pub(crate) struct OwnerLane {
     pub write_verifier: Option<[u8; 8]>,
 }
 
+#[derive(Debug)]
+pub(crate) struct LockLane {
+    pub owner: u64,
+    pub owner_wire: Bytes,
+    pub next_seqid: u32,
+    pub stateid: [u8; 16],
+    pub fh: Bytes,
+    pub lock_type: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct LockState {
+    lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
+}
+
+impl LockState {
+    pub(crate) async fn register(&self, lane: LockLane) -> Arc<Mutex<LockLane>> {
+        let stateid = lane.stateid;
+        let lane = Arc::new(Mutex::new(lane));
+        self.lanes.write().await.insert(stateid, Arc::clone(&lane));
+        lane
+    }
+
+    pub(crate) async fn by_stateid(&self, stateid: &[u8; 16]) -> Option<Arc<Mutex<LockLane>>> {
+        self.lanes.read().await.get(stateid).cloned()
+    }
+
+    pub(crate) async fn remove(&self, stateid: &[u8; 16]) {
+        self.lanes.write().await.remove(stateid);
+    }
+
+    pub(crate) async fn has_fh(&self, fh: &Bytes) -> bool {
+        let lanes = self
+            .lanes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for lane in lanes {
+            if lane.lock().await.fh == *fh {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OpenState {
     lanes: RwLock<HashMap<u64, Arc<Mutex<OwnerLane>>>>,
