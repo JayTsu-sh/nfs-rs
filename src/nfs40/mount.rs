@@ -369,6 +369,20 @@ impl RecoveryContext {
                     "NFSv4.0 reclaim OPEN returned incompatible state".into(),
                 ));
             }
+            if let Some(delegation) = reclaimed.delegation {
+                let response = self
+                    .rpc
+                    .call(
+                        CompoundBuilder::new("reclaim-delegreturn")
+                            .putfh(&fh)
+                            .delegreturn(&delegation.stateid)
+                            .encode_with_header(&self.auth),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        METADATA_TIMEOUT,
+                    )
+                    .await?;
+                decode_delegreturn_response(response)?;
+            }
             open.stateid = reclaimed.stateid;
             open.next_seqid = 1;
             Ok(())
@@ -677,8 +691,7 @@ impl Mount40 {
                         kind: super::compound::DelegationKind::Write,
                         ..
                     })
-                )
-            {
+                ) {
                 query_callback_attributes(&rpc, &auth, &fh).await.ok()
             } else {
                 None
