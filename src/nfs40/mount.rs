@@ -186,9 +186,16 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         lease: Arc::clone(&lease),
         callback_addr,
     };
+    let recovery_callback_state = callback_state.clone();
     let recovery: RecoveryHandler = Arc::new(move || {
         let context = recovery_context.clone();
-        Box::pin(async move { context.recover_or_lose().await })
+        let callback_state = recovery_callback_state.clone();
+        Box::pin(async move {
+            if let Some(callback_state) = callback_state {
+                callback_state.invalidate_delegations(context.lease.generation())?;
+            }
+            context.recover_or_lose().await
+        })
     });
     let renewal = LeaseRenewal::start(
         rpc.clone(),

@@ -166,6 +166,26 @@ impl CallbackState {
         Ok(())
     }
 
+    pub(crate) fn invalidate_delegations(&self, generation: u64) -> Result<()> {
+        self.generation.store(generation, Ordering::Release);
+        self.delegations
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?
+            .clear();
+        Ok(())
+    }
+
+    fn is_current(&self, recall: &RecallNotification) -> bool {
+        if self.generation.load(Ordering::Acquire) != recall.generation {
+            return false;
+        }
+        self.delegations.lock().is_ok_and(|delegations| {
+            delegations.get(&recall.fh).is_some_and(|record| {
+                record.generation == recall.generation && record.grant.stateid == recall.stateid
+            })
+        })
+    }
+
     fn finish_recall(
         &self,
         fh: &[u8],
@@ -206,6 +226,9 @@ impl CallbackWorker {
     ) -> Self {
         let task = tokio::spawn(async move {
             while let Some(recall) = recalls.recv().await {
+                if !state.is_current(&recall) {
+                    continue;
+                }
                 let returned = settle_recall(&rpc, &auth, &recall).await.is_ok();
                 let _ =
                     state.finish_recall(&recall.fh, &recall.stateid, recall.generation, returned);
@@ -946,6 +969,39 @@ mod tests {
         );
         assert!(recalls.try_recv().is_ok());
         assert!(recalls.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_generation_invalidates_old_delegation_callbacks() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        state
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Read,
+                    stateid: [0x33; 16],
+                    recall: false,
+                },
+                4,
+                None,
+            )
+            .unwrap();
+        state.invalidate_delegations(5).unwrap();
+        let mut callback = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(43);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 1, 1, 4]);
+        call.extend_from_slice(&[0x3333_3333; 4]);
+        call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
+        assert_eq!(
+            round_trip(&mut callback, &call).await,
+            [43, 1, 0, 0, 0, 0, 10001, 0, 1, 4, 10001]
+        );
     }
 
     #[tokio::test]
