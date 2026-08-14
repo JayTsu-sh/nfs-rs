@@ -147,14 +147,14 @@ fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
             accepted_reply(words[0], &[4])
         });
     }
-    let compound = match empty_compound_reply(&call[40..]) {
+    let compound = match compound_reply(&call[40..]) {
         Ok(compound) => compound,
         Err(_) => return Ok(accepted_reply(words[0], &[4])),
     };
     Ok(accepted_body(words[0], &compound))
 }
 
-fn empty_compound_reply(body: &[u8]) -> Result<Vec<u8>> {
+fn compound_reply(body: &[u8]) -> Result<Vec<u8>> {
     if body.len() < 16 {
         return Err(NfsError::Xdr("CB_COMPOUND envelope truncated".into()));
     }
@@ -163,11 +163,11 @@ fn empty_compound_reply(body: &[u8]) -> Result<Vec<u8>> {
         .checked_add(3)
         .ok_or_else(|| NfsError::Xdr("CB_COMPOUND tag length overflow".into()))?
         & !3;
-    let envelope_len = 4usize
+    let operations_offset = 4usize
         .checked_add(padded_tag)
         .and_then(|length| length.checked_add(12))
         .ok_or_else(|| NfsError::Xdr("CB_COMPOUND envelope length overflow".into()))?;
-    if body.len() != envelope_len || body.len() < 4 + tag_len {
+    if body.len() < operations_offset || body.len() < 4 + tag_len {
         return Err(NfsError::Xdr("CB_COMPOUND envelope malformed".into()));
     }
     let minor_offset = 4 + padded_tag;
@@ -181,18 +181,96 @@ fn empty_compound_reply(body: &[u8]) -> Result<Vec<u8>> {
             .try_into()
             .map_err(|_| NfsError::Xdr("CB_COMPOUND operation count truncated".into()))?,
     );
-    if operation_count != 0 {
-        return Err(NfsError::Xdr(
-            "CB_COMPOUND operations are not implemented by this envelope decoder".into(),
+    let status = if minor == 0 { 0u32 } else { 10021u32 };
+    if minor != 0 {
+        return Ok(compound_result(
+            status,
+            &body[4..4 + padded_tag],
+            tag_len,
+            &[],
         ));
     }
-    let status = if minor == 0 { 0u32 } else { 10021u32 };
-    let mut reply = Vec::with_capacity(12 + padded_tag);
+    let mut cursor = operations_offset;
+    let mut results = Vec::new();
+    let mut status = 0u32;
+    for _ in 0..operation_count {
+        let opcode = take_word(body, &mut cursor, "callback opcode")?;
+        match opcode {
+            3 => {
+                let _fh = take_opaque(body, &mut cursor, "CB_GETATTR filehandle")?;
+                let bitmap_words = take_word(body, &mut cursor, "CB_GETATTR bitmap length")?;
+                if bitmap_words > 4 {
+                    return Err(NfsError::Xdr("CB_GETATTR bitmap exceeds bound".into()));
+                }
+                for _ in 0..bitmap_words {
+                    let _ = take_word(body, &mut cursor, "CB_GETATTR bitmap word")?;
+                }
+                status = 10001;
+                results.extend_from_slice(&3u32.to_be_bytes());
+                results.extend_from_slice(&status.to_be_bytes());
+            }
+            _ => {
+                status = 10044;
+                results.extend_from_slice(&10044u32.to_be_bytes());
+                results.extend_from_slice(&status.to_be_bytes());
+            }
+        }
+        if status != 0 {
+            break;
+        }
+    }
+    if cursor != body.len() {
+        return Err(NfsError::Xdr("CB_COMPOUND has trailing data".into()));
+    }
+    Ok(compound_result(
+        status,
+        &body[4..4 + padded_tag],
+        tag_len,
+        &results,
+    ))
+}
+
+fn compound_result(status: u32, padded_tag: &[u8], tag_len: usize, results: &[u8]) -> Vec<u8> {
+    let mut reply = Vec::with_capacity(12 + padded_tag.len() + results.len());
     reply.extend_from_slice(&status.to_be_bytes());
     reply.extend_from_slice(&(tag_len as u32).to_be_bytes());
-    reply.extend_from_slice(&body[4..4 + padded_tag]);
-    reply.extend_from_slice(&0u32.to_be_bytes());
-    Ok(reply)
+    reply.extend_from_slice(padded_tag);
+    reply.extend_from_slice(&((results.len() / 8) as u32).to_be_bytes());
+    reply.extend_from_slice(results);
+    reply
+}
+
+fn take_word(body: &[u8], cursor: &mut usize, field: &str) -> Result<u32> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} offset overflow")))?;
+    let bytes = body
+        .get(*cursor..end)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} truncated")))?;
+    *cursor = end;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn take_opaque<'a>(body: &'a [u8], cursor: &mut usize, field: &str) -> Result<&'a [u8]> {
+    let length = take_word(body, cursor, field)? as usize;
+    let padded = length
+        .checked_add(3)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} length overflow")))?
+        & !3;
+    let end = cursor
+        .checked_add(padded)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} offset overflow")))?;
+    let value_end = cursor
+        .checked_add(length)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} value overflow")))?;
+    let value = body
+        .get(*cursor..value_end)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} truncated")))?;
+    if end > body.len() {
+        return Err(NfsError::Xdr(format!("{field} padding truncated")));
+    }
+    *cursor = end;
+    Ok(value)
 }
 
 fn accepted_reply(xid: u32, result: &[u32]) -> Vec<u8> {
@@ -319,5 +397,32 @@ mod tests {
             assert_eq!(reply[8], u32::from_be_bytes(*b"tag\0"));
             assert_eq!(reply[9], 0);
         }
+    }
+
+    #[tokio::test]
+    async fn cb_getattr_rejects_a_file_without_a_write_delegation() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(19);
+        call[5] = 1;
+        call.extend_from_slice(&[
+            0, // empty tag
+            0, // minor version
+            1, // callback ident
+            1, // operation count
+            3, // OP_CB_GETATTR
+            2, // filehandle length
+            u32::from_be_bytes(*b"fh\0\0"),
+            1,    // bitmap word count
+            0x18, // change + size
+        ]);
+        assert_eq!(
+            round_trip(&mut stream, &call).await,
+            [19, 1, 0, 0, 0, 0, 10001, 0, 1, 3, 10001]
+        );
     }
 }
