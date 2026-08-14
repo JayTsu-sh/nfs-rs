@@ -146,6 +146,23 @@ fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
 }
 
 #[test]
+fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
+    let workflow = include_str!("../.github/workflows/release-validation.yml");
+
+    assert!(workflow.contains("Discover persisted Rust toolchain"));
+    assert!(
+        workflow
+            .contains("/home/github-runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin")
+    );
+    assert!(workflow.contains("complete pre-provisioned Rust 1.95.0 toolchain not found"));
+    assert!(workflow.contains("rustc --version | grep -q '^rustc 1\\.95\\.0 '"));
+    assert!(workflow.contains("cache-bin: false"));
+    assert!(!workflow.contains("dtolnay/rust-toolchain"));
+    assert!(!workflow.contains("rustup default"));
+    assert!(!workflow.contains("rustup toolchain install"));
+}
+
+#[test]
 fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
     let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
         .expect("NFS fault helper must be readable");
