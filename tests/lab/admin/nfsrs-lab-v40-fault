@@ -22,6 +22,10 @@ restore() {
   rm -f "$state_file"
 }
 
+read_owner() {
+  read -r owner_run owner_ip owner_mode <"$state_file"
+}
+
 case "$action" in
   isolate)
     [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
@@ -29,8 +33,8 @@ case "$action" in
       exit 2
     }
     if [[ -e "$state_file" ]]; then
-      read -r owner_run owner_ip <"$state_file"
-      [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
+      read_owner
+      [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" && "${owner_mode:-nfs}" == nfs ]] || {
         echo "NFSv4.0 fault belongs to another run or target" >&2
         exit 2
       }
@@ -39,9 +43,28 @@ case "$action" in
     nft add table inet "$table"
     nft "add chain inet $table output { type filter hook output priority -10; policy accept; }"
     nft add rule inet "$table" output ip daddr "$target_ip" tcp dport 2049 drop
-    printf '%s %s\n' "$run_id" "$target_ip" >"$state_file"
+    printf '%s %s nfs\n' "$run_id" "$target_ip" >"$state_file"
     ss -K dst "$target_ip" dport = :2049 >/dev/null 2>&1 || true
     echo "isolated runner destination $target_ip:2049 for $run_id"
+    ;;
+  isolate-callback)
+    [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
+      echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
+      exit 2
+    }
+    if [[ -e "$state_file" ]]; then
+      read_owner
+      [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" && "$owner_mode" == callback ]] || {
+        echo "NFSv4.0 fault belongs to another run, target, or direction" >&2
+        exit 2
+      }
+      exit 0
+    fi
+    nft add table inet "$table"
+    nft "add chain inet $table input { type filter hook input priority -10; policy accept; }"
+    nft add rule inet "$table" input ip saddr "$target_ip" tcp flags \& syn == syn drop
+    printf '%s %s callback\n' "$run_id" "$target_ip" >"$state_file"
+    echo "isolated inbound callback SYN packets from $target_ip for $run_id"
     ;;
   restore)
     [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
@@ -49,7 +72,7 @@ case "$action" in
       exit 2
     }
     if [[ -e "$state_file" ]]; then
-      read -r owner_run owner_ip <"$state_file"
+      read_owner
       [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
         echo "NFSv4.0 fault belongs to another run or target" >&2
         exit 2
@@ -60,7 +83,7 @@ case "$action" in
     ;;
   restore-any)
     if [[ -e "$state_file" ]]; then
-      read -r owner_run owner_ip <"$state_file"
+      read_owner
       [[ "$owner_run" == "$run_id" ]] || {
         echo "NFSv4.0 fault belongs to another run" >&2
         exit 2

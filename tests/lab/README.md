@@ -49,3 +49,8 @@ TCP/2049 traffic, owns the fault by run ID, and is restored by both a shell trap
 and an unconditional nightly cleanup step. The below-lease case preserves the
 generation after reconnect; the above-lease case requires `LostState` and
 rejection of the old state token. It never changes ONTAP LIF or SVM state.
+
+The NFSv4.0 callback fault uses the same run-owned helper, but drops only new
+inbound TCP connections whose source is the selected `.200` or `.201` LIF. It
+arms after OPEN exposes the typed grant/no-grant outcome, verifies ordinary
+public-API I/O, and restores with a shell trap before cross-LIF checksum checks.

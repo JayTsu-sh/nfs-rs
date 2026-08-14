@@ -91,6 +91,7 @@ async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
         let created = mount.create_path(&filename, Some(0o600)).await?;
         mount.close(created.fh).await?;
         let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+        let granted_here = mount.callback_stats().await.grants_received > 0;
         let conflicting = contender.open_path(&filename, OPEN_BOTH).await?;
 
         let outcome = tokio::time::timeout(Duration::from_secs(15), async {
@@ -123,6 +124,12 @@ async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
                 )?;
                 println!("NFS40_DELEGATION_OUTCOME=GRANTED_RECALLED_RETURNED url={retention_url}");
             }
+            Err(_) if granted_here => {
+                return Err(io::Error::other(format!(
+                    "NFS40_DELEGATION_OUTCOME=GRANTED_CALLBACK_FAILED url={retention_url}"
+                ))
+                .into());
+            }
             Err(_) => println!("NFS40_DELEGATION_OUTCOME=SKIP_NOT_GRANTED url={retention_url}"),
         }
 
@@ -144,6 +151,77 @@ async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
     } else {
         println!("NFS40_DELEGATION_SUMMARY=PASS_GRANTED count={granted}");
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a runner-scoped inbound NFSv4.0 callback fault"]
+async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure(urls.len() == 2, "callback fault test requires two LIF URLs")?;
+    let primary = env::var("NFS_RS_LAB_V40_FAULT_PRIMARY")?.parse::<usize>()?;
+    ensure(primary < 2, "invalid callback fault primary index")?;
+    let mount = parse_url_and_mount(&format!("{}&retain-delegations=true", urls[primary])).await?;
+    let contender = parse_url_and_mount(&urls[1 - primary]).await?;
+    let filename = format!("nfs-rs-v40-callback-fault-{primary}.bin");
+    let _ = contender.remove_path(&filename).await;
+    let created = mount.create_path(&filename, Some(0o600)).await?;
+    mount.close(created.fh).await?;
+    let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+    if let (Ok(armed), Ok(applied)) = (
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_ARMED"),
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_APPLIED"),
+    ) {
+        std::fs::write(armed, b"delegation outcome observable")?;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while !std::path::Path::new(&applied).exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("callback fault was not applied"))?;
+    }
+    if mount.callback_stats().await.grants_received == 0 {
+        println!(
+            "NFS40_CALLBACK_FAULT_OUTCOME=SKIP_NOT_GRANTED url={}",
+            urls[primary]
+        );
+    } else {
+        ensure(
+            mount.callback_stats().await.recalls_received == 0,
+            "callback fault admitted an inbound recall",
+        )?;
+        println!(
+            "NFS40_CALLBACK_FAULT_OUTCOME=GRANTED_CALLBACK_UNREACHABLE url={}",
+            urls[primary]
+        );
+    }
+    let expected = Bytes::from_static(b"ordinary-io-survives-callback-loss");
+    write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
+    mount.close(delegated.fh).await?;
+    if let (Ok(ready), Ok(restored)) = (
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_READY"),
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_RESTORED"),
+    ) {
+        std::fs::write(ready, b"callback fault observed")?;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while !std::path::Path::new(&restored).exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("callback fault was not restored"))?;
+    }
+    let reopened = contender.open_path(&filename, OPEN_READ).await?;
+    let actual = read_all(contender.as_ref(), reopened.fh.clone(), expected.len()).await?;
+    contender.close(reopened.fh).await?;
+    ensure(actual == expected, "callback loss corrupted ordinary I/O")?;
+    contender.remove_path(&filename).await?;
+    contender.umount().await?;
+    mount.umount().await?;
     Ok(())
 }
 

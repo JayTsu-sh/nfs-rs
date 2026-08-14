@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::{NfsError, Result};
 use crate::nfs40::compound::{
@@ -52,6 +52,7 @@ pub(crate) struct CallbackState {
     generation: AtomicU64,
     recall_tx: mpsc::Sender<RecallNotification>,
     open_publications: AtomicUsize,
+    grants_received: AtomicU64,
     recalls_received: AtomicU64,
     returns_completed: AtomicU64,
     returns_failed: AtomicU64,
@@ -116,6 +117,7 @@ impl CallbackService {
             generation: AtomicU64::new(0),
             recall_tx,
             open_publications: AtomicUsize::new(0),
+            grants_received: AtomicU64::new(0),
             recalls_received: AtomicU64::new(0),
             returns_completed: AtomicU64::new(0),
             returns_failed: AtomicU64::new(0),
@@ -127,7 +129,7 @@ impl CallbackService {
         let service_state = Arc::clone(&state);
         let (stop, mut stopping) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     changed = stopping.changed() => {
@@ -222,7 +224,7 @@ impl CallbackState {
         });
     }
 
-    fn io_gate(&self, fh: &Bytes) -> Arc<tokio::sync::RwLock<()>> {
+    fn io_gate(&self, fh: &Bytes) -> Arc<RwLock<()>> {
         let mut gates = self
             .io_gates
             .lock()
@@ -230,21 +232,22 @@ impl CallbackState {
         if let Some(gate) = gates.get(fh).and_then(Weak::upgrade) {
             return gate;
         }
-        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let gate = Arc::new(RwLock::new(()));
         gates.insert(fh.clone(), Arc::downgrade(&gate));
         gate
     }
 
-    pub(crate) async fn foreground_io(&self, fh: &Bytes) -> tokio::sync::OwnedRwLockReadGuard<()> {
+    pub(crate) async fn foreground_io(&self, fh: &Bytes) -> OwnedRwLockReadGuard<()> {
         self.io_gate(fh).read_owned().await
     }
 
-    pub(crate) async fn recall_io(&self, fh: &Bytes) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub(crate) async fn recall_io(&self, fh: &Bytes) -> OwnedRwLockWriteGuard<()> {
         self.io_gate(fh).write_owned().await
     }
 
     pub(crate) fn stats(&self) -> crate::CallbackStats {
         crate::CallbackStats {
+            grants_received: self.grants_received.load(Ordering::Relaxed),
             recalls_received: self.recalls_received.load(Ordering::Relaxed),
             returns_completed: self.returns_completed.load(Ordering::Relaxed),
             returns_failed: self.returns_failed.load(Ordering::Relaxed),
@@ -329,6 +332,7 @@ impl CallbackState {
         generation: u64,
         attributes: Option<(u64, u64)>,
     ) -> Result<()> {
+        self.grants_received.fetch_add(1, Ordering::Relaxed);
         self.generation.store(generation, Ordering::Release);
         let recall = grant.recall;
         let stateid = grant.stateid;
@@ -1429,7 +1433,13 @@ mod tests {
             [27, 1, 0, 0, 0, 0, 10001, 0, 0]
         );
         assert!(recalls.try_recv().is_err());
-        assert_eq!(service.state().stats(), crate::CallbackStats::default());
+        assert_eq!(
+            service.state().stats(),
+            crate::CallbackStats {
+                grants_received: 1,
+                ..crate::CallbackStats::default()
+            }
+        );
     }
 
     #[tokio::test]
@@ -1530,6 +1540,7 @@ mod tests {
         assert_eq!(
             service.state().stats(),
             crate::CallbackStats {
+                grants_received: 1,
                 recalls_received: 1,
                 returns_completed: 0,
                 returns_failed: 0,
@@ -1851,6 +1862,7 @@ mod tests {
         assert_eq!(
             state.stats(),
             crate::CallbackStats {
+                grants_received: 1,
                 recalls_received: 1,
                 returns_completed: 1,
                 returns_failed: 0,
@@ -1923,6 +1935,7 @@ mod tests {
         assert_eq!(
             state.stats(),
             crate::CallbackStats {
+                grants_received: 1,
                 recalls_received: 1,
                 returns_completed: 1,
                 returns_failed: 0,

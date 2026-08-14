@@ -1166,11 +1166,12 @@ mod tests {
             .putfh(b"fh")
             .delegreturn(&stateid)
             .encode_body();
-        assert!(body.windows(16).any(|value| value == stateid));
-        assert!(
-            body.windows(8)
-                .any(|value| { value == [2u32.to_be_bytes(), OP_PUTFH.to_be_bytes()].concat() })
-        );
+        let expected = [
+            0, 0, 0, 6, b'r', b'e', b't', b'u', b'r', b'n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0,
+            22, 0, 0, 0, 2, b'f', b'h', 0, 0, 0, 0, 0, 8, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d,
+            0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d,
+        ];
+        assert_eq!(body, expected);
 
         decode_delegreturn_response(compound_response(
             "return",

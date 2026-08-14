@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
-    create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
-    decode_confirm_response, decode_create_response, decode_delegreturn_response,
+    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
+    OpenReclaimArgs, SetClientIdArgs, create_succeeded_before_compound_failure,
+    decode_access_response, decode_commit_response, decode_confirm_response,
+    decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
     decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
@@ -687,8 +688,8 @@ impl Mount40 {
             let delegation_attributes = if callback_state.is_some()
                 && matches!(
                     opened.delegation,
-                    Some(super::compound::DelegationGrant {
-                        kind: super::compound::DelegationKind::Write,
+                    Some(DelegationGrant {
+                        kind: DelegationKind::Write,
                         ..
                     })
                 ) {

@@ -100,6 +100,8 @@ pub struct MountHealth {
 /// Redacted callback counters shared by NFSv4 client engines.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CallbackStats {
+    /// Delegations granted by the server and observed by the client.
+    pub grants_received: u64,
     pub recalls_received: u64,
     pub returns_completed: u64,
     pub returns_failed: u64,
@@ -187,6 +189,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn callback_stats(&self) -> CallbackStats {
         let stats = self.nfs41_callback_stats().await.unwrap_or_default();
         CallbackStats {
+            grants_received: 0,
             recalls_received: stats.layout_recalls_received,
             returns_completed: stats.layout_returns_completed,
             returns_failed: 0,
