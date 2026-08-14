@@ -230,6 +230,38 @@ impl CallbackState {
         Ok(())
     }
 
+    pub(crate) async fn return_all_delegations(&self) -> Result<()> {
+        let notifications = {
+            let mut delegations = self
+                .delegations
+                .lock()
+                .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+            delegations
+                .iter_mut()
+                .filter_map(|(fh, record)| {
+                    if record.recalling {
+                        return None;
+                    }
+                    record.recalling = true;
+                    Some(RecallNotification {
+                        fh: fh.clone(),
+                        stateid: record.grant.stateid,
+                        generation: record.generation,
+                        truncate: false,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for notification in notifications {
+            if self.recall_tx.send(notification).await.is_err() {
+                return Err(NfsError::Rpc(
+                    "NFSv4.0 callback worker stopped before delegation cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn begin_open_publication(self: &Arc<Self>) -> OpenPublication {
         self.open_publications.fetch_add(1, Ordering::AcqRel);
         OpenPublication {
@@ -1288,6 +1320,44 @@ mod tests {
         assert_eq!(recall.stateid, [0x62; 16]);
         assert!(!recall.truncate);
         assert_eq!(service.state().stats().recalls_received, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_queues_every_unrecalled_delegation() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        for (fh, kind, stateid) in [
+            (b"read".as_slice(), DelegationKind::Read, [0x31; 16]),
+            (b"write".as_slice(), DelegationKind::Write, [0x32; 16]),
+        ] {
+            state
+                .register_delegation(
+                    Bytes::copy_from_slice(fh),
+                    DelegationGrant {
+                        kind,
+                        stateid,
+                        recall: false,
+                    },
+                    8,
+                    None,
+                )
+                .unwrap();
+        }
+
+        state.return_all_delegations().await.unwrap();
+
+        let mut returned = [recalls.try_recv().unwrap(), recalls.try_recv().unwrap()]
+            .map(|notification| notification.fh);
+        returned.sort();
+        assert_eq!(
+            returned,
+            [Bytes::from_static(b"read"), Bytes::from_static(b"write")]
+        );
+        assert!(recalls.try_recv().is_err());
+        assert_eq!(state.stats().recalls_received, 0);
     }
 
     #[tokio::test]

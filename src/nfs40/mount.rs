@@ -1153,12 +1153,17 @@ impl Mount for Mount40 {
         if let Some(callback) = &self._callback {
             callback.stop().await;
         }
+        let callback_cleanup = if let Some(callback_state) = &self.callback_state {
+            callback_state.return_all_delegations().await
+        } else {
+            Ok(())
+        };
         if let Some(worker) = &self._callback_worker {
             worker.stop().await;
         }
         self.rpc.shutdown().await;
         self.lease.mark_closed();
-        Ok(())
+        callback_cleanup
     }
 
     async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
