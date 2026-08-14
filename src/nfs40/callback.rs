@@ -209,6 +209,14 @@ fn compound_reply(body: &[u8]) -> Result<Vec<u8>> {
                 results.extend_from_slice(&3u32.to_be_bytes());
                 results.extend_from_slice(&status.to_be_bytes());
             }
+            4 => {
+                let _stateid = take_fixed(body, &mut cursor, 16, "CB_RECALL stateid")?;
+                let _truncate = take_word(body, &mut cursor, "CB_RECALL truncate")?;
+                let _fh = take_opaque(body, &mut cursor, "CB_RECALL filehandle")?;
+                status = 10001;
+                results.extend_from_slice(&4u32.to_be_bytes());
+                results.extend_from_slice(&status.to_be_bytes());
+            }
             _ => {
                 status = 10044;
                 results.extend_from_slice(&10044u32.to_be_bytes());
@@ -269,6 +277,22 @@ fn take_opaque<'a>(body: &'a [u8], cursor: &mut usize, field: &str) -> Result<&'
     if end > body.len() {
         return Err(NfsError::Xdr(format!("{field} padding truncated")));
     }
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_fixed<'a>(
+    body: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+    field: &str,
+) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} offset overflow")))?;
+    let value = body
+        .get(*cursor..end)
+        .ok_or_else(|| NfsError::Xdr(format!("{field} truncated")))?;
     *cursor = end;
     Ok(value)
 }
@@ -423,6 +447,36 @@ mod tests {
         assert_eq!(
             round_trip(&mut stream, &call).await,
             [19, 1, 0, 0, 0, 0, 10001, 0, 1, 3, 10001]
+        );
+    }
+
+    #[tokio::test]
+    async fn cb_recall_rejects_a_file_without_a_delegation() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(23);
+        call[5] = 1;
+        call.extend_from_slice(&[
+            0, // empty tag
+            0, // minor version
+            1, // callback ident
+            1, // operation count
+            4, // OP_CB_RECALL
+            0x0102_0304,
+            0x0506_0708,
+            0x090a_0b0c,
+            0x0d0e_0f10,
+            0, // truncate
+            2, // filehandle length
+            u32::from_be_bytes(*b"fh\0\0"),
+        ]);
+        assert_eq!(
+            round_trip(&mut stream, &call).await,
+            [23, 1, 0, 0, 0, 0, 10001, 0, 1, 4, 10001]
         );
     }
 }
