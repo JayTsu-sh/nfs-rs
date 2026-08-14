@@ -35,9 +35,23 @@ const MAX_LOCK_OWNER_LEN: usize = 1024;
 pub(crate) const OPEN4_RESULT_CONFIRM: u32 = 0x0000_0002;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DelegationKind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DelegationGrant {
+    pub kind: DelegationKind,
+    pub stateid: [u8; 16],
+    pub recall: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OpenResult {
     pub stateid: [u8; 16],
     pub confirm_required: bool,
+    pub delegation: Option<DelegationGrant>,
 }
 
 #[derive(Clone, Copy)]
@@ -483,17 +497,22 @@ fn skip_ace(buf: &mut Bytes) -> Result<()> {
     Ok(())
 }
 
-fn skip_delegation(buf: &mut Bytes) -> Result<()> {
+fn decode_delegation(buf: &mut Bytes) -> Result<Option<DelegationGrant>> {
     match take_u32(buf, "delegation type")? {
-        0 => Ok(()),
+        0 => Ok(None),
         1 => {
-            let _ = take_stateid(buf, "read delegation")?;
-            let _ = take_u32(buf, "recall")?;
-            skip_ace(buf)
+            let stateid = take_stateid(buf, "read delegation")?;
+            let recall = take_u32(buf, "recall")? != 0;
+            skip_ace(buf)?;
+            Ok(Some(DelegationGrant {
+                kind: DelegationKind::Read,
+                stateid,
+                recall,
+            }))
         }
         2 => {
-            let _ = take_stateid(buf, "write delegation")?;
-            let _ = take_u32(buf, "recall")?;
+            let stateid = take_stateid(buf, "write delegation")?;
+            let recall = take_u32(buf, "recall")? != 0;
             match take_u32(buf, "space limit")? {
                 1 => {
                     if buf.remaining() < 8 {
@@ -513,7 +532,12 @@ fn skip_delegation(buf: &mut Bytes) -> Result<()> {
                     )));
                 }
             }
-            skip_ace(buf)
+            skip_ace(buf)?;
+            Ok(Some(DelegationGrant {
+                kind: DelegationKind::Write,
+                stateid,
+                recall,
+            }))
         }
         value => Err(NfsError::Xdr(format!(
             "unsupported delegation type {value}"
@@ -537,13 +561,14 @@ pub(crate) fn decode_open_response(buf: Bytes) -> Result<(OpenResult, Bytes)> {
     buf.advance(20);
     let flags = take_u32(&mut buf, "OPEN result flags")?;
     skip_bitmap(&mut buf, "OPEN attrset")?;
-    skip_delegation(&mut buf)?;
+    let delegation = decode_delegation(&mut buf)?;
     expect_op(&mut buf, OP_GETFH, "GETFH")?;
     let fh = take_opaque(&mut buf, "GETFH filehandle")?;
     Ok((
         OpenResult {
             stateid,
             confirm_required: flags & OPEN4_RESULT_CONFIRM != 0,
+            delegation,
         },
         fh,
     ))
@@ -1015,6 +1040,68 @@ mod tests {
         assert_eq!(opened.stateid, [0x5a; 16]);
         assert!(opened.confirm_required);
         assert_eq!(actual_fh, Bytes::from_static(b"file-fh"));
+    }
+
+    #[test]
+    fn open_decoder_preserves_a_read_delegation_grant() {
+        let mut open = Vec::new();
+        open.extend_from_slice(&[0x5a; 16]);
+        open.extend_from_slice(&[0; 20]);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&1u32.to_be_bytes()); // OPEN_DELEGATE_READ
+        open.extend_from_slice(&[0x6b; 16]);
+        open.extend_from_slice(&1u32.to_be_bytes()); // recall
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE type
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE flags
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE mask
+        xdr_opaque(&mut open, b"");
+        let mut fh = Vec::new();
+        xdr_opaque(&mut fh, b"file-fh");
+        let response = compound_response(
+            "open",
+            &[(OP_PUTFH, &[]), (OP_OPEN, &open), (OP_GETFH, &fh)],
+        );
+
+        let (opened, _) = decode_open_response(response).unwrap();
+        let delegation = opened.delegation.unwrap();
+        assert_eq!(delegation.kind, DelegationKind::Read);
+        assert_eq!(delegation.stateid, [0x6b; 16]);
+        assert!(delegation.recall);
+    }
+
+    #[test]
+    fn open_decoder_preserves_a_write_delegation_grant() {
+        let mut open = Vec::new();
+        open.extend_from_slice(&[0x5a; 16]);
+        open.extend_from_slice(&[0; 20]);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&2u32.to_be_bytes()); // OPEN_DELEGATE_WRITE
+        open.extend_from_slice(&[0x7c; 16]);
+        open.extend_from_slice(&0u32.to_be_bytes()); // recall
+        open.extend_from_slice(&1u32.to_be_bytes()); // NFS_LIMIT_SIZE
+        open.extend_from_slice(&4096u64.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE type
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE flags
+        open.extend_from_slice(&0u32.to_be_bytes()); // ACE mask
+        xdr_opaque(&mut open, b"OWNER@");
+        let mut fh = Vec::new();
+        xdr_opaque(&mut fh, b"write-fh");
+        let response = compound_response(
+            "open",
+            &[(OP_PUTFH, &[]), (OP_OPEN, &open), (OP_GETFH, &fh)],
+        );
+
+        let (opened, _) = decode_open_response(response).unwrap();
+        assert_eq!(
+            opened.delegation,
+            Some(DelegationGrant {
+                kind: DelegationKind::Write,
+                stateid: [0x7c; 16],
+                recall: false,
+            })
+        );
     }
 
     #[test]
