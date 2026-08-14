@@ -572,8 +572,7 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
     else {
         return Ok(rpc_reply(&[words[0], 1, 1, 1, 1]));
     };
-    if credential_flavor != 0
-        || !credential.is_empty()
+    if !valid_callback_credential(credential_flavor, credential)
         || verifier_flavor != 0
         || !verifier.is_empty()
     {
@@ -605,6 +604,9 @@ fn decode_rpc_auth(mut encoded: &[u8]) -> Option<RpcAuthEnvelope<'_>> {
     fn take_auth<'a>(encoded: &mut &'a [u8]) -> Option<(u32, &'a [u8])> {
         let flavor = u32::from_be_bytes(encoded.get(..4)?.try_into().ok()?);
         let length = u32::from_be_bytes(encoded.get(4..8)?.try_into().ok()?) as usize;
+        if length > 400 {
+            return None;
+        }
         let padded = length.checked_add(3)? & !3;
         let value_end = 8usize.checked_add(length)?;
         let padded_end = 8usize.checked_add(padded)?;
@@ -622,6 +624,44 @@ fn decode_rpc_auth(mut encoded: &[u8]) -> Option<RpcAuthEnvelope<'_>> {
         verifier,
         body: encoded,
     })
+}
+
+fn valid_callback_credential(flavor: u32, mut credential: &[u8]) -> bool {
+    if flavor == 0 {
+        return credential.is_empty();
+    }
+    if flavor != 1 || credential.len() < 24 || !credential.len().is_multiple_of(4) {
+        return false;
+    }
+    credential = &credential[4..]; // stamp is opaque to the receiver
+    let machine_length = u32::from_be_bytes(
+        match credential.get(..4).and_then(|value| value.try_into().ok()) {
+            Some(value) => value,
+            None => return false,
+        },
+    ) as usize;
+    if machine_length > 255 {
+        return false;
+    }
+    let Some(machine_padded) = machine_length.checked_add(3).map(|length| length & !3) else {
+        return false;
+    };
+    let Some(after_machine) = 4usize.checked_add(machine_padded) else {
+        return false;
+    };
+    let Some(tail) = credential.get(after_machine..) else {
+        return false;
+    };
+    if tail.len() < 12 {
+        return false;
+    }
+    let group_count = u32::from_be_bytes(
+        match tail.get(8..12).and_then(|value| value.try_into().ok()) {
+            Some(value) => value,
+            None => return false,
+        },
+    ) as usize;
+    group_count <= 16 && tail.len() == 12 + group_count * 4
 }
 
 fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
@@ -1044,6 +1084,37 @@ mod tests {
         assert_eq!(
             round_trip(&mut stream, &cb_null_call(15)).await,
             [15, 1, 0, 0, 0, 0]
+        );
+
+        let auth_sys = vec![
+            16,
+            0,
+            2,
+            CB_PROGRAM,
+            1,
+            0,
+            1,
+            28,
+            9, // stamp
+            3, // machine-name length
+            u32::from_be_bytes(*b"fas\0"),
+            0, // uid
+            0, // gid
+            1, // auxiliary group count
+            0, // group
+            0, // AUTH_NONE verifier
+            0,
+        ];
+        assert_eq!(
+            round_trip(&mut stream, &auth_sys).await,
+            [16, 1, 0, 0, 0, 0]
+        );
+
+        let mut excessive_groups = auth_sys;
+        excessive_groups[13] = 17;
+        assert_eq!(
+            round_trip(&mut stream, &excessive_groups).await,
+            [16, 1, 1, 1, 1]
         );
     }
 
