@@ -62,6 +62,13 @@ pub(crate) struct NewLockArgs<'a> {
     pub owner: &'a [u8],
 }
 
+pub(crate) struct OpenReclaimArgs<'a> {
+    pub seqid: u32,
+    pub share_access: u32,
+    pub client_id: u64,
+    pub owner: &'a [u8],
+}
+
 pub(crate) struct CompoundBuilder {
     inner: CommonCompoundBuilder,
 }
@@ -142,6 +149,20 @@ impl CompoundBuilder {
         }
         xdr_u32(&mut args, 0); // CLAIM_NULL
         xdr_opaque(&mut args, open.filename.as_bytes());
+        self.inner = self.inner.operation(OP_OPEN, args);
+        self
+    }
+
+    pub(crate) fn open_reclaim(mut self, open: OpenReclaimArgs<'_>) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, open.seqid);
+        xdr_u32(&mut args, open.share_access);
+        xdr_u32(&mut args, 0); // OPEN4_SHARE_DENY_NONE
+        args.extend_from_slice(&open.client_id.to_be_bytes());
+        xdr_opaque(&mut args, open.owner);
+        xdr_u32(&mut args, 0); // OPEN4_NOCREATE
+        xdr_u32(&mut args, 1); // CLAIM_PREVIOUS
+        xdr_u32(&mut args, 0); // OPEN_DELEGATE_NONE
         self.inner = self.inner.operation(OP_OPEN, args);
         self
     }
@@ -1496,6 +1517,53 @@ mod tests {
         let mut truncated = compound_response("renew", &[(OP_RENEW, &[])]).to_vec();
         truncated.pop();
         assert!(decode_renew_response(Bytes::from(truncated)).is_err());
+    }
+
+    #[test]
+    fn reclaim_open_and_lock_match_rfc7530_vectors() {
+        let open = CompoundBuilder::new("reclaim-open")
+            .open_reclaim(OpenReclaimArgs {
+                seqid: 4,
+                share_access: 3,
+                client_id: 9,
+                owner: b"owner",
+            })
+            .encode_body();
+        let (opcode, args) = operation_arguments(&open, 0);
+        assert_eq!(opcode, OP_OPEN);
+        assert_eq!(
+            args,
+            [
+                4u32.to_be_bytes().as_slice(),
+                3u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                9u64.to_be_bytes().as_slice(),
+                5u32.to_be_bytes().as_slice(),
+                b"owner",
+                &[0, 0, 0],
+                0u32.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let lock = CompoundBuilder::new("reclaim-lock")
+            .lock_new(NewLockArgs {
+                lock_type: 2,
+                reclaim: true,
+                offset: 7,
+                length: 11,
+                open_seqid: 5,
+                open_stateid: &[0x41; 16],
+                lock_seqid: 0,
+                client_id: 9,
+                owner: b"locker",
+            })
+            .encode_body();
+        let (_, args) = operation_arguments(&lock, 0);
+        assert_eq!(&args[4..8], &1u32.to_be_bytes());
+        assert_eq!(&args[24..28], &1u32.to_be_bytes());
     }
 
     fn compound_response(tag: &str, ops: &[(u32, &[u8])]) -> Bytes {

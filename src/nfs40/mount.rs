@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, SetClientIdArgs,
+    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
     decode_confirm_response, decode_create_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
@@ -19,7 +19,7 @@ use super::compound::{
     decode_setattr_response, decode_setclientid_response, decode_stateid_response,
     decode_write_response, open_succeeded_before_compound_failure,
 };
-use super::lease::{LeaseRenewal, LeaseState};
+use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
@@ -40,7 +40,7 @@ struct Mount40 {
     rpc: rpc::Client,
     auth: Auth,
     root_fh: Bytes,
-    client_id: u64,
+    client_id: Arc<AtomicU64>,
     issuer: u64,
     next_owner: AtomicU64,
     state: Arc<OpenState>,
@@ -51,6 +51,21 @@ struct Mount40 {
     maxcount: u32,
     rsize: u32,
     wsize: u32,
+}
+
+#[derive(Clone)]
+struct ClientIdentity {
+    verifier: [u8; 8],
+    owner: String,
+}
+
+impl ClientIdentity {
+    fn new() -> Self {
+        Self {
+            verifier: rand::random(),
+            owner: format!("nfs-rs-v4.0-{:016x}", rand::random::<u64>()),
+        }
+    }
 }
 
 impl Debug for Mount40 {
@@ -89,11 +104,15 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let rpc = rpc::Client::new(mux, None);
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
-    let identity =
-        tokio::spawn(async move { establish_identity(&identity_rpc, &identity_auth).await });
+    let identity_config = ClientIdentity::new();
+    let identity_for_task = identity_config.clone();
+    let identity = tokio::spawn(async move {
+        establish_identity(&identity_rpc, &identity_auth, &identity_for_task).await
+    });
     let client_id = identity
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 identity task failed: {error}")))??;
+    let client_id = Arc::new(AtomicU64::new(client_id));
 
     let components: Vec<&str> = args
         .dirpath
@@ -115,6 +134,9 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let lease_time = query_lease_time(&rpc, &auth, &root_fh).await?;
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
+    let issuer = rand::random();
+    let state = Arc::new(OpenState::default());
+    let locks = Arc::new(LockState::default());
     let reconnect_lease = Arc::clone(&lease);
     rpc.set_reconnect_handler(move |_client, _generation| {
         let lease = Arc::clone(&reconnect_lease);
@@ -123,12 +145,27 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
             Ok(())
         }
     })?;
+    let recovery_context = RecoveryContext {
+        rpc: rpc.clone(),
+        auth: auth.clone(),
+        identity: identity_config,
+        client_id: Arc::clone(&client_id),
+        issuer,
+        state: Arc::clone(&state),
+        locks: Arc::clone(&locks),
+        lease: Arc::clone(&lease),
+    };
+    let recovery: RecoveryHandler = Arc::new(move || {
+        let context = recovery_context.clone();
+        Box::pin(async move { context.recover_or_lose().await })
+    });
     let renewal = LeaseRenewal::start(
         rpc.clone(),
         auth.clone(),
-        client_id,
+        Arc::clone(&client_id),
         Duration::from_secs(u64::from(lease_time / 3).max(1)),
         Arc::clone(&lease),
+        Some(recovery),
     );
 
     Ok(Mount40 {
@@ -136,10 +173,10 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         auth,
         root_fh,
         client_id,
-        issuer: rand::random(),
+        issuer,
         next_owner: AtomicU64::new(1),
-        state: Arc::new(OpenState::default()),
-        locks: Arc::new(LockState::default()),
+        state,
+        locks,
         lease,
         _renewal: Some(renewal),
         dircount: args.dircount,
@@ -174,13 +211,15 @@ async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Re
     Ok(seconds)
 }
 
-async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
-    let verifier: [u8; 8] = rand::random();
-    let owner = format!("nfs-rs-v4.0-{:016x}", rand::random::<u64>());
+async fn establish_identity(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    identity: &ClientIdentity,
+) -> Result<u64> {
     let identity_request = CompoundBuilder::new("identity")
         .setclientid(SetClientIdArgs {
-            verifier,
-            owner: owner.as_bytes(),
+            verifier: identity.verifier,
+            owner: identity.owner.as_bytes(),
             callback: CallbackAddress::DISABLED,
         })
         .encode_with_header(auth);
@@ -201,6 +240,111 @@ async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
         .await?;
     decode_confirm_response(confirm_response)?;
     Ok(client_id)
+}
+
+#[derive(Clone)]
+struct RecoveryContext {
+    rpc: rpc::Client,
+    auth: Auth,
+    identity: ClientIdentity,
+    client_id: Arc<AtomicU64>,
+    issuer: u64,
+    state: Arc<OpenState>,
+    locks: Arc<LockState>,
+    lease: Arc<LeaseState>,
+}
+
+impl RecoveryContext {
+    async fn recover(&self) -> Result<()> {
+        let renewed_client_id = establish_identity(&self.rpc, &self.auth, &self.identity).await?;
+        self.client_id.store(renewed_client_id, Ordering::Release);
+        self.lease.mark_reclaiming();
+
+        for lane in self.state.snapshot().await {
+            let mut open = lane.lock().await;
+            let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
+            let response = self
+                .rpc
+                .call(
+                    CompoundBuilder::new("reclaim-open")
+                        .putfh(&open.fh)
+                        .open_reclaim(OpenReclaimArgs {
+                            seqid: 0,
+                            share_access: open.access,
+                            client_id: renewed_client_id,
+                            owner: owner_wire.as_bytes(),
+                        })
+                        .getfh()
+                        .encode_with_header(&self.auth),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                )
+                .await?;
+            let (reclaimed, fh) = decode_open_response(response)?;
+            if reclaimed.confirm_required || fh != open.fh {
+                return Err(NfsError::Xdr(
+                    "NFSv4.0 reclaim OPEN returned incompatible state".into(),
+                ));
+            }
+            open.stateid = reclaimed.stateid;
+            open.next_seqid = 1;
+        }
+
+        for lane in self.locks.snapshot().await {
+            let (open_owner, old_stateid) = {
+                let lock = lane.lock().await;
+                (lock.open_owner, lock.stateid)
+            };
+            let open_lane =
+                self.state.by_owner(open_owner).await.ok_or_else(|| {
+                    NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
+                })?;
+            let mut open = open_lane.lock().await;
+            let mut lock = lane.lock().await;
+            let response = self
+                .rpc
+                .call(
+                    CompoundBuilder::new("reclaim-lock")
+                        .putfh(&lock.fh)
+                        .lock_new(NewLockArgs {
+                            lock_type: lock.lock_type,
+                            reclaim: true,
+                            offset: lock.offset,
+                            length: lock.length,
+                            open_seqid: open.next_seqid,
+                            open_stateid: &open.stateid,
+                            lock_seqid: 0,
+                            client_id: renewed_client_id,
+                            owner: &lock.owner_wire,
+                        })
+                        .encode_with_header(&self.auth),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                )
+                .await?;
+            let new_stateid = decode_lock_response(response, 12, "LOCK")?;
+            open.next_seqid = open.next_seqid.wrapping_add(1);
+            lock.stateid = new_stateid;
+            lock.next_seqid = 1;
+            drop(lock);
+            self.locks
+                .rekey(old_stateid, new_stateid, Arc::clone(&lane))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn recover_or_lose(&self) -> Result<()> {
+        match self.recover().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.state.clear().await;
+                self.locks.clear().await;
+                self.lease.mark_lost();
+                Err(error)
+            }
+        }
+    }
 }
 
 fn context(
@@ -259,10 +403,11 @@ impl Mount40 {
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         let locks = Arc::clone(&self.locks);
         let stateid = tokio::spawn(async move {
             let mut open = open_lane.lock().await;
+            let open_owner = open.owner;
             let request = CompoundBuilder::new("lock")
                 .putfh(&fh)
                 .lock_new(NewLockArgs {
@@ -290,6 +435,7 @@ impl Mount40 {
             locks
                 .register(LockLane {
                     owner,
+                    open_owner,
                     owner_wire,
                     next_seqid: 1,
                     stateid,
@@ -328,7 +474,7 @@ impl Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
         tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
@@ -1073,7 +1219,7 @@ impl Mount for Mount40 {
                 lock_type,
                 offset,
                 length,
-                self.client_id,
+                self.client_id.load(Ordering::Acquire),
                 owner_wire.as_bytes(),
             )
             .encode_with_header(&self.auth);
@@ -1162,7 +1308,7 @@ impl Mount for Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let locks = Arc::clone(&self.locks);
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         tokio::spawn(async move {
             let mut lane = lane.lock().await;
             if lane.fh != fh
@@ -1631,7 +1777,7 @@ mod tests {
             rpc,
             auth: Auth::new_null(),
             root_fh: Bytes::from_static(b"root"),
-            client_id: 7,
+            client_id: Arc::new(AtomicU64::new(7)),
             issuer: 9,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
@@ -1659,15 +1805,16 @@ mod tests {
         let renewal = LeaseRenewal::start(
             rpc.clone(),
             Auth::new_null(),
-            7,
+            Arc::new(AtomicU64::new(7)),
             interval,
             Arc::clone(&lease),
+            None,
         );
         Arc::new(Mount40 {
             rpc,
             auth: Auth::new_null(),
             root_fh: Bytes::from_static(b"root"),
-            client_id: 7,
+            client_id: Arc::new(AtomicU64::new(7)),
             issuer: 9,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
@@ -1766,6 +1913,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grace_renewal_is_suspect_until_a_later_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let (grace_tx, grace_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let mut grace = Vec::new();
+            grace.extend_from_slice(&10013u32.to_be_bytes());
+            xdr_opaque(&mut grace, b"renew");
+            grace.extend_from_slice(&1u32.to_be_bytes());
+            grace.extend_from_slice(&30u32.to_be_bytes());
+            grace.extend_from_slice(&10013u32.to_be_bytes());
+            reply(&mut stream, &first, &grace).await?;
+            let _ = grace_tx.send(());
+            let _ = continue_rx.await;
+            let second = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        grace_rx.await.unwrap();
+        for _ in 0..100 {
+            if mount.health().lifecycle == crate::MountLifecycleState::Suspect {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::Suspect
+        );
+        assert_eq!(mount.health().generation, 1);
+        let _ = continue_tx.send(());
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if mount.health().lease_renewals == 1 {
+                assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("successful RENEW did not clear GRACE suspicion");
+    }
+
+    #[tokio::test]
     async fn expired_renewal_loses_generation_and_gates_stateful_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
@@ -1831,6 +2032,157 @@ mod tests {
         assert_eq!(health.lease_healthy, Some(false));
         assert!(mount.read(Bytes::from_static(b"fh"), 0, 1).await.is_err());
         accepted.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scripted_recovery_reclaims_open_before_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 71, b"fh").await;
+        mount
+            .locks
+            .register(LockLane {
+                owner: 72,
+                open_owner: 71,
+                owner_wire: Bytes::from_static(b"lock-owner"),
+                next_seqid: 1,
+                stateid: [0x72; 16],
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 2,
+                offset: 7,
+                length: 11,
+            })
+            .await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&17u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x77; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim_open = read_record(&mut stream).await?;
+            assert!(
+                reclaim_open
+                    .windows(4)
+                    .any(|wire| wire == 18u32.to_be_bytes())
+            );
+            reply(
+                &mut stream,
+                &reclaim_open,
+                &open_result(0, [0x81; 16], b"fh"),
+            )
+            .await?;
+            let reclaim_lock = read_record(&mut stream).await?;
+            assert!(
+                reclaim_lock
+                    .windows(8)
+                    .any(|wire| { wire == [2u32.to_be_bytes(), 1u32.to_be_bytes()].concat() })
+            );
+            reply(
+                &mut stream,
+                &reclaim_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x82; 16])]),
+            )
+            .await
+        });
+        let identity = ClientIdentity {
+            verifier: [0x55; 8],
+            owner: "scripted-recovery".into(),
+        };
+        mount.lease.mark_recovering();
+        RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity,
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        }
+        .recover()
+        .await
+        .unwrap();
+        assert_eq!(mount.client_id.load(Ordering::Acquire), 17);
+        assert_eq!(
+            mount.state.by_owner(71).await.unwrap().lock().await.stateid,
+            [0x81; 16]
+        );
+        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
+        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_some());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_grace_reclaim_clears_protection_and_advances_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 73, b"fh").await;
+        register_scripted_lock(&mount, 74, [0x74; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &reclaim,
+                &failed_lock_result("reclaim-open", 18, 10033),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-no-grace".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        };
+        assert!(matches!(
+            context.recover_or_lose().await,
+            Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE))
+        ));
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState
+        );
+        assert_eq!(mount.health().generation, 2);
+        assert!(mount.state.snapshot().await.is_empty());
+        assert!(mount.locks.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2602,6 +2954,7 @@ mod tests {
             .locks
             .register(LockLane {
                 owner,
+                open_owner: owner,
                 owner_wire: Bytes::from(format!("scripted-lock-{owner}")),
                 next_seqid: 1,
                 stateid,

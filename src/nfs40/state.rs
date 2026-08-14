@@ -16,6 +16,7 @@ pub(crate) struct OwnerLane {
 #[derive(Debug)]
 pub(crate) struct LockLane {
     pub owner: u64,
+    pub open_owner: u64,
     pub owner_wire: Bytes,
     pub next_seqid: u32,
     pub stateid: [u8; 16],
@@ -60,6 +61,38 @@ impl LockState {
             }
         }
         false
+    }
+
+    pub(crate) async fn snapshot(&self) -> Vec<Arc<Mutex<LockLane>>> {
+        let lanes = self
+            .lanes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            let owner = lane.lock().await.owner;
+            ordered.push((owner, lane));
+        }
+        ordered.sort_by_key(|(owner, _)| *owner);
+        ordered.into_iter().map(|(_, lane)| lane).collect()
+    }
+
+    pub(crate) async fn rekey(
+        &self,
+        old_stateid: [u8; 16],
+        new_stateid: [u8; 16],
+        lane: Arc<Mutex<LockLane>>,
+    ) {
+        let mut lanes = self.lanes.write().await;
+        lanes.remove(&old_stateid);
+        lanes.insert(new_stateid, lane);
+    }
+
+    pub(crate) async fn clear(&self) {
+        self.lanes.write().await.clear();
     }
 }
 
@@ -107,6 +140,21 @@ impl OpenState {
                 by_fh.remove(fh);
             }
         }
+    }
+
+    pub(crate) async fn snapshot(&self) -> Vec<Arc<Mutex<OwnerLane>>> {
+        let mut owners = self.lanes.read().await.keys().copied().collect::<Vec<_>>();
+        owners.sort_unstable();
+        let lanes = self.lanes.read().await;
+        owners
+            .into_iter()
+            .filter_map(|owner| lanes.get(&owner).cloned())
+            .collect()
+    }
+
+    pub(crate) async fn clear(&self) {
+        self.lanes.write().await.clear();
+        self.by_fh.write().await.clear();
     }
 }
 

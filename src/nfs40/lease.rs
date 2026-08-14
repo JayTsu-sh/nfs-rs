@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 
 use super::compound::{CompoundBuilder, decode_renew_response};
@@ -121,6 +122,17 @@ impl LeaseState {
             .store(MountLifecycleState::Reconnecting as u8, Ordering::Release);
     }
 
+    pub(crate) fn mark_recovering(&self) {
+        self.healthy.store(false, Ordering::Release);
+        self.lifecycle
+            .store(MountLifecycleState::Recovering as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_reclaiming(&self) {
+        self.lifecycle
+            .store(MountLifecycleState::Reclaiming as u8, Ordering::Release);
+    }
+
     pub(crate) fn mark_closing(&self) {
         self.lifecycle
             .store(MountLifecycleState::Closing as u8, Ordering::Release);
@@ -132,7 +144,7 @@ impl LeaseState {
             .store(MountLifecycleState::Closed as u8, Ordering::Release);
     }
 
-    fn mark_lost(&self) {
+    pub(crate) fn mark_lost(&self) {
         self.healthy.store(false, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.lifecycle
@@ -144,19 +156,23 @@ pub(crate) struct LeaseRenewal {
     handle: JoinHandle<()>,
 }
 
+pub(crate) type RecoveryHandler =
+    Arc<dyn Fn() -> BoxFuture<'static, crate::Result<()>> + Send + Sync>;
+
 impl LeaseRenewal {
     pub(crate) fn start(
         rpc: rpc::Client,
         auth: Auth,
-        client_id: u64,
+        client_id: Arc<AtomicU64>,
         interval: Duration,
         state: Arc<LeaseState>,
+        recovery: Option<RecoveryHandler>,
     ) -> Self {
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(renewal_delay(interval, rand::random())).await;
                 let request = CompoundBuilder::new("renew")
-                    .renew(client_id)
+                    .renew(client_id.load(Ordering::Acquire))
                     .encode_with_header(&auth);
                 let context = RequestContext {
                     operation: "renew".into(),
@@ -175,7 +191,16 @@ impl LeaseRenewal {
                     Err(NfsError::Nfs4(
                         crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
                         | crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID,
-                    )) => state.mark_lost(),
+                    )) => {
+                        if let Some(recover) = &recovery {
+                            state.mark_recovering();
+                            if recover().await.is_ok() {
+                                state.mark_ready();
+                            }
+                        } else {
+                            state.mark_lost();
+                        }
+                    }
                     Err(NfsError::Nfs4(_)) | Err(NfsError::OperationOutcome(_)) => {
                         state.mark_suspect()
                     }
