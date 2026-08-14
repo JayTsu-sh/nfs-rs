@@ -205,7 +205,8 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     ] {
         assert!(helper.contains(required), "fault helper lacks {required}");
     }
-    assert!(!helper.contains("input {"));
+    assert!(helper.contains("output ip daddr \"$target_ip\" tcp dport 2049 drop"));
+    assert!(helper.contains("input ip saddr \"$target_ip\" tcp flags"));
     assert!(runner.contains("trap cleanup EXIT INT TERM"));
     assert!(runner.contains("NFS_RS_LAB_V40_LIF_A"));
     assert!(runner.contains("NFS_RS_LAB_V40_LIF_B"));

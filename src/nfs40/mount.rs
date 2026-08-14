@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
-    create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
-    decode_confirm_response, decode_create_response,
+    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
+    OpenReclaimArgs, SetClientIdArgs, create_succeeded_before_compound_failure,
+    decode_access_response, decode_commit_response, decode_confirm_response,
+    decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
     decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
@@ -36,6 +38,30 @@ use crate::{Mount, MountArgs};
 const NFS4_DEFAULT_PORT: u16 = 2049;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
+const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
+
+fn decode_callback_attributes(mut data: Bytes) -> Result<(u64, u64)> {
+    let (bitmap, mut values) = decode_fattr4_envelope(&mut data, "delegation getattr")?;
+    if bitmap != CALLBACK_GETATTR_BITMAP || values.remaining() != 16 {
+        return Err(NfsError::Xdr(
+            "delegation GETATTR did not return exactly change and size".into(),
+        ));
+    }
+    Ok((values.get_u64(), values.get_u64()))
+}
+
+async fn query_callback_attributes(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+) -> Result<(u64, u64)> {
+    let request = CompoundBuilder::new("delegation-getattr")
+        .putfh(fh)
+        .getattr(&CALLBACK_GETATTR_BITMAP)
+        .encode_with_header(auth);
+    let response = rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?;
+    decode_callback_attributes(decode_getattr_compound(response)?)
+}
 
 struct Mount40 {
     rpc: rpc::Client,
@@ -48,6 +74,9 @@ struct Mount40 {
     locks: Arc<LockState>,
     lease: Arc<LeaseState>,
     _renewal: Option<LeaseRenewal>,
+    _callback: Option<CallbackService>,
+    _callback_worker: Option<CallbackWorker>,
+    callback_state: Option<Arc<CallbackState>>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
@@ -103,12 +132,37 @@ pub(crate) async fn mount(args: &MountArgs) -> Result<Box<dyn Mount>> {
 async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result<Mount40> {
     let mux = rpc::StreamMux::connect(addr, args.noresvport).await?;
     let rpc = rpc::Client::new(mux, None);
+    let callback = if args.retain_delegations {
+        Some(CallbackService::bind_for(addr).await?)
+    } else {
+        None
+    };
+    let callback_addr = callback
+        .as_ref()
+        .map(|service| service.universal_addr().to_string());
+    let callback_state = callback.as_ref().map(CallbackService::state);
+    let callback_worker = match (&callback, &callback_state) {
+        (Some(service), Some(state)) => Some(CallbackWorker::start(
+            service.take_recall_receiver()?,
+            rpc.clone(),
+            auth.clone(),
+            Arc::clone(state),
+        )),
+        _ => None,
+    };
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
     let identity_config = ClientIdentity::new();
     let identity_for_task = identity_config.clone();
+    let callback_for_task = callback_addr.clone();
     let identity = tokio::spawn(async move {
-        establish_identity(&identity_rpc, &identity_auth, &identity_for_task).await
+        establish_identity(
+            &identity_rpc,
+            &identity_auth,
+            &identity_for_task,
+            callback_for_task.as_deref(),
+        )
+        .await
     });
     let client_id = identity
         .await
@@ -155,10 +209,18 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         state: Arc::clone(&state),
         locks: Arc::clone(&locks),
         lease: Arc::clone(&lease),
+        callback_addr,
     };
+    let recovery_callback_state = callback_state.clone();
     let recovery: RecoveryHandler = Arc::new(move || {
         let context = recovery_context.clone();
-        Box::pin(async move { context.recover_or_lose().await })
+        let callback_state = recovery_callback_state.clone();
+        Box::pin(async move {
+            if let Some(callback_state) = callback_state {
+                callback_state.invalidate_delegations(context.lease.generation())?;
+            }
+            context.recover_or_lose().await
+        })
     });
     let renewal = LeaseRenewal::start(
         rpc.clone(),
@@ -180,6 +242,9 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         locks,
         lease,
         _renewal: Some(renewal),
+        _callback: callback,
+        _callback_worker: callback_worker,
+        callback_state,
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
@@ -216,12 +281,16 @@ async fn establish_identity(
     rpc: &rpc::Client,
     auth: &Auth,
     identity: &ClientIdentity,
+    callback_addr: Option<&str>,
 ) -> Result<u64> {
+    let callback = callback_addr
+        .map(|addr| CallbackAddress::tcp(addr, 1))
+        .unwrap_or(CallbackAddress::DISABLED);
     let identity_request = CompoundBuilder::new("identity")
         .setclientid(SetClientIdArgs {
             verifier: identity.verifier,
             owner: identity.owner.as_bytes(),
-            callback: CallbackAddress::DISABLED,
+            callback,
         })
         .encode_with_header(auth);
     let identity_response = rpc
@@ -253,11 +322,18 @@ struct RecoveryContext {
     state: Arc<OpenState>,
     locks: Arc<LockState>,
     lease: Arc<LeaseState>,
+    callback_addr: Option<String>,
 }
 
 impl RecoveryContext {
     async fn recover(&self) -> Result<()> {
-        let renewed_client_id = establish_identity(&self.rpc, &self.auth, &self.identity).await?;
+        let renewed_client_id = establish_identity(
+            &self.rpc,
+            &self.auth,
+            &self.identity,
+            self.callback_addr.as_deref(),
+        )
+        .await?;
         self.client_id.store(renewed_client_id, Ordering::Release);
         self.lease.mark_reclaiming();
 
@@ -293,6 +369,20 @@ impl RecoveryContext {
                 return Err(NfsError::Xdr(
                     "NFSv4.0 reclaim OPEN returned incompatible state".into(),
                 ));
+            }
+            if let Some(delegation) = reclaimed.delegation {
+                let response = self
+                    .rpc
+                    .call(
+                        CompoundBuilder::new("reclaim-delegreturn")
+                            .putfh(&fh)
+                            .delegreturn(&delegation.stateid)
+                            .encode_with_header(&self.auth),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        METADATA_TIMEOUT,
+                    )
+                    .await?;
+                decode_delegreturn_response(response)?;
             }
             open.stateid = reclaimed.stateid;
             open.next_seqid = 1;
@@ -515,6 +605,10 @@ impl Mount40 {
         let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
         let lease = Arc::clone(&self.lease);
+        let callback_state = self.callback_state.clone();
+        let callback_publication = callback_state
+            .as_ref()
+            .map(|state| state.begin_open_publication());
         let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
@@ -569,6 +663,40 @@ impl Mount40 {
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
             }
+            if callback_state.is_none()
+                && let Some(delegation) = opened.delegation
+            {
+                let return_rpc = rpc.clone();
+                let return_auth = auth.clone();
+                let return_fh = fh.clone();
+                tokio::spawn(async move {
+                    let response = return_rpc
+                        .call(
+                            CompoundBuilder::new("delegreturn")
+                                .putfh(&return_fh)
+                                .delegreturn(&delegation.stateid)
+                                .encode_with_header(&return_auth),
+                            ReplayPolicy::ONE_ATTEMPT,
+                            METADATA_TIMEOUT,
+                        )
+                        .await;
+                    if let Ok(response) = response {
+                        let _ = decode_delegreturn_response(response);
+                    }
+                });
+            }
+            let delegation_attributes = if callback_state.is_some()
+                && matches!(
+                    opened.delegation,
+                    Some(DelegationGrant {
+                        kind: DelegationKind::Write,
+                        ..
+                    })
+                ) {
+                query_callback_attributes(&rpc, &auth, &fh).await.ok()
+            } else {
+                None
+            };
             let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "open")?;
             state
@@ -581,6 +709,15 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
+                callback_state.register_delegation(
+                    fh.clone(),
+                    delegation,
+                    expected_generation,
+                    delegation_attributes,
+                )?;
+            }
+            drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
                 state.remove(owner, &fh).await;
                 return Err(error);
@@ -611,10 +748,17 @@ impl Mount40 {
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
         let expected_generation = self.lease.begin_stateful("close")?;
+        let close_fh = lane.lock().await.fh.clone();
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.recall_io(&close_fh).await)
+        } else {
+            None
+        };
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
+            let _io_guard = io_guard;
             let mut lane = lane.lock().await;
             let request = CompoundBuilder::new("close")
                 .putfh(&lane.fh)
@@ -678,6 +822,15 @@ impl Mount40 {
                 .await?,
         )?;
         decode_fattr4_envelope(&mut data, label)
+    }
+
+    async fn refresh_callback_attributes(&self, fh: &Bytes) {
+        let Some(state) = &self.callback_state else {
+            return;
+        };
+        if let Ok((change, size)) = query_callback_attributes(&self.rpc, &self.auth, fh).await {
+            let _ = state.publish_attributes(fh, change, size);
+        }
     }
 
     async fn readdir_page(
@@ -956,8 +1109,28 @@ impl Mount40 {
 
 #[async_trait]
 impl Mount for Mount40 {
+    fn capabilities(&self) -> crate::MountCapabilities {
+        crate::MountCapabilities {
+            acl: true,
+            named_attributes: false,
+            locks: true,
+            callbacks: true,
+            delegation_retention: self.callback_state.is_some(),
+            pnfs: false,
+            session_diagnostics: false,
+        }
+    }
+
     fn health(&self) -> crate::MountHealth {
-        self.lease.health()
+        let mut health = self.lease.health();
+        health.callback_healthy = self.callback_state.as_ref().map(|state| state.healthy());
+        health
+    }
+
+    async fn callback_stats(&self) -> crate::CallbackStats {
+        self.callback_state
+            .as_ref()
+            .map_or_else(crate::CallbackStats::default, |state| state.stats())
     }
     fn get_max_read_size(&self) -> u32 {
         self.rsize
@@ -985,9 +1158,20 @@ impl Mount for Mount40 {
         if let Some(renewal) = &self._renewal {
             renewal.stop().await;
         }
+        if let Some(callback) = &self._callback {
+            callback.stop().await;
+        }
+        let callback_cleanup = if let Some(callback_state) = &self.callback_state {
+            callback_state.return_all_delegations().await
+        } else {
+            Ok(())
+        };
+        if let Some(worker) = &self._callback_worker {
+            worker.stop().await;
+        }
         self.rpc.shutdown().await;
         self.lease.mark_closed();
-        Ok(())
+        callback_cleanup
     }
 
     async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
@@ -1231,6 +1415,14 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
+        let _io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
+        if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?;
+        }
         let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
         let (stateid, expected_generation) = match lane {
             Some(lane) => (
@@ -1252,6 +1444,7 @@ impl Mount for Mount40 {
         if let Some(generation) = expected_generation {
             self.lease.finish_stateful(generation, "setattr")?;
         }
+        self.refresh_callback_attributes(&fh).await;
         Ok(())
     }
     async fn setattr_path(
@@ -1626,11 +1819,20 @@ impl Mount for Mount40 {
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
             .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
+        if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?;
+        }
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let lane_for_settlement = Arc::clone(&lane);
         let fh_for_settlement = fh.clone();
         let settled = tokio::spawn(async move {
+            let _io_guard = io_guard;
             // The lane guard spans request construction through reply decoding.
             // CLOSE takes the same guard, so cancellation cannot reorder CLOSE
             // ahead of a detached WRITE settlement.
@@ -1685,6 +1887,7 @@ impl Mount for Mount40 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
         self.lease.finish_stateful(expected_generation, "write")?;
+        self.refresh_callback_attributes(&fh).await;
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -1901,6 +2104,9 @@ mod tests {
             locks: Arc::new(LockState::default()),
             lease: LeaseState::ready(1, 60),
             _renewal: None,
+            _callback: None,
+            _callback_worker: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1955,6 +2161,9 @@ mod tests {
             locks: Arc::new(LockState::default()),
             lease,
             _renewal: Some(renewal),
+            _callback: None,
+            _callback_worker: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1969,6 +2178,52 @@ mod tests {
         open.extend_from_slice(&flags.to_be_bytes());
         open.extend_from_slice(&0u32.to_be_bytes());
         open.extend_from_slice(&0u32.to_be_bytes());
+        let mut getfh = Vec::new();
+        xdr_opaque(&mut getfh, fh);
+        compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
+    }
+
+    #[test]
+    fn delegation_getattr_decodes_exact_change_and_size() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&0x18u32.to_be_bytes());
+        encoded.extend_from_slice(&16u32.to_be_bytes());
+        encoded.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        encoded.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+        assert_eq!(
+            decode_callback_attributes(Bytes::from(encoded)).unwrap(),
+            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+        );
+    }
+
+    #[test]
+    fn delegation_getattr_rejects_missing_required_attributes() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&0x10u32.to_be_bytes());
+        encoded.extend_from_slice(&8u32.to_be_bytes());
+        encoded.extend_from_slice(&7u64.to_be_bytes());
+        assert!(decode_callback_attributes(Bytes::from(encoded)).is_err());
+    }
+
+    fn open_result_with_read_delegation(
+        stateid: [u8; 16],
+        delegation: [u8; 16],
+        fh: &[u8],
+    ) -> Vec<u8> {
+        let mut open = Vec::new();
+        open.extend_from_slice(&stateid);
+        open.extend_from_slice(&[0; 20]);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&1u32.to_be_bytes());
+        open.extend_from_slice(&delegation);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        xdr_opaque(&mut open, b"");
         let mut getfh = Vec::new();
         xdr_opaque(&mut getfh, fh);
         compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
@@ -2454,6 +2709,7 @@ mod tests {
             state: Arc::clone(&state),
             locks: Arc::clone(&locks),
             lease: Arc::clone(&lease),
+            callback_addr: None,
         };
         let recovery: RecoveryHandler = Arc::new(move || {
             let context = context.clone();
@@ -2478,6 +2734,9 @@ mod tests {
             locks,
             lease,
             _renewal: Some(renewal),
+            _callback: None,
+            _callback_worker: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -2639,6 +2898,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover()
         .await
@@ -2724,6 +2984,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         };
         context.recover().await.unwrap();
         server.await.unwrap().unwrap();
@@ -2805,6 +3066,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover()
         .await
@@ -2857,6 +3119,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         };
         let error = context.recover_or_lose().await.unwrap_err();
         let outcome = error.operation_outcome().unwrap();
@@ -2917,6 +3180,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover_or_lose()
         .await
@@ -2974,6 +3238,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover_or_lose()
         .await
@@ -3106,6 +3371,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_retention_returns_an_unsolicited_delegation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
+            )
+            .await?;
+            let delegreturn =
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .expect("unsolicited delegation was not returned")?;
+            assert!(delegreturn.windows(16).any(|value| value == [0x71; 16]));
+            reply(
+                &mut stream,
+                &delegreturn,
+                &compound_result("delegreturn", &[(22, &[]), (8, &[])]),
+            )
+            .await
+        });
+        mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn scripted_mount_reconnect_preserves_confirmed_identity() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3198,6 +3495,227 @@ mod tests {
         mount.null().await.unwrap();
         server.await.unwrap().unwrap();
         mount.umount().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_delegations_publish_callback_before_setclientid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            assert!(
+                identity.windows(3).any(|value| value == b"tcp"),
+                "SETCLIENTID did not publish a ready TCP callback listener"
+            );
+            let netid = identity
+                .windows(3)
+                .position(|value| value == b"tcp")
+                .expect("TCP netid missing");
+            let addr_len_offset = netid + 4;
+            let addr_len = u32::from_be_bytes(
+                identity[addr_len_offset..addr_len_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let universal =
+                std::str::from_utf8(&identity[addr_len_offset + 4..addr_len_offset + 4 + addr_len])
+                    .unwrap();
+            let fields: Vec<_> = universal.split('.').collect();
+            assert_eq!(fields.len(), 6, "invalid callback universal address");
+            let callback_addr = format!(
+                "{}.{}.{}.{}:{}",
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4].parse::<u16>().unwrap() * 256 + fields[5].parse::<u16>().unwrap()
+            );
+            TcpStream::connect(callback_addr).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let args = crate::MountArgs {
+            versions: vec![NFSVersion::NFSv4p0],
+            host: "127.0.0.1".to_string(),
+            dirpath: "/export".to_string(),
+            mountport: 0,
+            nfsport: addr.port(),
+            uid: 0,
+            gid: 0,
+            dircount: 32 * 1024,
+            maxcount: 32 * 1024,
+            rsize: 0,
+            wsize: 0,
+            noresvport: true,
+            retain_delegations: true,
+        };
+
+        let error = mount_on_addr(addr, &args, Auth::new_null())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NfsError::Rpc(_) | NfsError::Io(_)));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scripted_public_io_survives_a_lost_callback_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let callback = CallbackService::bind_for(addr).await.unwrap();
+        let callback_addr = callback.universal_addr().to_string();
+        let callback_state = callback.state();
+        let recalls = callback.take_recall_receiver().unwrap();
+        let worker = CallbackWorker::start(
+            recalls,
+            rpc.clone(),
+            Auth::new_null(),
+            Arc::clone(&callback_state),
+        );
+        let mount = Arc::new(Mount40 {
+            rpc,
+            auth: Auth::new_null(),
+            root_fh: Bytes::from_static(b"root"),
+            client_id: Arc::new(AtomicU64::new(7)),
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state: Arc::new(OpenState::default()),
+            locks: Arc::new(LockState::default()),
+            lease: LeaseState::ready(1, 60),
+            _renewal: None,
+            _callback: Some(callback),
+            _callback_worker: Some(worker),
+            callback_state: Some(callback_state),
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        });
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
+            )
+            .await?;
+            for _ in 0..6 {
+                let request = read_record(&mut stream).await?;
+                let (tag, result) = if request.windows(11).any(|part| part == b"delegreturn") {
+                    (
+                        "delegreturn",
+                        compound_result("delegreturn", &[(22, &[]), (8, &[])]),
+                    )
+                } else if request.windows(5).any(|part| part == b"write") {
+                    let data = [
+                        4u32.to_be_bytes().as_slice(),
+                        2u32.to_be_bytes().as_slice(),
+                        [0x33; 8].as_slice(),
+                    ]
+                    .concat();
+                    ("write", compound_result("write", &[(22, &[]), (38, &data)]))
+                } else if request.windows(6).any(|part| part == b"commit") {
+                    (
+                        "commit",
+                        compound_result("commit", &[(22, &[]), (5, &[0x33; 8])]),
+                    )
+                } else if request.windows(4).any(|part| part == b"read") {
+                    let mut data = 1u32.to_be_bytes().to_vec();
+                    xdr_opaque(&mut data, b"data");
+                    ("read", compound_result("read", &[(22, &[]), (25, &data)]))
+                } else {
+                    (
+                        "close",
+                        compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
+                    )
+                };
+                let _ = tag;
+                reply(&mut stream, &request, &result).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let opened = mount
+            .open(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+            .await
+            .unwrap();
+        let fields = callback_addr
+            .split('.')
+            .map(|field| field.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        let callback_socket = SocketAddr::from((
+            [
+                fields[0] as u8,
+                fields[1] as u8,
+                fields[2] as u8,
+                fields[3] as u8,
+            ],
+            fields[4] * 256 + fields[5],
+        ));
+        let mut words = vec![
+            77,
+            0,
+            2,
+            super::super::callback::CB_PROGRAM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[0, 0, 1, 1, 4]);
+        words.extend_from_slice(&[0x7171_7171; 4]);
+        words.extend_from_slice(&[0, 12]);
+        words.extend(
+            b"delegated-fh"
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().unwrap())),
+        );
+        let call = words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect::<Vec<_>>();
+        let mut first = TcpStream::connect(callback_socket).await.unwrap();
+        first
+            .write_u32(0x8000_0000 | call.len() as u32)
+            .await
+            .unwrap();
+        first.write_all(&call).await.unwrap();
+        drop(first);
+        let mut retry = TcpStream::connect(callback_socket).await.unwrap();
+        retry
+            .write_u32(0x8000_0000 | call.len() as u32)
+            .await
+            .unwrap();
+        retry.write_all(&call).await.unwrap();
+        let marker = retry.read_u32().await.unwrap();
+        let mut reply_body = vec![0; (marker & 0x7fff_ffff) as usize];
+        retry.read_exact(&mut reply_body).await.unwrap();
+        assert_eq!(u32::from_be_bytes(reply_body[0..4].try_into().unwrap()), 77);
+        for _ in 0..100 {
+            if mount.callback_stats().await.returns_completed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mount.callback_stats().await.returns_completed, 1);
+        assert_eq!(
+            mount
+                .write(opened.fh.clone(), 0, Bytes::from_static(b"data"))
+                .await
+                .unwrap(),
+            4
+        );
+        mount.commit(opened.fh.clone(), 0, 4).await.unwrap();
+        assert_eq!(
+            mount.read(opened.fh.clone(), 0, 4).await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+        mount.close(opened.fh).await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

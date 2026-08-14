@@ -58,6 +58,189 @@ async fn nfs_v40_mount_null_and_traversal_on_both_lifs() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the writable NetApp NFSv4.0 delegation fixture"]
+async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure(
+        urls.len() == 2,
+        "NFSv4.0 delegation validation requires exactly two LIF URLs",
+    )?;
+    let filename = env::var("NFS_RS_LAB_V40_DELEGATION_FILE")
+        .unwrap_or_else(|_| "nfs-rs-v40-delegation.bin".to_string());
+    let mut granted = 0usize;
+
+    for primary in 0..urls.len() {
+        let retention_url = format!("{}&retain-delegations=true", urls[primary]);
+        let contender_url = &urls[1 - primary];
+        let mount = parse_url_and_mount(&retention_url).await?;
+        let contender = parse_url_and_mount(contender_url).await?;
+        ensure(
+            mount.capabilities().delegation_retention,
+            "NFSv4.0 delegation retention was not enabled",
+        )?;
+        ensure(
+            mount.health().callback_healthy == Some(true),
+            format!("callback listener is not healthy: {:?}", mount.health()),
+        )?;
+        let _ = contender.remove_path(&filename).await;
+        let created = mount.create_path(&filename, Some(0o600)).await?;
+        mount.close(created.fh).await?;
+        let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+        let granted_here = mount.callback_stats().await.grants_received > 0;
+        let conflicting = contender.open_path(&filename, OPEN_BOTH).await?;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let stats = mount.callback_stats().await;
+                if stats.recalls_received > 0 {
+                    break stats;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        match outcome {
+            Ok(_) => {
+                granted += 1;
+                let stats = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let stats = mount.callback_stats().await;
+                        if stats.returns_completed + stats.returns_failed > 0 {
+                            break stats;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .map_err(|_| io::Error::other("delegation return did not settle"))?;
+                ensure(
+                    stats.returns_completed > 0 && stats.returns_failed == 0,
+                    format!("delegation return failed through {retention_url}: {stats:?}"),
+                )?;
+                println!("NFS40_DELEGATION_OUTCOME=GRANTED_RECALLED_RETURNED url={retention_url}");
+            }
+            Err(_) if granted_here => {
+                return Err(io::Error::other(format!(
+                    "NFS40_DELEGATION_OUTCOME=GRANTED_CALLBACK_FAILED url={retention_url}"
+                ))
+                .into());
+            }
+            Err(_) => println!("NFS40_DELEGATION_OUTCOME=SKIP_NOT_GRANTED url={retention_url}"),
+        }
+
+        let expected = Bytes::from_static(b"nfs-rs-v40-delegation-checksum");
+        write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
+        mount.close(delegated.fh).await?;
+        contender.close(conflicting.fh).await?;
+        let reopened = contender.open_path(&filename, OPEN_READ).await?;
+        let actual = read_all(contender.as_ref(), reopened.fh.clone(), expected.len()).await?;
+        contender.close(reopened.fh).await?;
+        ensure(actual == expected, "post-delegation checksum mismatch")?;
+        contender.remove_path(&filename).await?;
+        mount.umount().await?;
+        contender.umount().await?;
+    }
+
+    if granted == 0 {
+        println!("NFS40_DELEGATION_SUMMARY=SKIP_NOT_GRANTED");
+    } else {
+        println!("NFS40_DELEGATION_SUMMARY=PASS_GRANTED count={granted}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a runner-scoped inbound NFSv4.0 callback fault"]
+async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure(urls.len() == 2, "callback fault test requires two LIF URLs")?;
+    let primary = env::var("NFS_RS_LAB_V40_FAULT_PRIMARY")?.parse::<usize>()?;
+    ensure(primary < 2, "invalid callback fault primary index")?;
+    let mount = parse_url_and_mount(&format!("{}&retain-delegations=true", urls[primary])).await?;
+    let contender = parse_url_and_mount(&urls[1 - primary]).await?;
+    let filename = format!("nfs-rs-v40-callback-fault-{primary}.bin");
+    let _ = contender.remove_path(&filename).await;
+    let created = mount.create_path(&filename, Some(0o600)).await?;
+    mount.close(created.fh).await?;
+    let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+    if let (Ok(armed), Ok(applied)) = (
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_ARMED"),
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_APPLIED"),
+    ) {
+        std::fs::write(armed, b"delegation outcome observable")?;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while !std::path::Path::new(&applied).exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("callback fault was not applied"))?;
+    }
+    if mount.callback_stats().await.grants_received == 0 {
+        println!(
+            "NFS40_CALLBACK_FAULT_OUTCOME=SKIP_NOT_GRANTED url={}",
+            urls[primary]
+        );
+    } else {
+        ensure(
+            mount.callback_stats().await.recalls_received == 0,
+            "callback fault admitted an inbound recall",
+        )?;
+        println!(
+            "NFS40_CALLBACK_FAULT_OUTCOME=GRANTED_CALLBACK_UNREACHABLE url={}",
+            urls[primary]
+        );
+        if let Ok(trigger) = env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_TRIGGER") {
+            std::fs::write(trigger, b"trigger recall")?;
+            let conflicting = tokio::time::timeout(
+                Duration::from_secs(90),
+                contender.open_path(&filename, OPEN_BOTH),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::other("conflicting OPEN did not recover after callback fault")
+            })??;
+            contender.close(conflicting.fh).await?;
+            ensure(
+                mount.callback_stats().await.recalls_received > 0,
+                "restored callback did not deliver the pending recall",
+            )?;
+        }
+    }
+    let expected = Bytes::from_static(b"ordinary-io-survives-callback-loss");
+    write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
+    mount.close(delegated.fh).await?;
+    if let (Ok(ready), Ok(restored)) = (
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_READY"),
+        env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_RESTORED"),
+    ) {
+        std::fs::write(ready, b"callback fault observed")?;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while !std::path::Path::new(&restored).exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("callback fault was not restored"))?;
+    }
+    let reopened = contender.open_path(&filename, OPEN_READ).await?;
+    let actual = read_all(contender.as_ref(), reopened.fh.clone(), expected.len()).await?;
+    contender.close(reopened.fh).await?;
+    ensure(actual == expected, "callback loss corrupted ordinary I/O")?;
+    contender.remove_path(&filename).await?;
+    contender.umount().await?;
+    mount.umount().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires the writable NetApp NFSv4.0 reference fixture"]
 async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
