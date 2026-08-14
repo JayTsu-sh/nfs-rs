@@ -173,6 +173,8 @@ impl LeaseRenewal {
     ) -> Self {
         let (stop, mut stopping) = watch::channel(false);
         let handle = tokio::spawn(async move {
+            let lease_duration = Duration::from_secs(u64::from(state.lease_seconds));
+            let mut expires_at = tokio::time::Instant::now() + lease_duration;
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(renewal_delay(interval, rand::random())) => {}
@@ -199,7 +201,10 @@ impl LeaseRenewal {
                     })
                     .and_then(decode_renew_response);
                 match result {
-                    Ok(()) => state.mark_ready(),
+                    Ok(()) => {
+                        expires_at = tokio::time::Instant::now() + lease_duration;
+                        state.mark_ready();
+                    }
                     Err(NfsError::Nfs4(
                         crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
                         | crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID,
@@ -207,16 +212,20 @@ impl LeaseRenewal {
                         if let Some(recover) = &recovery {
                             state.mark_recovering();
                             if recover().await.is_ok() {
+                                expires_at = tokio::time::Instant::now() + lease_duration;
                                 state.mark_ready();
                             }
                         } else {
                             state.mark_lost();
                         }
                     }
-                    Err(NfsError::Nfs4(_)) | Err(NfsError::OperationOutcome(_)) => {
-                        state.mark_suspect()
+                    Err(_) => {
+                        if tokio::time::Instant::now() >= expires_at {
+                            state.mark_lost();
+                            return;
+                        }
+                        state.mark_suspect();
                     }
-                    Err(_) => state.mark_suspect(),
                 }
                 if *stopping.borrow() {
                     return;

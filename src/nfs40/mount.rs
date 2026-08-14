@@ -1801,7 +1801,15 @@ mod tests {
     }
 
     fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
-        let lease = LeaseState::ready(1, 60);
+        direct_mount_with_lease_renewal(rpc, interval, 60)
+    }
+
+    fn direct_mount_with_lease_renewal(
+        rpc: rpc::Client,
+        interval: Duration,
+        lease_seconds: u32,
+    ) -> Arc<Mount40> {
+        let lease = LeaseState::ready(1, lease_seconds);
         let reconnect_lease = Arc::clone(&lease);
         rpc.set_reconnect_handler(move |_client, _generation| {
             let lease = Arc::clone(&reconnect_lease);
@@ -1973,6 +1981,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("successful RENEW did not clear GRACE suspicion");
+    }
+
+    #[tokio::test]
+    async fn transient_renewal_failures_lose_state_after_the_lease_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(20),
+            1,
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            while let Ok(request) = read_record(&mut stream).await {
+                if reply(
+                    &mut stream,
+                    &request,
+                    &failed_lock_result("renew", 30, 10013),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transient renewal failures never expired the lease");
+        assert_eq!(mount.health().generation, 2);
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
