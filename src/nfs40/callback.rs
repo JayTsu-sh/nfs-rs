@@ -47,7 +47,8 @@ pub(crate) struct CallbackState {
     recalls_received: AtomicU64,
     returns_completed: AtomicU64,
     returns_failed: AtomicU64,
-    healthy: AtomicBool,
+    service_healthy: AtomicBool,
+    worker_healthy: AtomicBool,
 }
 
 pub(crate) struct OpenPublication {
@@ -108,7 +109,8 @@ impl CallbackService {
             recalls_received: AtomicU64::new(0),
             returns_completed: AtomicU64::new(0),
             returns_failed: AtomicU64::new(0),
-            healthy: AtomicBool::new(true),
+            service_healthy: AtomicBool::new(true),
+            worker_healthy: AtomicBool::new(true),
         });
         let service_state = Arc::clone(&state);
         let (stop, mut stopping) = watch::channel(false);
@@ -122,7 +124,10 @@ impl CallbackService {
                         }
                     }
                     accepted = listener.accept() => {
-                        let Ok((stream, peer)) = accepted else { break };
+                        let Ok((stream, peer)) = accepted else {
+                            service_state.service_healthy.store(false, Ordering::Release);
+                            break;
+                        };
                         if peer.ip() != IpAddr::V4(server_ip) {
                             drop(stream);
                             continue;
@@ -165,6 +170,7 @@ impl CallbackService {
 
     pub(crate) async fn stop(&self) {
         let _ = self.stop.send(true);
+        self.state.service_healthy.store(false, Ordering::Release);
         let Some(mut task) = self
             .task
             .lock()
@@ -193,7 +199,7 @@ impl CallbackState {
     }
 
     pub(crate) fn healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        self.service_healthy.load(Ordering::Acquire) && self.worker_healthy.load(Ordering::Acquire)
     }
 
     pub(crate) fn mark_attributes_unknown(&self, fh: &[u8]) -> Result<bool> {
@@ -239,18 +245,39 @@ impl CallbackState {
         attributes: Option<(u64, u64)>,
     ) -> Result<()> {
         self.generation.store(generation, Ordering::Release);
-        self.delegations
+        let recall = grant.recall;
+        let stateid = grant.stateid;
+        let mut delegations = self
+            .delegations
             .lock()
-            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?
-            .insert(
-                fh,
-                DelegationRecord {
-                    grant,
-                    generation,
-                    attributes,
-                    recalling: false,
-                },
-            );
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+        delegations.insert(
+            fh.clone(),
+            DelegationRecord {
+                grant,
+                generation,
+                attributes,
+                recalling: recall,
+            },
+        );
+        if recall {
+            match self.recall_tx.try_send(RecallNotification {
+                fh: fh.clone(),
+                stateid,
+                generation,
+                truncate: false,
+            }) {
+                Ok(()) => {
+                    self.recalls_received.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    if let Some(record) = delegations.get_mut(&fh) {
+                        record.recalling = false;
+                    }
+                    self.worker_healthy.store(false, Ordering::Release);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -338,9 +365,10 @@ impl CallbackWorker {
                 let returned = settle_recall(&rpc, &auth, &recall).await.is_ok();
                 if returned {
                     state.returns_completed.fetch_add(1, Ordering::Relaxed);
+                    state.worker_healthy.store(true, Ordering::Release);
                 } else {
                     state.returns_failed.fetch_add(1, Ordering::Relaxed);
-                    state.healthy.store(false, Ordering::Release);
+                    state.worker_healthy.store(false, Ordering::Release);
                 }
                 let _ =
                     state.finish_recall(&recall.fh, &recall.stateid, recall.generation, returned);
@@ -367,7 +395,7 @@ impl CallbackWorker {
             .await
             .is_err()
         {
-            self.state.healthy.store(false, Ordering::Release);
+            self.state.worker_healthy.store(false, Ordering::Release);
             task.abort();
             let _ = task.await;
         }
@@ -390,6 +418,7 @@ impl Drop for CallbackWorker {
 impl Drop for CallbackService {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+        self.state.service_healthy.store(false, Ordering::Release);
         let task = match self.task.get_mut() {
             Ok(task) => task,
             Err(poisoned) => poisoned.into_inner(),
@@ -936,6 +965,7 @@ mod tests {
 
         service.stop().await;
 
+        assert!(!service.state().healthy());
         let mut byte = [0; 1];
         assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
@@ -1231,6 +1261,33 @@ mod tests {
                 returns_failed: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn delegation_granted_with_recall_is_queued_immediately() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        service
+            .state()
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Write,
+                    stateid: [0x62; 16],
+                    recall: true,
+                },
+                3,
+                Some((4, 5)),
+            )
+            .unwrap();
+
+        let recall = recalls.try_recv().unwrap();
+        assert_eq!(recall.fh, Bytes::from_static(b"fh"));
+        assert_eq!(recall.stateid, [0x62; 16]);
+        assert!(!recall.truncate);
+        assert_eq!(service.state().stats().recalls_received, 1);
     }
 
     #[tokio::test]
