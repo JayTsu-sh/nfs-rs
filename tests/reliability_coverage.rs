@@ -238,6 +238,8 @@ fn nfsv40_release_evidence_is_typed_hashed_and_fail_closed() {
     assert!(release.contains("run-netapp-v40-release-matrix.sh"));
     assert!(nightly.contains("run-netapp-v40-release-matrix.sh"));
     assert!(collector.contains("missing required NFSv4.0 evidence"));
+    assert!(collector.contains("stale NFSv4.0 performance report identity"));
+    assert!(collector.contains("NFSv4.0 performance report topology mismatch"));
     assert!(collector.contains("SHA256SUMS"));
 }
 

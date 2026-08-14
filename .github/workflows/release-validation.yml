@@ -78,5 +78,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
+          tests/lab/verify-netapp-v40-cleanup.sh "$RUN_ID"
           tests/lab/cleanup-run.sh "$RUN_ID"

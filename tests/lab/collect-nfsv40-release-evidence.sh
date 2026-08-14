@@ -58,6 +58,16 @@ for name in sys.argv[2:]:
         raise SystemExit(f"NFSv4.0 evidence hash mismatch: {name}")
     records.append(record)
 
+performance = json.loads((root / "performance-report.json").read_text(encoding="utf-8"))
+if performance.get("run_id") != os.environ["RUN_ID"] or performance.get("commit") != os.environ["COMMIT"]:
+    raise SystemExit("stale NFSv4.0 performance report identity")
+if performance.get("lifs") != [os.environ["LIF_A"], os.environ["LIF_B"]]:
+    raise SystemExit("NFSv4.0 performance report topology mismatch")
+if performance.get("protocol") != "4.0" or performance.get("liveness") != "pass":
+    raise SystemExit("NFSv4.0 performance report did not prove liveness")
+if len(performance.get("workloads", [])) != 4:
+    raise SystemExit("NFSv4.0 performance report lacks the four workload quadrants")
+
 manifest = {
     "schema_version": 1,
     "run_id": os.environ["RUN_ID"],

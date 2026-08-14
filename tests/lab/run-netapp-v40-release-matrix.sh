@@ -28,6 +28,8 @@ record callback-fault runner-inbound-source-lif-syn flock --wait 10800 \
   /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$run_id"
 record lease-fault runner-outbound-destination-lif-tcp2049 flock --wait 10800 \
   /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$run_id"
+performance_output="${NFS_RS_LAB_V40_PERF_OUTPUT:-nfsv40-performance.json}"
+rm -f -- "$performance_output"
 record performance none flock --wait 10800 /tmp/terrasync-lab-tests.lock \
   tests/lab/run-netapp-v40-performance.sh "$run_id"
 record cleanup runner-run-owned tests/lab/verify-netapp-v40-cleanup.sh "$run_id"
