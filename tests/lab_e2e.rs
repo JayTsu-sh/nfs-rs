@@ -536,38 +536,75 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct V40PerfWorkload {
+    name: &'static str,
+    file_count: usize,
+    payload_size: usize,
+    chunk_size: usize,
+    tasks: usize,
+}
+
+const V40_PERF_WORKLOADS: [V40PerfWorkload; 4] = [
+    V40PerfWorkload {
+        name: "small-single",
+        file_count: 128,
+        payload_size: 4 * 1024,
+        chunk_size: 4 * 1024,
+        tasks: 1,
+    },
+    V40PerfWorkload {
+        name: "small-multi",
+        file_count: 128,
+        payload_size: 4 * 1024,
+        chunk_size: 4 * 1024,
+        tasks: 4,
+    },
+    V40PerfWorkload {
+        name: "large-single",
+        file_count: 4,
+        payload_size: 16 * 1024 * 1024,
+        chunk_size: 1024 * 1024,
+        tasks: 1,
+    },
+    V40PerfWorkload {
+        name: "large-multi",
+        file_count: 4,
+        payload_size: 16 * 1024 * 1024,
+        chunk_size: 1024 * 1024,
+        tasks: 4,
+    },
+];
+
 async fn run_v40_performance_task(
     url: String,
     run_id: String,
-    workload: &'static str,
+    workload: V40PerfWorkload,
     task: usize,
-    small: bool,
 ) -> TestResult<(u64, Vec<f64>)> {
     let mount = parse_url_and_mount(&url).await?;
-    let file_count = if small { 32 } else { 1 };
-    let payload_size = if small { 4 * 1024 } else { 16 * 1024 * 1024 };
     let payload = Bytes::from(
-        (0..payload_size)
+        (0..workload.payload_size)
             .map(|index| ((index * 17 + task * 13 + 29) % 251) as u8)
             .collect::<Vec<_>>(),
     );
     let mut latencies = Vec::new();
     let mut transferred = 0u64;
-    for file in 0..file_count {
-        let name = format!("nfsrs-perf-{run_id}-{workload}-{task}-{file}.bin");
+    for file in 0..workload.file_count {
+        let name = format!("nfsrs-perf-{run_id}-{}-{task}-{file}.bin", workload.name);
         let _ = mount.remove_path(&name).await;
         let created = mount.create_path(&name, Some(0o600)).await?;
         let started = Instant::now();
-        if small {
+        if workload.payload_size <= workload.chunk_size {
             write_all(mount.as_ref(), created.fh.clone(), &payload).await?;
             latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
         } else {
-            for (index, chunk) in payload.chunks(1024 * 1024).enumerate() {
+            for (index, chunk) in payload.chunks(workload.chunk_size).enumerate() {
                 let chunk_started = Instant::now();
                 let written = mount
                     .write(
                         created.fh.clone(),
-                        (index * 1024 * 1024) as u64,
+                        (index * workload.chunk_size) as u64,
                         Bytes::copy_from_slice(chunk),
                     )
                     .await?;
@@ -615,50 +652,63 @@ async fn nfs_v40_small_large_single_multi_performance() -> TestResult {
     ensure(urls.len() == 2, "performance matrix requires both FAS LIFs")?;
     let run_id = env::var("NFS_RS_LAB_V40_PERF_RUN_ID")?;
     let output = env::var("NFS_RS_LAB_V40_PERF_OUTPUT")?;
+    let lifs = urls
+        .iter()
+        .map(|url| {
+            url::Url::parse(url)?
+                .host_str()
+                .map(str::to_string)
+                .ok_or_else(|| io::Error::other("NFSv4.0 performance URL lacks host").into())
+        })
+        .collect::<TestResult<Vec<_>>>()?;
     let mut results = Vec::new();
-    for (name, small, tasks) in [
-        ("small-single", true, 1usize),
-        ("small-multi", true, 4),
-        ("large-single", false, 1),
-        ("large-multi", false, 4),
-    ] {
-        let started = Instant::now();
-        let mut joins = Vec::new();
-        for task in 0..tasks {
-            joins.push(tokio::spawn(run_v40_performance_task(
-                urls[task % urls.len()].clone(),
-                run_id.clone(),
-                name,
-                task,
-                small,
-            )));
+    for workload in V40_PERF_WORKLOADS {
+        let mut throughput_samples = Vec::new();
+        let mut p95_samples = Vec::new();
+        let mut bytes_per_sample = 0u64;
+        for _ in 0..3 {
+            let started = Instant::now();
+            let mut joins = Vec::new();
+            for task in 0..workload.tasks {
+                joins.push(tokio::spawn(run_v40_performance_task(
+                    urls[task % urls.len()].clone(),
+                    run_id.clone(),
+                    workload,
+                    task,
+                )));
+            }
+            let mut latencies = Vec::new();
+            bytes_per_sample = 0;
+            for join in joins {
+                let (task_bytes, mut task_latencies) = join.await??;
+                bytes_per_sample += task_bytes;
+                latencies.append(&mut task_latencies);
+            }
+            latencies.sort_by(f64::total_cmp);
+            let p95_index = ((latencies.len() as f64 * 0.95).ceil() as usize)
+                .saturating_sub(1)
+                .min(latencies.len().saturating_sub(1));
+            throughput_samples
+                .push(bytes_per_sample as f64 / 1_048_576.0 / started.elapsed().as_secs_f64());
+            p95_samples.push(latencies[p95_index]);
         }
-        let mut bytes = 0u64;
-        let mut latencies = Vec::new();
-        for join in joins {
-            let (task_bytes, mut task_latencies) = join.await??;
-            bytes += task_bytes;
-            latencies.append(&mut task_latencies);
-        }
-        latencies.sort_by(f64::total_cmp);
-        let p95_index = ((latencies.len() as f64 * 0.95).ceil() as usize)
-            .saturating_sub(1)
-            .min(latencies.len().saturating_sub(1));
-        let elapsed = started.elapsed().as_secs_f64();
+        throughput_samples.sort_by(f64::total_cmp);
+        p95_samples.sort_by(f64::total_cmp);
         results.push(serde_json::json!({
-            "name": name,
-            "throughput_mib_s": bytes as f64 / 1_048_576.0 / elapsed,
-            "p95_latency_ms": latencies[p95_index],
+            "name": workload.name,
+            "throughput_mib_s": throughput_samples[1],
+            "p95_latency_ms": p95_samples[1],
             "peak_rss_kib": peak_rss_kib(),
-            "bytes": bytes,
-            "tasks": tasks,
+            "bytes_per_sample": bytes_per_sample,
+            "samples": 3,
+            "tasks": workload.tasks,
         }));
     }
     let report = serde_json::json!({
         "schema_version": 1,
         "run_id": run_id,
         "commit": env::var("NFS_RS_LAB_V40_PERF_COMMIT")?,
-        "lifs": ["10.128.61.200", "10.128.61.201"],
+        "lifs": lifs,
         "protocol": "4.0",
         "liveness": "pass",
         "workloads": results,

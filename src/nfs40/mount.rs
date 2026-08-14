@@ -1106,6 +1106,46 @@ impl Mount40 {
         let response = settled_call(self.rpc.clone(), request, class, context).await?;
         Ok(response)
     }
+
+    async fn set_encoded_attributes(
+        &self,
+        operation: &str,
+        fh: &Bytes,
+        bitmap: &[u32],
+        values: &[u8],
+        invalidate_cached_attributes: bool,
+    ) -> Result<()> {
+        let _io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(fh).await)
+        } else {
+            None
+        };
+        if invalidate_cached_attributes && let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(fh)?;
+        }
+        let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
+        let (stateid, expected_generation) = match lane {
+            Some(lane) => (
+                lane.lock().await.stateid,
+                Some(self.lease.begin_stateful(operation)?),
+            ),
+            None => ([0; 16], None),
+        };
+        let request = CompoundBuilder::new(operation)
+            .putfh(fh)
+            .setattr(&stateid, bitmap, values)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
+        decode_setattr_response(response, bitmap)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, operation)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1410,33 +1450,8 @@ impl Mount for Mount40 {
     }
     async fn setacl(&self, fh: Bytes, acl_value: &mount::Acl) -> Result<()> {
         let (bitmap, values) = acl::encode_setattr_acl(acl_value);
-        let _io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
-        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
-        let (stateid, expected_generation) = match lane {
-            Some(lane) => (
-                lane.lock().await.stateid,
-                Some(self.lease.begin_stateful("setacl")?),
-            ),
-            None => ([0; 16], None),
-        };
-        let request = CompoundBuilder::new("setacl")
-            .putfh(&fh)
-            .setattr(&stateid, &bitmap, &values)
-            .encode_with_header(&self.auth);
-        let (class, ctx) = context("setacl", 0, 0, OperationClass::ReplaySensitive);
-        let response = self
-            .activity_settled_call(request, class, ctx.clone())
-            .await?;
-        decode_setattr_response(response, &bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-        if let Some(generation) = expected_generation {
-            self.lease.finish_stateful(generation, "setacl")?;
-        }
-        Ok(())
+        self.set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
+            .await
     }
     async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
         let bitmap = [1 << 13];
@@ -1470,35 +1485,8 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        let _io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
-        if let Some(callback_state) = &self.callback_state {
-            callback_state.mark_attributes_unknown(&fh)?;
-        }
-        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
-        let (stateid, expected_generation) = match lane {
-            Some(lane) => (
-                lane.lock().await.stateid,
-                Some(self.lease.begin_stateful("setattr")?),
-            ),
-            None => ([0; 16], None),
-        };
-        let request = CompoundBuilder::new("setattr")
-            .putfh(&fh)
-            .setattr(&stateid, &bitmap, &values)
-            .encode_with_header(&self.auth);
-        let (class, ctx) = context("setattr", 0, 0, OperationClass::ReplaySensitive);
-        let response = self
-            .activity_settled_call(request, class, ctx.clone())
+        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true)
             .await?;
-        decode_setattr_response(response, &bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-        if let Some(generation) = expected_generation {
-            self.lease.finish_stateful(generation, "setattr")?;
-        }
         self.refresh_callback_attributes(&fh).await;
         Ok(())
     }

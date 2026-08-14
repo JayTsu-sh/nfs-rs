@@ -170,6 +170,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let changelog = fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
     let release = include_str!("../.github/workflows/release-validation.yml");
     let nightly = include_str!("../.github/workflows/nightly.yml");
+    let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
     assert!(cargo.contains("version = \"0.5.0\""));
     for required in [
@@ -190,7 +191,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
         "tests/lab/collect-nfsv40-release-evidence.sh",
     ] {
         assert!(
-            release.contains(command) || nightly.contains(command),
+            release.contains(command) || nightly.contains(command) || matrix.contains(command),
             "release matrix lacks {command}"
         );
     }
@@ -204,6 +205,8 @@ fn nfsv40_release_evidence_is_typed_hashed_and_fail_closed() {
         "tests/lab/collect-nfsv40-release-evidence.sh",
     ))
     .expect("NFSv4.0 evidence collector readable");
+    let matrix = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-release-matrix.sh"))
+        .expect("NFSv4.0 release matrix readable");
     let release = include_str!("../.github/workflows/release-validation.yml");
     let nightly = include_str!("../.github/workflows/nightly.yml");
 
@@ -223,14 +226,17 @@ fn nfsv40_release_evidence_is_typed_hashed_and_fail_closed() {
         "lease-fault",
         "performance",
         "cleanup",
+        "grace-reclaim",
     ] {
-        let invocation = format!("record-nfsv40-evidence.sh \"$evidence_dir\" {evidence}");
+        let invocation = format!("record {evidence} ");
         assert!(
-            release.contains(&invocation) && nightly.contains(&invocation),
-            "workflows do not record {evidence} evidence"
+            matrix.contains(&invocation),
+            "release matrix does not record {evidence} evidence"
         );
         assert!(collector.contains(evidence), "collector lacks {evidence}");
     }
+    assert!(release.contains("run-netapp-v40-release-matrix.sh"));
+    assert!(nightly.contains("run-netapp-v40-release-matrix.sh"));
     assert!(collector.contains("missing required NFSv4.0 evidence"));
     assert!(collector.contains("SHA256SUMS"));
 }
@@ -330,6 +336,8 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     .expect("NFSv4.0 lease fault runner must be readable");
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
+    let matrix = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-release-matrix.sh"))
+        .expect("NFSv4.0 release matrix must be readable");
     for required in [
         "10.131.9.11",
         "10.128.61.200",
@@ -347,9 +355,9 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     assert!(runner.contains("run_case \"$target_ip\" below"));
     assert!(runner.contains("run_case \"$target_ip\" above"));
     assert!(runner.contains("restore-any"));
-    assert!(workflow.contains("run-netapp-v40-lease-fault-e2e.sh"));
+    assert!(matrix.contains("run-netapp-v40-lease-fault-e2e.sh"));
     assert!(workflow.contains("Restore NetApp NFSv4.0 connectivity"));
-    assert!(workflow.contains("restore-any"));
+    assert!(workflow.contains("verify-netapp-v40-cleanup.sh"));
 }
 
 #[test]

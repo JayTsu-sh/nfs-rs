@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 240
     env:
       RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
-      NFS_RS_LAB_V40_EVIDENCE_DIR: ${{ runner.temp }}/nfsv40-evidence-records
+      NFS_RS_LAB_V40_EVIDENCE_DIR: ${{ runner.temp }}/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -57,29 +57,15 @@ jobs:
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
-      - name: Record NetApp NFSv4.0 semantic evidence
-        run: |
-          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
-          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" semantic flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
-      - name: Record NetApp NFSv4.0 callback-fault evidence
-        run: |
-          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
-          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" callback-fault flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$RUN_ID"
-      - name: Record NetApp NFSv4.0 lease-fault evidence
-        run: |
-          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
-          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" lease-fault flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
+      - name: Record complete NetApp NFSv4.0 release matrix
+        run: tests/lab/run-netapp-v40-release-matrix.sh "$RUN_ID" "$NFS_RS_LAB_V40_EVIDENCE_DIR"
+      - name: NetApp NFSv4.1 compatibility E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.1 pNFS compatibility E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
       - run: cargo build --release --locked
       - run: cargo package --locked
       - run: cargo publish --locked --dry-run
-      - name: Record NetApp NFSv4.0 performance evidence
-        run: |
-          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
-          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" performance flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-performance.sh "$RUN_ID"
-      - name: Record NetApp NFSv4.0 cleanup evidence
-        run: |
-          evidence_dir="$NFS_RS_LAB_V40_EVIDENCE_DIR"
-          tests/lab/record-nfsv40-evidence.sh "$evidence_dir" cleanup sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
       - run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" release-evidence
       - name: Checksums
         run: find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum | tee release-sha256.txt
