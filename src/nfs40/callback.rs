@@ -644,8 +644,7 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
         return Ok(rpc_reply(&[words[0], 1, 1, 1, 1]));
     };
     if !valid_callback_credential(credential_flavor, credential)
-        || verifier_flavor != 0
-        || !verifier.is_empty()
+        || !valid_callback_verifier(verifier_flavor, verifier)
     {
         return Ok(rpc_reply(&[words[0], 1, 1, 1, 1]));
     }
@@ -665,6 +664,14 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
         state.cache_reply(words[0], call, &reply);
     }
     Ok(reply)
+}
+
+fn valid_callback_verifier(flavor: u32, verifier: &[u8]) -> bool {
+    // RFC 5531 recommends AUTH_NONE here. ONTAP's NFSv4.0 callback
+    // implementation sends an AUTH_SYS verifier containing one XDR word;
+    // accept only that observed, bounded compatibility form. The callback
+    // listener separately pins the TCP peer to the mounted server LIF.
+    (flavor == 0 && verifier.is_empty()) || (flavor == 1 && verifier.len() == 4)
 }
 
 fn successful_single_recall(body: &[u8], reply: &[u8]) -> bool {
@@ -1232,6 +1239,14 @@ mod tests {
         assert_eq!(
             round_trip(&mut stream, &auth_sys).await,
             [16, 1, 0, 0, 0, 0]
+        );
+
+        let mut ontap_auth_sys = auth_sys.clone();
+        ontap_auth_sys.splice(15..17, [1, 4, 1]);
+        ontap_auth_sys[0] = 17;
+        assert_eq!(
+            round_trip(&mut stream, &ontap_auth_sys).await,
+            [17, 1, 0, 0, 0, 0]
         );
 
         let mut excessive_groups = auth_sys;
