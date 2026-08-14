@@ -19,6 +19,7 @@ use super::compound::{
     decode_setattr_response, decode_setclientid_response, decode_stateid_response,
     decode_write_response, open_succeeded_before_compound_failure,
 };
+use super::lease::{LeaseRenewal, LeaseState};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
@@ -45,6 +46,8 @@ struct Mount40 {
     next_owner: AtomicU64,
     state: Arc<OpenState>,
     locks: Arc<LockState>,
+    lease: Arc<LeaseState>,
+    _renewal: Option<LeaseRenewal>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
@@ -110,6 +113,16 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         )
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
+    let lease_time = query_lease_time(&rpc, &auth, &root_fh).await?;
+    let generation = 1;
+    let lease = LeaseState::ready(generation, lease_time);
+    let renewal = LeaseRenewal::start(
+        rpc.clone(),
+        auth.clone(),
+        client_id,
+        Duration::from_secs(u64::from(lease_time / 3).max(1)),
+        Arc::clone(&lease),
+    );
 
     Ok(Mount40 {
         rpc,
@@ -117,15 +130,42 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         root_fh,
         client_id,
         issuer: rand::random(),
-        generation: 1,
+        generation,
         next_owner: AtomicU64::new(1),
         state: Arc::new(OpenState::default()),
         locks: Arc::new(LockState::default()),
+        lease,
+        _renewal: Some(renewal),
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
         wsize: args.wsize,
     })
+}
+
+async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Result<u32> {
+    let response = rpc
+        .call(
+            CompoundBuilder::new("lease-time")
+                .putfh(root_fh)
+                .getattr(&[1 << 10])
+                .encode_with_header(auth),
+            SAFE_REPLAY,
+            METADATA_TIMEOUT,
+        )
+        .await?;
+    let mut attrs = decode_getattr_compound(response)?;
+    let (bitmap, mut values) = decode_fattr4_envelope(&mut attrs, "lease_time")?;
+    if !fattr4_has(&bitmap, 10) || values.remaining() != 4 {
+        return Err(NfsError::Xdr(
+            "NFSv4.0 lease_time response is missing or malformed".into(),
+        ));
+    }
+    let seconds = values.get_u32();
+    if seconds == 0 {
+        return Err(NfsError::Xdr("NFSv4.0 lease_time is zero".into()));
+    }
+    Ok(seconds)
 }
 
 async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
@@ -690,6 +730,9 @@ fn classify_create_compound_error(
 
 #[async_trait]
 impl Mount for Mount40 {
+    fn health(&self) -> crate::MountHealth {
+        self.lease.health()
+    }
     fn get_max_read_size(&self) -> u32 {
         self.rsize
     }
@@ -1575,6 +1618,36 @@ mod tests {
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
             locks: Arc::new(LockState::default()),
+            lease: LeaseState::ready(1, 60),
+            _renewal: None,
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        })
+    }
+
+    fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
+        let lease = LeaseState::ready(1, 60);
+        let renewal = LeaseRenewal::start(
+            rpc.clone(),
+            Auth::new_null(),
+            7,
+            interval,
+            Arc::clone(&lease),
+        );
+        Arc::new(Mount40 {
+            rpc,
+            auth: Auth::new_null(),
+            root_fh: Bytes::from_static(b"root"),
+            client_id: 7,
+            issuer: 9,
+            generation: 1,
+            next_owner: AtomicU64::new(1),
+            state: Arc::new(OpenState::default()),
+            locks: Arc::new(LockState::default()),
+            lease,
+            _renewal: Some(renewal),
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1599,6 +1672,65 @@ mod tests {
             .await
             .unwrap();
         direct_mount(rpc::Client::new(mux, None))
+    }
+
+    #[tokio::test]
+    async fn public_health_reports_successful_background_renewal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..20 {
+            let health = mount.health();
+            if health.lease_renewals == 1 {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
+                assert_eq!(health.generation, 1);
+                assert_eq!(health.lease_seconds, Some(60));
+                assert_eq!(health.lease_healthy, Some(true));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("successful RENEW was not reflected in public health");
+    }
+
+    #[tokio::test]
+    async fn authoritative_renewal_failure_marks_public_health_suspect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let mut result = Vec::new();
+            result.extend_from_slice(&10011u32.to_be_bytes());
+            xdr_opaque(&mut result, b"renew");
+            result.extend_from_slice(&1u32.to_be_bytes());
+            result.extend_from_slice(&30u32.to_be_bytes());
+            result.extend_from_slice(&10011u32.to_be_bytes());
+            reply(&mut stream, &renew, &result).await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            let health = mount.health();
+            if health.lease_healthy == Some(false) {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::Suspect);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("failed RENEW was not reflected in public health");
     }
 
     #[tokio::test]
@@ -1769,6 +1901,17 @@ mod tests {
                 &mut first,
                 &navigation,
                 &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
+            )
+            .await?;
+            let lease_time = read_record(&mut first).await?;
+            let mut attrs = Vec::new();
+            attrs.extend_from_slice(&1u32.to_be_bytes());
+            attrs.extend_from_slice(&(1u32 << 10).to_be_bytes());
+            xdr_opaque(&mut attrs, &60u32.to_be_bytes());
+            reply(
+                &mut first,
+                &lease_time,
+                &compound_result("lease-time", &[(22, &[]), (9, &attrs)]),
             )
             .await?;
             mounted_for_server.notified().await;

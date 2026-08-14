@@ -26,6 +26,7 @@ const OP_READ: u32 = 25;
 const OP_READDIR: u32 = 26;
 const OP_REMOVE: u32 = 28;
 const OP_RENAME: u32 = 29;
+const OP_RENEW: u32 = 30;
 const OP_SAVEFH: u32 = 32;
 const OP_READLINK: u32 = 27;
 const OP_WRITE: u32 = 38;
@@ -219,6 +220,13 @@ impl CompoundBuilder {
         args.extend_from_slice(&client_id.to_be_bytes());
         xdr_opaque(&mut args, owner);
         self.inner = self.inner.operation(OP_RELEASE_LOCKOWNER, args);
+        self
+    }
+
+    pub(crate) fn renew(mut self, client_id: u64) -> Self {
+        self.inner = self
+            .inner
+            .operation(OP_RENEW, client_id.to_be_bytes().to_vec());
         self
     }
 
@@ -784,6 +792,16 @@ pub(crate) fn decode_release_lockowner_response(buf: Bytes) -> Result<()> {
         )));
     }
     expect_op(&mut ops, OP_RELEASE_LOCKOWNER, "RELEASE_LOCKOWNER")
+}
+
+pub(crate) fn decode_renew_response(buf: Bytes) -> Result<()> {
+    let (count, mut ops) = response_ops(buf)?;
+    if count != 1 {
+        return Err(NfsError::Xdr(format!(
+            "RENEW response has {count} operations, expected 1"
+        )));
+    }
+    expect_op(&mut ops, OP_RENEW, "RENEW")
 }
 
 pub(crate) fn decode_stateid_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
@@ -1452,6 +1470,32 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn renew_arguments_match_rfc7530_vector() {
+        let body = CompoundBuilder::new("renew")
+            .renew(0x0102_0304_0506_0708)
+            .encode_body();
+        let (opcode, args) = operation_arguments(&body, 0);
+        assert_eq!(opcode, OP_RENEW);
+        assert_eq!(args.as_ref(), &0x0102_0304_0506_0708u64.to_be_bytes());
+    }
+
+    #[test]
+    fn renew_result_requires_one_complete_void_operation() {
+        decode_renew_response(compound_response("renew", &[(OP_RENEW, &[])])).unwrap();
+        assert!(
+            decode_renew_response(compound_response(
+                "renew",
+                &[(OP_RENEW, &[]), (OP_PUTFH, &[])],
+            ))
+            .is_err()
+        );
+
+        let mut truncated = compound_response("renew", &[(OP_RENEW, &[])]).to_vec();
+        truncated.pop();
+        assert!(decode_renew_response(Bytes::from(truncated)).is_err());
     }
 
     fn compound_response(tag: &str, ops: &[(u32, &[u8])]) -> Bytes {

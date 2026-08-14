@@ -1,6 +1,7 @@
 //! Independent NFSv4.0 protocol engine (RFC 7530).
 
 mod compound;
+mod lease;
 mod mount;
 mod state;
 
