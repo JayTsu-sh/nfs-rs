@@ -1,17 +1,35 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
 use crate::error::{NfsError, Result};
+use crate::nfs40::compound::{DelegationGrant, DelegationKind};
 
 pub(crate) const CB_PROGRAM: u32 = 0x4000_0000;
 const MAX_CALLBACK_RECORD: usize = 64 * 1024;
 
 pub(crate) struct CallbackService {
     universal_addr: String,
+    state: Arc<CallbackState>,
     task: JoinHandle<()>,
+}
+
+struct DelegationRecord {
+    grant: DelegationGrant,
+    generation: u64,
+    attributes: Option<(u64, u64)>,
+}
+
+#[derive(Default)]
+pub(crate) struct CallbackState {
+    delegations: Mutex<HashMap<Bytes, DelegationRecord>>,
+    generation: AtomicU64,
 }
 
 impl CallbackService {
@@ -46,15 +64,19 @@ impl CallbackService {
             port >> 8,
             port & 0xff
         );
+        let state = Arc::new(CallbackState::default());
+        let service_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
+                let state = Arc::clone(&service_state);
                 tokio::spawn(async move {
-                    let _ = serve_connection(stream).await;
+                    let _ = serve_connection(stream, state).await;
                 });
             }
         });
         Ok(Self {
             universal_addr,
+            state,
             task,
         })
     }
@@ -62,14 +84,45 @@ impl CallbackService {
     pub(crate) fn universal_addr(&self) -> &str {
         &self.universal_addr
     }
+
+    pub(crate) fn state(&self) -> Arc<CallbackState> {
+        Arc::clone(&self.state)
+    }
 }
 
-async fn serve_connection(mut stream: tokio::net::TcpStream) -> Result<()> {
+impl CallbackState {
+    pub(crate) fn register_delegation(
+        &self,
+        fh: Bytes,
+        grant: DelegationGrant,
+        generation: u64,
+        attributes: Option<(u64, u64)>,
+    ) -> Result<()> {
+        self.generation.store(generation, Ordering::Release);
+        self.delegations
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?
+            .insert(
+                fh,
+                DelegationRecord {
+                    grant,
+                    generation,
+                    attributes,
+                },
+            );
+        Ok(())
+    }
+}
+
+async fn serve_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<CallbackState>,
+) -> Result<()> {
     loop {
         let Some(call) = read_record(&mut stream).await? else {
             return Ok(());
         };
-        let reply = handle_rpc_call(&call)?;
+        let reply = handle_rpc_call(&call, &state)?;
         stream
             .write_u32(0x8000_0000 | reply.len() as u32)
             .await
@@ -108,7 +161,7 @@ async fn read_record(stream: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8
     }
 }
 
-fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
+fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
     if call.len() < 40 || !call.len().is_multiple_of(4) {
         return Err(NfsError::Xdr(
             "NFSv4.0 callback RPC call has an invalid length".into(),
@@ -147,14 +200,14 @@ fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
             accepted_reply(words[0], &[4])
         });
     }
-    let compound = match compound_reply(&call[40..]) {
+    let compound = match compound_reply(&call[40..], state) {
         Ok(compound) => compound,
         Err(_) => return Ok(accepted_reply(words[0], &[4])),
     };
     Ok(accepted_body(words[0], &compound))
 }
 
-fn compound_reply(body: &[u8]) -> Result<Vec<u8>> {
+fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
     if body.len() < 16 {
         return Err(NfsError::Xdr("CB_COMPOUND envelope truncated".into()));
     }
@@ -187,27 +240,83 @@ fn compound_reply(body: &[u8]) -> Result<Vec<u8>> {
             status,
             &body[4..4 + padded_tag],
             tag_len,
+            0,
             &[],
         ));
     }
     let mut cursor = operations_offset;
     let mut results = Vec::new();
     let mut status = 0u32;
+    let mut result_count = 0u32;
     for _ in 0..operation_count {
         let opcode = take_word(body, &mut cursor, "callback opcode")?;
+        result_count += 1;
         match opcode {
             3 => {
-                let _fh = take_opaque(body, &mut cursor, "CB_GETATTR filehandle")?;
+                let fh = take_opaque(body, &mut cursor, "CB_GETATTR filehandle")?;
                 let bitmap_words = take_word(body, &mut cursor, "CB_GETATTR bitmap length")?;
                 if bitmap_words > 4 {
                     return Err(NfsError::Xdr("CB_GETATTR bitmap exceeds bound".into()));
                 }
+                let mut requested = 0u32;
                 for _ in 0..bitmap_words {
-                    let _ = take_word(body, &mut cursor, "CB_GETATTR bitmap word")?;
+                    let word = take_word(body, &mut cursor, "CB_GETATTR bitmap word")?;
+                    if requested == 0 {
+                        requested = word;
+                    }
                 }
-                status = 10001;
-                results.extend_from_slice(&3u32.to_be_bytes());
-                results.extend_from_slice(&status.to_be_bytes());
+                let delegation = state
+                    .delegations
+                    .lock()
+                    .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+                let record = delegation.get(fh);
+                let active_generation = state.generation.load(Ordering::Acquire);
+                if let Some(DelegationRecord {
+                    grant:
+                        DelegationGrant {
+                            kind: DelegationKind::Write,
+                            ..
+                        },
+                    attributes: Some((change, size)),
+                    generation,
+                }) = record
+                    && *generation == active_generation
+                {
+                    let returned = requested & 0x18;
+                    status = 0;
+                    results.extend_from_slice(&3u32.to_be_bytes());
+                    results.extend_from_slice(&0u32.to_be_bytes());
+                    results.extend_from_slice(&1u32.to_be_bytes());
+                    results.extend_from_slice(&returned.to_be_bytes());
+                    let value_length = u32::from(returned & 0x08 != 0)
+                        .saturating_add(u32::from(returned & 0x10 != 0))
+                        * 8;
+                    results.extend_from_slice(&value_length.to_be_bytes());
+                    if returned & 0x08 != 0 {
+                        results.extend_from_slice(&change.to_be_bytes());
+                    }
+                    if returned & 0x10 != 0 {
+                        results.extend_from_slice(&size.to_be_bytes());
+                    }
+                } else {
+                    status = if matches!(
+                        record,
+                        Some(DelegationRecord {
+                            grant: DelegationGrant {
+                                kind: DelegationKind::Write,
+                                ..
+                            },
+                            attributes: None,
+                            ..
+                        })
+                    ) {
+                        10008
+                    } else {
+                        10001
+                    };
+                    results.extend_from_slice(&3u32.to_be_bytes());
+                    results.extend_from_slice(&status.to_be_bytes());
+                }
             }
             4 => {
                 let _stateid = take_fixed(body, &mut cursor, 16, "CB_RECALL stateid")?;
@@ -234,16 +343,23 @@ fn compound_reply(body: &[u8]) -> Result<Vec<u8>> {
         status,
         &body[4..4 + padded_tag],
         tag_len,
+        result_count,
         &results,
     ))
 }
 
-fn compound_result(status: u32, padded_tag: &[u8], tag_len: usize, results: &[u8]) -> Vec<u8> {
+fn compound_result(
+    status: u32,
+    padded_tag: &[u8],
+    tag_len: usize,
+    result_count: u32,
+    results: &[u8],
+) -> Vec<u8> {
     let mut reply = Vec::with_capacity(12 + padded_tag.len() + results.len());
     reply.extend_from_slice(&status.to_be_bytes());
     reply.extend_from_slice(&(tag_len as u32).to_be_bytes());
     reply.extend_from_slice(padded_tag);
-    reply.extend_from_slice(&((results.len() / 8) as u32).to_be_bytes());
+    reply.extend_from_slice(&result_count.to_be_bytes());
     reply.extend_from_slice(results);
     reply
 }
@@ -328,6 +444,8 @@ impl Drop for CallbackService {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::nfs40::compound::{DelegationGrant, DelegationKind};
+    use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn socket_addr(universal: &str) -> SocketAddr {
@@ -477,6 +595,55 @@ mod tests {
         assert_eq!(
             round_trip(&mut stream, &call).await,
             [23, 1, 0, 0, 0, 0, 10001, 0, 1, 4, 10001]
+        );
+    }
+
+    #[tokio::test]
+    async fn cb_getattr_returns_cached_change_and_size_for_a_write_delegation() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        service
+            .state()
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Write,
+                    stateid: [0x44; 16],
+                    recall: false,
+                },
+                7,
+                Some((0x0102_0304_0506_0708, 0x1112_1314_1516_1718)),
+            )
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(29);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 1, 1, 3, 2, u32::from_be_bytes(*b"fh\0\0"), 1, 0x18]);
+        assert_eq!(
+            round_trip(&mut stream, &call).await,
+            [
+                29,
+                1,
+                0,
+                0,
+                0,
+                0, // RPC accepted
+                0,
+                0,
+                1, // CB_COMPOUND success, empty tag, one result
+                3,
+                0, // CB_GETATTR success
+                1,
+                0x18,
+                16, // fattr bitmap and value length
+                0x0102_0304,
+                0x0506_0708,
+                0x1112_1314,
+                0x1516_1718,
+            ]
         );
     }
 }

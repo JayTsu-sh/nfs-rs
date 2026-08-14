@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::callback::CallbackService;
+use super::callback::{CallbackService, CallbackState};
 use super::compound::{
     CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
@@ -50,6 +50,7 @@ struct Mount40 {
     lease: Arc<LeaseState>,
     _renewal: Option<LeaseRenewal>,
     _callback: Option<CallbackService>,
+    callback_state: Option<Arc<CallbackState>>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
@@ -113,6 +114,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let callback_addr = callback
         .as_ref()
         .map(|service| service.universal_addr().to_string());
+    let callback_state = callback.as_ref().map(CallbackService::state);
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
     let identity_config = ClientIdentity::new();
@@ -199,6 +201,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         lease,
         _renewal: Some(renewal),
         _callback: callback,
+        callback_state,
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
@@ -545,6 +548,7 @@ impl Mount40 {
         let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
         let lease = Arc::clone(&self.lease);
+        let callback_state = self.callback_state.clone();
         let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
@@ -611,6 +615,14 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
+            if let (Some(callback_state), Some(delegation)) = (callback_state, opened.delegation) {
+                callback_state.register_delegation(
+                    fh.clone(),
+                    delegation,
+                    expected_generation,
+                    None,
+                )?;
+            }
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
                 state.remove(owner, &fh).await;
                 return Err(error);
@@ -1932,6 +1944,7 @@ mod tests {
             lease: LeaseState::ready(1, 60),
             _renewal: None,
             _callback: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1987,6 +2000,7 @@ mod tests {
             lease,
             _renewal: Some(renewal),
             _callback: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -2512,6 +2526,7 @@ mod tests {
             lease,
             _renewal: Some(renewal),
             _callback: None,
+            callback_state: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
