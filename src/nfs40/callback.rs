@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -49,6 +49,7 @@ pub(crate) struct CallbackState {
     returns_failed: AtomicU64,
     service_healthy: AtomicBool,
     worker_healthy: AtomicBool,
+    io_gates: Mutex<HashMap<Bytes, Weak<tokio::sync::RwLock<()>>>>,
 }
 
 pub(crate) struct OpenPublication {
@@ -111,6 +112,7 @@ impl CallbackService {
             returns_failed: AtomicU64::new(0),
             service_healthy: AtomicBool::new(true),
             worker_healthy: AtomicBool::new(true),
+            io_gates: Mutex::new(HashMap::new()),
         });
         let service_state = Arc::clone(&state);
         let (stop, mut stopping) = watch::channel(false);
@@ -190,6 +192,27 @@ impl CallbackService {
 }
 
 impl CallbackState {
+    fn io_gate(&self, fh: &Bytes) -> Arc<tokio::sync::RwLock<()>> {
+        let mut gates = self
+            .io_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(gate) = gates.get(fh).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        gates.insert(fh.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    pub(crate) async fn foreground_io(&self, fh: &Bytes) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.io_gate(fh).read_owned().await
+    }
+
+    pub(crate) async fn recall_io(&self, fh: &Bytes) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.io_gate(fh).write_owned().await
+    }
+
     pub(crate) fn stats(&self) -> crate::CallbackStats {
         crate::CallbackStats {
             recalls_received: self.recalls_received.load(Ordering::Relaxed),
@@ -391,6 +414,10 @@ impl CallbackWorker {
                     }
                 };
                 let Some(recall) = recall else { break };
+                if !state.is_current(&recall) {
+                    continue;
+                }
+                let _io = state.recall_io(&recall.fh).await;
                 if !state.is_current(&recall) {
                     continue;
                 }
@@ -1429,6 +1456,45 @@ mod tests {
         );
         assert!(recalls.try_recv().is_err());
         assert_eq!(state.stats().recalls_received, 0);
+    }
+
+    #[tokio::test]
+    async fn per_file_gate_serializes_recall_after_foreground_io() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        let first = state.foreground_io(&Bytes::from_static(b"same")).await;
+        let second = state.foreground_io(&Bytes::from_static(b"same")).await;
+        let waiting_state = Arc::clone(&state);
+        let recall =
+            tokio::spawn(
+                async move { waiting_state.recall_io(&Bytes::from_static(b"same")).await },
+            );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!recall.is_finished());
+        drop(first);
+        assert!(!recall.is_finished());
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), recall)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_file_gate_keeps_different_files_independent() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        let _foreground = state.foreground_io(&Bytes::from_static(b"a")).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state.recall_io(&Bytes::from_static(b"b")),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

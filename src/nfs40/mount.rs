@@ -747,10 +747,17 @@ impl Mount40 {
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
         let expected_generation = self.lease.begin_stateful("close")?;
+        let close_fh = lane.lock().await.fh.clone();
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.recall_io(&close_fh).await)
+        } else {
+            None
+        };
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
+            let _io_guard = io_guard;
             let mut lane = lane.lock().await;
             let request = CompoundBuilder::new("close")
                 .putfh(&lane.fh)
@@ -1407,6 +1414,11 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
+        let _io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
         if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?;
         }
@@ -1806,6 +1818,11 @@ impl Mount for Mount40 {
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
             .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
         if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?;
         }
@@ -1814,6 +1831,7 @@ impl Mount for Mount40 {
         let lane_for_settlement = Arc::clone(&lane);
         let fh_for_settlement = fh.clone();
         let settled = tokio::spawn(async move {
+            let _io_guard = io_guard;
             // The lane guard spans request construction through reply decoding.
             // CLOSE takes the same guard, so cancellation cannot reorder CLOSE
             // ahead of a detached WRITE settlement.
