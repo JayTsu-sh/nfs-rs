@@ -1,8 +1,9 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::compound::{CompoundBuilder, decode_renew_response};
@@ -13,6 +14,7 @@ use crate::rpc::auth::Auth;
 use crate::rpc::{self, ReplayPolicy};
 
 const RENEW_TIMEOUT: Duration = Duration::from_secs(5);
+const RENEW_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn renewal_delay(interval: Duration, sample: u16) -> Duration {
     let per_mille = 900 + u32::from(sample) % 201;
@@ -153,7 +155,8 @@ impl LeaseState {
 }
 
 pub(crate) struct LeaseRenewal {
-    handle: JoinHandle<()>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    stop: watch::Sender<bool>,
 }
 
 pub(crate) type RecoveryHandler =
@@ -168,9 +171,18 @@ impl LeaseRenewal {
         state: Arc<LeaseState>,
         recovery: Option<RecoveryHandler>,
     ) -> Self {
+        let (stop, mut stopping) = watch::channel(false);
         let handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(renewal_delay(interval, rand::random())).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(renewal_delay(interval, rand::random())) => {}
+                    changed = stopping.changed() => {
+                        if changed.is_err() || *stopping.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 let request = CompoundBuilder::new("renew")
                     .renew(client_id.load(Ordering::Acquire))
                     .encode_with_header(&auth);
@@ -206,19 +218,43 @@ impl LeaseRenewal {
                     }
                     Err(_) => state.mark_suspect(),
                 }
+                if *stopping.borrow() {
+                    return;
+                }
             }
         });
-        Self { handle }
+        Self {
+            handle: Mutex::new(Some(handle)),
+            stop,
+        }
     }
 
-    pub(crate) fn stop(&self) {
-        self.handle.abort();
+    pub(crate) async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let Some(mut handle) = self.handle.lock().expect("lease task lock poisoned").take() else {
+            return;
+        };
+        if tokio::time::timeout(RENEW_STOP_TIMEOUT, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
 impl Drop for LeaseRenewal {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop.send(true);
+        if let Some(handle) = self
+            .handle
+            .get_mut()
+            .expect("lease task lock poisoned")
+            .take()
+        {
+            handle.abort();
+        }
     }
 }
 

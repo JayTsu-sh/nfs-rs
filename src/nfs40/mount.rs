@@ -912,7 +912,7 @@ impl Mount for Mount40 {
     async fn umount(&self) -> Result<()> {
         self.lease.mark_closing();
         if let Some(renewal) = &self._renewal {
-            renewal.stop();
+            renewal.stop().await;
         }
         self.rpc.shutdown().await;
         self.lease.mark_closed();
@@ -2032,6 +2032,113 @@ mod tests {
         assert_eq!(health.lease_healthy, Some(false));
         assert!(mount.read(Bytes::from_static(b"fh"), 0, 1).await.is_err());
         accepted.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn umount_waits_for_a_sent_reclaim_before_shutting_down_rpc() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let auth = Auth::new_null();
+        let client_id = Arc::new(AtomicU64::new(7));
+        let lease = LeaseState::ready(1, 60);
+        let state = Arc::new(OpenState::default());
+        state
+            .register(OwnerLane {
+                owner: 75,
+                next_seqid: 1,
+                stateid: [0x75; 16],
+                fh: Bytes::from_static(b"fh"),
+                access: crate::OPEN_BOTH,
+                write_verifier: None,
+            })
+            .await;
+        let locks = Arc::new(LockState::default());
+        let context = RecoveryContext {
+            rpc: rpc.clone(),
+            auth: auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5a; 8],
+                owner: "shutdown-reclaim".into(),
+            },
+            client_id: Arc::clone(&client_id),
+            issuer: 9,
+            state: Arc::clone(&state),
+            locks: Arc::clone(&locks),
+            lease: Arc::clone(&lease),
+        };
+        let recovery: RecoveryHandler = Arc::new(move || {
+            let context = context.clone();
+            Box::pin(async move { context.recover_or_lose().await })
+        });
+        let renewal = LeaseRenewal::start(
+            rpc.clone(),
+            auth.clone(),
+            Arc::clone(&client_id),
+            Duration::from_millis(10),
+            Arc::clone(&lease),
+            Some(recovery),
+        );
+        let mount = Arc::new(Mount40 {
+            rpc,
+            auth,
+            root_fh: Bytes::from_static(b"root"),
+            client_id,
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state,
+            locks,
+            lease,
+            _renewal: Some(renewal),
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        });
+        let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
+        let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            reply(&mut stream, &renew, &failed_lock_result("renew", 30, 10011)).await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&23u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7a; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            let _ = reclaim_seen_tx.send(());
+            let _ = release_reclaim_rx.await;
+            reply(&mut stream, &reclaim, &open_result(0, [0x85; 16], b"fh")).await
+        });
+
+        reclaim_seen_rx.await.unwrap();
+        let for_umount = Arc::clone(&mount);
+        let mut umount = tokio::spawn(async move { for_umount.umount().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut umount)
+                .await
+                .is_err(),
+            "umount completed while the sent reclaim was unsettled"
+        );
+        let _ = release_reclaim_tx.send(());
+        umount.await.unwrap().unwrap();
+        server.await.unwrap().unwrap();
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Closed);
     }
 
     #[tokio::test]
