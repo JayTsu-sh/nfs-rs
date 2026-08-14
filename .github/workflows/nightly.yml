@@ -64,6 +64,17 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
       - name: NetApp NFSv4.0 callback fault E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.0 performance matrix
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-performance.sh "$RUN_ID"
+      - name: Collect NFSv4.0 release evidence
+        if: always()
+        run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" "$RUNNER_TEMP/nfsv40-release-evidence"
+      - name: Upload NFSv4.0 release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfsv40-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nfsv40-release-evidence
       - name: NetApp NFSv4.0 below/above lease partition E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 compatibility E2E

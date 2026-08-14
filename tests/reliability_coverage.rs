@@ -163,6 +163,40 @@ fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
 }
 
 #[test]
+fn nfsv40_experimental_release_contract_is_complete() {
+    let cargo = fs::read_to_string(workspace_path("Cargo.toml")).expect("Cargo.toml readable");
+    let readme = fs::read_to_string(workspace_path("README.md")).expect("README readable");
+    let changelog =
+        fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
+    let release = include_str!("../.github/workflows/release-validation.yml");
+    let nightly = include_str!("../.github/workflows/nightly.yml");
+
+    assert!(cargo.contains("version = \"0.5.0\""));
+    for required in [
+        "NFSv4.0 (experimental)",
+        "AUTH_SYS",
+        "RPCSEC_GSS",
+        "version=4.0",
+        "retain-delegations=true",
+        "grace/reclaim",
+    ] {
+        assert!(readme.contains(required), "README lacks {required}");
+    }
+    assert!(changelog.contains("## [0.5.0]"));
+    for command in [
+        "cargo package --locked",
+        "cargo publish --locked --dry-run",
+        "tests/lab/run-netapp-v40-performance.sh",
+        "tests/lab/collect-nfsv40-release-evidence.sh",
+    ] {
+        assert!(
+            release.contains(command) || nightly.contains(command),
+            "release matrix lacks {command}"
+        );
+    }
+}
+
+#[test]
 fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
     let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
         .expect("NFS fault helper must be readable");
