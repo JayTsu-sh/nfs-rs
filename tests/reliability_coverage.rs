@@ -170,6 +170,33 @@ fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
 }
 
 #[test]
+fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
+    let helper = fs::read_to_string(workspace_path("tests/lab/admin/nfsrs-lab-v40-fault"))
+        .expect("NFSv4.0 fault helper must be readable");
+    let runner = fs::read_to_string(workspace_path(
+        "tests/lab/run-netapp-v40-lease-fault-e2e.sh",
+    ))
+    .expect("NFSv4.0 lease fault runner must be readable");
+    let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    for required in [
+        "10.131.9.11",
+        "10.128.61.200",
+        "10.128.61.201",
+        "tcp dport 2049 drop",
+        "^(nightly|release)-",
+    ] {
+        assert!(helper.contains(required), "fault helper lacks {required}");
+    }
+    assert!(!helper.contains("input {"));
+    assert!(runner.contains("trap cleanup EXIT INT TERM"));
+    assert!(runner.contains("run_case below"));
+    assert!(runner.contains("run_case above"));
+    assert!(workflow.contains("run-netapp-v40-lease-fault-e2e.sh"));
+    assert!(workflow.contains("Restore NetApp NFSv4.0 connectivity"));
+}
+
+#[test]
 fn callback_fault_coverage_is_explicit_and_capability_honest() {
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");

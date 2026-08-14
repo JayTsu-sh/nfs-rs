@@ -42,3 +42,10 @@ READDIRPLUS, rename, hard links, symbolic links, removal, and unmount.
 The Rust integration test is ignored by default and requires both
 `NFS_RS_LAB_E2E=1` and a whitespace-separated `NFS_RS_LAB_URLS` value. This
 keeps normal CI from accidentally accessing the private lab.
+
+The NFSv4.0 lease fault case uses `nfsrs-lab-v40-fault` on the runner. The
+helper accepts only `.200` or `.201`, drops only runner-originated destination
+TCP/2049 traffic, owns the fault by run ID, and is restored by both a shell trap
+and an unconditional nightly cleanup step. The below-lease case preserves the
+generation after reconnect; the above-lease case requires `LostState` and
+rejection of the old state token. It never changes ONTAP LIF or SVM state.

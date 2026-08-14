@@ -240,7 +240,12 @@ impl LeaseRenewal {
 
     pub(crate) async fn stop(&self) {
         let _ = self.stop.send(true);
-        let Some(mut handle) = self.handle.lock().expect("lease task lock poisoned").take() else {
+        let Some(mut handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
             return;
         };
         if tokio::time::timeout(RENEW_STOP_TIMEOUT, &mut handle)
@@ -256,12 +261,11 @@ impl LeaseRenewal {
 impl Drop for LeaseRenewal {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
-        if let Some(handle) = self
-            .handle
-            .get_mut()
-            .expect("lease task lock poisoned")
-            .take()
-        {
+        let handle = match self.handle.get_mut() {
+            Ok(handle) => handle,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(handle) = handle.take() {
             handle.abort();
         }
     }
