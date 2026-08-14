@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use tokio::sync::watch;
+use tokio::sync::{RwLock, RwLockReadGuard, watch};
 use tokio::task::JoinHandle;
 
 use super::compound::{CompoundBuilder, decode_renew_response};
@@ -29,6 +29,7 @@ pub(crate) struct LeaseState {
     lease_seconds: u32,
     renewals: AtomicU64,
     deadline: watch::Sender<tokio::time::Instant>,
+    publication: RwLock<()>,
 }
 
 impl LeaseState {
@@ -42,6 +43,7 @@ impl LeaseState {
             lease_seconds,
             renewals: AtomicU64::new(0),
             deadline,
+            publication: RwLock::new(()),
         })
     }
 
@@ -186,7 +188,12 @@ impl LeaseState {
             .store(MountLifecycleState::Closed as u8, Ordering::Release);
     }
 
-    pub(crate) fn mark_lost(&self) {
+    pub(crate) async fn publication_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.publication.read().await
+    }
+
+    pub(crate) async fn mark_lost(&self) {
+        let _publication = self.publication.write().await;
         self.healthy.store(false, Ordering::Release);
         self.lifecycle
             .store(MountLifecycleState::LostState as u8, Ordering::Release);
@@ -255,7 +262,7 @@ impl LeaseRenewal {
                         _ = tokio::time::sleep_until(expires_at) => {
                             // Fence state at the conservative deadline, but retain
                             // the sent RPC until it settles instead of cancelling it.
-                            state.mark_lost();
+                            state.mark_lost().await;
                             let _ = renew.await;
                             return;
                         }
@@ -280,12 +287,12 @@ impl LeaseRenewal {
                                 state.mark_ready();
                             }
                         } else {
-                            state.mark_lost();
+                            state.mark_lost().await;
                         }
                     }
                     Err(_) => {
                         if tokio::time::Instant::now() >= *deadline.borrow() {
-                            state.mark_lost();
+                            state.mark_lost().await;
                             return;
                         }
                         state.mark_suspect();

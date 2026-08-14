@@ -357,9 +357,9 @@ impl RecoveryContext {
         match self.recover().await {
             Ok(()) => Ok(()),
             Err(error) => {
+                self.lease.mark_lost().await;
                 self.state.clear().await;
                 self.locks.clear().await;
-                self.lease.mark_lost();
                 Err(NfsError::OperationOutcome(Box::new(
                     crate::error::OperationOutcomeError::new(
                         crate::error::OperationOutcome::Uncertain,
@@ -428,7 +428,7 @@ impl Mount40 {
         lock_type: u32,
         offset: u64,
         length: u64,
-    ) -> Result<Bytes> {
+    ) -> Result<(Bytes, u64)> {
         let expected_generation = self.lease.begin_stateful("lock")?;
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
@@ -464,6 +464,7 @@ impl Mount40 {
                 open.next_seqid = open.next_seqid.wrapping_add(1);
             }
             let stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "lock")?;
             locks
                 .register(LockLane {
@@ -478,11 +479,15 @@ impl Mount40 {
                     length,
                 })
                 .await;
+            if let Err(error) = lease.validate_stateful(expected_generation, "lock") {
+                locks.remove(&stateid).await;
+                return Err(error);
+            }
             Ok::<_, NfsError>(stateid)
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
-        Ok(Bytes::copy_from_slice(&stateid))
+        Ok((Bytes::copy_from_slice(&stateid), expected_generation))
     }
 
     async fn open_file(
@@ -564,6 +569,7 @@ impl Mount40 {
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
             }
+            let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "open")?;
             state
                 .register(OwnerLane {
@@ -575,6 +581,10 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
+            if let Err(error) = lease.validate_stateful(expected_generation, "open") {
+                state.remove(owner, &fh).await;
+                return Err(error);
+            }
             Ok::<_, NfsError>(mount::OpenFile::with_protocol_state(
                 mount::ObjRes { fh, attr: None },
                 encode_owner(issuer, owner),
@@ -1221,9 +1231,13 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        let stateid = match self.state.for_fh(&fh, crate::OPEN_WRITE).await {
-            Some(lane) => lane.lock().await.stateid,
-            None => [0; 16],
+        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
+        let (stateid, expected_generation) = match lane {
+            Some(lane) => (
+                lane.lock().await.stateid,
+                Some(self.lease.begin_stateful("setattr")?),
+            ),
+            None => ([0; 16], None),
         };
         let request = CompoundBuilder::new("setattr")
             .putfh(&fh)
@@ -1234,7 +1248,11 @@ impl Mount for Mount40 {
             .activity_settled_call(request, class, ctx.clone())
             .await?;
         decode_setattr_response(response, &bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, "setattr")?;
+        }
+        Ok(())
     }
     async fn setattr_path(
         &self,
@@ -1270,8 +1288,10 @@ impl Mount for Mount40 {
         let open_lane = self.state.for_fh(&fh, access).await.ok_or_else(|| {
             NfsError::InvalidInput("NFSv4.0 LOCK requires a compatible open file".into())
         })?;
-        self.acquire_lock(open_lane, fh, lock_type, offset, length)
-            .await
+        Ok(self
+            .acquire_lock(open_lane, fh, lock_type, offset, length)
+            .await?
+            .0)
     }
     async fn lock_test(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
         if !matches!(lock_type, 1 | 2) || length == 0 {
@@ -1303,7 +1323,22 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<crate::LockToken> {
-        let stateid = self.lock(fh.clone(), lock_type, offset, length).await?;
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCK requires type 1/2 and non-zero length".into(),
+            ));
+        }
+        let access = if lock_type == 1 {
+            crate::OPEN_READ
+        } else {
+            crate::OPEN_WRITE
+        };
+        let open_lane = self.state.for_fh(&fh, access).await.ok_or_else(|| {
+            NfsError::InvalidInput("NFSv4.0 LOCK requires a compatible open file".into())
+        })?;
+        let (stateid, generation) = self
+            .acquire_lock(open_lane, fh.clone(), lock_type, offset, length)
+            .await?;
         Ok(crate::LockToken::new(
             fh,
             stateid,
@@ -1311,7 +1346,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.lease.generation(),
+            generation,
         ))
     }
     async fn lock_open_stateful(
@@ -1340,7 +1375,7 @@ impl Mount for Mount40 {
         let lane = self.state.by_owner(owner).await.ok_or_else(|| {
             NfsError::InvalidInput("open token is stale or already closed".into())
         })?;
-        let stateid = self
+        let (stateid, generation) = self
             .acquire_lock(lane, opened.object.fh.clone(), lock_type, offset, length)
             .await?;
         Ok(crate::LockToken::new(
@@ -1350,7 +1385,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.lease.generation(),
+            generation,
         ))
     }
     async fn locku(
@@ -2356,7 +2391,7 @@ mod tests {
                 .await
         });
         seen_rx.await.unwrap();
-        mount.lease.mark_lost();
+        mount.lease.mark_lost().await;
         let _ = reply_tx.send(());
         let error = lock.await.unwrap().unwrap_err();
         assert_eq!(
