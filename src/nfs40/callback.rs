@@ -1234,6 +1234,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_recall_queue_delays_without_consuming_the_recall() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+
+        for index in 0u8..=64 {
+            state
+                .register_delegation(
+                    Bytes::from(vec![index]),
+                    DelegationGrant {
+                        kind: DelegationKind::Read,
+                        stateid: [index; 16],
+                        recall: false,
+                    },
+                    7,
+                    None,
+                )
+                .unwrap();
+            let mut call = cb_null_call(u32::from(index) + 100);
+            call[5] = 1;
+            call.extend_from_slice(&[0, 0, 1, 1, 4]);
+            call.extend_from_slice(&[u32::from_be_bytes([index; 4]); 4]);
+            call.extend_from_slice(&[0, 1, u32::from(index) << 24]);
+            let reply = round_trip(&mut stream, &call).await;
+            if index < 64 {
+                assert_eq!(reply[6], 0);
+            } else {
+                assert_eq!(reply, [164, 1, 0, 0, 0, 0, 10008, 0, 1, 4, 10008]);
+            }
+        }
+        assert_eq!(state.stats().recalls_received, 64);
+
+        recalls.try_recv().unwrap();
+        let mut retry = cb_null_call(200);
+        retry[5] = 1;
+        retry.extend_from_slice(&[0, 0, 1, 1, 4]);
+        retry.extend_from_slice(&[u32::from_be_bytes([64; 4]); 4]);
+        retry.extend_from_slice(&[0, 1, 64 << 24]);
+        assert_eq!(round_trip(&mut stream, &retry).await[6], 0);
+        assert_eq!(state.stats().recalls_received, 65);
+    }
+
+    #[tokio::test]
     async fn recall_racing_open_publication_delays_then_queues_once() {
         let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
             .await
