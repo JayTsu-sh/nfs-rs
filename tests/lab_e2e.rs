@@ -638,7 +638,7 @@ async fn nfs_v40_small_large_single_multi_performance() -> TestResult {
     let report = serde_json::json!({
         "schema_version": 1,
         "run_id": run_id,
-        "commit": option_env!("GITHUB_SHA").unwrap_or("local"),
+        "commit": env::var("NFS_RS_LAB_V40_PERF_COMMIT")?,
         "lifs": ["10.128.61.200", "10.128.61.201"],
         "protocol": "4.0",
         "liveness": "pass",
