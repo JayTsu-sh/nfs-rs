@@ -1150,6 +1150,12 @@ impl Mount for Mount40 {
         if let Some(renewal) = &self._renewal {
             renewal.stop().await;
         }
+        if let Some(callback) = &self._callback {
+            callback.stop().await;
+        }
+        if let Some(worker) = &self._callback_worker {
+            worker.stop().await;
+        }
         self.rpc.shutdown().await;
         self.lease.mark_closed();
         Ok(())

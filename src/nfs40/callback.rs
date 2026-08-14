@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{NfsError, Result};
@@ -21,12 +21,15 @@ use crate::rpc::{self, ReplayPolicy};
 pub(crate) const CB_PROGRAM: u32 = 0x4000_0000;
 const MAX_CALLBACK_RECORD: usize = 64 * 1024;
 const CALLBACK_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const CALLBACK_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const CALLBACK_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
 
 pub(crate) struct CallbackService {
     universal_addr: String,
     state: Arc<CallbackState>,
     recall_rx: Mutex<Option<mpsc::Receiver<RecallNotification>>>,
-    task: JoinHandle<()>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    stop: watch::Sender<bool>,
 }
 
 struct DelegationRecord {
@@ -59,7 +62,9 @@ pub(crate) struct RecallNotification {
 }
 
 pub(crate) struct CallbackWorker {
-    task: JoinHandle<()>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    stop: watch::Sender<bool>,
+    state: Arc<CallbackState>,
 }
 
 impl CallbackService {
@@ -106,23 +111,39 @@ impl CallbackService {
             healthy: AtomicBool::new(true),
         });
         let service_state = Arc::clone(&state);
+        let (stop, mut stopping) = watch::channel(false);
         let task = tokio::spawn(async move {
-            while let Ok((stream, peer)) = listener.accept().await {
-                if peer.ip() != IpAddr::V4(server_ip) {
-                    drop(stream);
-                    continue;
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    changed = stopping.changed() => {
+                        if changed.is_err() || *stopping.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((stream, peer)) = accepted else { break };
+                        if peer.ip() != IpAddr::V4(server_ip) {
+                            drop(stream);
+                            continue;
+                        }
+                        let state = Arc::clone(&service_state);
+                        connections.spawn(async move {
+                            let _ = serve_connection(stream, state).await;
+                        });
+                    }
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
                 }
-                let state = Arc::clone(&service_state);
-                tokio::spawn(async move {
-                    let _ = serve_connection(stream, state).await;
-                });
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
         Ok(Self {
             universal_addr,
             state,
             recall_rx: Mutex::new(Some(recall_rx)),
-            task,
+            task: Mutex::new(Some(task)),
+            stop,
         })
     }
 
@@ -140,6 +161,25 @@ impl CallbackService {
             .map_err(|_| NfsError::Rpc("NFSv4.0 callback receiver lock poisoned".into()))?
             .take()
             .ok_or_else(|| NfsError::Rpc("NFSv4.0 callback receiver already taken".into()))
+    }
+
+    pub(crate) async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let Some(mut task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        if tokio::time::timeout(CALLBACK_SERVICE_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -272,8 +312,26 @@ impl CallbackWorker {
         auth: Auth,
         state: Arc<CallbackState>,
     ) -> Self {
+        let worker_state = Arc::clone(&state);
+        let (stop, mut stopping) = watch::channel(false);
         let task = tokio::spawn(async move {
-            while let Some(recall) = recalls.recv().await {
+            let mut draining = false;
+            loop {
+                let recall = if draining {
+                    recalls.recv().await
+                } else {
+                    tokio::select! {
+                        recall = recalls.recv() => recall,
+                        changed = stopping.changed() => {
+                            if changed.is_err() || *stopping.borrow() {
+                                recalls.close();
+                                draining = true;
+                            }
+                            continue;
+                        }
+                    }
+                };
+                let Some(recall) = recall else { break };
                 if !state.is_current(&recall) {
                     continue;
                 }
@@ -288,13 +346,57 @@ impl CallbackWorker {
                     state.finish_recall(&recall.fh, &recall.stateid, recall.generation, returned);
             }
         });
-        Self { task }
+        Self {
+            task: Mutex::new(Some(task)),
+            stop,
+            state: worker_state,
+        }
+    }
+
+    pub(crate) async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let Some(mut task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        if tokio::time::timeout(CALLBACK_WORKER_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            self.state.healthy.store(false, Ordering::Release);
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for CallbackWorker {
     fn drop(&mut self) {
-        self.task.abort();
+        let _ = self.stop.send(true);
+        let task = match self.task.get_mut() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for CallbackService {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        let task = match self.task.get_mut() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -688,12 +790,6 @@ fn rpc_reply(words: &[u32]) -> Vec<u8> {
     reply
 }
 
-impl Drop for CallbackService {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -781,6 +877,25 @@ mod tests {
             .unwrap();
         let words = round_trip(&mut stream, &cb_null_call(0x1020_3040)).await;
         assert_eq!(words, [0x1020_3040, 1, 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn stopping_callback_service_closes_listener_and_connections() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let address = socket_addr(service.universal_addr());
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &cb_null_call(5)).await,
+            [5, 1, 0, 0, 0, 0]
+        );
+
+        service.stop().await;
+
+        let mut byte = [0; 1];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
 
     #[tokio::test]
@@ -1133,7 +1248,7 @@ mod tests {
         let rpc = rpc::Client::new(mux, None);
         let service = CallbackService::bind_for(server_addr).await.unwrap();
         let state = service.state();
-        let _worker = CallbackWorker::start(
+        let worker = CallbackWorker::start(
             service.take_recall_receiver().unwrap(),
             rpc,
             Auth::new_null(),
@@ -1202,5 +1317,6 @@ mod tests {
             }
         );
         assert!(state.healthy());
+        worker.stop().await;
     }
 }
