@@ -2038,6 +2038,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_flight_renewal_is_fenced_at_deadline_but_still_settles() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = sent_tx.send(());
+            let _ = settle_rx.await;
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        sent_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight RENEW prevented conservative lease expiry");
+        assert_eq!(mount.health().generation, 2);
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn expired_renewal_loses_generation_and_gates_stateful_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)

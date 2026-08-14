@@ -193,13 +193,29 @@ impl LeaseRenewal {
                     protocol: NFSVersion::NFSv4p0,
                     request_id: None,
                 };
-                let result = rpc
-                    .call(request, ReplayPolicy::byte_identical(2), RENEW_TIMEOUT)
-                    .await
-                    .map_err(|error| {
-                        classify_sent_nfs40_error(OperationClass::SessionControl, context, error)
-                    })
-                    .and_then(decode_renew_response);
+                let renew = async {
+                    rpc.call(request, ReplayPolicy::byte_identical(2), RENEW_TIMEOUT)
+                        .await
+                        .map_err(|error| {
+                            classify_sent_nfs40_error(
+                                OperationClass::SessionControl,
+                                context,
+                                error,
+                            )
+                        })
+                        .and_then(decode_renew_response)
+                };
+                tokio::pin!(renew);
+                let result = tokio::select! {
+                    result = &mut renew => result,
+                    _ = tokio::time::sleep_until(expires_at) => {
+                        // Fence state at the conservative deadline, but retain
+                        // the sent RPC until it settles instead of cancelling it.
+                        state.mark_lost();
+                        let _ = renew.await;
+                        return;
+                    }
+                };
                 match result {
                     Ok(()) => {
                         expires_at = tokio::time::Instant::now() + lease_duration;
