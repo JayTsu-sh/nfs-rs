@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "status": "accepted",
-  "captured_at_utc": "2026-08-14T08:13:00Z",
-  "commit": "babd06017854a531c3bc0a753141e4348523b8f4",
+  "captured_at_utc": "2026-08-14T08:40:00Z",
+  "commit": "5bdd2d3f8807de45cb604795d1b9af9029b5787f",
   "fixture": {
     "server": "FAS2750",
     "svm": "lizy",
@@ -15,9 +15,9 @@
     "peak_rss_regression_percent": 25
   },
   "workloads": [
-    {"name": "small-single", "throughput_mib_s": 0.6865078115, "p95_latency_ms": 1.021546, "peak_rss_kib": 7020},
-    {"name": "small-multi", "throughput_mib_s": 2.2145700853, "p95_latency_ms": 1.181987, "peak_rss_kib": 8564},
-    {"name": "large-single", "throughput_mib_s": 28.9516305344, "p95_latency_ms": 13.895620, "peak_rss_kib": 41280},
-    {"name": "large-multi", "throughput_mib_s": 52.0992179134, "p95_latency_ms": 56.915571, "peak_rss_kib": 149144}
+    {"name": "small-single", "throughput_mib_s": 0.7093854559, "p95_latency_ms": 1.343790, "peak_rss_kib": 7104},
+    {"name": "small-multi", "throughput_mib_s": 1.7232795195, "p95_latency_ms": 3.098372, "peak_rss_kib": 11720},
+    {"name": "large-single", "throughput_mib_s": 24.6076825716, "p95_latency_ms": 26.135911, "peak_rss_kib": 45456},
+    {"name": "large-multi", "throughput_mib_s": 36.7780573704, "p95_latency_ms": 85.418372, "peak_rss_kib": 239352}
   ]
 }
