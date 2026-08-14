@@ -334,6 +334,89 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an authorized runner-side NetApp NFSv4.0 partition"]
+async fn nfs_v40_destination_partition_respects_lease_generation() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let url = env::var("NFS_RS_LAB_V40_FAULT_URL")?;
+    let mode = env::var("NFS_RS_LAB_V40_FAULT_MODE")?;
+    let ready = env::var("NFS_RS_LAB_V40_FAULT_READY_FILE")?;
+    let applied = env::var("NFS_RS_LAB_V40_FAULT_APPLIED_FILE")?;
+    let restored = env::var("NFS_RS_LAB_V40_FAULT_RESTORED_FILE")?;
+    let observed = env::var("NFS_RS_LAB_V40_FAULT_OBSERVED_FILE")?;
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(mount.version() == NFSVersion::NFSv4p0, "NFSv4.0 required")?;
+    let initial = mount.health();
+    let lease_seconds = initial
+        .lease_seconds
+        .ok_or_else(|| io::Error::other("NFSv4.0 lease time is not observable"))?;
+    ensure(lease_seconds > 0, "NFSv4.0 lease time is zero")?;
+    let opened = mount
+        .open_path_stateful("nfs-rs-small.bin", OPEN_READ)
+        .await?;
+    std::fs::write(&ready, lease_seconds.to_string())?;
+    wait_for_lab_file(&applied, Duration::from_secs(30)).await?;
+
+    match mode.as_str() {
+        "below" => {
+            wait_for_lab_file(
+                &restored,
+                Duration::from_secs(u64::from(lease_seconds) + 60),
+            )
+            .await?;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let health = mount.health();
+                    if health.lifecycle == MountLifecycleState::Ready
+                        && health.lease_renewals > initial.lease_renewals
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::other("below-lease partition did not renew after restore"))?;
+            ensure(
+                mount.health().generation == initial.generation,
+                "below-lease reconnect invalidated the generation",
+            )?;
+            mount.close_stateful(opened).await?;
+        }
+        "above" => {
+            tokio::time::timeout(Duration::from_secs(u64::from(lease_seconds) + 60), async {
+                loop {
+                    if mount.health().lifecycle == MountLifecycleState::LostState {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::other("above-lease partition did not lose state"))?;
+            ensure(
+                mount.health().generation > initial.generation,
+                "above-lease partition retained the old generation",
+            )?;
+            let error = mount.close_stateful(opened).await.unwrap_err();
+            ensure(
+                error
+                    .operation_outcome()
+                    .is_some_and(|outcome| outcome.recovery == nfs_rs::RecoveryAction::Reopen),
+                format!("stale generation did not require reopen: {error}"),
+            )?;
+            std::fs::write(&observed, b"lost-state-old-token-rejected")?;
+            wait_for_lab_file(&restored, Duration::from_secs(30)).await?;
+        }
+        _ => return Err(io::Error::other("invalid NFSv4.0 fault mode").into()),
+    }
+    mount.umount().await?;
+    Ok(())
+}
+
 fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     if condition {
         Ok(())

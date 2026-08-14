@@ -9,6 +9,10 @@ export NFS_RS_LAB_V40_URLS="nfs://${lif_a}${export_path}?version=4.0&noresvport=
 export NFS_RS_LAB_V40_SMALL_FILE="${NFS_RS_LAB_V40_SMALL_FILE:-nfs-rs-small.bin}"
 export NFS_RS_LAB_V40_LARGE_FILE="${NFS_RS_LAB_V40_LARGE_FILE:-nfs-rs-large.bin}"
 
-cargo test --locked --test lab_e2e \
-  nfs_v40_ \
-  -- --ignored --nocapture
+for test_name in \
+  nfs_v40_mount_null_and_traversal_on_both_lifs \
+  nfs_v40_open_io_commit_close_on_both_lifs; do
+  cargo test --locked --test lab_e2e \
+    "$test_name" \
+    -- --ignored --exact --nocapture
+done

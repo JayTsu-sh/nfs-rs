@@ -146,6 +146,23 @@ fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
 }
 
 #[test]
+fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
+    let workflow = include_str!("../.github/workflows/release-validation.yml");
+
+    assert!(workflow.contains("Discover persisted Rust toolchain"));
+    assert!(
+        workflow
+            .contains("/home/github-runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin")
+    );
+    assert!(workflow.contains("complete pre-provisioned Rust 1.95.0 toolchain not found"));
+    assert!(workflow.contains("rustc --version | grep -q '^rustc 1\\.95\\.0 '"));
+    assert!(workflow.contains("cache-bin: false"));
+    assert!(!workflow.contains("dtolnay/rust-toolchain"));
+    assert!(!workflow.contains("rustup default"));
+    assert!(!workflow.contains("rustup toolchain install"));
+}
+
+#[test]
 fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
     let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
         .expect("NFS fault helper must be readable");
@@ -167,6 +184,37 @@ fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
             "fault helper contains forbidden capability: {forbidden}"
         );
     }
+}
+
+#[test]
+fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
+    let helper = fs::read_to_string(workspace_path("tests/lab/admin/nfsrs-lab-v40-fault"))
+        .expect("NFSv4.0 fault helper must be readable");
+    let runner = fs::read_to_string(workspace_path(
+        "tests/lab/run-netapp-v40-lease-fault-e2e.sh",
+    ))
+    .expect("NFSv4.0 lease fault runner must be readable");
+    let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    for required in [
+        "10.131.9.11",
+        "10.128.61.200",
+        "10.128.61.201",
+        "tcp dport 2049 drop",
+        "^(nightly|release)-",
+    ] {
+        assert!(helper.contains(required), "fault helper lacks {required}");
+    }
+    assert!(!helper.contains("input {"));
+    assert!(runner.contains("trap cleanup EXIT INT TERM"));
+    assert!(runner.contains("NFS_RS_LAB_V40_LIF_A"));
+    assert!(runner.contains("NFS_RS_LAB_V40_LIF_B"));
+    assert!(runner.contains("run_case \"$target_ip\" below"));
+    assert!(runner.contains("run_case \"$target_ip\" above"));
+    assert!(runner.contains("restore-any"));
+    assert!(workflow.contains("run-netapp-v40-lease-fault-e2e.sh"));
+    assert!(workflow.contains("Restore NetApp NFSv4.0 connectivity"));
+    assert!(workflow.contains("restore-any"));
 }
 
 #[test]

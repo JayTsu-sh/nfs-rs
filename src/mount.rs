@@ -90,6 +90,10 @@ pub struct MountHealth {
     pub lifecycle: MountLifecycleState,
     pub generation: u64,
     pub lease_healthy: Option<bool>,
+    /// Server-advertised lease duration when the protocol exposes one.
+    pub lease_seconds: Option<u32>,
+    /// Number of validated background lease renewals in this generation.
+    pub lease_renewals: u64,
     pub callback_healthy: Option<bool>,
 }
 

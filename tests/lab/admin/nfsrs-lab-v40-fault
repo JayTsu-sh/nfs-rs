@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:?action required}"
+run_id="${2:?run id required}"
+target_ip="${3:-}"
+runner_ip=10.131.9.11
+state_file=/run/nfsrs-lab-v40-fault.state
+table=nfsrs_v40_fault
+
+[[ "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
+  echo "unsafe run id: $run_id" >&2
+  exit 2
+}
+ip -o -4 addr show | grep -Fq " $runner_ip/" || {
+  echo "refusing NFSv4.0 fault outside the authorized runner" >&2
+  exit 2
+}
+
+restore() {
+  nft list table inet "$table" >/dev/null 2>&1 && nft delete table inet "$table"
+  rm -f "$state_file"
+}
+
+case "$action" in
+  isolate)
+    [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
+      echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
+      exit 2
+    }
+    if [[ -e "$state_file" ]]; then
+      read -r owner_run owner_ip <"$state_file"
+      [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
+        echo "NFSv4.0 fault belongs to another run or target" >&2
+        exit 2
+      }
+      exit 0
+    fi
+    nft add table inet "$table"
+    nft "add chain inet $table output { type filter hook output priority -10; policy accept; }"
+    nft add rule inet "$table" output ip daddr "$target_ip" tcp dport 2049 drop
+    printf '%s %s\n' "$run_id" "$target_ip" >"$state_file"
+    ss -K dst "$target_ip" dport = :2049 >/dev/null 2>&1 || true
+    echo "isolated runner destination $target_ip:2049 for $run_id"
+    ;;
+  restore)
+    [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
+      echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
+      exit 2
+    }
+    if [[ -e "$state_file" ]]; then
+      read -r owner_run owner_ip <"$state_file"
+      [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
+        echo "NFSv4.0 fault belongs to another run or target" >&2
+        exit 2
+      }
+    fi
+    restore
+    echo "restored runner destination $target_ip:2049 for $run_id"
+    ;;
+  restore-any)
+    if [[ -e "$state_file" ]]; then
+      read -r owner_run owner_ip <"$state_file"
+      [[ "$owner_run" == "$run_id" ]] || {
+        echo "NFSv4.0 fault belongs to another run" >&2
+        exit 2
+      }
+      echo "restoring runner destination $owner_ip:2049 for $run_id"
+    fi
+    restore
+    ;;
+  status)
+    if nft list table inet "$table" >/dev/null 2>&1; then
+      printf 'isolated %s\n' "$(<"$state_file")"
+    else
+      echo restored
+    fi
+    ;;
+  *)
+    echo "unsupported action: $action" >&2
+    exit 2
+    ;;
+esac

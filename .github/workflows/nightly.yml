@@ -62,6 +62,8 @@ jobs:
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.0 mount and traversal E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
+      - name: NetApp NFSv4.0 below/above lease partition E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 negotiated channel limits E2E
@@ -93,6 +95,9 @@ jobs:
       - name: Restore NetApp pNFS DS connectivity
         if: always()
         run: sudo -n /usr/local/sbin/nfsrs-lab-pnfs-fault restore-ds "$RUN_ID"
+      - name: Restore NetApp NFSv4.0 connectivity
+        if: always()
+        run: sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
       - name: Cleanup NetApp pNFS run
         if: always()
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/cleanup-pnfs-run.sh "$RUN_ID"

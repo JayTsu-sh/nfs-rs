@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use futures::stream;
 use futures::stream::TryStreamExt as _;
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, SetClientIdArgs,
+    CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
     decode_confirm_response, decode_create_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
@@ -19,6 +20,7 @@ use super::compound::{
     decode_setattr_response, decode_setclientid_response, decode_stateid_response,
     decode_write_response, open_succeeded_before_compound_failure,
 };
+use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
@@ -39,16 +41,32 @@ struct Mount40 {
     rpc: rpc::Client,
     auth: Auth,
     root_fh: Bytes,
-    client_id: u64,
+    client_id: Arc<AtomicU64>,
     issuer: u64,
-    generation: u64,
     next_owner: AtomicU64,
     state: Arc<OpenState>,
     locks: Arc<LockState>,
+    lease: Arc<LeaseState>,
+    _renewal: Option<LeaseRenewal>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
     wsize: u32,
+}
+
+#[derive(Clone)]
+struct ClientIdentity {
+    verifier: [u8; 8],
+    owner: String,
+}
+
+impl ClientIdentity {
+    fn new() -> Self {
+        Self {
+            verifier: rand::random(),
+            owner: format!("nfs-rs-v4.0-{:016x}", rand::random::<u64>()),
+        }
+    }
 }
 
 impl Debug for Mount40 {
@@ -87,11 +105,15 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     let rpc = rpc::Client::new(mux, None);
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
-    let identity =
-        tokio::spawn(async move { establish_identity(&identity_rpc, &identity_auth).await });
+    let identity_config = ClientIdentity::new();
+    let identity_for_task = identity_config.clone();
+    let identity = tokio::spawn(async move {
+        establish_identity(&identity_rpc, &identity_auth, &identity_for_task).await
+    });
     let client_id = identity
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 identity task failed: {error}")))??;
+    let client_id = Arc::new(AtomicU64::new(client_id));
 
     let components: Vec<&str> = args
         .dirpath
@@ -110,17 +132,54 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         )
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
+    let lease_time = query_lease_time(&rpc, &auth, &root_fh).await?;
+    let generation = 1;
+    let lease = LeaseState::ready(generation, lease_time);
+    let issuer = rand::random();
+    let state = Arc::new(OpenState::default());
+    let locks = Arc::new(LockState::default());
+    let reconnect_lease = Arc::clone(&lease);
+    rpc.set_reconnect_handler(move |_client, _generation| {
+        let lease = Arc::clone(&reconnect_lease);
+        async move {
+            lease.mark_reconnecting();
+            Ok(())
+        }
+    })?;
+    let recovery_context = RecoveryContext {
+        rpc: rpc.clone(),
+        auth: auth.clone(),
+        identity: identity_config,
+        client_id: Arc::clone(&client_id),
+        issuer,
+        state: Arc::clone(&state),
+        locks: Arc::clone(&locks),
+        lease: Arc::clone(&lease),
+    };
+    let recovery: RecoveryHandler = Arc::new(move || {
+        let context = recovery_context.clone();
+        Box::pin(async move { context.recover_or_lose().await })
+    });
+    let renewal = LeaseRenewal::start(
+        rpc.clone(),
+        auth.clone(),
+        Arc::clone(&client_id),
+        Duration::from_secs(u64::from(lease_time / 3).max(1)),
+        Arc::clone(&lease),
+        Some(recovery),
+    );
 
     Ok(Mount40 {
         rpc,
         auth,
         root_fh,
         client_id,
-        issuer: rand::random(),
-        generation: 1,
+        issuer,
         next_owner: AtomicU64::new(1),
-        state: Arc::new(OpenState::default()),
-        locks: Arc::new(LockState::default()),
+        state,
+        locks,
+        lease,
+        _renewal: Some(renewal),
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
@@ -128,13 +187,40 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
     })
 }
 
-async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
-    let verifier: [u8; 8] = rand::random();
-    let owner = format!("nfs-rs-v4.0-{:016x}", rand::random::<u64>());
+async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Result<u32> {
+    let response = rpc
+        .call(
+            CompoundBuilder::new("lease-time")
+                .putfh(root_fh)
+                .getattr(&[1 << 10])
+                .encode_with_header(auth),
+            SAFE_REPLAY,
+            METADATA_TIMEOUT,
+        )
+        .await?;
+    let mut attrs = decode_getattr_compound(response)?;
+    let (bitmap, mut values) = decode_fattr4_envelope(&mut attrs, "lease_time")?;
+    if !fattr4_has(&bitmap, 10) || values.remaining() != 4 {
+        return Err(NfsError::Xdr(
+            "NFSv4.0 lease_time response is missing or malformed".into(),
+        ));
+    }
+    let seconds = values.get_u32();
+    if seconds == 0 {
+        return Err(NfsError::Xdr("NFSv4.0 lease_time is zero".into()));
+    }
+    Ok(seconds)
+}
+
+async fn establish_identity(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    identity: &ClientIdentity,
+) -> Result<u64> {
     let identity_request = CompoundBuilder::new("identity")
         .setclientid(SetClientIdArgs {
-            verifier,
-            owner: owner.as_bytes(),
+            verifier: identity.verifier,
+            owner: identity.owner.as_bytes(),
             callback: CallbackAddress::DISABLED,
         })
         .encode_with_header(auth);
@@ -155,6 +241,141 @@ async fn establish_identity(rpc: &rpc::Client, auth: &Auth) -> Result<u64> {
         .await?;
     decode_confirm_response(confirm_response)?;
     Ok(client_id)
+}
+
+#[derive(Clone)]
+struct RecoveryContext {
+    rpc: rpc::Client,
+    auth: Auth,
+    identity: ClientIdentity,
+    client_id: Arc<AtomicU64>,
+    issuer: u64,
+    state: Arc<OpenState>,
+    locks: Arc<LockState>,
+    lease: Arc<LeaseState>,
+}
+
+impl RecoveryContext {
+    async fn recover(&self) -> Result<()> {
+        let renewed_client_id = establish_identity(&self.rpc, &self.auth, &self.identity).await?;
+        self.client_id.store(renewed_client_id, Ordering::Release);
+        self.lease.mark_reclaiming();
+
+        stream::iter(
+            self.state
+                .snapshot()
+                .await
+                .into_iter()
+                .map(Ok::<_, NfsError>),
+        )
+        .try_for_each_concurrent(None, |lane| async move {
+            let mut open = lane.lock().await;
+            let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
+            let response = self
+                .rpc
+                .call(
+                    CompoundBuilder::new("reclaim-open")
+                        .putfh(&open.fh)
+                        .open_reclaim(OpenReclaimArgs {
+                            seqid: 0,
+                            share_access: open.access,
+                            client_id: renewed_client_id,
+                            owner: owner_wire.as_bytes(),
+                        })
+                        .getfh()
+                        .encode_with_header(&self.auth),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                )
+                .await?;
+            let (reclaimed, fh) = decode_open_response(response)?;
+            if reclaimed.confirm_required || fh != open.fh {
+                return Err(NfsError::Xdr(
+                    "NFSv4.0 reclaim OPEN returned incompatible state".into(),
+                ));
+            }
+            open.stateid = reclaimed.stateid;
+            open.next_seqid = 1;
+            Ok(())
+        })
+        .await?;
+
+        let mut lock_groups = BTreeMap::<u64, Vec<_>>::new();
+        for lane in self.locks.snapshot().await {
+            let open_owner = lane.lock().await.open_owner;
+            lock_groups.entry(open_owner).or_default().push(lane);
+        }
+        stream::iter(lock_groups.into_values().map(Ok::<_, NfsError>))
+            .try_for_each_concurrent(None, |lanes| async move {
+                for lane in lanes {
+                    let (open_owner, old_stateid) = {
+                        let lock = lane.lock().await;
+                        (lock.open_owner, lock.stateid)
+                    };
+                    let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
+                        NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
+                    })?;
+                    let mut open = open_lane.lock().await;
+                    let mut lock = lane.lock().await;
+                    let response = self
+                        .rpc
+                        .call(
+                            CompoundBuilder::new("reclaim-lock")
+                                .putfh(&lock.fh)
+                                .lock_new(NewLockArgs {
+                                    lock_type: lock.lock_type,
+                                    reclaim: true,
+                                    offset: lock.offset,
+                                    length: lock.length,
+                                    open_seqid: open.next_seqid,
+                                    open_stateid: &open.stateid,
+                                    lock_seqid: 0,
+                                    client_id: renewed_client_id,
+                                    owner: &lock.owner_wire,
+                                })
+                                .encode_with_header(&self.auth),
+                            ReplayPolicy::ONE_ATTEMPT,
+                            METADATA_TIMEOUT,
+                        )
+                        .await?;
+                    let new_stateid = decode_lock_response(response, 12, "LOCK")?;
+                    open.next_seqid = open.next_seqid.wrapping_add(1);
+                    lock.stateid = new_stateid;
+                    lock.next_seqid = 1;
+                    drop(lock);
+                    self.locks
+                        .rekey(old_stateid, new_stateid, Arc::clone(&lane))
+                        .await;
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn recover_or_lose(&self) -> Result<()> {
+        match self.recover().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.lease.mark_lost().await;
+                self.state.clear().await;
+                self.locks.clear().await;
+                Err(NfsError::OperationOutcome(Box::new(
+                    crate::error::OperationOutcomeError::new(
+                        crate::error::OperationOutcome::Uncertain,
+                        OperationClass::ReplaySensitive,
+                        crate::error::RecoveryAction::Reopen,
+                        RequestContext {
+                            operation: "nfs40_lease_recovery".into(),
+                            protocol: NFSVersion::NFSv4p0,
+                            request_id: None,
+                        },
+                        error,
+                    ),
+                )))
+            }
+        }
+    }
 }
 
 fn context(
@@ -207,15 +428,18 @@ impl Mount40 {
         lock_type: u32,
         offset: u64,
         length: u64,
-    ) -> Result<Bytes> {
+    ) -> Result<(Bytes, u64)> {
+        let expected_generation = self.lease.begin_stateful("lock")?;
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         let locks = Arc::clone(&self.locks);
+        let lease = Arc::clone(&self.lease);
         let stateid = tokio::spawn(async move {
             let mut open = open_lane.lock().await;
+            let open_owner = open.owner;
             let request = CompoundBuilder::new("lock")
                 .putfh(&fh)
                 .lock_new(NewLockArgs {
@@ -240,9 +464,12 @@ impl Mount40 {
                 open.next_seqid = open.next_seqid.wrapping_add(1);
             }
             let stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            let _publication = lease.publication_guard().await;
+            lease.finish_stateful(expected_generation, "lock")?;
             locks
                 .register(LockLane {
                     owner,
+                    open_owner,
                     owner_wire,
                     next_seqid: 1,
                     stateid,
@@ -252,11 +479,15 @@ impl Mount40 {
                     length,
                 })
                 .await;
+            if let Err(error) = lease.validate_stateful(expected_generation, "lock") {
+                locks.remove(&stateid).await;
+                return Err(error);
+            }
             Ok::<_, NfsError>(stateid)
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
-        Ok(Bytes::copy_from_slice(&stateid))
+        Ok((Bytes::copy_from_slice(&stateid), expected_generation))
     }
 
     async fn open_file(
@@ -266,6 +497,7 @@ impl Mount40 {
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
+        let expected_generation = self.lease.begin_stateful("open")?;
         if !matches!(
             access,
             crate::OPEN_READ | crate::OPEN_WRITE | crate::OPEN_BOTH
@@ -280,9 +512,10 @@ impl Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         let issuer = self.issuer;
-        tokio::spawn(async move {
+        let lease = Arc::clone(&self.lease);
+        let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
                 .open(OpenArgs {
@@ -336,6 +569,8 @@ impl Mount40 {
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
             }
+            let _publication = lease.publication_guard().await;
+            lease.finish_stateful(expected_generation, "open")?;
             state
                 .register(OwnerLane {
                     owner,
@@ -346,13 +581,18 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
-            Ok(mount::OpenFile::with_protocol_state(
+            if let Err(error) = lease.validate_stateful(expected_generation, "open") {
+                state.remove(owner, &fh).await;
+                return Err(error);
+            }
+            Ok::<_, NfsError>(mount::OpenFile::with_protocol_state(
                 mount::ObjRes { fh, attr: None },
                 encode_owner(issuer, owner),
             ))
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 open task failed: {error}")))??;
+        Ok(opened)
     }
 
     async fn commit_verifier(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
@@ -361,12 +601,16 @@ impl Mount40 {
             .commit(offset, count)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("commit", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
-        decode_commit_response(response)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
+        let verifier = decode_commit_response(response)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        Ok(verifier)
     }
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
+        let expected_generation = self.lease.begin_stateful("close")?;
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
@@ -393,10 +637,12 @@ impl Mount40 {
             let fh = lane.fh.clone();
             drop(lane);
             state.remove(owner, &fh).await;
-            Ok(())
+            Ok::<_, NfsError>(())
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))??;
+        self.lease.finish_stateful(expected_generation, "close")?;
+        Ok(())
     }
 
     async fn readdir_payload(
@@ -411,8 +657,7 @@ impl Mount40 {
             .readdir(cookie, verifier, self.dircount, self.maxcount, bitmap)
             .encode_with_header(&self.auth);
         let payload = decode_readdir_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )?;
         validate_readdir_payload(payload, self.maxcount)
@@ -429,8 +674,7 @@ impl Mount40 {
             .getattr(bitmap)
             .encode_with_header(&self.auth);
         let mut data = decode_getattr_compound(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )?;
         decode_fattr4_envelope(&mut data, label)
@@ -688,8 +932,33 @@ fn classify_create_compound_error(
     }
 }
 
+impl Mount40 {
+    async fn activity_call(
+        &self,
+        request: Vec<u8>,
+        replay: ReplayPolicy,
+        timeout: Duration,
+    ) -> Result<Bytes> {
+        let response = self.rpc.call(request, replay, timeout).await?;
+        Ok(response)
+    }
+
+    async fn activity_settled_call(
+        &self,
+        request: Vec<u8>,
+        class: OperationClass,
+        context: RequestContext,
+    ) -> Result<Bytes> {
+        let response = settled_call(self.rpc.clone(), request, class, context).await?;
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl Mount for Mount40 {
+    fn health(&self) -> crate::MountHealth {
+        self.lease.health()
+    }
     fn get_max_read_size(&self) -> u32 {
         self.rsize
     }
@@ -706,14 +975,18 @@ impl Mount for Mount40 {
     async fn null(&self) -> Result<()> {
         let mut request = Vec::new();
         crate::nfs3::rpc_header(100003, 4, 0, &self.auth).encode(&mut request);
-        self.rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+        self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         Ok(())
     }
 
     async fn umount(&self) -> Result<()> {
+        self.lease.mark_closing();
+        if let Some(renewal) = &self._renewal {
+            renewal.stop().await;
+        }
         self.rpc.shutdown().await;
+        self.lease.mark_closed();
         Ok(())
     }
 
@@ -729,8 +1002,7 @@ impl Mount for Mount40 {
             .access(mode)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let (_supported, granted) = decode_access_response(response)?;
         Ok(granted)
@@ -794,8 +1066,18 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
+        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
+        let expected_generation = if lane.is_some() {
+            Some(self.lease.begin_stateful("commit")?)
+        } else {
+            None
+        };
         let verifier = self.commit_verifier(&fh, offset, count).await?;
-        if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_WRITE).await {
+        if let Some(expected_generation) = expected_generation {
+            self.lease
+                .validate_stateful(expected_generation, "commit")?;
+        }
+        if let Some(lane) = lane {
             let mut lane = lane.lock().await;
             if lane
                 .write_verifier
@@ -924,8 +1206,7 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let mut data = decode_getattr_compound(response)?;
         decode_getattr_response(&mut data)
@@ -950,18 +1231,28 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        let stateid = match self.state.for_fh(&fh, crate::OPEN_WRITE).await {
-            Some(lane) => lane.lock().await.stateid,
-            None => [0; 16],
+        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
+        let (stateid, expected_generation) = match lane {
+            Some(lane) => (
+                lane.lock().await.stateid,
+                Some(self.lease.begin_stateful("setattr")?),
+            ),
+            None => ([0; 16], None),
         };
         let request = CompoundBuilder::new("setattr")
             .putfh(&fh)
             .setattr(&stateid, &bitmap, &values)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("setattr", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_setattr_response(response, &bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, "setattr")?;
+        }
+        Ok(())
     }
     async fn setattr_path(
         &self,
@@ -997,8 +1288,10 @@ impl Mount for Mount40 {
         let open_lane = self.state.for_fh(&fh, access).await.ok_or_else(|| {
             NfsError::InvalidInput("NFSv4.0 LOCK requires a compatible open file".into())
         })?;
-        self.acquire_lock(open_lane, fh, lock_type, offset, length)
-            .await
+        Ok(self
+            .acquire_lock(open_lane, fh, lock_type, offset, length)
+            .await?
+            .0)
     }
     async fn lock_test(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
         if !matches!(lock_type, 1 | 2) || length == 0 {
@@ -1014,13 +1307,12 @@ impl Mount for Mount40 {
                 lock_type,
                 offset,
                 length,
-                self.client_id,
+                self.client_id.load(Ordering::Acquire),
                 owner_wire.as_bytes(),
             )
             .encode_with_header(&self.auth);
         decode_lockt_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )
     }
@@ -1031,7 +1323,22 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<crate::LockToken> {
-        let stateid = self.lock(fh.clone(), lock_type, offset, length).await?;
+        if !matches!(lock_type, 1 | 2) || length == 0 {
+            return Err(NfsError::InvalidInput(
+                "LOCK requires type 1/2 and non-zero length".into(),
+            ));
+        }
+        let access = if lock_type == 1 {
+            crate::OPEN_READ
+        } else {
+            crate::OPEN_WRITE
+        };
+        let open_lane = self.state.for_fh(&fh, access).await.ok_or_else(|| {
+            NfsError::InvalidInput("NFSv4.0 LOCK requires a compatible open file".into())
+        })?;
+        let (stateid, generation) = self
+            .acquire_lock(open_lane, fh.clone(), lock_type, offset, length)
+            .await?;
         Ok(crate::LockToken::new(
             fh,
             stateid,
@@ -1039,7 +1346,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.generation,
+            generation,
         ))
     }
     async fn lock_open_stateful(
@@ -1068,7 +1375,7 @@ impl Mount for Mount40 {
         let lane = self.state.by_owner(owner).await.ok_or_else(|| {
             NfsError::InvalidInput("open token is stale or already closed".into())
         })?;
-        let stateid = self
+        let (stateid, generation) = self
             .acquire_lock(lane, opened.object.fh.clone(), lock_type, offset, length)
             .await?;
         Ok(crate::LockToken::new(
@@ -1078,7 +1385,7 @@ impl Mount for Mount40 {
             offset,
             length,
             self.issuer,
-            self.generation,
+            generation,
         ))
     }
     async fn locku(
@@ -1089,6 +1396,7 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<()> {
+        let expected_generation = self.lease.begin_stateful("locku")?;
         if lock_stateid.len() != 16 {
             return Err(NfsError::InvalidInput(
                 "lock_stateid must be 16 bytes".into(),
@@ -1102,7 +1410,7 @@ impl Mount for Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let locks = Arc::clone(&self.locks);
-        let client_id = self.client_id;
+        let client_id = self.client_id.load(Ordering::Acquire);
         tokio::spawn(async move {
             let mut lane = lane.lock().await;
             if lane.fh != fh
@@ -1156,10 +1464,12 @@ impl Mount for Mount40 {
             Ok(())
         })
         .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))?
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))??;
+        self.lease.finish_stateful(expected_generation, "locku")?;
+        Ok(())
     }
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
-        if token.issuer != self.issuer || token.generation != self.generation {
+        if token.issuer != self.issuer || token.generation != self.lease.generation() {
             return Err(NfsError::InvalidInput(
                 "lock token belongs to another mount generation".into(),
             ));
@@ -1186,7 +1496,9 @@ impl Mount for Mount40 {
             .link(dst_filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("link", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_link_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
         self.getattr(src_fh).await
@@ -1216,7 +1528,9 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("symlink", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         let (fh, mut data) = decode_create_response(response.clone())
             .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
         Ok(mount::ObjRes {
@@ -1230,8 +1544,7 @@ impl Mount for Mount40 {
             .readlink()
             .encode_with_header(&self.auth);
         decode_readlink_response(
-            self.rpc
-                .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
                 .await?,
         )
     }
@@ -1244,8 +1557,7 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         let (fh, mut data) = decode_lookup_getattr_response(response)?;
         Ok(mount::ObjRes {
@@ -1284,22 +1596,28 @@ impl Mount for Mount40 {
         Ok(result)
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
-        let stateid = if let Some(lane) = self.state.for_fh(&fh, crate::OPEN_READ).await {
-            lane.lock().await.stateid
+        let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
+        let (stateid, expected_generation) = if let Some(lane) = lane {
+            let generation = self.lease.begin_stateful("read")?;
+            (lane.lock().await.stateid, Some(generation))
         } else {
-            [0; 16]
+            ([0; 16], None)
         };
         let request = CompoundBuilder::new("read")
             .putfh(&fh)
             .read(&stateid, offset, count)
             .encode_with_header(&self.auth);
         let response = self
-            .rpc
-            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
-        decode_read_response(response)
+        let data = decode_read_response(response)?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, "read")?;
+        }
+        Ok(data)
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let expected_generation = self.lease.begin_stateful("write")?;
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
         }
@@ -1366,6 +1684,7 @@ impl Mount for Mount40 {
         if count > data.len() as u32 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
+        self.lease.finish_stateful(expected_generation, "write")?;
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -1411,7 +1730,9 @@ impl Mount for Mount40 {
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("mkdir", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         let (fh, mut data) = decode_create_response(response.clone())
             .map_err(|error| classify_create_compound_error(&response, class, ctx, error))?;
         let mut object = mount::ObjRes {
@@ -1441,7 +1762,9 @@ impl Mount for Mount40 {
             .remove(filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("remove", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_remove_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
@@ -1478,7 +1801,9 @@ impl Mount for Mount40 {
             .rename(from_filename, to_filename)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("rename", 0, 0, OperationClass::ReplaySensitive);
-        let response = settled_call(self.rpc.clone(), request, class, ctx.clone()).await?;
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
         decode_rename_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
@@ -1569,12 +1894,67 @@ mod tests {
             rpc,
             auth: Auth::new_null(),
             root_fh: Bytes::from_static(b"root"),
-            client_id: 7,
+            client_id: Arc::new(AtomicU64::new(7)),
             issuer: 9,
-            generation: 1,
             next_owner: AtomicU64::new(1),
             state: Arc::new(OpenState::default()),
             locks: Arc::new(LockState::default()),
+            lease: LeaseState::ready(1, 60),
+            _renewal: None,
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        })
+    }
+
+    fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
+        direct_mount_with_lease_renewal(rpc, interval, 60)
+    }
+
+    fn direct_mount_with_lease_renewal(
+        rpc: rpc::Client,
+        interval: Duration,
+        lease_seconds: u32,
+    ) -> Arc<Mount40> {
+        direct_mount_with_recovery(rpc, interval, lease_seconds, None)
+    }
+
+    fn direct_mount_with_recovery(
+        rpc: rpc::Client,
+        interval: Duration,
+        lease_seconds: u32,
+        recovery: Option<RecoveryHandler>,
+    ) -> Arc<Mount40> {
+        let lease = LeaseState::ready(1, lease_seconds);
+        let reconnect_lease = Arc::clone(&lease);
+        rpc.set_reconnect_handler(move |_client, _generation| {
+            let lease = Arc::clone(&reconnect_lease);
+            async move {
+                lease.mark_reconnecting();
+                Ok(())
+            }
+        })
+        .unwrap();
+        let renewal = LeaseRenewal::start(
+            rpc.clone(),
+            Auth::new_null(),
+            Arc::new(AtomicU64::new(7)),
+            interval,
+            Arc::clone(&lease),
+            recovery,
+        );
+        Arc::new(Mount40 {
+            rpc,
+            auth: Auth::new_null(),
+            root_fh: Bytes::from_static(b"root"),
+            client_id: Arc::new(AtomicU64::new(7)),
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state: Arc::new(OpenState::default()),
+            locks: Arc::new(LockState::default()),
+            lease,
+            _renewal: Some(renewal),
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1599,6 +1979,1010 @@ mod tests {
             .await
             .unwrap();
         direct_mount(rpc::Client::new(mux, None))
+    }
+
+    #[tokio::test]
+    async fn public_health_reports_successful_background_renewal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..20 {
+            let health = mount.health();
+            if health.lease_renewals == 1 {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
+                assert_eq!(health.generation, 1);
+                assert_eq!(health.lease_seconds, Some(60));
+                assert_eq!(health.lease_healthy, Some(true));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("successful RENEW was not reflected in public health");
+    }
+
+    #[tokio::test]
+    async fn renewal_reconnects_with_byte_identical_request_and_preserves_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await?;
+            let original = read_record(&mut first).await?;
+            socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
+            drop(first);
+
+            let (mut second, _) = listener.accept().await?;
+            let replay = read_record(&mut second).await?;
+            assert_eq!(&original[4..], &replay[4..]);
+            reply(
+                &mut second,
+                &replay,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            let health = mount.health();
+            if health.lease_renewals == 1 {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
+                assert_eq!(health.generation, 1);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("replayed RENEW did not restore healthy lease state");
+    }
+
+    #[tokio::test]
+    async fn grace_renewal_is_suspect_until_a_later_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        let (grace_tx, grace_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let mut grace = Vec::new();
+            grace.extend_from_slice(&10013u32.to_be_bytes());
+            xdr_opaque(&mut grace, b"renew");
+            grace.extend_from_slice(&1u32.to_be_bytes());
+            grace.extend_from_slice(&30u32.to_be_bytes());
+            grace.extend_from_slice(&10013u32.to_be_bytes());
+            reply(&mut stream, &first, &grace).await?;
+            let _ = grace_tx.send(());
+            let _ = continue_rx.await;
+            let second = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        grace_rx.await.unwrap();
+        for _ in 0..100 {
+            if mount.health().lifecycle == crate::MountLifecycleState::Suspect {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::Suspect
+        );
+        assert_eq!(mount.health().generation, 1);
+        let _ = continue_tx.send(());
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if mount.health().lease_renewals == 1 {
+                assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("successful RENEW did not clear GRACE suspicion");
+    }
+
+    #[tokio::test]
+    async fn transient_renewal_failures_lose_state_after_the_lease_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(20),
+            1,
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            while let Ok(request) = read_record(&mut stream).await {
+                if reply(
+                    &mut stream,
+                    &request,
+                    &failed_lock_result("renew", 30, 10013),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transient renewal failures never expired the lease");
+        assert_eq!(mount.health().generation, 2);
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_flight_renewal_is_fenced_at_deadline_but_still_settles() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = sent_tx.send(());
+            let _ = settle_rx.await;
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("renew", &[(30, &[])]),
+            )
+            .await
+        });
+        sent_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight RENEW prevented conservative lease expiry");
+        assert_eq!(mount.health().generation, 2);
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_stateid_activity_extends_an_in_flight_renew_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        register_scripted_open(&mount, 81, b"fh").await;
+        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let _ = renew_sent_tx.send(());
+            let read = read_record(&mut stream).await?;
+            let mut read_data = Vec::new();
+            read_data.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut read_data, b"x");
+            reply(
+                &mut stream,
+                &read,
+                &compound_result("read", &[(22, &[]), (25, &read_data)]),
+            )
+            .await?;
+            let _ = settle_rx.await;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        renew_sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
+            Bytes::from_static(b"x")
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_ne!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState,
+            "successful foreground activity did not extend the lease deadline"
+        );
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_stateless_activity_does_not_extend_the_lease_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount = direct_mount_with_lease_renewal(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            1,
+        );
+        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
+        let (settle_tx, settle_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let _ = renew_sent_tx.send(());
+            let null = read_record(&mut stream).await?;
+            reply(&mut stream, &null, &[]).await?;
+            let _ = settle_rx.await;
+            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
+        });
+        renew_sent_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        mount.null().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stateless NULL incorrectly extended the lease deadline");
+        let _ = settle_tx.send(());
+        mount.umount().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_renewal_loses_generation_and_gates_stateful_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let mount =
+            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
+        register_scripted_open(&mount, 82, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            let mut result = Vec::new();
+            result.extend_from_slice(&10011u32.to_be_bytes());
+            xdr_opaque(&mut result, b"renew");
+            result.extend_from_slice(&1u32.to_be_bytes());
+            result.extend_from_slice(&30u32.to_be_bytes());
+            result.extend_from_slice(&10011u32.to_be_bytes());
+            reply(&mut stream, &renew, &result).await
+        });
+        server.await.unwrap().unwrap();
+        for _ in 0..100 {
+            let health = mount.health();
+            if health.lease_healthy == Some(false) {
+                assert_eq!(health.lifecycle, crate::MountLifecycleState::LostState);
+                assert_eq!(health.generation, 2);
+                let error = mount
+                    .read(Bytes::from_static(b"fh"), 0, 1)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.operation_outcome().unwrap().recovery,
+                    crate::RecoveryAction::Reopen
+                );
+                let stale = crate::LockToken::new(
+                    Bytes::from_static(b"fh"),
+                    Bytes::from_static(&[0x31; 16]),
+                    2,
+                    0,
+                    1,
+                    mount.issuer,
+                    1,
+                );
+                assert!(mount.unlock_stateful(stale).await.is_err());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("expired RENEW was not reflected in public health");
+    }
+
+    #[tokio::test]
+    async fn stale_clientid_renewal_runs_recovery_and_preserves_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let recoveries = Arc::new(AtomicU64::new(0));
+        let recovery_count = Arc::clone(&recoveries);
+        let recovery: RecoveryHandler = Arc::new(move || {
+            let recovery_count = Arc::clone(&recovery_count);
+            Box::pin(async move {
+                recovery_count.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        });
+        let mount = direct_mount_with_recovery(
+            rpc::Client::new(mux, None),
+            Duration::from_millis(10),
+            60,
+            Some(recovery),
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            reply(&mut stream, &renew, &failed_lock_result("renew", 30, 10022)).await
+        });
+        server.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if recoveries.load(Ordering::Acquire) == 1
+                    && mount.health().lifecycle == crate::MountLifecycleState::Ready
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mount.health().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn late_lock_result_cannot_publish_across_a_generation_fence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 83, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("lock", &[(22, &[]), (12, &[0x8a; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock = tokio::spawn(async move {
+            for_lock
+                .lock_stateful(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        let error = lock.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            crate::RecoveryAction::Reopen
+        );
+        assert!(mount.locks.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_umount_stops_renewal_and_reports_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        mount.umount().await.unwrap();
+        let health = mount.health();
+        assert_eq!(health.lifecycle, crate::MountLifecycleState::Closed);
+        assert_eq!(health.lease_healthy, Some(false));
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 1).await.is_err());
+        accepted.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_umount_keeps_a_sent_reclaim_settling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let auth = Auth::new_null();
+        let client_id = Arc::new(AtomicU64::new(7));
+        let lease = LeaseState::ready(1, 60);
+        let state = Arc::new(OpenState::default());
+        state
+            .register(OwnerLane {
+                owner: 75,
+                next_seqid: 1,
+                stateid: [0x75; 16],
+                fh: Bytes::from_static(b"fh"),
+                access: crate::OPEN_BOTH,
+                write_verifier: None,
+            })
+            .await;
+        let locks = Arc::new(LockState::default());
+        let context = RecoveryContext {
+            rpc: rpc.clone(),
+            auth: auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5a; 8],
+                owner: "shutdown-reclaim".into(),
+            },
+            client_id: Arc::clone(&client_id),
+            issuer: 9,
+            state: Arc::clone(&state),
+            locks: Arc::clone(&locks),
+            lease: Arc::clone(&lease),
+        };
+        let recovery: RecoveryHandler = Arc::new(move || {
+            let context = context.clone();
+            Box::pin(async move { context.recover_or_lose().await })
+        });
+        let renewal = LeaseRenewal::start(
+            rpc.clone(),
+            auth.clone(),
+            Arc::clone(&client_id),
+            Duration::from_millis(10),
+            Arc::clone(&lease),
+            Some(recovery),
+        );
+        let mount = Arc::new(Mount40 {
+            rpc,
+            auth,
+            root_fh: Bytes::from_static(b"root"),
+            client_id,
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state,
+            locks,
+            lease,
+            _renewal: Some(renewal),
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        });
+        let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
+        let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let renew = read_record(&mut stream).await?;
+            reply(&mut stream, &renew, &failed_lock_result("renew", 30, 10011)).await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&23u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7a; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            let _ = reclaim_seen_tx.send(());
+            let _ = release_reclaim_rx.await;
+            reply(&mut stream, &reclaim, &open_result(0, [0x85; 16], b"fh")).await
+        });
+
+        reclaim_seen_rx.await.unwrap();
+        let for_umount = Arc::clone(&mount);
+        let mut umount = tokio::spawn(async move { for_umount.umount().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut umount)
+                .await
+                .is_err(),
+            "umount completed while the sent reclaim was unsettled"
+        );
+        umount.abort();
+        let _ = umount.await;
+        let _ = release_reclaim_tx.send(());
+        server.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if mount.state.by_owner(75).await.unwrap().lock().await.stateid == [0x85; 16] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled umount abandoned the sent reclaim settlement");
+        mount.umount().await.unwrap();
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Closed);
+    }
+
+    #[tokio::test]
+    async fn scripted_recovery_reclaims_open_before_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 71, b"fh").await;
+        mount
+            .locks
+            .register(LockLane {
+                owner: 72,
+                open_owner: 71,
+                owner_wire: Bytes::from_static(b"lock-owner"),
+                next_seqid: 1,
+                stateid: [0x72; 16],
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 2,
+                offset: 7,
+                length: 11,
+            })
+            .await;
+        let original_lock_token = crate::LockToken::new(
+            Bytes::from_static(b"fh"),
+            Bytes::from_static(&[0x72; 16]),
+            2,
+            7,
+            11,
+            mount.issuer,
+            mount.lease.generation(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&17u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x77; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim_open = read_record(&mut stream).await?;
+            assert!(
+                reclaim_open
+                    .windows(4)
+                    .any(|wire| wire == 18u32.to_be_bytes())
+            );
+            reply(
+                &mut stream,
+                &reclaim_open,
+                &open_result(0, [0x81; 16], b"fh"),
+            )
+            .await?;
+            let reclaim_lock = read_record(&mut stream).await?;
+            assert!(
+                reclaim_lock
+                    .windows(8)
+                    .any(|wire| { wire == [2u32.to_be_bytes(), 1u32.to_be_bytes()].concat() })
+            );
+            reply(
+                &mut stream,
+                &reclaim_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x82; 16])]),
+            )
+            .await?;
+            let locku = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x83; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let identity = ClientIdentity {
+            verifier: [0x55; 8],
+            owner: "scripted-recovery".into(),
+        };
+        mount.lease.mark_recovering();
+        RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity,
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        }
+        .recover()
+        .await
+        .unwrap();
+        assert_eq!(mount.client_id.load(Ordering::Acquire), 17);
+        assert_eq!(
+            mount.state.by_owner(71).await.unwrap().lock().await.stateid,
+            [0x81; 16]
+        );
+        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_some());
+        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_some());
+        mount.lease.mark_ready();
+        mount.unlock_stateful(original_lock_token).await.unwrap();
+        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
+        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_none());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_reclaims_independent_open_and_lock_owners_concurrently() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 76, b"fh-a").await;
+        register_scripted_open(&mount, 77, b"fh-b").await;
+        register_scripted_lock(&mount, 76, [0x76; 16]).await;
+        register_scripted_lock(&mount, 77, [0x77; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&29u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7b; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+
+            // Reading both before replying proves that one owner's pending OPEN
+            // does not prevent another independent owner from being reclaimed.
+            let first = read_record(&mut stream).await?;
+            let second = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .expect("second owner reclaim was globally serialized")?;
+            reply(&mut stream, &first, &open_result(0, [0x86; 16], b"fh-a")).await?;
+            reply(&mut stream, &second, &open_result(0, [0x87; 16], b"fh-b")).await?;
+
+            let first_lock = read_record(&mut stream).await?;
+            let second_lock =
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .expect("second owner LOCK reclaim was globally serialized")?;
+            reply(
+                &mut stream,
+                &first_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x96; 16])]),
+            )
+            .await?;
+            reply(
+                &mut stream,
+                &second_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x97; 16])]),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5b; 8],
+                owner: "concurrent-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        };
+        context.recover().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_serializes_locks_that_share_an_open_owner() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 78, b"fh").await;
+        for (owner, stateid) in [(780, [0x78; 16]), (781, [0x79; 16])] {
+            mount
+                .locks
+                .register(LockLane {
+                    owner,
+                    open_owner: 78,
+                    owner_wire: Bytes::from(format!("same-open-{owner}")),
+                    next_seqid: 1,
+                    stateid,
+                    fh: Bytes::from_static(b"fh"),
+                    lock_type: 2,
+                    offset: owner - 780,
+                    length: 1,
+                })
+                .await;
+        }
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&31u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7c; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0x88; 16], b"fh")).await?;
+
+            let first = read_record(&mut stream).await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "same-owner LOCK reclaims were concurrently in flight"
+            );
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x98; 16])]),
+            )
+            .await?;
+            let second = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x99; 16])]),
+            )
+            .await
+        });
+        RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5c; 8],
+                owner: "same-owner-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        }
+        .recover()
+        .await
+        .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_grace_reclaim_clears_protection_and_advances_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 73, b"fh").await;
+        register_scripted_lock(&mount, 74, [0x74; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &reclaim,
+                &failed_lock_result("reclaim-open", 18, 10033),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-no-grace".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        };
+        let error = context.recover_or_lose().await.unwrap_err();
+        let outcome = error.operation_outcome().unwrap();
+        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
+        assert!(matches!(
+            outcome.source.as_ref(),
+            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE)
+        ));
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState
+        );
+        assert_eq!(mount.health().generation, 2);
+        assert!(mount.state.snapshot().await.is_empty());
+        assert!(mount.locks.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_reclaim_compound_loses_state_with_structured_guidance() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 79, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&37u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7d; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            let mut partial = open_result(0, [0x89; 16], b"fh");
+            partial[..4].copy_from_slice(&10006u32.to_be_bytes());
+            reply(&mut stream, &reclaim, &partial).await
+        });
+        let error = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5d; 8],
+                owner: "partial-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        }
+        .recover_or_lose()
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            crate::RecoveryAction::Reopen
+        );
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::LostState
+        );
+        assert!(mount.state.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclaim_reply_loss_is_not_replayed_and_requires_reopen() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 80, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&41u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7e; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let _reclaim = read_record(&mut stream).await?;
+            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let error = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5e; 8],
+                owner: "reply-loss-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        }
+        .recover_or_lose()
+        .await
+        .unwrap_err();
+        let outcome = error.operation_outcome().unwrap();
+        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
+        assert_eq!(mount.health().generation, 2);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1769,6 +3153,17 @@ mod tests {
                 &mut first,
                 &navigation,
                 &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
+            )
+            .await?;
+            let lease_time = read_record(&mut first).await?;
+            let mut attrs = Vec::new();
+            attrs.extend_from_slice(&1u32.to_be_bytes());
+            attrs.extend_from_slice(&(1u32 << 10).to_be_bytes());
+            xdr_opaque(&mut attrs, &60u32.to_be_bytes());
+            reply(
+                &mut first,
+                &lease_time,
+                &compound_result("lease-time", &[(22, &[]), (9, &attrs)]),
             )
             .await?;
             mounted_for_server.notified().await;
@@ -2359,6 +3754,7 @@ mod tests {
             .locks
             .register(LockLane {
                 owner,
+                open_owner: owner,
                 owner_wire: Bytes::from(format!("scripted-lock-{owner}")),
                 next_seqid: 1,
                 stateid,
@@ -2629,7 +4025,7 @@ mod tests {
             0,
             1,
             mount.issuer,
-            mount.generation + 1,
+            mount.lease.generation() + 1,
         );
         assert!(mount.unlock_stateful(stale).await.is_err());
     }
