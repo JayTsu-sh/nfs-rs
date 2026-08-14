@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::callback::{CallbackService, CallbackState};
+use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
     CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
@@ -50,6 +50,7 @@ struct Mount40 {
     lease: Arc<LeaseState>,
     _renewal: Option<LeaseRenewal>,
     _callback: Option<CallbackService>,
+    _callback_worker: Option<CallbackWorker>,
     callback_state: Option<Arc<CallbackState>>,
     dircount: u32,
     maxcount: u32,
@@ -115,6 +116,15 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         .as_ref()
         .map(|service| service.universal_addr().to_string());
     let callback_state = callback.as_ref().map(CallbackService::state);
+    let callback_worker = match (&callback, &callback_state) {
+        (Some(service), Some(state)) => Some(CallbackWorker::start(
+            service.take_recall_receiver()?,
+            rpc.clone(),
+            auth.clone(),
+            Arc::clone(state),
+        )),
+        _ => None,
+    };
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
     let identity_config = ClientIdentity::new();
@@ -201,6 +211,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         lease,
         _renewal: Some(renewal),
         _callback: callback,
+        _callback_worker: callback_worker,
         callback_state,
         dircount: args.dircount,
         maxcount: args.maxcount,
@@ -1944,6 +1955,7 @@ mod tests {
             lease: LeaseState::ready(1, 60),
             _renewal: None,
             _callback: None,
+            _callback_worker: None,
             callback_state: None,
             dircount: 8192,
             maxcount: 32768,
@@ -2000,6 +2012,7 @@ mod tests {
             lease,
             _renewal: Some(renewal),
             _callback: None,
+            _callback_worker: None,
             callback_state: None,
             dircount: 8192,
             maxcount: 32768,
@@ -2526,6 +2539,7 @@ mod tests {
             lease,
             _renewal: Some(renewal),
             _callback: None,
+            _callback_worker: None,
             callback_state: None,
             dircount: 8192,
             maxcount: 32768,

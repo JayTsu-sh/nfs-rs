@@ -14,6 +14,7 @@ const OP_CLOSE: u32 = 4;
 const OP_CREATE: u32 = 6;
 const OP_ACCESS: u32 = 3;
 const OP_COMMIT: u32 = 5;
+const OP_DELEGRETURN: u32 = 8;
 const OP_GETATTR: u32 = 9;
 const OP_LINK: u32 = 11;
 const OP_LOCK: u32 = 12;
@@ -144,6 +145,11 @@ impl CompoundBuilder {
         args.extend_from_slice(&client_id.to_be_bytes());
         args.extend_from_slice(&verifier);
         self.inner = self.inner.operation(OP_SETCLIENTID_CONFIRM, args);
+        self
+    }
+
+    pub(crate) fn delegreturn(mut self, stateid: &[u8; 16]) -> Self {
+        self.inner = self.inner.operation(OP_DELEGRETURN, stateid.to_vec());
         self
     }
 
@@ -456,6 +462,17 @@ pub(crate) fn decode_confirm_response(buf: Bytes) -> Result<()> {
         ));
     }
     check_status(take_u32(&mut buf, "SETCLIENTID_CONFIRM status")?)
+}
+
+pub(crate) fn decode_delegreturn_response(buf: Bytes) -> Result<()> {
+    let (count, mut buf) = response_ops(buf)?;
+    if count != 2 {
+        return Err(NfsError::Xdr(format!(
+            "DELEGRETURN response has {count} operations, expected 2"
+        )));
+    }
+    expect_op(&mut buf, OP_PUTFH, "PUTFH")?;
+    expect_op(&mut buf, OP_DELEGRETURN, "DELEGRETURN")
 }
 
 fn expect_op(buf: &mut Bytes, expected: u32, name: &str) -> Result<()> {
@@ -1140,6 +1157,26 @@ mod tests {
             .unwrap(),
             [0x44; 8]
         );
+    }
+
+    #[test]
+    fn delegreturn_request_and_response_match_rfc7530_shape() {
+        let stateid = [0x5d; 16];
+        let body = CompoundBuilder::new("return")
+            .putfh(b"fh")
+            .delegreturn(&stateid)
+            .encode_body();
+        assert!(body.windows(16).any(|value| value == stateid));
+        assert!(
+            body.windows(8)
+                .any(|value| { value == [2u32.to_be_bytes(), OP_PUTFH.to_be_bytes()].concat() })
+        );
+
+        decode_delegreturn_response(compound_response(
+            "return",
+            &[(OP_PUTFH, &[]), (OP_DELEGRETURN, &[])],
+        ))
+        .unwrap();
     }
 
     #[test]

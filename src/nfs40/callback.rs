@@ -2,21 +2,30 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{NfsError, Result};
-use crate::nfs40::compound::{DelegationGrant, DelegationKind};
+use crate::nfs40::compound::{
+    CompoundBuilder, DelegationGrant, DelegationKind, decode_commit_response,
+    decode_delegreturn_response,
+};
+use crate::rpc::auth::Auth;
+use crate::rpc::{self, ReplayPolicy};
 
 pub(crate) const CB_PROGRAM: u32 = 0x4000_0000;
 const MAX_CALLBACK_RECORD: usize = 64 * 1024;
+const CALLBACK_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct CallbackService {
     universal_addr: String,
     state: Arc<CallbackState>,
+    recall_rx: Mutex<Option<mpsc::Receiver<RecallNotification>>>,
     task: JoinHandle<()>,
 }
 
@@ -24,12 +33,24 @@ struct DelegationRecord {
     grant: DelegationGrant,
     generation: u64,
     attributes: Option<(u64, u64)>,
+    recalling: bool,
 }
 
-#[derive(Default)]
 pub(crate) struct CallbackState {
     delegations: Mutex<HashMap<Bytes, DelegationRecord>>,
     generation: AtomicU64,
+    recall_tx: mpsc::Sender<RecallNotification>,
+}
+
+pub(crate) struct RecallNotification {
+    pub fh: Bytes,
+    pub stateid: [u8; 16],
+    pub generation: u64,
+    pub truncate: bool,
+}
+
+pub(crate) struct CallbackWorker {
+    task: JoinHandle<()>,
 }
 
 impl CallbackService {
@@ -64,7 +85,12 @@ impl CallbackService {
             port >> 8,
             port & 0xff
         );
-        let state = Arc::new(CallbackState::default());
+        let (recall_tx, recall_rx) = mpsc::channel(64);
+        let state = Arc::new(CallbackState {
+            delegations: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            recall_tx,
+        });
         let service_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
@@ -77,6 +103,7 @@ impl CallbackService {
         Ok(Self {
             universal_addr,
             state,
+            recall_rx: Mutex::new(Some(recall_rx)),
             task,
         })
     }
@@ -87,6 +114,14 @@ impl CallbackService {
 
     pub(crate) fn state(&self) -> Arc<CallbackState> {
         Arc::clone(&self.state)
+    }
+
+    pub(crate) fn take_recall_receiver(&self) -> Result<mpsc::Receiver<RecallNotification>> {
+        self.recall_rx
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback receiver lock poisoned".into()))?
+            .take()
+            .ok_or_else(|| NfsError::Rpc("NFSv4.0 callback receiver already taken".into()))
     }
 }
 
@@ -108,10 +143,86 @@ impl CallbackState {
                     grant,
                     generation,
                     attributes,
+                    recalling: false,
                 },
             );
         Ok(())
     }
+
+    fn finish_recall(
+        &self,
+        fh: &[u8],
+        stateid: &[u8; 16],
+        generation: u64,
+        returned: bool,
+    ) -> Result<()> {
+        let mut delegations = self
+            .delegations
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+        if let Some(record) = delegations.get_mut(fh)
+            && record.generation == generation
+            && record.grant.stateid == *stateid
+        {
+            if returned {
+                delegations.remove(fh);
+            } else {
+                record.recalling = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CallbackWorker {
+    pub(crate) fn start(
+        mut recalls: mpsc::Receiver<RecallNotification>,
+        rpc: rpc::Client,
+        auth: Auth,
+        state: Arc<CallbackState>,
+    ) -> Self {
+        let task = tokio::spawn(async move {
+            while let Some(recall) = recalls.recv().await {
+                let returned = settle_recall(&rpc, &auth, &recall).await.is_ok();
+                let _ =
+                    state.finish_recall(&recall.fh, &recall.stateid, recall.generation, returned);
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for CallbackWorker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn settle_recall(rpc: &rpc::Client, auth: &Auth, recall: &RecallNotification) -> Result<()> {
+    if !recall.truncate {
+        let response = rpc
+            .call(
+                CompoundBuilder::new("delegation-flush")
+                    .putfh(&recall.fh)
+                    .commit(0, 0)
+                    .encode_with_header(auth),
+                ReplayPolicy::ONE_ATTEMPT,
+                CALLBACK_SETTLEMENT_TIMEOUT,
+            )
+            .await?;
+        let _ = decode_commit_response(response)?;
+    }
+    let response = rpc
+        .call(
+            CompoundBuilder::new("delegreturn")
+                .putfh(&recall.fh)
+                .delegreturn(&recall.stateid)
+                .encode_with_header(auth),
+            ReplayPolicy::ONE_ATTEMPT,
+            CALLBACK_SETTLEMENT_TIMEOUT,
+        )
+        .await?;
+    decode_delegreturn_response(response)
 }
 
 async fn serve_connection(
@@ -279,6 +390,7 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                         },
                     attributes: Some((change, size)),
                     generation,
+                    ..
                 }) = record
                     && *generation == active_generation
                 {
@@ -319,10 +431,36 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                 }
             }
             4 => {
-                let _stateid = take_fixed(body, &mut cursor, 16, "CB_RECALL stateid")?;
-                let _truncate = take_word(body, &mut cursor, "CB_RECALL truncate")?;
-                let _fh = take_opaque(body, &mut cursor, "CB_RECALL filehandle")?;
-                status = 10001;
+                let stateid = take_fixed(body, &mut cursor, 16, "CB_RECALL stateid")?;
+                let truncate = take_word(body, &mut cursor, "CB_RECALL truncate")? != 0;
+                let fh = take_opaque(body, &mut cursor, "CB_RECALL filehandle")?;
+                let active_generation = state.generation.load(Ordering::Acquire);
+                let mut delegations = state
+                    .delegations
+                    .lock()
+                    .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+                status = match delegations.get_mut(fh) {
+                    None => 10001,
+                    Some(record) if record.generation != active_generation => 10001,
+                    Some(record) if record.grant.stateid.as_slice() != stateid => 10025,
+                    Some(record) if record.recalling => 0,
+                    Some(record) => {
+                        let mut callback_stateid = [0; 16];
+                        callback_stateid.copy_from_slice(stateid);
+                        match state.recall_tx.try_send(RecallNotification {
+                            fh: Bytes::copy_from_slice(fh),
+                            stateid: callback_stateid,
+                            generation: record.generation,
+                            truncate,
+                        }) {
+                            Ok(()) => {
+                                record.recalling = true;
+                                0
+                            }
+                            Err(_) => 10008,
+                        }
+                    }
+                };
                 results.extend_from_slice(&4u32.to_be_bytes());
                 results.extend_from_slice(&status.to_be_bytes());
             }
@@ -447,6 +585,35 @@ mod tests {
     use crate::nfs40::compound::{DelegationGrant, DelegationKind};
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn compound_response(tag: &[u8], opcode: u32, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&(tag.len() as u32).to_be_bytes());
+        body.extend_from_slice(tag);
+        body.resize(body.len().next_multiple_of(4), 0);
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&22u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&opcode.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(data);
+        body
+    }
+
+    async fn nfs_reply(stream: &mut tokio::net::TcpStream, request: &[u8], body: &[u8]) {
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&request[..4]);
+        for word in [1u32, 0, 0, 0, 0] {
+            reply.extend_from_slice(&word.to_be_bytes());
+        }
+        reply.extend_from_slice(body);
+        stream
+            .write_u32(0x8000_0000 | reply.len() as u32)
+            .await
+            .unwrap();
+        stream.write_all(&reply).await.unwrap();
+    }
 
     fn socket_addr(universal: &str) -> SocketAddr {
         let fields: Vec<u16> = universal
@@ -645,5 +812,115 @@ mod tests {
                 0x1516_1718,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_cb_recall_is_acknowledged_and_queued_once() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        service
+            .state()
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Read,
+                    stateid: [0x44; 16],
+                    recall: false,
+                },
+                7,
+                None,
+            )
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(31);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 1, 1, 4]);
+        for chunk in [0x4444_4444u32; 4] {
+            call.push(chunk);
+        }
+        call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
+        let expected = [31, 1, 0, 0, 0, 0, 0, 0, 1, 4, 0];
+        assert_eq!(round_trip(&mut stream, &call).await, expected);
+        assert_eq!(round_trip(&mut stream, &call).await, expected);
+
+        let recall = recalls.try_recv().unwrap();
+        assert_eq!(recall.fh, Bytes::from_static(b"fh"));
+        assert_eq!(recall.stateid, [0x44; 16]);
+        assert_eq!(recall.generation, 7);
+        assert!(recalls.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_recall_flushes_and_returns_the_delegation_exactly_once() {
+        let nfs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = nfs_listener.local_addr().unwrap();
+        let mux = rpc::StreamMux::connect(server_addr, true).await.unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let service = CallbackService::bind_for(server_addr).await.unwrap();
+        let state = service.state();
+        let _worker = CallbackWorker::start(
+            service.take_recall_receiver().unwrap(),
+            rpc,
+            Auth::new_null(),
+            Arc::clone(&state),
+        );
+        state
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Write,
+                    stateid: [0x55; 16],
+                    recall: false,
+                },
+                9,
+                Some((1, 2)),
+            )
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = nfs_listener.accept().await.unwrap();
+            let commit = read_record(&mut stream).await.unwrap().unwrap();
+            assert!(commit.windows(4).any(|word| word == 5u32.to_be_bytes()));
+            nfs_reply(
+                &mut stream,
+                &commit,
+                &compound_response(b"delegation-flush", 5, &[0x66; 8]),
+            )
+            .await;
+            let delegreturn = read_record(&mut stream).await.unwrap().unwrap();
+            assert!(
+                delegreturn
+                    .windows(4)
+                    .any(|word| word == 8u32.to_be_bytes())
+            );
+            nfs_reply(
+                &mut stream,
+                &delegreturn,
+                &compound_response(b"delegreturn", 8, &[]),
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "duplicate callback scheduled a second return"
+            );
+        });
+
+        let mut callback = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(37);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 1, 1, 4]);
+        call.extend_from_slice(&[0x5555_5555; 4]);
+        call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
+        let expected = [37, 1, 0, 0, 0, 0, 0, 0, 1, 4, 0];
+        assert_eq!(round_trip(&mut callback, &call).await, expected);
+        assert_eq!(round_trip(&mut callback, &call).await, expected);
+        server.await.unwrap();
     }
 }
