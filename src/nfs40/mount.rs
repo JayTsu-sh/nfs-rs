@@ -350,7 +350,19 @@ impl RecoveryContext {
                 self.state.clear().await;
                 self.locks.clear().await;
                 self.lease.mark_lost();
-                Err(error)
+                Err(NfsError::OperationOutcome(Box::new(
+                    crate::error::OperationOutcomeError::new(
+                        crate::error::OperationOutcome::Uncertain,
+                        OperationClass::ReplaySensitive,
+                        crate::error::RecoveryAction::Reopen,
+                        RequestContext {
+                            operation: "nfs40_lease_recovery".into(),
+                            protocol: NFSVersion::NFSv4p0,
+                            request_id: None,
+                        },
+                        error,
+                    ),
+                )))
             }
         }
     }
@@ -2389,9 +2401,13 @@ mod tests {
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
         };
+        let error = context.recover_or_lose().await.unwrap_err();
+        let outcome = error.operation_outcome().unwrap();
+        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
         assert!(matches!(
-            context.recover_or_lose().await,
-            Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE))
+            outcome.source.as_ref(),
+            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE)
         ));
         assert_eq!(
             mount.health().lifecycle,
