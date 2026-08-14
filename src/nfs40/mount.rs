@@ -260,7 +260,14 @@ impl RecoveryContext {
         self.client_id.store(renewed_client_id, Ordering::Release);
         self.lease.mark_reclaiming();
 
-        for lane in self.state.snapshot().await {
+        stream::iter(
+            self.state
+                .snapshot()
+                .await
+                .into_iter()
+                .map(Ok::<_, NfsError>),
+        )
+        .try_for_each_concurrent(None, |lane| async move {
             let mut open = lane.lock().await;
             let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
             let response = self
@@ -288,7 +295,9 @@ impl RecoveryContext {
             }
             open.stateid = reclaimed.stateid;
             open.next_seqid = 1;
-        }
+            Ok(())
+        })
+        .await?;
 
         for lane in self.locks.snapshot().await {
             let (open_owner, old_stateid) = {
@@ -2229,6 +2238,58 @@ mod tests {
         );
         assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
         assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_some());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_reclaims_independent_open_owners_concurrently() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 76, b"fh-a").await;
+        register_scripted_open(&mount, 77, b"fh-b").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&29u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x7b; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+
+            // Reading both before replying proves that one owner's pending OPEN
+            // does not prevent another independent owner from being reclaimed.
+            let first = read_record(&mut stream).await?;
+            let second = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .expect("second owner reclaim was globally serialized")?;
+            reply(&mut stream, &first, &open_result(0, [0x86; 16], b"fh-a")).await?;
+            reply(&mut stream, &second, &open_result(0, [0x87; 16], b"fh-b")).await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5b; 8],
+                owner: "concurrent-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+        };
+        context.recover().await.unwrap();
         server.await.unwrap().unwrap();
     }
 
