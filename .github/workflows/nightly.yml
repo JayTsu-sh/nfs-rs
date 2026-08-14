@@ -20,6 +20,8 @@ jobs:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
+      - name: Allocate unique NFSv4.0 evidence directory
+        run: echo "NFS_RS_LAB_V40_EVIDENCE_DIR=$RUNNER_TEMP/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - run: tests/lab/health-check.sh
       - name: Collect read-only lab capability report
         run: tests/lab/capability-report.sh "$RUNNER_TEMP/nfs41-capabilities"
@@ -60,12 +62,17 @@ jobs:
       - name: Validate reliability coverage manifest
         run: cargo test --locked --test reliability_coverage -- --nocapture
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
-      - name: NetApp NFSv4.0 mount and traversal E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-e2e.sh
-      - name: NetApp NFSv4.0 callback fault E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-callback-fault-e2e.sh "$RUN_ID"
-      - name: NetApp NFSv4.0 below/above lease partition E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v40-lease-fault-e2e.sh "$RUN_ID"
+      - name: Record complete NetApp NFSv4.0 release matrix
+        run: tests/lab/run-netapp-v40-release-matrix.sh "$RUN_ID" "$NFS_RS_LAB_V40_EVIDENCE_DIR"
+      - name: Collect NFSv4.0 release evidence
+        if: always()
+        run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" "$RUNNER_TEMP/nfsv40-release-evidence"
+      - name: Upload NFSv4.0 release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfsv40-release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nfsv40-release-evidence
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 negotiated channel limits E2E
@@ -99,7 +106,7 @@ jobs:
         run: sudo -n /usr/local/sbin/nfsrs-lab-pnfs-fault restore-ds "$RUN_ID"
       - name: Restore NetApp NFSv4.0 connectivity
         if: always()
-        run: sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
+        run: tests/lab/verify-netapp-v40-cleanup.sh "$RUN_ID"
       - name: Cleanup NetApp pNFS run
         if: always()
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/cleanup-pnfs-run.sh "$RUN_ID"

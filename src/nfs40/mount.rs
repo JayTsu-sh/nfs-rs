@@ -26,6 +26,7 @@ use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
+use crate::nfs4::acl;
 use crate::nfs4::attrs::{
     decode_fattr4_envelope, decode_getattr_response, encode_setattr, fattr4_has,
     standard_getattr_bitmap,
@@ -1105,6 +1106,46 @@ impl Mount40 {
         let response = settled_call(self.rpc.clone(), request, class, context).await?;
         Ok(response)
     }
+
+    async fn set_encoded_attributes(
+        &self,
+        operation: &str,
+        fh: &Bytes,
+        bitmap: &[u32],
+        values: &[u8],
+        invalidate_cached_attributes: bool,
+    ) -> Result<()> {
+        let _io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(fh).await)
+        } else {
+            None
+        };
+        if invalidate_cached_attributes && let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(fh)?;
+        }
+        let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
+        let (stateid, expected_generation) = match lane {
+            Some(lane) => (
+                lane.lock().await.stateid,
+                Some(self.lease.begin_stateful(operation)?),
+            ),
+            None => ([0; 16], None),
+        };
+        let request = CompoundBuilder::new(operation)
+            .putfh(fh)
+            .setattr(&stateid, bitmap, values)
+            .encode_with_header(&self.auth);
+        let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
+        let response = self
+            .activity_settled_call(request, class, ctx.clone())
+            .await?;
+        decode_setattr_response(response, bitmap)
+            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+        if let Some(generation) = expected_generation {
+            self.lease.finish_stateful(generation, operation)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1395,6 +1436,35 @@ impl Mount for Mount40 {
         let mut data = decode_getattr_compound(response)?;
         decode_getattr_response(&mut data)
     }
+    async fn getacl(&self, fh: Bytes) -> Result<mount::Acl> {
+        let bitmap = [1 << 12];
+        let request = CompoundBuilder::new("getacl")
+            .putfh(&fh)
+            .getattr(&bitmap)
+            .encode_with_header(&self.auth);
+        let response = self
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        let mut data = decode_getattr_compound(response)?;
+        acl::decode_getattr_acl(&mut data)
+    }
+    async fn setacl(&self, fh: Bytes, acl_value: &mount::Acl) -> Result<()> {
+        let (bitmap, values) = acl::encode_setattr_acl(acl_value);
+        self.set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
+            .await
+    }
+    async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
+        let bitmap = [1 << 13];
+        let request = CompoundBuilder::new("aclsupport")
+            .putfh(&fh)
+            .getattr(&bitmap)
+            .encode_with_header(&self.auth);
+        let response = self
+            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+            .await?;
+        let mut data = decode_getattr_compound(response)?;
+        acl::decode_getattr_aclsupport(&mut data)
+    }
     async fn setattr(
         &self,
         fh: Bytes,
@@ -1415,35 +1485,8 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        let _io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
-        if let Some(callback_state) = &self.callback_state {
-            callback_state.mark_attributes_unknown(&fh)?;
-        }
-        let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
-        let (stateid, expected_generation) = match lane {
-            Some(lane) => (
-                lane.lock().await.stateid,
-                Some(self.lease.begin_stateful("setattr")?),
-            ),
-            None => ([0; 16], None),
-        };
-        let request = CompoundBuilder::new("setattr")
-            .putfh(&fh)
-            .setattr(&stateid, &bitmap, &values)
-            .encode_with_header(&self.auth);
-        let (class, ctx) = context("setattr", 0, 0, OperationClass::ReplaySensitive);
-        let response = self
-            .activity_settled_call(request, class, ctx.clone())
+        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true)
             .await?;
-        decode_setattr_response(response, &bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-        if let Some(generation) = expected_generation {
-            self.lease.finish_stateful(generation, "setattr")?;
-        }
         self.refresh_callback_attributes(&fh).await;
         Ok(())
     }
@@ -3715,6 +3758,95 @@ mod tests {
             Bytes::from_static(b"data")
         );
         mount.close(opened.fh).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_getacl_uses_the_nfsv40_getattr_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let expected = mount::Acl {
+            aces: vec![mount::NfsAce {
+                ace_type: mount::AceType::AccessAllowed,
+                flags: mount::AceFlags(0),
+                access_mask: mount::AceMask(mount::AceMask::READ_DATA),
+                who: "OWNER@".to_string(),
+            }],
+        };
+        let expected_for_server = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let (bitmap, values) = crate::nfs4::acl::encode_setattr_acl(&expected_for_server);
+            let mut getattr = Vec::new();
+            getattr.extend_from_slice(&1u32.to_be_bytes());
+            getattr.extend_from_slice(&bitmap[0].to_be_bytes());
+            xdr_opaque(&mut getattr, &values);
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("getacl", &[(22, &[]), (9, &getattr)]),
+            )
+            .await
+        });
+        assert_eq!(
+            mount.getacl(Bytes::from_static(b"file")).await.unwrap(),
+            expected
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_setacl_and_aclsupport_use_nfsv40_attributes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let acl = mount::Acl {
+            aces: vec![mount::NfsAce {
+                ace_type: mount::AceType::AccessAllowed,
+                flags: mount::AceFlags(0),
+                access_mask: mount::AceMask(mount::AceMask::READ_DATA),
+                who: "OWNER@".to_string(),
+            }],
+        };
+        let (_, encoded_acl) = crate::nfs4::acl::encode_setattr_acl(&acl);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let setacl = read_record(&mut stream).await?;
+            assert!(
+                setacl
+                    .windows(encoded_acl.len())
+                    .any(|wire| wire == encoded_acl)
+            );
+            let attrsset = [1u32.to_be_bytes(), (1u32 << 12).to_be_bytes()].concat();
+            reply(
+                &mut stream,
+                &setacl,
+                &compound_result("setacl", &[(22, &[]), (34, &attrsset)]),
+            )
+            .await?;
+            let support = read_record(&mut stream).await?;
+            let mut getattr = Vec::new();
+            getattr.extend_from_slice(&1u32.to_be_bytes());
+            getattr.extend_from_slice(&(1u32 << 13).to_be_bytes());
+            xdr_opaque(
+                &mut getattr,
+                &(mount::AclSupport::ALLOW | mount::AclSupport::DENY).to_be_bytes(),
+            );
+            reply(
+                &mut stream,
+                &support,
+                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
+            )
+            .await
+        });
+        mount
+            .setacl(Bytes::from_static(b"file"), &acl)
+            .await
+            .unwrap();
+        assert_eq!(
+            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
+            mount::AclSupport(mount::AclSupport::ALLOW | mount::AclSupport::DENY)
+        );
         server.await.unwrap().unwrap();
     }
 

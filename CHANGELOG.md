@@ -7,6 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-14
+
+### Added
+
+- Add experimental AUTH_SYS NFSv4.0 support through the common `Mount` API,
+  including namespace, metadata, ACL, stateful I/O, locks, lease recovery and
+  opt-in automatic delegation callbacks.
+- Add deterministic RFC/scripted coverage and physical FAS2750 validation
+  through both reference data LIFs.
+
+### Changed
+
+- Accept exact `version=4.0` and ordered fallback lists while continuing to
+  reject ambiguous `version=4`; NFSv3 remains the default.
+
+### Known limitations
+
+- RPCSEC_GSS is not included. NFSv4.0 remains experimental, and real server
+  restart grace/reclaim evidence requires a dedicated fixture or maintenance
+  window.
+
 ## [0.4.0] - 2026-08-13
 
 ### Added
@@ -53,7 +74,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/JayTsu-sh/nfs-rs/releases/tag/v0.3.0

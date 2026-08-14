@@ -1,6 +1,6 @@
 use std::env;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -332,6 +332,25 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
                 && metadata.mtime == timestamp,
             format!("NFSv4.0 owner/timestamp SETATTR mismatch through {url}: {metadata:?}"),
         )?;
+        let acl_support = mount.aclsupport(created_file.fh.clone()).await?;
+        ensure(
+            acl_support.supports(nfs_rs::AclSupport::ALLOW),
+            format!("NFSv4.0 ACLSUPPORT omitted ALLOW through {url}"),
+        )?;
+        let original_acl = mount.getacl(created_file.fh.clone()).await?;
+        mount.setacl(created_file.fh.clone(), &original_acl).await?;
+        ensure(
+            mount.getacl(created_file.fh.clone()).await? == original_acl,
+            format!("NFSv4.0 ACL round trip mismatch through {url}"),
+        )?;
+        ensure(
+            !mount.capabilities().named_attributes
+                && matches!(
+                    mount.listxattr(created_file.fh.clone()).await,
+                    Err(NfsError::Unsupported(_))
+                ),
+            format!("NFSv4.0 named attributes were not explicitly unsupported through {url}"),
+        )?;
         let names = mount
             .readdir(mount.getfh().await)
             .await
@@ -514,6 +533,187 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
         }
         mount.umount().await?;
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct V40PerfWorkload {
+    name: &'static str,
+    file_count: usize,
+    payload_size: usize,
+    chunk_size: usize,
+    tasks: usize,
+}
+
+const V40_PERF_WORKLOADS: [V40PerfWorkload; 4] = [
+    V40PerfWorkload {
+        name: "small-single",
+        file_count: 128,
+        payload_size: 4 * 1024,
+        chunk_size: 4 * 1024,
+        tasks: 1,
+    },
+    V40PerfWorkload {
+        name: "small-multi",
+        file_count: 128,
+        payload_size: 4 * 1024,
+        chunk_size: 4 * 1024,
+        tasks: 4,
+    },
+    V40PerfWorkload {
+        name: "large-single",
+        file_count: 4,
+        payload_size: 16 * 1024 * 1024,
+        chunk_size: 1024 * 1024,
+        tasks: 1,
+    },
+    V40PerfWorkload {
+        name: "large-multi",
+        file_count: 4,
+        payload_size: 16 * 1024 * 1024,
+        chunk_size: 1024 * 1024,
+        tasks: 4,
+    },
+];
+
+async fn run_v40_performance_task(
+    url: String,
+    run_id: String,
+    workload: V40PerfWorkload,
+    task: usize,
+) -> TestResult<(u64, Vec<f64>)> {
+    let mount = parse_url_and_mount(&url).await?;
+    let payload = Bytes::from(
+        (0..workload.payload_size)
+            .map(|index| ((index * 17 + task * 13 + 29) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let mut latencies = Vec::new();
+    let mut transferred = 0u64;
+    for file in 0..workload.file_count {
+        let name = format!("nfsrs-perf-{run_id}-{}-{task}-{file}.bin", workload.name);
+        let _ = mount.remove_path(&name).await;
+        let created = mount.create_path(&name, Some(0o600)).await?;
+        let started = Instant::now();
+        if workload.payload_size <= workload.chunk_size {
+            write_all(mount.as_ref(), created.fh.clone(), &payload).await?;
+            latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
+        } else {
+            for (index, chunk) in payload.chunks(workload.chunk_size).enumerate() {
+                let chunk_started = Instant::now();
+                let written = mount
+                    .write(
+                        created.fh.clone(),
+                        (index * workload.chunk_size) as u64,
+                        Bytes::copy_from_slice(chunk),
+                    )
+                    .await?;
+                ensure(written as usize == chunk.len(), "short performance write")?;
+                latencies.push(chunk_started.elapsed().as_secs_f64() * 1_000.0);
+            }
+        }
+        mount
+            .commit(created.fh.clone(), 0, payload.len() as u32)
+            .await?;
+        mount.close(created.fh).await?;
+        let opened = mount.open_path(&name, OPEN_READ).await?;
+        let actual = read_all(mount.as_ref(), opened.fh.clone(), payload.len()).await?;
+        mount.close(opened.fh).await?;
+        ensure(actual == payload, "performance payload checksum mismatch")?;
+        mount.remove_path(&name).await?;
+        transferred += payload.len() as u64;
+    }
+    mount.umount().await?;
+    Ok((transferred, latencies))
+}
+
+fn peak_rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the writable NetApp NFSv4.0 performance fixture"]
+async fn nfs_v40_small_large_single_multi_performance() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure(urls.len() == 2, "performance matrix requires both FAS LIFs")?;
+    let run_id = env::var("NFS_RS_LAB_V40_PERF_RUN_ID")?;
+    let output = env::var("NFS_RS_LAB_V40_PERF_OUTPUT")?;
+    let lifs = urls
+        .iter()
+        .map(|url| {
+            url::Url::parse(url)?
+                .host_str()
+                .map(str::to_string)
+                .ok_or_else(|| io::Error::other("NFSv4.0 performance URL lacks host").into())
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    let mut results = Vec::new();
+    for workload in V40_PERF_WORKLOADS {
+        let mut throughput_samples = Vec::new();
+        let mut p95_samples = Vec::new();
+        let mut bytes_per_sample = 0u64;
+        for _ in 0..3 {
+            let started = Instant::now();
+            let mut joins = Vec::new();
+            for task in 0..workload.tasks {
+                joins.push(tokio::spawn(run_v40_performance_task(
+                    urls[task % urls.len()].clone(),
+                    run_id.clone(),
+                    workload,
+                    task,
+                )));
+            }
+            let mut latencies = Vec::new();
+            bytes_per_sample = 0;
+            for join in joins {
+                let (task_bytes, mut task_latencies) = join.await??;
+                bytes_per_sample += task_bytes;
+                latencies.append(&mut task_latencies);
+            }
+            latencies.sort_by(f64::total_cmp);
+            let p95_index = ((latencies.len() as f64 * 0.95).ceil() as usize)
+                .saturating_sub(1)
+                .min(latencies.len().saturating_sub(1));
+            throughput_samples
+                .push(bytes_per_sample as f64 / 1_048_576.0 / started.elapsed().as_secs_f64());
+            p95_samples.push(latencies[p95_index]);
+        }
+        throughput_samples.sort_by(f64::total_cmp);
+        p95_samples.sort_by(f64::total_cmp);
+        results.push(serde_json::json!({
+            "name": workload.name,
+            "throughput_mib_s": throughput_samples[1],
+            "p95_latency_ms": p95_samples[1],
+            "peak_rss_kib": peak_rss_kib(),
+            "bytes_per_sample": bytes_per_sample,
+            "samples": 3,
+            "tasks": workload.tasks,
+        }));
+    }
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "commit": env::var("NFS_RS_LAB_V40_PERF_COMMIT")?,
+        "lifs": lifs,
+        "protocol": "4.0",
+        "liveness": "pass",
+        "workloads": results,
+    });
+    std::fs::write(output, serde_json::to_vec_pretty(&report)?)?;
     Ok(())
 }
 

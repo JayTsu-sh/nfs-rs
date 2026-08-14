@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "status": "accepted",
+  "captured_at_utc": "2026-08-14T08:47:00Z",
+  "commit": "896c78097f3395d155fd591f059b9a0496e7fd16",
+  "fixture": {
+    "server": "FAS2750",
+    "svm": "lizy",
+    "export": "/nfsrs_v40_test",
+    "protocol": "4.0"
+  },
+  "thresholds": {
+    "throughput_regression_percent": 15,
+    "p95_latency_regression_percent": 20,
+    "peak_rss_regression_percent": 25
+  },
+  "workloads": [
+    {"name": "small-single", "throughput_mib_s": 0.6286501194, "p95_latency_ms": 1.707337, "peak_rss_kib": 8140},
+    {"name": "small-multi", "throughput_mib_s": 1.7232795195, "p95_latency_ms": 3.098372, "peak_rss_kib": 11720},
+    {"name": "large-single", "throughput_mib_s": 22.1688337358, "p95_latency_ms": 27.842887, "peak_rss_kib": 60120},
+    {"name": "large-multi", "throughput_mib_s": 36.7780573704, "p95_latency_ms": 85.418372, "peak_rss_kib": 239352}
+  ]
+}

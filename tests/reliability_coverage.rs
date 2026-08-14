@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::Value;
 
@@ -163,6 +164,147 @@ fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
 }
 
 #[test]
+fn nfsv40_experimental_release_contract_is_complete() {
+    let cargo = fs::read_to_string(workspace_path("Cargo.toml")).expect("Cargo.toml readable");
+    let readme = fs::read_to_string(workspace_path("README.md")).expect("README readable");
+    let changelog = fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
+    let release = include_str!("../.github/workflows/release-validation.yml");
+    let nightly = include_str!("../.github/workflows/nightly.yml");
+    let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
+
+    assert!(cargo.contains("version = \"0.5.0\""));
+    for required in [
+        "NFSv4.0 (experimental)",
+        "AUTH_SYS",
+        "RPCSEC_GSS",
+        "version=4.0",
+        "retain-delegations=true",
+        "grace/reclaim",
+    ] {
+        assert!(readme.contains(required), "README lacks {required}");
+    }
+    assert!(changelog.contains("## [0.5.0]"));
+    for command in [
+        "cargo package --locked",
+        "cargo publish --locked --dry-run",
+        "tests/lab/run-netapp-v40-performance.sh",
+        "tests/lab/collect-nfsv40-release-evidence.sh",
+    ] {
+        assert!(
+            release.contains(command) || nightly.contains(command) || matrix.contains(command),
+            "release matrix lacks {command}"
+        );
+    }
+}
+
+#[test]
+fn nfsv40_release_evidence_is_typed_hashed_and_fail_closed() {
+    let recorder = fs::read_to_string(workspace_path("tests/lab/record-nfsv40-evidence.sh"))
+        .expect("NFSv4.0 evidence recorder readable");
+    let collector = fs::read_to_string(workspace_path(
+        "tests/lab/collect-nfsv40-release-evidence.sh",
+    ))
+    .expect("NFSv4.0 evidence collector readable");
+    let matrix = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-release-matrix.sh"))
+        .expect("NFSv4.0 release matrix readable");
+    let release = include_str!("../.github/workflows/release-validation.yml");
+    let nightly = include_str!("../.github/workflows/nightly.yml");
+
+    for required in [
+        "started_at_utc",
+        "finished_at_utc",
+        "outcome",
+        "exit_code",
+        "command",
+        "sha256",
+    ] {
+        assert!(recorder.contains(required), "recorder lacks {required}");
+    }
+    for evidence in [
+        "semantic",
+        "callback-fault",
+        "lease-fault",
+        "performance",
+        "cleanup",
+        "grace-reclaim",
+    ] {
+        let invocation = format!("record {evidence} ");
+        assert!(
+            matrix.contains(&invocation),
+            "release matrix does not record {evidence} evidence"
+        );
+        assert!(collector.contains(evidence), "collector lacks {evidence}");
+    }
+    assert!(release.contains("run-netapp-v40-release-matrix.sh"));
+    assert!(nightly.contains("run-netapp-v40-release-matrix.sh"));
+    assert!(collector.contains("missing required NFSv4.0 evidence"));
+    assert!(collector.contains("stale NFSv4.0 performance report identity"));
+    assert!(collector.contains("NFSv4.0 performance report topology mismatch"));
+    assert!(collector.contains("SHA256SUMS"));
+}
+
+#[test]
+fn nfsv40_performance_gate_covers_four_workload_quadrants() {
+    let baseline: Value = serde_json::from_slice(
+        &fs::read(workspace_path("tests/lab/nfsv40-performance-baseline.json"))
+            .expect("NFSv4.0 performance baseline readable"),
+    )
+    .expect("NFSv4.0 performance baseline valid JSON");
+    assert_eq!(baseline["schema_version"], 1);
+    assert_eq!(baseline["thresholds"]["throughput_regression_percent"], 15);
+    assert_eq!(baseline["thresholds"]["p95_latency_regression_percent"], 20);
+    let names = baseline["workloads"]
+        .as_array()
+        .expect("workloads array")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("workload name"))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        names,
+        HashSet::from(["small-single", "small-multi", "large-single", "large-multi",])
+    );
+    let checker = fs::read_to_string(workspace_path("tests/lab/check-nfsv40-performance.py"))
+        .expect("performance checker readable");
+    for required in [
+        "throughput_mib_s",
+        "p95_latency_ms",
+        "peak_rss_kib",
+        "liveness",
+    ] {
+        assert!(checker.contains(required), "checker lacks {required}");
+    }
+}
+
+#[test]
+fn nfsv40_performance_gate_rejects_regressions() {
+    let baseline_path = workspace_path("tests/lab/nfsv40-performance-baseline.json");
+    let baseline: Value = serde_json::from_slice(&fs::read(&baseline_path).expect("baseline"))
+        .expect("valid baseline");
+    let temp = std::env::temp_dir().join(format!("nfsrs-perf-gate-{}", std::process::id()));
+    fs::create_dir_all(&temp).expect("create temporary gate directory");
+    let current_path = temp.join("current.json");
+    let mut current = serde_json::json!({
+        "liveness": "pass",
+        "workloads": baseline["workloads"].clone(),
+    });
+    current["workloads"][0]["throughput_mib_s"] = serde_json::json!(0.0);
+    fs::write(
+        &current_path,
+        serde_json::to_vec(&current).expect("encode current report"),
+    )
+    .expect("write current report");
+    let status = Command::new("python3")
+        .arg(workspace_path("tests/lab/check-nfsv40-performance.py"))
+        .arg(&baseline_path)
+        .arg(&current_path)
+        .status()
+        .expect("run performance checker");
+    assert!(!status.success(), "regressed performance was accepted");
+    fs::remove_file(current_path).expect("remove current report");
+    fs::remove_dir(temp).expect("remove temporary gate directory");
+}
+
+#[test]
 fn nfs_fault_helper_is_allow_listed_and_run_scoped() {
     let source = fs::read_to_string(workspace_path("tests/lab/admin/terrasync-lab-nfs-fault"))
         .expect("NFS fault helper must be readable");
@@ -196,6 +338,8 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     .expect("NFSv4.0 lease fault runner must be readable");
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
+    let matrix = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-release-matrix.sh"))
+        .expect("NFSv4.0 release matrix must be readable");
     for required in [
         "10.131.9.11",
         "10.128.61.200",
@@ -213,9 +357,9 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     assert!(runner.contains("run_case \"$target_ip\" below"));
     assert!(runner.contains("run_case \"$target_ip\" above"));
     assert!(runner.contains("restore-any"));
-    assert!(workflow.contains("run-netapp-v40-lease-fault-e2e.sh"));
+    assert!(matrix.contains("run-netapp-v40-lease-fault-e2e.sh"));
     assert!(workflow.contains("Restore NetApp NFSv4.0 connectivity"));
-    assert!(workflow.contains("restore-any"));
+    assert!(workflow.contains("verify-netapp-v40-cleanup.sh"));
 }
 
 #[test]

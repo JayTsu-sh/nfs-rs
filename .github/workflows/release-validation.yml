@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+      - name: Allocate unique NFSv4.0 evidence directory
+        run: echo "NFS_RS_LAB_V40_EVIDENCE_DIR=$RUNNER_TEMP/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - name: Discover persisted Rust toolchain
         run: |
           toolchain_bin=""
@@ -56,13 +58,26 @@ jobs:
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Record complete NetApp NFSv4.0 release matrix
+        run: tests/lab/run-netapp-v40-release-matrix.sh "$RUN_ID" "$NFS_RS_LAB_V40_EVIDENCE_DIR"
+      - name: NetApp NFSv4.1 compatibility E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
+      - name: NetApp NFSv4.1 pNFS compatibility E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
       - run: cargo build --release --locked
+      - run: cargo package --locked
+      - run: cargo publish --locked --dry-run
+      - run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" release-evidence
       - name: Checksums
         run: find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum | tee release-sha256.txt
       - uses: actions/upload-artifact@v4
         with:
           name: nfs-rs-release-validation-${{ github.run_id }}
-          path: release-sha256.txt
+          path: |
+            release-sha256.txt
+            release-evidence
       - name: Cleanup
         if: always()
-        run: tests/lab/cleanup-run.sh "$RUN_ID"
+        run: |
+          tests/lab/verify-netapp-v40-cleanup.sh "$RUN_ID"
+          tests/lab/cleanup-run.sh "$RUN_ID"
