@@ -412,6 +412,11 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
             .try_into()
             .map_err(|_| NfsError::Xdr("CB_COMPOUND minorversion truncated".into()))?,
     );
+    let callback_ident = u32::from_be_bytes(
+        body[minor_offset + 4..minor_offset + 8]
+            .try_into()
+            .map_err(|_| NfsError::Xdr("CB_COMPOUND callback ident truncated".into()))?,
+    );
     let operation_count = u32::from_be_bytes(
         body[minor_offset + 8..minor_offset + 12]
             .try_into()
@@ -421,6 +426,15 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
     if minor != 0 {
         return Ok(compound_result(
             status,
+            &body[4..4 + padded_tag],
+            tag_len,
+            0,
+            &[],
+        ));
+    }
+    if callback_ident != 1 {
+        return Ok(compound_result(
+            10001,
             &body[4..4 + padded_tag],
             tag_len,
             0,
@@ -866,6 +880,42 @@ mod tests {
             round_trip(&mut stream, &call).await,
             [23, 1, 0, 0, 0, 0, 10001, 0, 1, 4, 10001]
         );
+    }
+
+    #[tokio::test]
+    async fn cb_compound_rejects_the_wrong_callback_ident_before_side_effects() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        service
+            .state()
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Read,
+                    stateid: [0x44; 16],
+                    recall: false,
+                },
+                7,
+                None,
+            )
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(27);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 2, 1, 4]);
+        call.extend_from_slice(&[0x4444_4444; 4]);
+        call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
+
+        assert_eq!(
+            round_trip(&mut stream, &call).await,
+            [27, 1, 0, 0, 0, 0, 10001, 0, 0]
+        );
+        assert!(recalls.try_recv().is_err());
+        assert_eq!(service.state().stats(), crate::CallbackStats::default());
     }
 
     #[tokio::test]
