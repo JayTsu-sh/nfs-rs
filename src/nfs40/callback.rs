@@ -109,12 +109,12 @@ async fn read_record(stream: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8
 }
 
 fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
-    if call.len() != 40 {
+    if call.len() < 40 || !call.len().is_multiple_of(4) {
         return Err(NfsError::Xdr(
-            "NFSv4.0 CB_NULL RPC call has an invalid length".into(),
+            "NFSv4.0 callback RPC call has an invalid length".into(),
         ));
     }
-    let words: Vec<u32> = call
+    let words: Vec<u32> = call[..40]
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
         .collect();
@@ -132,7 +132,7 @@ fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
     if words[4] != 1 {
         return Ok(accepted_reply(words[0], &[2, 1, 1]));
     }
-    if words[5] != 0 {
+    if words[5] > 1 {
         return Ok(accepted_reply(words[0], &[3]));
     }
     if words[6..] != [0, 0, 0, 0] {
@@ -140,7 +140,59 @@ fn handle_rpc_call(call: &[u8]) -> Result<Vec<u8>> {
             "NFSv4.0 CB_NULL authentication does not match AUTH_NONE".into(),
         ));
     }
-    Ok(accepted_reply(words[0], &[0]))
+    if words[5] == 0 {
+        return Ok(if call.len() == 40 {
+            accepted_reply(words[0], &[0])
+        } else {
+            accepted_reply(words[0], &[4])
+        });
+    }
+    let compound = match empty_compound_reply(&call[40..]) {
+        Ok(compound) => compound,
+        Err(_) => return Ok(accepted_reply(words[0], &[4])),
+    };
+    Ok(accepted_body(words[0], &compound))
+}
+
+fn empty_compound_reply(body: &[u8]) -> Result<Vec<u8>> {
+    if body.len() < 16 {
+        return Err(NfsError::Xdr("CB_COMPOUND envelope truncated".into()));
+    }
+    let tag_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let padded_tag = tag_len
+        .checked_add(3)
+        .ok_or_else(|| NfsError::Xdr("CB_COMPOUND tag length overflow".into()))?
+        & !3;
+    let envelope_len = 4usize
+        .checked_add(padded_tag)
+        .and_then(|length| length.checked_add(12))
+        .ok_or_else(|| NfsError::Xdr("CB_COMPOUND envelope length overflow".into()))?;
+    if body.len() != envelope_len || body.len() < 4 + tag_len {
+        return Err(NfsError::Xdr("CB_COMPOUND envelope malformed".into()));
+    }
+    let minor_offset = 4 + padded_tag;
+    let minor = u32::from_be_bytes(
+        body[minor_offset..minor_offset + 4]
+            .try_into()
+            .map_err(|_| NfsError::Xdr("CB_COMPOUND minorversion truncated".into()))?,
+    );
+    let operation_count = u32::from_be_bytes(
+        body[minor_offset + 8..minor_offset + 12]
+            .try_into()
+            .map_err(|_| NfsError::Xdr("CB_COMPOUND operation count truncated".into()))?,
+    );
+    if operation_count != 0 {
+        return Err(NfsError::Xdr(
+            "CB_COMPOUND operations are not implemented by this envelope decoder".into(),
+        ));
+    }
+    let status = if minor == 0 { 0u32 } else { 10021u32 };
+    let mut reply = Vec::with_capacity(12 + padded_tag);
+    reply.extend_from_slice(&status.to_be_bytes());
+    reply.extend_from_slice(&(tag_len as u32).to_be_bytes());
+    reply.extend_from_slice(&body[4..4 + padded_tag]);
+    reply.extend_from_slice(&0u32.to_be_bytes());
+    Ok(reply)
 }
 
 fn accepted_reply(xid: u32, result: &[u32]) -> Vec<u8> {
@@ -148,6 +200,12 @@ fn accepted_reply(xid: u32, result: &[u32]) -> Vec<u8> {
     words.extend_from_slice(&[xid, 1, 0, 0, 0]);
     words.extend_from_slice(result);
     rpc_reply(&words)
+}
+
+fn accepted_body(xid: u32, body: &[u8]) -> Vec<u8> {
+    let mut reply = rpc_reply(&[xid, 1, 0, 0, 0, 0]);
+    reply.extend_from_slice(body);
+    reply
 }
 
 fn rpc_reply(words: &[u32]) -> Vec<u8> {
@@ -239,6 +297,27 @@ mod tests {
             let mut call = cb_null_call(7);
             call[index] = value;
             assert_eq!(round_trip(&mut stream, &call).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_cb_compound_echoes_tag_and_rejects_other_minor_versions() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        for (minor, expected_status) in [(0, 0), (1, 10021)] {
+            let mut call = cb_null_call(11 + minor);
+            call[5] = 1;
+            call.extend_from_slice(&[3, u32::from_be_bytes(*b"tag\0"), minor, 1, 0]);
+            let reply = round_trip(&mut stream, &call).await;
+            assert_eq!(&reply[..6], &[11 + minor, 1, 0, 0, 0, 0]);
+            assert_eq!(reply[6], expected_status);
+            assert_eq!(reply[7], 3);
+            assert_eq!(reply[8], u32::from_be_bytes(*b"tag\0"));
+            assert_eq!(reply[9], 0);
         }
     }
 }
