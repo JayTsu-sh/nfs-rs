@@ -166,8 +166,7 @@ fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
 fn nfsv40_experimental_release_contract_is_complete() {
     let cargo = fs::read_to_string(workspace_path("Cargo.toml")).expect("Cargo.toml readable");
     let readme = fs::read_to_string(workspace_path("README.md")).expect("README readable");
-    let changelog =
-        fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
+    let changelog = fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
     let release = include_str!("../.github/workflows/release-validation.yml");
     let nightly = include_str!("../.github/workflows/nightly.yml");
 
@@ -193,6 +192,38 @@ fn nfsv40_experimental_release_contract_is_complete() {
             release.contains(command) || nightly.contains(command),
             "release matrix lacks {command}"
         );
+    }
+}
+
+#[test]
+fn nfsv40_performance_gate_covers_four_workload_quadrants() {
+    let baseline: Value = serde_json::from_slice(
+        &fs::read(workspace_path("tests/lab/nfsv40-performance-baseline.json"))
+            .expect("NFSv4.0 performance baseline readable"),
+    )
+    .expect("NFSv4.0 performance baseline valid JSON");
+    assert_eq!(baseline["schema_version"], 1);
+    assert_eq!(baseline["thresholds"]["throughput_regression_percent"], 15);
+    assert_eq!(baseline["thresholds"]["p95_latency_regression_percent"], 20);
+    let names = baseline["workloads"]
+        .as_array()
+        .expect("workloads array")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("workload name"))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        names,
+        HashSet::from(["small-single", "small-multi", "large-single", "large-multi",])
+    );
+    let checker = fs::read_to_string(workspace_path("tests/lab/check-nfsv40-performance.py"))
+        .expect("performance checker readable");
+    for required in [
+        "throughput_mib_s",
+        "p95_latency_ms",
+        "peak_rss_kib",
+        "liveness",
+    ] {
+        assert!(checker.contains(required), "checker lacks {required}");
     }
 }
 
