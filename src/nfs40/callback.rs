@@ -475,12 +475,12 @@ async fn read_record(stream: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8
 }
 
 fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
-    if call.len() < 40 || !call.len().is_multiple_of(4) {
+    if call.len() < 24 || !call.len().is_multiple_of(4) {
         return Err(NfsError::Xdr(
             "NFSv4.0 callback RPC call has an invalid length".into(),
         ));
     }
-    let words: Vec<u32> = call[..40]
+    let words: Vec<u32> = call[..24]
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
         .collect();
@@ -501,23 +501,66 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
     if words[5] > 1 {
         return Ok(accepted_reply(words[0], &[3]));
     }
-    if words[6..] != [0, 0, 0, 0] {
-        return Err(NfsError::Rpc(
-            "NFSv4.0 CB_NULL authentication does not match AUTH_NONE".into(),
-        ));
+    let Some(RpcAuthEnvelope {
+        credential_flavor,
+        credential,
+        verifier_flavor,
+        verifier,
+        body,
+    }) = decode_rpc_auth(&call[24..])
+    else {
+        return Ok(rpc_reply(&[words[0], 1, 1, 1, 1]));
+    };
+    if credential_flavor != 0
+        || !credential.is_empty()
+        || verifier_flavor != 0
+        || !verifier.is_empty()
+    {
+        return Ok(rpc_reply(&[words[0], 1, 1, 1, 1]));
     }
     if words[5] == 0 {
-        return Ok(if call.len() == 40 {
+        return Ok(if body.is_empty() {
             accepted_reply(words[0], &[0])
         } else {
             accepted_reply(words[0], &[4])
         });
     }
-    let compound = match compound_reply(&call[40..], state) {
+    let compound = match compound_reply(body, state) {
         Ok(compound) => compound,
         Err(_) => return Ok(accepted_reply(words[0], &[4])),
     };
     Ok(accepted_body(words[0], &compound))
+}
+
+struct RpcAuthEnvelope<'a> {
+    credential_flavor: u32,
+    credential: &'a [u8],
+    verifier_flavor: u32,
+    verifier: &'a [u8],
+    body: &'a [u8],
+}
+
+fn decode_rpc_auth(mut encoded: &[u8]) -> Option<RpcAuthEnvelope<'_>> {
+    fn take_auth<'a>(encoded: &mut &'a [u8]) -> Option<(u32, &'a [u8])> {
+        let flavor = u32::from_be_bytes(encoded.get(..4)?.try_into().ok()?);
+        let length = u32::from_be_bytes(encoded.get(4..8)?.try_into().ok()?) as usize;
+        let padded = length.checked_add(3)? & !3;
+        let value_end = 8usize.checked_add(length)?;
+        let padded_end = 8usize.checked_add(padded)?;
+        let value = encoded.get(8..value_end)?;
+        *encoded = encoded.get(padded_end..)?;
+        Some((flavor, value))
+    }
+
+    let (credential_flavor, credential) = take_auth(&mut encoded)?;
+    let (verifier_flavor, verifier) = take_auth(&mut encoded)?;
+    Some(RpcAuthEnvelope {
+        credential_flavor,
+        credential,
+        verifier_flavor,
+        verifier,
+        body: encoded,
+    })
 }
 
 fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
@@ -916,6 +959,30 @@ mod tests {
             call[index] = value;
             assert_eq!(round_trip(&mut stream, &call).await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn callback_auth_failures_are_denied_without_poisoning_the_connection() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+
+        let mut unsupported = cb_null_call(13);
+        unsupported[6] = 1;
+        assert_eq!(
+            round_trip(&mut stream, &unsupported).await,
+            [13, 1, 1, 1, 1]
+        );
+        let mut malformed = cb_null_call(14);
+        malformed[7] = 4;
+        assert_eq!(round_trip(&mut stream, &malformed).await, [14, 1, 1, 1, 1]);
+        assert_eq!(
+            round_trip(&mut stream, &cb_null_call(15)).await,
+            [15, 1, 0, 0, 0, 0]
+        );
     }
 
     #[tokio::test]
