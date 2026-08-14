@@ -4,14 +4,12 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
-target_ip="${NFS_RS_LAB_V40_LIF_A:-10.128.61.200}"
 export_path="${NFS_RS_LAB_V40_EXPORT:-/nfsrs_v40_test}"
-validate_ipv4 "$target_ip"
 validate_export_path "$export_path"
 tmpdir="$(mktemp -d)"
 
 restore_fault() {
-  sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore "$run_id" "$target_ip" || true
+  sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$run_id" || true
 }
 cleanup() {
   restore_fault
@@ -20,13 +18,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 export NFS_RS_LAB_E2E=1
-export NFS_RS_LAB_V40_FAULT_URL="nfs://$target_ip$export_path?version=4.0&noresvport=true&uid=0&gid=0"
-
 run_case() {
-  local mode="$1"
-  local case_dir="$tmpdir/$mode"
+  local target_ip="$1"
+  local mode="$2"
+  local case_dir="$tmpdir/${target_ip//./-}-$mode"
   mkdir -p "$case_dir"
   export NFS_RS_LAB_V40_FAULT_MODE="$mode"
+  export NFS_RS_LAB_V40_FAULT_URL="nfs://$target_ip$export_path?version=4.0&noresvport=true&uid=0&gid=0"
   export NFS_RS_LAB_V40_FAULT_READY_FILE="$case_dir/ready"
   export NFS_RS_LAB_V40_FAULT_APPLIED_FILE="$case_dir/applied"
   export NFS_RS_LAB_V40_FAULT_RESTORED_FILE="$case_dir/restored"
@@ -62,5 +60,10 @@ run_case() {
   wait "$test_pid"
 }
 
-run_case below
-run_case above
+for target_ip in \
+  "${NFS_RS_LAB_V40_LIF_A:-10.128.61.200}" \
+  "${NFS_RS_LAB_V40_LIF_B:-10.128.61.201}"; do
+  validate_ipv4 "$target_ip"
+  run_case "$target_ip" below
+  run_case "$target_ip" above
+done

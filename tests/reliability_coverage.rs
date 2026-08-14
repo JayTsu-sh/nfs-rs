@@ -190,10 +190,14 @@ fn netapp_v40_lease_fault_is_destination_scoped_and_restored() {
     }
     assert!(!helper.contains("input {"));
     assert!(runner.contains("trap cleanup EXIT INT TERM"));
-    assert!(runner.contains("run_case below"));
-    assert!(runner.contains("run_case above"));
+    assert!(runner.contains("NFS_RS_LAB_V40_LIF_A"));
+    assert!(runner.contains("NFS_RS_LAB_V40_LIF_B"));
+    assert!(runner.contains("run_case \"$target_ip\" below"));
+    assert!(runner.contains("run_case \"$target_ip\" above"));
+    assert!(runner.contains("restore-any"));
     assert!(workflow.contains("run-netapp-v40-lease-fault-e2e.sh"));
     assert!(workflow.contains("Restore NetApp NFSv4.0 connectivity"));
+    assert!(workflow.contains("restore-any"));
 }
 
 #[test]

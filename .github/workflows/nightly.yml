@@ -97,7 +97,7 @@ jobs:
         run: sudo -n /usr/local/sbin/nfsrs-lab-pnfs-fault restore-ds "$RUN_ID"
       - name: Restore NetApp NFSv4.0 connectivity
         if: always()
-        run: sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore "$RUN_ID" "${NFS_RS_LAB_V40_LIF_A:-10.128.61.200}"
+        run: sudo -n /usr/local/sbin/nfsrs-lab-v40-fault restore-any "$RUN_ID"
       - name: Cleanup NetApp pNFS run
         if: always()
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/cleanup-pnfs-run.sh "$RUN_ID"

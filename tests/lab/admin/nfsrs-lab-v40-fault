@@ -3,17 +3,13 @@ set -euo pipefail
 
 action="${1:?action required}"
 run_id="${2:?run id required}"
-target_ip="${3:?target IPv4 required}"
+target_ip="${3:-}"
 runner_ip=10.131.9.11
 state_file=/run/nfsrs-lab-v40-fault.state
 table=nfsrs_v40_fault
 
 [[ "$run_id" =~ ^(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
   echo "unsafe run id: $run_id" >&2
-  exit 2
-}
-[[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
-  echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
   exit 2
 }
 ip -o -4 addr show | grep -Fq " $runner_ip/" || {
@@ -28,6 +24,10 @@ restore() {
 
 case "$action" in
   isolate)
+    [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
+      echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
+      exit 2
+    }
     if [[ -e "$state_file" ]]; then
       read -r owner_run owner_ip <"$state_file"
       [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
@@ -44,6 +44,10 @@ case "$action" in
     echo "isolated runner destination $target_ip:2049 for $run_id"
     ;;
   restore)
+    [[ "$target_ip" == 10.128.61.200 || "$target_ip" == 10.128.61.201 ]] || {
+      echo "target is not an authorized NFSv4.0 LIF: $target_ip" >&2
+      exit 2
+    }
     if [[ -e "$state_file" ]]; then
       read -r owner_run owner_ip <"$state_file"
       [[ "$owner_run" == "$run_id" && "$owner_ip" == "$target_ip" ]] || {
@@ -53,6 +57,17 @@ case "$action" in
     fi
     restore
     echo "restored runner destination $target_ip:2049 for $run_id"
+    ;;
+  restore-any)
+    if [[ -e "$state_file" ]]; then
+      read -r owner_run owner_ip <"$state_file"
+      [[ "$owner_run" == "$run_id" ]] || {
+        echo "NFSv4.0 fault belongs to another run" >&2
+        exit 2
+      }
+      echo "restoring runner destination $owner_ip:2049 for $run_id"
+    fi
+    restore
     ;;
   status)
     if nft list table inet "$table" >/dev/null 2>&1; then
