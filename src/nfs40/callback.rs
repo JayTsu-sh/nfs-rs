@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -23,6 +23,7 @@ const MAX_CALLBACK_RECORD: usize = 64 * 1024;
 const CALLBACK_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
+const CALLBACK_REPLAY_CACHE_SIZE: usize = 128;
 
 pub(crate) struct CallbackService {
     universal_addr: String,
@@ -39,6 +40,12 @@ struct DelegationRecord {
     recalling: bool,
 }
 
+struct ReplayEntry {
+    xid: u32,
+    call: Vec<u8>,
+    reply: Vec<u8>,
+}
+
 pub(crate) struct CallbackState {
     delegations: Mutex<HashMap<Bytes, DelegationRecord>>,
     generation: AtomicU64,
@@ -50,6 +57,7 @@ pub(crate) struct CallbackState {
     service_healthy: AtomicBool,
     worker_healthy: AtomicBool,
     io_gates: Mutex<HashMap<Bytes, Weak<tokio::sync::RwLock<()>>>>,
+    replies: Mutex<VecDeque<ReplayEntry>>,
 }
 
 pub(crate) struct OpenPublication {
@@ -113,6 +121,7 @@ impl CallbackService {
             service_healthy: AtomicBool::new(true),
             worker_healthy: AtomicBool::new(true),
             io_gates: Mutex::new(HashMap::new()),
+            replies: Mutex::new(VecDeque::new()),
         });
         let service_state = Arc::clone(&state);
         let (stop, mut stopping) = watch::channel(false);
@@ -192,6 +201,26 @@ impl CallbackService {
 }
 
 impl CallbackState {
+    fn cached_reply(&self, xid: u32, call: &[u8]) -> Option<Vec<u8>> {
+        self.replies.lock().ok()?.iter().find_map(|record| {
+            (record.xid == xid && record.call == call).then(|| record.reply.clone())
+        })
+    }
+
+    fn cache_reply(&self, xid: u32, call: &[u8], reply: &[u8]) {
+        let Ok(mut replies) = self.replies.lock() else {
+            return;
+        };
+        if replies.len() == CALLBACK_REPLAY_CACHE_SIZE {
+            replies.pop_front();
+        }
+        replies.push_back(ReplayEntry {
+            xid,
+            call: call.to_vec(),
+            reply: reply.to_vec(),
+        });
+    }
+
     fn io_gate(&self, fh: &Bytes) -> Arc<tokio::sync::RwLock<()>> {
         let mut gates = self
             .io_gates
@@ -572,6 +601,9 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
         .chunks_exact(4)
         .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
         .collect();
+    if let Some(reply) = state.cached_reply(words[0], call) {
+        return Ok(reply);
+    }
     if words[1] != 0 {
         return Err(NfsError::Rpc(
             "NFSv4.0 callback RPC message is not a CALL".into(),
@@ -616,7 +648,41 @@ fn handle_rpc_call(call: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
         Ok(compound) => compound,
         Err(_) => return Ok(accepted_reply(words[0], &[4])),
     };
-    Ok(accepted_body(words[0], &compound))
+    let reply = accepted_body(words[0], &compound);
+    if successful_single_recall(body, &compound) {
+        state.cache_reply(words[0], call, &reply);
+    }
+    Ok(reply)
+}
+
+fn successful_single_recall(body: &[u8], reply: &[u8]) -> bool {
+    let Some(tag_length) = body
+        .get(..4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes)
+        .map(|value| value as usize)
+    else {
+        return false;
+    };
+    let Some(padded_tag) = tag_length.checked_add(3).map(|length| length & !3) else {
+        return false;
+    };
+    let Some(minor_offset) = 4usize.checked_add(padded_tag) else {
+        return false;
+    };
+    let operation_count = body
+        .get(minor_offset + 8..minor_offset + 12)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes);
+    let opcode = body
+        .get(minor_offset + 12..minor_offset + 16)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes);
+    let status = reply
+        .get(..4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_be_bytes);
+    operation_count == Some(1) && opcode == Some(4) && status == Some(0)
 }
 
 struct RpcAuthEnvelope<'a> {
@@ -1620,7 +1686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_recall_flushes_and_returns_the_delegation_exactly_once() {
+    async fn lost_callback_reply_retries_but_returns_the_delegation_exactly_once() {
         let nfs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = nfs_listener.local_addr().unwrap();
         let mux = rpc::StreamMux::connect(server_addr, true).await.unwrap();
@@ -1675,16 +1741,33 @@ mod tests {
             );
         });
 
-        let mut callback = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
-            .await
-            .unwrap();
+        let callback_addr = socket_addr(service.universal_addr());
+        let mut callback = tokio::net::TcpStream::connect(callback_addr).await.unwrap();
         let mut call = cb_null_call(37);
         call[5] = 1;
         call.extend_from_slice(&[0, 0, 1, 1, 4]);
         call.extend_from_slice(&[0x5555_5555; 4]);
         call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
         let expected = [37, 1, 0, 0, 0, 0, 0, 0, 1, 4, 0];
-        assert_eq!(round_trip(&mut callback, &call).await, expected);
+        let mut encoded = Vec::new();
+        for word in &call {
+            encoded.extend_from_slice(&word.to_be_bytes());
+        }
+        callback
+            .write_u32(0x8000_0000 | encoded.len() as u32)
+            .await
+            .unwrap();
+        callback.write_all(&encoded).await.unwrap();
+        drop(callback); // Simulate loss of the successful callback reply.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.stats().recalls_received == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut callback = tokio::net::TcpStream::connect(callback_addr).await.unwrap();
         assert_eq!(round_trip(&mut callback, &call).await, expected);
         server.await.unwrap();
         assert_eq!(
