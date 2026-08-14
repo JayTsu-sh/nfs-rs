@@ -156,6 +156,34 @@ impl CallbackState {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub(crate) fn mark_attributes_unknown(&self, fh: &[u8]) -> Result<bool> {
+        let mut delegations = self
+            .delegations
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+        let Some(record) = delegations.get_mut(fh) else {
+            return Ok(false);
+        };
+        if record.grant.kind != DelegationKind::Write {
+            return Ok(false);
+        }
+        record.attributes = None;
+        Ok(true)
+    }
+
+    pub(crate) fn publish_attributes(&self, fh: &[u8], change: u64, size: u64) -> Result<()> {
+        let mut delegations = self
+            .delegations
+            .lock()
+            .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
+        if let Some(record) = delegations.get_mut(fh)
+            && record.grant.kind == DelegationKind::Write
+        {
+            record.attributes = Some((change, size));
+        }
+        Ok(())
+    }
+
     pub(crate) fn begin_open_publication(self: &Arc<Self>) -> OpenPublication {
         self.open_publications.fetch_add(1, Ordering::AcqRel);
         OpenPublication {
@@ -965,6 +993,14 @@ mod tests {
                 0x1516_1718,
             ]
         );
+        service.state().mark_attributes_unknown(b"fh").unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &call).await,
+            [29, 1, 0, 0, 0, 0, 10008, 0, 1, 3, 10008]
+        );
+        service.state().publish_attributes(b"fh", 9, 10).unwrap();
+        let refreshed = round_trip(&mut stream, &call).await;
+        assert_eq!(&refreshed[14..], &[0, 9, 0, 10]);
     }
 
     #[tokio::test]

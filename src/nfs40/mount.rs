@@ -37,6 +37,30 @@ use crate::{Mount, MountArgs};
 const NFS4_DEFAULT_PORT: u16 = 2049;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
+const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
+
+fn decode_callback_attributes(mut data: Bytes) -> Result<(u64, u64)> {
+    let (bitmap, mut values) = decode_fattr4_envelope(&mut data, "delegation getattr")?;
+    if bitmap != CALLBACK_GETATTR_BITMAP || values.remaining() != 16 {
+        return Err(NfsError::Xdr(
+            "delegation GETATTR did not return exactly change and size".into(),
+        ));
+    }
+    Ok((values.get_u64(), values.get_u64()))
+}
+
+async fn query_callback_attributes(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+) -> Result<(u64, u64)> {
+    let request = CompoundBuilder::new("delegation-getattr")
+        .putfh(fh)
+        .getattr(&CALLBACK_GETATTR_BITMAP)
+        .encode_with_header(auth);
+    let response = rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?;
+    decode_callback_attributes(decode_getattr_compound(response)?)
+}
 
 struct Mount40 {
     rpc: rpc::Client,
@@ -646,6 +670,19 @@ impl Mount40 {
                     }
                 });
             }
+            let delegation_attributes = if callback_state.is_some()
+                && matches!(
+                    opened.delegation,
+                    Some(super::compound::DelegationGrant {
+                        kind: super::compound::DelegationKind::Write,
+                        ..
+                    })
+                )
+            {
+                query_callback_attributes(&rpc, &auth, &fh).await.ok()
+            } else {
+                None
+            };
             let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "open")?;
             state
@@ -663,7 +700,7 @@ impl Mount40 {
                     fh.clone(),
                     delegation,
                     expected_generation,
-                    None,
+                    delegation_attributes,
                 )?;
             }
             drop(callback_publication);
@@ -764,6 +801,15 @@ impl Mount40 {
                 .await?,
         )?;
         decode_fattr4_envelope(&mut data, label)
+    }
+
+    async fn refresh_callback_attributes(&self, fh: &Bytes) {
+        let Some(state) = &self.callback_state else {
+            return;
+        };
+        if let Ok((change, size)) = query_callback_attributes(&self.rpc, &self.auth, fh).await {
+            let _ = state.publish_attributes(fh, change, size);
+        }
     }
 
     async fn readdir_page(
@@ -1337,6 +1383,9 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
+        if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?;
+        }
         let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
         let (stateid, expected_generation) = match lane {
             Some(lane) => (
@@ -1358,6 +1407,7 @@ impl Mount for Mount40 {
         if let Some(generation) = expected_generation {
             self.lease.finish_stateful(generation, "setattr")?;
         }
+        self.refresh_callback_attributes(&fh).await;
         Ok(())
     }
     async fn setattr_path(
@@ -1732,6 +1782,9 @@ impl Mount for Mount40 {
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
             .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+        if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?;
+        }
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let lane_for_settlement = Arc::clone(&lane);
@@ -1791,6 +1844,7 @@ impl Mount for Mount40 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
         self.lease.finish_stateful(expected_generation, "write")?;
+        self.refresh_callback_attributes(&fh).await;
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -2084,6 +2138,30 @@ mod tests {
         let mut getfh = Vec::new();
         xdr_opaque(&mut getfh, fh);
         compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
+    }
+
+    #[test]
+    fn delegation_getattr_decodes_exact_change_and_size() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&0x18u32.to_be_bytes());
+        encoded.extend_from_slice(&16u32.to_be_bytes());
+        encoded.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        encoded.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+        assert_eq!(
+            decode_callback_attributes(Bytes::from(encoded)).unwrap(),
+            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+        );
+    }
+
+    #[test]
+    fn delegation_getattr_rejects_missing_required_attributes() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&0x10u32.to_be_bytes());
+        encoded.extend_from_slice(&8u32.to_be_bytes());
+        encoded.extend_from_slice(&7u64.to_be_bytes());
+        assert!(decode_callback_attributes(Bytes::from(encoded)).is_err());
     }
 
     fn open_result_with_read_delegation(
