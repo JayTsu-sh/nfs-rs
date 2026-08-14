@@ -93,7 +93,11 @@ impl CallbackService {
         });
         let service_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            while let Ok((stream, _peer)) = listener.accept().await {
+            while let Ok((stream, peer)) = listener.accept().await {
+                if peer.ip() != IpAddr::V4(server_ip) {
+                    drop(stream);
+                    continue;
+                }
                 let state = Arc::clone(&service_state);
                 tokio::spawn(async move {
                     let _ = serve_connection(stream, state).await;
@@ -684,6 +688,35 @@ mod tests {
             let mut call = cb_null_call(7);
             call[index] = value;
             assert_eq!(round_trip(&mut stream, &call).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_listener_rejects_a_different_source_address() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        let mut stream = socket
+            .connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = Vec::new();
+        for word in cb_null_call(41) {
+            call.extend_from_slice(&word.to_be_bytes());
+        }
+        let write = async {
+            stream.write_u32(0x8000_0000 | call.len() as u32).await?;
+            stream.write_all(&call).await
+        }
+        .await;
+        if write.is_ok() {
+            let read = tokio::time::timeout(Duration::from_millis(100), stream.read_u32()).await;
+            assert!(
+                !matches!(read, Ok(Ok(_))),
+                "unauthorized callback source received an RPC response"
+            );
         }
     }
 
