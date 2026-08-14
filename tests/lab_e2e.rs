@@ -332,6 +332,25 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
                 && metadata.mtime == timestamp,
             format!("NFSv4.0 owner/timestamp SETATTR mismatch through {url}: {metadata:?}"),
         )?;
+        let acl_support = mount.aclsupport(created_file.fh.clone()).await?;
+        ensure(
+            acl_support.supports(nfs_rs::AclSupport::ALLOW),
+            format!("NFSv4.0 ACLSUPPORT omitted ALLOW through {url}"),
+        )?;
+        let original_acl = mount.getacl(created_file.fh.clone()).await?;
+        mount.setacl(created_file.fh.clone(), &original_acl).await?;
+        ensure(
+            mount.getacl(created_file.fh.clone()).await? == original_acl,
+            format!("NFSv4.0 ACL round trip mismatch through {url}"),
+        )?;
+        ensure(
+            !mount.capabilities().named_attributes
+                && matches!(
+                    mount.listxattr(created_file.fh.clone()).await,
+                    Err(NfsError::Unsupported(_))
+                ),
+            format!("NFSv4.0 named attributes were not explicitly unsupported through {url}"),
+        )?;
         let names = mount
             .readdir(mount.getfh().await)
             .await
