@@ -742,7 +742,7 @@ fn valid_callback_credential(flavor: u32, mut credential: &[u8]) -> bool {
     if flavor == 0 {
         return credential.is_empty();
     }
-    if flavor != 1 || credential.len() < 24 || !credential.len().is_multiple_of(4) {
+    if flavor != 1 || credential.len() < 20 || !credential.len().is_multiple_of(4) {
         return false;
     }
     credential = &credential[4..]; // stamp is opaque to the receiver
@@ -1247,6 +1247,12 @@ mod tests {
         assert_eq!(
             round_trip(&mut stream, &ontap_auth_sys).await,
             [17, 1, 0, 0, 0, 0]
+        );
+
+        let minimal_ontap_auth_sys = vec![18, 0, 2, CB_PROGRAM, 1, 0, 1, 20, 9, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            round_trip(&mut stream, &minimal_ontap_auth_sys).await,
+            [18, 1, 0, 0, 0, 0]
         );
 
         let mut excessive_groups = auth_sys;
