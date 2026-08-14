@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,6 +40,11 @@ pub(crate) struct CallbackState {
     delegations: Mutex<HashMap<Bytes, DelegationRecord>>,
     generation: AtomicU64,
     recall_tx: mpsc::Sender<RecallNotification>,
+    open_publications: AtomicUsize,
+}
+
+pub(crate) struct OpenPublication {
+    state: Arc<CallbackState>,
 }
 
 pub(crate) struct RecallNotification {
@@ -90,6 +95,7 @@ impl CallbackService {
             delegations: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             recall_tx,
+            open_publications: AtomicUsize::new(0),
         });
         let service_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -130,6 +136,13 @@ impl CallbackService {
 }
 
 impl CallbackState {
+    pub(crate) fn begin_open_publication(self: &Arc<Self>) -> OpenPublication {
+        self.open_publications.fetch_add(1, Ordering::AcqRel);
+        OpenPublication {
+            state: Arc::clone(self),
+        }
+    }
+
     pub(crate) fn register_delegation(
         &self,
         fh: Bytes,
@@ -175,6 +188,12 @@ impl CallbackState {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for OpenPublication {
+    fn drop(&mut self) {
+        self.state.open_publications.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -444,6 +463,7 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                     .lock()
                     .map_err(|_| NfsError::Rpc("NFSv4.0 callback state lock poisoned".into()))?;
                 status = match delegations.get_mut(fh) {
+                    None if state.open_publications.load(Ordering::Acquire) != 0 => 10008,
                     None => 10001,
                     Some(record) if record.generation != active_generation => 10001,
                     Some(record) if record.grant.stateid.as_slice() != stateid => 10025,
@@ -884,6 +904,47 @@ mod tests {
         assert_eq!(recall.fh, Bytes::from_static(b"fh"));
         assert_eq!(recall.stateid, [0x44; 16]);
         assert_eq!(recall.generation, 7);
+        assert!(recalls.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recall_racing_open_publication_delays_then_queues_once() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let state = service.state();
+        let publication = state.begin_open_publication();
+        let mut recalls = service.take_recall_receiver().unwrap();
+        let mut callback = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+        let mut call = cb_null_call(35);
+        call[5] = 1;
+        call.extend_from_slice(&[0, 0, 1, 1, 4]);
+        call.extend_from_slice(&[0x7777_7777; 4]);
+        call.extend_from_slice(&[0, 2, u32::from_be_bytes(*b"fh\0\0")]);
+        assert_eq!(
+            round_trip(&mut callback, &call).await,
+            [35, 1, 0, 0, 0, 0, 10008, 0, 1, 4, 10008]
+        );
+        state
+            .register_delegation(
+                Bytes::from_static(b"fh"),
+                DelegationGrant {
+                    kind: DelegationKind::Read,
+                    stateid: [0x77; 16],
+                    recall: false,
+                },
+                11,
+                None,
+            )
+            .unwrap();
+        drop(publication);
+        assert_eq!(
+            round_trip(&mut callback, &call).await,
+            [35, 1, 0, 0, 0, 0, 0, 0, 1, 4, 0]
+        );
+        assert!(recalls.try_recv().is_ok());
         assert!(recalls.try_recv().is_err());
     }
 

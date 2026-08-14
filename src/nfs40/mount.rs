@@ -560,6 +560,9 @@ impl Mount40 {
         let issuer = self.issuer;
         let lease = Arc::clone(&self.lease);
         let callback_state = self.callback_state.clone();
+        let callback_publication = callback_state
+            .as_ref()
+            .map(|state| state.begin_open_publication());
         let opened = tokio::spawn(async move {
             let request = CompoundBuilder::new(if create { "create" } else { "open" })
                 .putfh(&dir_fh)
@@ -626,7 +629,7 @@ impl Mount40 {
                     write_verifier: None,
                 })
                 .await;
-            if let (Some(callback_state), Some(delegation)) = (callback_state, opened.delegation) {
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
                 callback_state.register_delegation(
                     fh.clone(),
                     delegation,
@@ -634,6 +637,7 @@ impl Mount40 {
                     None,
                 )?;
             }
+            drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
                 state.remove(owner, &fh).await;
                 return Err(error);
