@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::Value;
 
@@ -225,6 +226,35 @@ fn nfsv40_performance_gate_covers_four_workload_quadrants() {
     ] {
         assert!(checker.contains(required), "checker lacks {required}");
     }
+}
+
+#[test]
+fn nfsv40_performance_gate_rejects_regressions() {
+    let baseline_path = workspace_path("tests/lab/nfsv40-performance-baseline.json");
+    let baseline: Value = serde_json::from_slice(&fs::read(&baseline_path).expect("baseline"))
+        .expect("valid baseline");
+    let temp = std::env::temp_dir().join(format!("nfsrs-perf-gate-{}", std::process::id()));
+    fs::create_dir_all(&temp).expect("create temporary gate directory");
+    let current_path = temp.join("current.json");
+    let mut current = serde_json::json!({
+        "liveness": "pass",
+        "workloads": baseline["workloads"].clone(),
+    });
+    current["workloads"][0]["throughput_mib_s"] = serde_json::json!(0.0);
+    fs::write(
+        &current_path,
+        serde_json::to_vec(&current).expect("encode current report"),
+    )
+    .expect("write current report");
+    let status = Command::new("python3")
+        .arg(workspace_path("tests/lab/check-nfsv40-performance.py"))
+        .arg(&baseline_path)
+        .arg(&current_path)
+        .status()
+        .expect("run performance checker");
+    assert!(!status.success(), "regressed performance was accepted");
+    fs::remove_file(current_path).expect("remove current report");
+    fs::remove_dir(temp).expect("remove temporary gate directory");
 }
 
 #[test]
