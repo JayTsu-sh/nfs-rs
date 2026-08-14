@@ -69,7 +69,7 @@ pub(crate) struct RecallNotification {
     pub fh: Bytes,
     pub stateid: [u8; 16],
     pub generation: u64,
-    pub truncate: bool,
+    pub flush: bool,
 }
 
 pub(crate) struct CallbackWorker {
@@ -300,7 +300,7 @@ impl CallbackState {
                         fh: fh.clone(),
                         stateid: record.grant.stateid,
                         generation: record.generation,
-                        truncate: false,
+                        flush: record.grant.kind == DelegationKind::Write,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -350,7 +350,7 @@ impl CallbackState {
                 fh: fh.clone(),
                 stateid,
                 generation,
-                truncate: false,
+                flush: grant.kind == DelegationKind::Write,
             }) {
                 Ok(()) => {
                     self.recalls_received.fetch_add(1, Ordering::Relaxed);
@@ -519,7 +519,7 @@ impl Drop for CallbackService {
 }
 
 async fn settle_recall(rpc: &rpc::Client, auth: &Auth, recall: &RecallNotification) -> Result<()> {
-    if !recall.truncate {
+    if recall.flush {
         let response = rpc
             .call(
                 CompoundBuilder::new("delegation-flush")
@@ -542,7 +542,18 @@ async fn settle_recall(rpc: &rpc::Client, auth: &Auth, recall: &RecallNotificati
             CALLBACK_SETTLEMENT_TIMEOUT,
         )
         .await?;
-    decode_delegreturn_response(response)
+    match decode_delegreturn_response(response) {
+        Ok(()) => Ok(()),
+        Err(NfsError::Nfs4(
+            crate::Nfs4ErrorCode::NFS4ERR_ADMIN_REVOKED
+            | crate::Nfs4ErrorCode::NFS4ERR_DELEG_REVOKED
+            | crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+            | crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+            | crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+            | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+        )) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn serve_connection(
@@ -915,7 +926,7 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                             fh: Bytes::copy_from_slice(fh),
                             stateid: callback_stateid,
                             generation: record.generation,
-                            truncate,
+                            flush: record.grant.kind == DelegationKind::Write && !truncate,
                         }) {
                             Ok(()) => {
                                 record.recalling = true;
@@ -1057,6 +1068,16 @@ mod tests {
         body.extend_from_slice(&opcode.to_be_bytes());
         body.extend_from_slice(&0u32.to_be_bytes());
         body.extend_from_slice(data);
+        body
+    }
+
+    fn compound_error(tag: &[u8], status: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&status.to_be_bytes());
+        body.extend_from_slice(&(tag.len() as u32).to_be_bytes());
+        body.extend_from_slice(tag);
+        body.resize(body.len().next_multiple_of(4), 0);
+        body.extend_from_slice(&0u32.to_be_bytes());
         body
     }
 
@@ -1518,7 +1539,7 @@ mod tests {
         let recall = recalls.try_recv().unwrap();
         assert_eq!(recall.fh, Bytes::from_static(b"fh"));
         assert_eq!(recall.stateid, [0x62; 16]);
-        assert!(!recall.truncate);
+        assert!(recall.flush);
         assert_eq!(service.state().stats().recalls_received, 1);
     }
 
@@ -1815,6 +1836,83 @@ mod tests {
             }
         );
         assert!(state.healthy());
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn revoked_delegation_is_discarded_without_retrying_the_return() {
+        assert!(matches!(
+            decode_delegreturn_response(Bytes::from(compound_error(
+                b"delegreturn",
+                crate::Nfs4ErrorCode::NFS4ERR_ADMIN_REVOKED as u32,
+            ))),
+            Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_ADMIN_REVOKED))
+        ));
+        let nfs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = nfs_listener.local_addr().unwrap();
+        let mux = rpc::StreamMux::connect(server_addr, true).await.unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let service = CallbackService::bind_for(server_addr).await.unwrap();
+        let state = service.state();
+        let worker = CallbackWorker::start(
+            service.take_recall_receiver().unwrap(),
+            rpc,
+            Auth::new_null(),
+            Arc::clone(&state),
+        );
+        state
+            .register_delegation(
+                Bytes::from_static(b"revoked"),
+                DelegationGrant {
+                    kind: DelegationKind::Read,
+                    stateid: [0x73; 16],
+                    recall: true,
+                },
+                12,
+                None,
+            )
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = nfs_listener.accept().await.unwrap();
+            let delegreturn = read_record(&mut stream).await.unwrap().unwrap();
+            nfs_reply(
+                &mut stream,
+                &delegreturn,
+                &compound_error(
+                    b"delegreturn",
+                    crate::Nfs4ErrorCode::NFS4ERR_ADMIN_REVOKED as u32,
+                ),
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err()
+            );
+        });
+
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.stats().returns_completed + state.stats().returns_failed == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            state.stats(),
+            crate::CallbackStats {
+                recalls_received: 1,
+                returns_completed: 1,
+                returns_failed: 0,
+            }
+        );
+        assert!(!state.is_current(&RecallNotification {
+            fh: Bytes::from_static(b"revoked"),
+            stateid: [0x73; 16],
+            generation: 12,
+            flush: false,
+        }));
         worker.stop().await;
     }
 }
