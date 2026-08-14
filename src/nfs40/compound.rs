@@ -95,6 +95,17 @@ impl CallbackAddress<'static> {
     };
 }
 
+impl<'a> CallbackAddress<'a> {
+    pub(crate) fn tcp(addr: &'a str, ident: u32) -> Self {
+        Self {
+            program: super::callback::CB_PROGRAM,
+            netid: "tcp",
+            addr,
+            ident,
+        }
+    }
+}
+
 impl CompoundBuilder {
     pub(crate) fn new(tag: &str) -> Self {
         Self {

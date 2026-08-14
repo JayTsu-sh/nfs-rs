@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::callback::CallbackService;
 use super::compound::{
     CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
@@ -48,6 +49,7 @@ struct Mount40 {
     locks: Arc<LockState>,
     lease: Arc<LeaseState>,
     _renewal: Option<LeaseRenewal>,
+    _callback: Option<CallbackService>,
     dircount: u32,
     maxcount: u32,
     rsize: u32,
@@ -103,12 +105,27 @@ pub(crate) async fn mount(args: &MountArgs) -> Result<Box<dyn Mount>> {
 async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result<Mount40> {
     let mux = rpc::StreamMux::connect(addr, args.noresvport).await?;
     let rpc = rpc::Client::new(mux, None);
+    let callback = if args.retain_delegations {
+        Some(CallbackService::bind_for(addr).await?)
+    } else {
+        None
+    };
+    let callback_addr = callback
+        .as_ref()
+        .map(|service| service.universal_addr().to_string());
     let identity_rpc = rpc.clone();
     let identity_auth = auth.clone();
     let identity_config = ClientIdentity::new();
     let identity_for_task = identity_config.clone();
+    let callback_for_task = callback_addr.clone();
     let identity = tokio::spawn(async move {
-        establish_identity(&identity_rpc, &identity_auth, &identity_for_task).await
+        establish_identity(
+            &identity_rpc,
+            &identity_auth,
+            &identity_for_task,
+            callback_for_task.as_deref(),
+        )
+        .await
     });
     let client_id = identity
         .await
@@ -155,6 +172,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         state: Arc::clone(&state),
         locks: Arc::clone(&locks),
         lease: Arc::clone(&lease),
+        callback_addr,
     };
     let recovery: RecoveryHandler = Arc::new(move || {
         let context = recovery_context.clone();
@@ -180,6 +198,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         locks,
         lease,
         _renewal: Some(renewal),
+        _callback: callback,
         dircount: args.dircount,
         maxcount: args.maxcount,
         rsize: args.rsize,
@@ -216,12 +235,16 @@ async fn establish_identity(
     rpc: &rpc::Client,
     auth: &Auth,
     identity: &ClientIdentity,
+    callback_addr: Option<&str>,
 ) -> Result<u64> {
+    let callback = callback_addr
+        .map(|addr| CallbackAddress::tcp(addr, 1))
+        .unwrap_or(CallbackAddress::DISABLED);
     let identity_request = CompoundBuilder::new("identity")
         .setclientid(SetClientIdArgs {
             verifier: identity.verifier,
             owner: identity.owner.as_bytes(),
-            callback: CallbackAddress::DISABLED,
+            callback,
         })
         .encode_with_header(auth);
     let identity_response = rpc
@@ -253,11 +276,18 @@ struct RecoveryContext {
     state: Arc<OpenState>,
     locks: Arc<LockState>,
     lease: Arc<LeaseState>,
+    callback_addr: Option<String>,
 }
 
 impl RecoveryContext {
     async fn recover(&self) -> Result<()> {
-        let renewed_client_id = establish_identity(&self.rpc, &self.auth, &self.identity).await?;
+        let renewed_client_id = establish_identity(
+            &self.rpc,
+            &self.auth,
+            &self.identity,
+            self.callback_addr.as_deref(),
+        )
+        .await?;
         self.client_id.store(renewed_client_id, Ordering::Release);
         self.lease.mark_reclaiming();
 
@@ -1901,6 +1931,7 @@ mod tests {
             locks: Arc::new(LockState::default()),
             lease: LeaseState::ready(1, 60),
             _renewal: None,
+            _callback: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -1955,6 +1986,7 @@ mod tests {
             locks: Arc::new(LockState::default()),
             lease,
             _renewal: Some(renewal),
+            _callback: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -2454,6 +2486,7 @@ mod tests {
             state: Arc::clone(&state),
             locks: Arc::clone(&locks),
             lease: Arc::clone(&lease),
+            callback_addr: None,
         };
         let recovery: RecoveryHandler = Arc::new(move || {
             let context = context.clone();
@@ -2478,6 +2511,7 @@ mod tests {
             locks,
             lease,
             _renewal: Some(renewal),
+            _callback: None,
             dircount: 8192,
             maxcount: 32768,
             rsize: 1_048_576,
@@ -2639,6 +2673,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover()
         .await
@@ -2724,6 +2759,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         };
         context.recover().await.unwrap();
         server.await.unwrap().unwrap();
@@ -2805,6 +2841,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover()
         .await
@@ -2857,6 +2894,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         };
         let error = context.recover_or_lose().await.unwrap_err();
         let outcome = error.operation_outcome().unwrap();
@@ -2917,6 +2955,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover_or_lose()
         .await
@@ -2974,6 +3013,7 @@ mod tests {
             state: Arc::clone(&mount.state),
             locks: Arc::clone(&mount.locks),
             lease: Arc::clone(&mount.lease),
+            callback_addr: None,
         }
         .recover_or_lose()
         .await
@@ -3198,6 +3238,66 @@ mod tests {
         mount.null().await.unwrap();
         server.await.unwrap().unwrap();
         mount.umount().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_delegations_publish_callback_before_setclientid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            assert!(
+                identity.windows(3).any(|value| value == b"tcp"),
+                "SETCLIENTID did not publish a ready TCP callback listener"
+            );
+            let netid = identity
+                .windows(3)
+                .position(|value| value == b"tcp")
+                .expect("TCP netid missing");
+            let addr_len_offset = netid + 4;
+            let addr_len = u32::from_be_bytes(
+                identity[addr_len_offset..addr_len_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let universal =
+                std::str::from_utf8(&identity[addr_len_offset + 4..addr_len_offset + 4 + addr_len])
+                    .unwrap();
+            let fields: Vec<_> = universal.split('.').collect();
+            assert_eq!(fields.len(), 6, "invalid callback universal address");
+            let callback_addr = format!(
+                "{}.{}.{}.{}:{}",
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4].parse::<u16>().unwrap() * 256 + fields[5].parse::<u16>().unwrap()
+            );
+            TcpStream::connect(callback_addr).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let args = crate::MountArgs {
+            versions: vec![NFSVersion::NFSv4p0],
+            host: "127.0.0.1".to_string(),
+            dirpath: "/export".to_string(),
+            mountport: 0,
+            nfsport: addr.port(),
+            uid: 0,
+            gid: 0,
+            dircount: 32 * 1024,
+            maxcount: 32 * 1024,
+            rsize: 0,
+            wsize: 0,
+            noresvport: true,
+            retain_delegations: true,
+        };
+
+        let error = mount_on_addr(addr, &args, Auth::new_null())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NfsError::Rpc(_) | NfsError::Io(_)));
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
