@@ -13,7 +13,7 @@ use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
     CallbackAddress, CompoundBuilder, NewLockArgs, OpenArgs, OpenReclaimArgs, SetClientIdArgs,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
-    decode_confirm_response, decode_create_response,
+    decode_confirm_response, decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
     decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
@@ -616,6 +616,28 @@ impl Mount40 {
                 stateid = decode_stateid_response(response, 20, "OPEN_CONFIRM")
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
+            }
+            if callback_state.is_none()
+                && let Some(delegation) = opened.delegation
+            {
+                let return_rpc = rpc.clone();
+                let return_auth = auth.clone();
+                let return_fh = fh.clone();
+                tokio::spawn(async move {
+                    let response = return_rpc
+                        .call(
+                            CompoundBuilder::new("delegreturn")
+                                .putfh(&return_fh)
+                                .delegreturn(&delegation.stateid)
+                                .encode_with_header(&return_auth),
+                            ReplayPolicy::ONE_ATTEMPT,
+                            METADATA_TIMEOUT,
+                        )
+                        .await;
+                    if let Ok(response) = response {
+                        let _ = decode_delegreturn_response(response);
+                    }
+                });
             }
             let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "open")?;
@@ -2037,6 +2059,28 @@ mod tests {
         compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
     }
 
+    fn open_result_with_read_delegation(
+        stateid: [u8; 16],
+        delegation: [u8; 16],
+        fh: &[u8],
+    ) -> Vec<u8> {
+        let mut open = Vec::new();
+        open.extend_from_slice(&stateid);
+        open.extend_from_slice(&[0; 20]);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&1u32.to_be_bytes());
+        open.extend_from_slice(&delegation);
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        open.extend_from_slice(&0u32.to_be_bytes());
+        xdr_opaque(&mut open, b"");
+        let mut getfh = Vec::new();
+        xdr_opaque(&mut getfh, fh);
+        compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
+    }
+
     async fn connected_direct_mount(listener: &TcpListener) -> Arc<Mount40> {
         let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
             .await
@@ -3175,6 +3219,38 @@ mod tests {
         let lane = mount.state.by_owner(owner).await.unwrap();
         assert_eq!(lane.lock().await.stateid, [0x62; 16]);
         assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_retention_returns_an_unsolicited_delegation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
+            )
+            .await?;
+            let delegreturn =
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .expect("unsolicited delegation was not returned")?;
+            assert!(delegreturn.windows(16).any(|value| value == [0x71; 16]));
+            reply(
+                &mut stream,
+                &delegreturn,
+                &compound_result("delegreturn", &[(22, &[]), (8, &[])]),
+            )
+            .await
+        });
+        mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .await
+            .unwrap();
         server.await.unwrap().unwrap();
     }
 
