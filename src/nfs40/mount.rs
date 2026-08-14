@@ -3558,6 +3558,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_public_io_survives_a_lost_callback_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
+        let rpc = rpc::Client::new(mux, None);
+        let callback = CallbackService::bind_for(addr).await.unwrap();
+        let callback_addr = callback.universal_addr().to_string();
+        let callback_state = callback.state();
+        let recalls = callback.take_recall_receiver().unwrap();
+        let worker = CallbackWorker::start(
+            recalls,
+            rpc.clone(),
+            Auth::new_null(),
+            Arc::clone(&callback_state),
+        );
+        let mount = Arc::new(Mount40 {
+            rpc,
+            auth: Auth::new_null(),
+            root_fh: Bytes::from_static(b"root"),
+            client_id: Arc::new(AtomicU64::new(7)),
+            issuer: 9,
+            next_owner: AtomicU64::new(1),
+            state: Arc::new(OpenState::default()),
+            locks: Arc::new(LockState::default()),
+            lease: LeaseState::ready(1, 60),
+            _renewal: None,
+            _callback: Some(callback),
+            _callback_worker: Some(worker),
+            callback_state: Some(callback_state),
+            dircount: 8192,
+            maxcount: 32768,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
+        });
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
+            )
+            .await?;
+            for _ in 0..6 {
+                let request = read_record(&mut stream).await?;
+                let (tag, result) = if request.windows(11).any(|part| part == b"delegreturn") {
+                    (
+                        "delegreturn",
+                        compound_result("delegreturn", &[(22, &[]), (8, &[])]),
+                    )
+                } else if request.windows(5).any(|part| part == b"write") {
+                    let data = [
+                        4u32.to_be_bytes().as_slice(),
+                        2u32.to_be_bytes().as_slice(),
+                        [0x33; 8].as_slice(),
+                    ]
+                    .concat();
+                    ("write", compound_result("write", &[(22, &[]), (38, &data)]))
+                } else if request.windows(6).any(|part| part == b"commit") {
+                    (
+                        "commit",
+                        compound_result("commit", &[(22, &[]), (5, &[0x33; 8])]),
+                    )
+                } else if request.windows(4).any(|part| part == b"read") {
+                    let mut data = 1u32.to_be_bytes().to_vec();
+                    xdr_opaque(&mut data, b"data");
+                    ("read", compound_result("read", &[(22, &[]), (25, &data)]))
+                } else {
+                    (
+                        "close",
+                        compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
+                    )
+                };
+                let _ = tag;
+                reply(&mut stream, &request, &result).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let opened = mount
+            .open(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+            .await
+            .unwrap();
+        let fields = callback_addr
+            .split('.')
+            .map(|field| field.parse::<u16>().unwrap())
+            .collect::<Vec<_>>();
+        let callback_socket = SocketAddr::from((
+            [
+                fields[0] as u8,
+                fields[1] as u8,
+                fields[2] as u8,
+                fields[3] as u8,
+            ],
+            fields[4] * 256 + fields[5],
+        ));
+        let mut words = vec![
+            77,
+            0,
+            2,
+            super::super::callback::CB_PROGRAM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        words.extend_from_slice(&[0, 0, 1, 1, 4]);
+        words.extend_from_slice(&[0x7171_7171; 4]);
+        words.extend_from_slice(&[0, 12]);
+        words.extend(
+            b"delegated-fh"
+                .chunks_exact(4)
+                .map(|word| u32::from_be_bytes(word.try_into().unwrap())),
+        );
+        let call = words
+            .iter()
+            .flat_map(|word| word.to_be_bytes())
+            .collect::<Vec<_>>();
+        let mut first = TcpStream::connect(callback_socket).await.unwrap();
+        first
+            .write_u32(0x8000_0000 | call.len() as u32)
+            .await
+            .unwrap();
+        first.write_all(&call).await.unwrap();
+        drop(first);
+        let mut retry = TcpStream::connect(callback_socket).await.unwrap();
+        retry
+            .write_u32(0x8000_0000 | call.len() as u32)
+            .await
+            .unwrap();
+        retry.write_all(&call).await.unwrap();
+        let marker = retry.read_u32().await.unwrap();
+        let mut reply_body = vec![0; (marker & 0x7fff_ffff) as usize];
+        retry.read_exact(&mut reply_body).await.unwrap();
+        assert_eq!(u32::from_be_bytes(reply_body[0..4].try_into().unwrap()), 77);
+        for _ in 0..100 {
+            if mount.callback_stats().await.returns_completed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mount.callback_stats().await.returns_completed, 1);
+        assert_eq!(
+            mount
+                .write(opened.fh.clone(), 0, Bytes::from_static(b"data"))
+                .await
+                .unwrap(),
+            4
+        );
+        mount.commit(opened.fh.clone(), 0, 4).await.unwrap();
+        assert_eq!(
+            mount.read(opened.fh.clone(), 0, 4).await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+        mount.close(opened.fh).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_after_setclientid_detaches_while_confirm_settles() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
