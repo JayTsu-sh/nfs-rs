@@ -24,6 +24,7 @@ const CALLBACK_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
 const CALLBACK_REPLAY_CACHE_SIZE: usize = 128;
+const MAX_CALLBACK_OPERATIONS: u32 = 64;
 
 pub(crate) struct CallbackService {
     universal_addr: String,
@@ -808,6 +809,15 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
             &[],
         ));
     }
+    if operation_count > MAX_CALLBACK_OPERATIONS {
+        return Ok(compound_result(
+            10018,
+            &body[4..4 + padded_tag],
+            tag_len,
+            0,
+            &[],
+        ));
+    }
     let mut cursor = operations_offset;
     let mut results = Vec::new();
     let mut status = 0u32;
@@ -919,9 +929,9 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
                 results.extend_from_slice(&4u32.to_be_bytes());
                 results.extend_from_slice(&status.to_be_bytes());
             }
-            _ => {
+            illegal_opcode => {
                 status = 10044;
-                results.extend_from_slice(&10044u32.to_be_bytes());
+                results.extend_from_slice(&illegal_opcode.to_be_bytes());
                 results.extend_from_slice(&status.to_be_bytes());
             }
         }
@@ -929,7 +939,7 @@ fn compound_reply(body: &[u8], state: &CallbackState) -> Result<Vec<u8>> {
             break;
         }
     }
-    if cursor != body.len() {
+    if status == 0 && cursor != body.len() {
         return Err(NfsError::Xdr("CB_COMPOUND has trailing data".into()));
     }
     Ok(compound_result(
@@ -1259,6 +1269,32 @@ mod tests {
             assert_eq!(reply[8], u32::from_be_bytes(*b"tag\0"));
             assert_eq!(reply[9], 0);
         }
+    }
+
+    #[tokio::test]
+    async fn cb_compound_bounds_operations_and_reports_the_illegal_opcode() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
+            .await
+            .unwrap();
+
+        let mut excessive = cb_null_call(17);
+        excessive[5] = 1;
+        excessive.extend_from_slice(&[0, 0, 1, MAX_CALLBACK_OPERATIONS + 1]);
+        assert_eq!(
+            round_trip(&mut stream, &excessive).await,
+            [17, 1, 0, 0, 0, 0, 10018, 0, 0]
+        );
+
+        let mut illegal = cb_null_call(18);
+        illegal[5] = 1;
+        illegal.extend_from_slice(&[0, 0, 1, 1, 99]);
+        assert_eq!(
+            round_trip(&mut stream, &illegal).await,
+            [18, 1, 0, 0, 0, 0, 10044, 0, 1, 99, 10044]
+        );
     }
 
     #[tokio::test]
