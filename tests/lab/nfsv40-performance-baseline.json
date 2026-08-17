@@ -17,7 +17,7 @@
   "workloads": [
     {"name": "small-single", "throughput_mib_s": 0.7840314656, "write_p95_latency_ms": 1.042859, "workload_p95_latency_ms": 5.411107, "peak_rss_kib": 7384},
     {"name": "small-multi", "throughput_mib_s": 2.3683386712, "write_p95_latency_ms": 1.288771, "workload_p95_latency_ms": 7.295981, "peak_rss_kib": 10044},
-    {"name": "large-single", "throughput_mib_s": 23.6271566952, "write_p95_latency_ms": 1.779627, "workload_p95_latency_ms": 675.383420, "peak_rss_kib": 55204},
+    {"name": "large-single", "throughput_mib_s": 23.6271566952, "write_p95_latency_ms": 1.779627, "workload_p95_latency_ms": 675.383420, "peak_rss_kib": 60120},
     {"name": "large-multi", "throughput_mib_s": 50.1852594833, "write_p95_latency_ms": 3.150631, "workload_p95_latency_ms": 1277.751722, "peak_rss_kib": 253552}
   ]
 }
