@@ -334,6 +334,7 @@ fn nfsv40_performance_gate_rejects_regressions() {
         "workloads": baseline["workloads"].clone(),
     });
     current["workloads"][0]["throughput_mib_s"] = serde_json::json!(0.0);
+    current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
     fs::write(
         &current_path,
         serde_json::to_vec(&current).expect("encode current report"),
@@ -349,6 +350,9 @@ fn nfsv40_performance_gate_rejects_regressions() {
     let diagnostic = String::from_utf8(output.stderr).expect("UTF-8 performance diagnostic");
     for field in ["baseline=", "actual=", "limit=", "regression_percent="] {
         assert!(diagnostic.contains(field), "diagnostic lacks {field}: {diagnostic}");
+    }
+    for metric in ["throughput_mib_s", "workload_p95_latency_ms"] {
+        assert!(diagnostic.contains(metric), "diagnostic lacks {metric}: {diagnostic}");
     }
     current["workloads"] = baseline["workloads"].clone();
     current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
