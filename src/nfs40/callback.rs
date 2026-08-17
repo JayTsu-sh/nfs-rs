@@ -1599,7 +1599,13 @@ mod tests {
                 0x1516_1718,
             ]
         );
-        service.state().mark_attributes_unknown(b"fh").unwrap();
+        assert!(
+            !service
+                .state()
+                .mark_attributes_unknown(b"not-delegated")
+                .unwrap()
+        );
+        assert!(service.state().mark_attributes_unknown(b"fh").unwrap());
         assert_eq!(
             round_trip(&mut stream, &call).await,
             [29, 1, 0, 0, 0, 0, 10008, 0, 1, 3, 10008]

@@ -4,9 +4,12 @@ use futures::stream;
 use futures::stream::TryStreamExt as _;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
@@ -41,6 +44,48 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
 const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
 const MAX_CONCURRENT_RECLAIMS: usize = 16;
+
+struct DetachedSettlement<T: 'static> {
+    future: Option<Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>>,
+}
+
+impl<T: 'static> DetachedSettlement<T> {
+    fn new(future: impl Future<Output = Result<T>> + Send + 'static) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+        }
+    }
+}
+
+impl<T: 'static> Future for DetachedSettlement<T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(future) = self.future.as_mut() else {
+            return Poll::Ready(Err(NfsError::Rpc(
+                "NFSv4.0 settlement polled after completion".into(),
+            )));
+        };
+        let result = future.as_mut().poll(context);
+        if result.is_ready() {
+            self.future = None;
+        }
+        result
+    }
+}
+
+impl<T: 'static> Drop for DetachedSettlement<T> {
+    fn drop(&mut self) {
+        let Some(future) = self.future.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _ = future.await;
+            }));
+        }
+    }
+}
 
 fn decode_callback_attributes(mut data: Bytes) -> Result<(u64, u64)> {
     let (bitmap, mut values) = decode_fattr4_envelope(&mut data, "delegation getattr")?;
@@ -188,7 +233,8 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         )
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
-    let lease_time = query_lease_time(&rpc, &auth, &root_fh).await?;
+    let (lease_time, rsize, wsize) =
+        query_mount_parameters(&rpc, &auth, &root_fh, args.rsize, args.wsize).await?;
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
     let issuer = rand::random();
@@ -249,17 +295,23 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         callback_state,
         dircount: args.dircount,
         maxcount: args.maxcount,
-        rsize: args.rsize,
-        wsize: args.wsize,
+        rsize,
+        wsize,
     })
 }
 
-async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Result<u32> {
+async fn query_mount_parameters(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    root_fh: &Bytes,
+    requested_rsize: u32,
+    requested_wsize: u32,
+) -> Result<(u32, u32, u32)> {
     let response = rpc
         .call(
             CompoundBuilder::new("lease-time")
                 .putfh(root_fh)
-                .getattr(&[1 << 10])
+                .getattr(&[(1 << 10) | (1 << 30) | (1 << 31)])
                 .encode_with_header(auth),
             SAFE_REPLAY,
             METADATA_TIMEOUT,
@@ -267,7 +319,7 @@ async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Re
         .await?;
     let mut attrs = decode_getattr_compound(response)?;
     let (bitmap, mut values) = decode_fattr4_envelope(&mut attrs, "lease_time")?;
-    if !fattr4_has(&bitmap, 10) || values.remaining() != 4 {
+    if !fattr4_has(&bitmap, 10) || values.remaining() < 4 {
         return Err(NfsError::Xdr(
             "NFSv4.0 lease_time response is missing or malformed".into(),
         ));
@@ -276,7 +328,25 @@ async fn query_lease_time(rpc: &rpc::Client, auth: &Auth, root_fh: &Bytes) -> Re
     if seconds == 0 {
         return Err(NfsError::Xdr("NFSv4.0 lease_time is zero".into()));
     }
-    Ok(seconds)
+    let server_maxread = if fattr4_has(&bitmap, 30) {
+        take_u64_attr(&mut values, "maxread")?
+    } else {
+        u64::MAX
+    };
+    let server_maxwrite = if fattr4_has(&bitmap, 31) {
+        take_u64_attr(&mut values, "maxwrite")?
+    } else {
+        u64::MAX
+    };
+    ensure_attr_values_consumed(&values, "mount parameters")?;
+    let rsize = server_maxread.min(u64::from(requested_rsize)) as u32;
+    let wsize = server_maxwrite.min(u64::from(requested_wsize)) as u32;
+    if rsize == 0 || wsize == 0 {
+        return Err(NfsError::Xdr(
+            "NFSv4.0 MAXREAD and MAXWRITE produced a zero effective I/O size".into(),
+        ));
+    }
+    Ok((seconds, rsize, wsize))
 }
 
 async fn establish_identity(
@@ -348,6 +418,7 @@ impl RecoveryContext {
         )
         .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
             let mut open = lane.lock().await;
+            let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
             let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
             let response = self
                 .rpc
@@ -408,6 +479,7 @@ impl RecoveryContext {
                         NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
                     })?;
                     let mut open = open_lane.lock().await;
+                    let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
                     let mut lock = lane.lock().await;
                     let response = self
                         .rpc
@@ -676,6 +748,7 @@ impl Mount40 {
                     fh: fh.clone(),
                     access,
                     write_verifier: None,
+                    io_fence: Arc::new(tokio::sync::RwLock::new(())),
                     closing: false,
                 })
                 .await;
@@ -761,7 +834,7 @@ impl Mount40 {
         let lease = Arc::clone(&self.lease);
         let callback_state = self.callback_state.clone();
         tokio::spawn(async move {
-            let close_fh = {
+            let (close_fh, io_fence) = {
                 let mut lane = lane.lock().await;
                 if lane.closing {
                     return Err(NfsError::InvalidInput(
@@ -769,8 +842,9 @@ impl Mount40 {
                     ));
                 }
                 lane.closing = true;
-                lane.fh.clone()
+                (lane.fh.clone(), Arc::clone(&lane.io_fence))
             };
+            let _in_flight_settled = io_fence.write_owned().await;
             let io_guard = if let Some(callback_state) = &callback_state {
                 Some(callback_state.recall_io(&close_fh).await)
             } else {
@@ -1856,24 +1930,48 @@ impl Mount for Mount40 {
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
-        let (stateid, expected_generation) = if let Some(lane) = lane {
-            let generation = self.lease.begin_stateful("read")?;
-            (lane.lock().await.stateid, Some(generation))
-        } else {
-            ([0; 16], None)
+        let Some(lane) = lane else {
+            let request = CompoundBuilder::new("read")
+                .putfh(&fh)
+                .read(&[0; 16], offset, count)
+                .encode_with_header(&self.auth);
+            return decode_read_response(
+                self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                    .await?,
+            );
         };
-        let request = CompoundBuilder::new("read")
-            .putfh(&fh)
-            .read(&stateid, offset, count)
-            .encode_with_header(&self.auth);
-        let response = self
-            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
-            .await?;
-        let data = decode_read_response(response)?;
-        if let Some(generation) = expected_generation {
-            self.lease.finish_stateful(generation, "read")?;
-        }
-        Ok(data)
+        let expected_generation = self.lease.begin_stateful("read")?;
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let lease = Arc::clone(&self.lease);
+        let settled = DetachedSettlement::new(async move {
+            let _callback_io = io_guard;
+            let (stateid, _in_flight) = {
+                let guard = lane.lock().await;
+                if guard.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is closing or closed".into(),
+                    ));
+                }
+                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
+                (guard.stateid, in_flight)
+            };
+            let request = CompoundBuilder::new("read")
+                .putfh(&fh)
+                .read(&stateid, offset, count)
+                .encode_with_header(&auth);
+            let data =
+                decode_read_response(rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?)?;
+            lease.finish_stateful(expected_generation, "read")?;
+            Ok::<_, NfsError>(data)
+        })
+        .await?;
+        Ok(settled)
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
         let expected_generation = self.lease.begin_stateful("write")?;
@@ -1890,29 +1988,33 @@ impl Mount for Mount40 {
         } else {
             None
         };
-        if let Some(callback_state) = &self.callback_state {
-            callback_state.mark_attributes_unknown(&fh)?;
-        }
+        let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?
+        } else {
+            false
+        };
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
+        let lease = Arc::clone(&self.lease);
         let lane_for_settlement = Arc::clone(&lane);
         let fh_for_settlement = fh.clone();
-        let settled = tokio::spawn(async move {
+        let settled = DetachedSettlement::new(async move {
             let _io_guard = io_guard;
-            // The lane guard spans request construction through reply decoding.
-            // CLOSE takes the same guard, so cancellation cannot reorder CLOSE
-            // ahead of a detached WRITE settlement.
-            let guard = lane_for_settlement.lock().await;
+            let (stateid, owner, next_seqid, _in_flight) = {
+                let guard = lane_for_settlement.lock().await;
+                if guard.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is closing or closed".into(),
+                    ));
+                }
+                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
+                (guard.stateid, guard.owner, guard.next_seqid, in_flight)
+            };
             let request = CompoundBuilder::new("write")
                 .putfh(&fh_for_settlement)
-                .write_header(&guard.stateid, offset, 2, data.len() as u32)
+                .write_header(&stateid, offset, 2, data.len() as u32)
                 .encode_with_header(&auth);
-            let (class, ctx) = context(
-                "write",
-                guard.owner,
-                guard.next_seqid,
-                OperationClass::ReplaySensitive,
-            );
+            let (class, ctx) = context("write", owner, next_seqid, OperationClass::ReplaySensitive);
             let response = rpc
                 .call_with_data(
                     request,
@@ -1930,7 +2032,7 @@ impl Mount for Mount40 {
                     .commit(offset, count)
                     .encode_with_header(&auth);
                 let (commit_class, commit_ctx) =
-                    context("commit", guard.owner, 0, OperationClass::ReplaySensitive);
+                    context("commit", owner, 0, OperationClass::ReplaySensitive);
                 let commit_response = rpc
                     .call(commit_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                     .await
@@ -1943,17 +2045,17 @@ impl Mount for Mount40 {
                     return Err(verifier_changed_error());
                 }
             }
-            drop(guard);
+            lease.finish_stateful(expected_generation, "write")?;
             Ok::<_, NfsError>((count, data))
         })
-        .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 write task failed: {error}")))??;
+        .await?;
         let (count, data) = settled;
         if count > data.len() as u32 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
-        self.lease.finish_stateful(expected_generation, "write")?;
-        self.refresh_callback_attributes(&fh).await;
+        if refresh_delegation_attributes {
+            self.refresh_callback_attributes(&fh).await;
+        }
         Ok(count)
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
@@ -2760,6 +2862,7 @@ mod tests {
                 fh: Bytes::from_static(b"fh"),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                io_fence: Arc::new(tokio::sync::RwLock::new(())),
                 closing: false,
             })
             .await;
@@ -3724,8 +3827,16 @@ mod tests {
             let lease_time = read_record(&mut first).await?;
             let mut attrs = Vec::new();
             attrs.extend_from_slice(&1u32.to_be_bytes());
-            attrs.extend_from_slice(&(1u32 << 10).to_be_bytes());
-            xdr_opaque(&mut attrs, &60u32.to_be_bytes());
+            attrs.extend_from_slice(
+                &((1u32 << 10) | (1u32 << 30) | (1u32 << 31)).to_be_bytes(),
+            );
+            let values = [
+                60u32.to_be_bytes().as_slice(),
+                65536u64.to_be_bytes().as_slice(),
+                32768u64.to_be_bytes().as_slice(),
+            ]
+            .concat();
+            xdr_opaque(&mut attrs, &values);
             reply(
                 &mut first,
                 &lease_time,
@@ -3752,12 +3863,14 @@ mod tests {
             gid: 0,
             dircount: 32 * 1024,
             maxcount: 32 * 1024,
-            rsize: 0,
-            wsize: 0,
+            rsize: 1_048_576,
+            wsize: 1_048_576,
             noresvport: true,
             retain_delegations: false,
         };
         let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
+        assert_eq!(mount.get_max_read_size(), 65536);
+        assert_eq!(mount.get_max_write_size(), 32768);
         assert_eq!(mount.root_fh, Bytes::from_static(b"scripted-fh"));
         mounted.notify_one();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3870,7 +3983,8 @@ mod tests {
                 &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
             )
             .await?;
-            for _ in 0..6 {
+            let mut operations = Vec::new();
+            for _ in 0..5 {
                 let request = read_record(&mut stream).await?;
                 let (tag, result) = if request.windows(11).any(|part| part == b"delegreturn") {
                     (
@@ -3900,10 +4014,10 @@ mod tests {
                         compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
                     )
                 };
-                let _ = tag;
+                operations.push(tag);
                 reply(&mut stream, &request, &result).await?;
             }
-            Ok::<(), std::io::Error>(())
+            Ok::<_, std::io::Error>(operations)
         });
 
         let opened = mount
@@ -3984,7 +4098,10 @@ mod tests {
             Bytes::from_static(b"data")
         );
         mount.close(opened.fh).await.unwrap();
-        server.await.unwrap().unwrap();
+        assert_eq!(
+            server.await.unwrap().unwrap(),
+            ["delegreturn", "write", "commit", "read", "close"]
+        );
     }
 
     #[tokio::test]
@@ -4718,6 +4835,7 @@ mod tests {
                 fh: Bytes::from_static(fh),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                io_fence: Arc::new(tokio::sync::RwLock::new(())),
                 closing: false,
             })
             .await;
@@ -5119,6 +5237,196 @@ mod tests {
             mount.lock(Bytes::from_static(b"fh-b"), 2, 0, 1),
         );
         assert!(a.is_ok() && b.is_ok());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_open_file_writes_use_rpc_xids_without_owner_lane_serialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 66, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let second = tokio::time::timeout(Duration::from_millis(250), read_record(&mut stream))
+                .await
+                .map_err(|_| {
+                    std::io::Error::other("second WRITE was serialized behind the first reply")
+                })??;
+            let write_result = [
+                1u32.to_be_bytes().as_slice(),
+                2u32.to_be_bytes().as_slice(),
+                [0x71; 8].as_slice(),
+            ]
+            .concat();
+            reply(
+                &mut stream,
+                &second,
+                &compound_result("write", &[(22, &[]), (38, &write_result)]),
+            )
+            .await?;
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("write", &[(22, &[]), (38, &write_result)]),
+            )
+            .await
+        });
+
+        let (first, second) = tokio::join!(
+            mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
+            mount.write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
+        );
+        assert_eq!(first.unwrap(), 1);
+        assert_eq!(second.unwrap(), 1);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_in_flight_read_to_settle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 67, b"fh").await;
+        let (read_seen_tx, read_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            let _ = read_seen_tx.send(());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "CLOSE overtook an in-flight READ"
+            );
+            let mut read_result = 1u32.to_be_bytes().to_vec();
+            xdr_opaque(&mut read_result, b"x");
+            reply(
+                &mut stream,
+                &read,
+                &compound_result("read", &[(22, &[]), (25, &read_result)]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x98; 16])]),
+            )
+            .await
+        });
+
+        let reading_mount = Arc::clone(&mount);
+        let read =
+            tokio::spawn(async move { reading_mount.read(Bytes::from_static(b"fh"), 0, 1).await });
+        read_seen_rx.await.unwrap();
+        let close = mount.close(Bytes::from_static(b"fh"));
+        let (read, close) = tokio::join!(read, close);
+        assert_eq!(read.unwrap().unwrap(), Bytes::from_static(b"x"));
+        close.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_keeps_its_close_fence_until_rpc_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 69, b"fh").await;
+        let (read_seen_tx, read_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            let _ = read_seen_tx.send(());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "CLOSE overtook a cancelled READ that was still settling"
+            );
+            let mut read_result = 1u32.to_be_bytes().to_vec();
+            xdr_opaque(&mut read_result, b"x");
+            reply(
+                &mut stream,
+                &read,
+                &compound_result("read", &[(22, &[]), (25, &read_result)]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x9a; 16])]),
+            )
+            .await
+        });
+
+        let reading_mount = Arc::clone(&mount);
+        let read =
+            tokio::spawn(async move { reading_mount.read(Bytes::from_static(b"fh"), 0, 1).await });
+        read_seen_rx.await.unwrap();
+        read.abort();
+        let _ = read.await;
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_concurrent_writes_to_settle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 68, b"fh").await;
+        let (writes_seen_tx, writes_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let second = read_record(&mut stream).await?;
+            let _ = writes_seen_tx.send(());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "CLOSE overtook concurrent WRITEs"
+            );
+            let write_result = [
+                1u32.to_be_bytes().as_slice(),
+                2u32.to_be_bytes().as_slice(),
+                [0x72; 8].as_slice(),
+            ]
+            .concat();
+            for write in [&second, &first] {
+                reply(
+                    &mut stream,
+                    write,
+                    &compound_result("write", &[(22, &[]), (38, &write_result)]),
+                )
+                .await?;
+            }
+            let close = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x99; 16])]),
+            )
+            .await
+        });
+
+        let first_mount = Arc::clone(&mount);
+        let first = tokio::spawn(async move {
+            first_mount
+                .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
+                .await
+        });
+        let second_mount = Arc::clone(&mount);
+        let second = tokio::spawn(async move {
+            second_mount
+                .write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
+                .await
+        });
+        writes_seen_rx.await.unwrap();
+        let close = mount.close(Bytes::from_static(b"fh"));
+        let (first, second, close) = tokio::join!(first, second, close);
+        assert_eq!(first.unwrap().unwrap(), 1);
+        assert_eq!(second.unwrap().unwrap(), 1);
+        close.unwrap();
         server.await.unwrap().unwrap();
     }
 
