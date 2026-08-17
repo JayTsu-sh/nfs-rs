@@ -143,14 +143,17 @@ fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
         "vers=4.0",
         "findmnt",
         "trap cleanup EXIT INT TERM",
-        "NFS_RS_LAB_V40_LIF_A",
-        "NFS_RS_LAB_V40_LIF_B",
+        "NFS_RS_LAB_KERNEL_V40_SERVER_A",
+        "NFS_RS_LAB_KERNEL_V40_SERVER_B",
+        "LAB_NFS41_EXPORT",
         "sha256sum",
         "flock",
     ] {
         assert!(runner.contains(required), "kernel NFSv4.0 runner lacks {required}");
     }
     assert!(!runner.contains("rm -rf"));
+    assert!(!runner.contains("10.128.61.200"));
+    assert!(!runner.contains("10.128.61.201"));
     assert!(nightly.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
     assert!(release.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
 }

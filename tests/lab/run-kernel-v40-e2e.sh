@@ -6,11 +6,11 @@ source "$(dirname "$0")/common.sh"
 run_id="${1:?usage: run-kernel-v40-e2e.sh RUN_ID}"
 validate_run_id "$run_id"
 
-lif_a="${NFS_RS_LAB_V40_LIF_A:-10.128.61.200}"
-lif_b="${NFS_RS_LAB_V40_LIF_B:-10.128.61.201}"
-export_path="${NFS_RS_LAB_V40_EXPORT:-/nfsrs_v40_test}"
-validate_ipv4 "$lif_a"
-validate_ipv4 "$lif_b"
+server_a="${NFS_RS_LAB_KERNEL_V40_SERVER_A:-$LAB_SOURCE_DATA}"
+server_b="${NFS_RS_LAB_KERNEL_V40_SERVER_B:-$LAB_DEST_DATA}"
+export_path="${NFS_RS_LAB_KERNEL_V40_EXPORT:-$LAB_NFS41_EXPORT}"
+validate_ipv4 "$server_a"
+validate_ipv4 "$server_b"
 validate_export_path "$export_path"
 
 mount_a="$(mktemp -d /tmp/nfsrs-kernel-v40-a.XXXXXX)"
@@ -47,9 +47,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-sudo -n "$mount_helper" mount-a "$mount_a" "$lif_a" "$export_path"
+sudo -n "$mount_helper" mount-a "$mount_a" "$server_a" "$export_path"
 mounted_a=true
-sudo -n "$mount_helper" mount-b "$mount_b" "$lif_b" "$export_path"
+sudo -n "$mount_helper" mount-b "$mount_b" "$server_b" "$export_path"
 mounted_b=true
 
 for mountpoint in "$mount_a" "$mount_b"; do
@@ -95,4 +95,4 @@ if command -v getfacl >/dev/null 2>&1; then
   getfacl -cp "$test_dir_b/renamed.bin" | grep -q '^user::rw-'
 fi
 
-echo "kernel NFSv4.0 E2E passed for $lif_a,$lif_b:$export_path"
+echo "kernel NFSv4.0 E2E passed for $server_a,$server_b:$export_path"

@@ -5,8 +5,8 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Role | Management | Data | Services |
 |---|---|---|---|
 | Controller | 10.131.9.11 | 10.10.1.11 | GitHub Actions Runner |
-| Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.1, RustFS |
-| Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.1, RustFS |
+| Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
+| Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
 | NetApp pNFS MDS | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y` |
 | NetApp pNFS DS | — | 10.128.56.161 | Independent NFSv4.1 data LIF |
