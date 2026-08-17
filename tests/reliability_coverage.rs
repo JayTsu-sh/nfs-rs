@@ -339,13 +339,17 @@ fn nfsv40_performance_gate_rejects_regressions() {
         serde_json::to_vec(&current).expect("encode current report"),
     )
     .expect("write current report");
-    let status = Command::new("python3")
+    let output = Command::new("python3")
         .arg(workspace_path("tests/lab/check-nfsv40-performance.py"))
         .arg(&baseline_path)
         .arg(&current_path)
-        .status()
+        .output()
         .expect("run performance checker");
-    assert!(!status.success(), "regressed performance was accepted");
+    assert!(!output.status.success(), "regressed performance was accepted");
+    let diagnostic = String::from_utf8(output.stderr).expect("UTF-8 performance diagnostic");
+    for field in ["baseline=", "actual=", "limit=", "regression_percent="] {
+        assert!(diagnostic.contains(field), "diagnostic lacks {field}: {diagnostic}");
+    }
     current["workloads"] = baseline["workloads"].clone();
     current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
     fs::write(
@@ -365,6 +369,32 @@ fn nfsv40_performance_gate_rejects_regressions() {
     );
     fs::remove_file(current_path).expect("remove current report");
     fs::remove_dir(temp).expect("remove temporary gate directory");
+}
+
+#[test]
+fn nfsv40_evidence_preserves_raw_performance_report_on_gate_failure() {
+    let temp = std::env::temp_dir().join(format!("nfsrs-perf-evidence-{}", std::process::id()));
+    let records = temp.join("records");
+    let output = temp.join("output");
+    let performance = temp.join("performance.json");
+    fs::create_dir_all(&records).expect("create empty evidence records");
+    fs::write(&performance, br#"{"liveness":"pass","workloads":[]}"#)
+        .expect("write raw performance report");
+    let status = Command::new("bash")
+        .arg(workspace_path("tests/lab/collect-nfsv40-release-evidence.sh"))
+        .arg("nightly-evidence-preservation")
+        .arg(&output)
+        .env("NFS_RS_LAB_V40_EVIDENCE_DIR", &records)
+        .env("NFS_RS_LAB_V40_PERF_OUTPUT", &performance)
+        .env("NFS_RS_LAB_V40_EVIDENCE_COMMIT", "test-commit")
+        .status()
+        .expect("run incomplete evidence collection");
+    assert!(!status.success(), "incomplete evidence unexpectedly passed");
+    assert_eq!(
+        fs::read(output.join("performance-report.json")).expect("preserved performance report"),
+        fs::read(&performance).expect("source performance report"),
+    );
+    fs::remove_dir_all(temp).expect("remove evidence test directory");
 }
 
 #[test]

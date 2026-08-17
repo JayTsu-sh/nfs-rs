@@ -15,6 +15,13 @@ lif_a="${NFS_RS_LAB_V40_LIF_A:-10.128.61.200}"
 lif_b="${NFS_RS_LAB_V40_LIF_B:-10.128.61.201}"
 export_path="${NFS_RS_LAB_V40_EXPORT:-/nfsrs_v40_test}"
 
+# Preserve the raw measurement before validating the rest of the evidence. A
+# performance-gate failure stops the matrix before cleanup records are written,
+# but the measured values are still essential failure evidence.
+if [[ -f "$performance" ]]; then
+  cp "$performance" "$output/performance-report.json"
+fi
+
 required=(semantic callback-fault lease-fault performance cleanup grace-reclaim)
 for name in "${required[@]}"; do
   if [[ ! -f "$source_dir/$name.json" || ! -f "$source_dir/$name.log" ]]; then
@@ -23,8 +30,10 @@ for name in "${required[@]}"; do
   fi
   cp "$source_dir/$name.json" "$source_dir/$name.log" "$output/"
 done
-[[ -f "$performance" ]] || { echo "missing required NFSv4.0 performance report" >&2; exit 1; }
-cp "$performance" "$output/performance-report.json"
+[[ -f "$output/performance-report.json" ]] || {
+  echo "missing required NFSv4.0 performance report" >&2
+  exit 1
+}
 
 RUN_ID="$run_id" COMMIT="$commit" LIF_A="$lif_a" LIF_B="$lif_b" \
 EXPORT_PATH="$export_path" python3 - "$output" "${required[@]}" <<'PY'
