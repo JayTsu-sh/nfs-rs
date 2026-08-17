@@ -34,7 +34,10 @@ for reference in baseline["workloads"]:
     throughput_floor = reference["throughput_mib_s"] * (
         1 - thresholds["throughput_regression_percent"] / 100
     )
-    latency_ceiling = reference["p95_latency_ms"] * (
+    latency_ceiling = reference["write_p95_latency_ms"] * (
+        1 + thresholds["p95_latency_regression_percent"] / 100
+    )
+    workload_latency_ceiling = reference["workload_p95_latency_ms"] * (
         1 + thresholds["p95_latency_regression_percent"] / 100
     )
     rss_ceiling = reference["peak_rss_kib"] * (
@@ -42,8 +45,10 @@ for reference in baseline["workloads"]:
     )
     if result["throughput_mib_s"] < throughput_floor:
         fail(f"{reference['name']}: throughput regression exceeds budget")
-    if result["p95_latency_ms"] > latency_ceiling:
-        fail(f"{reference['name']}: p95 latency regression exceeds budget")
+    if result["write_p95_latency_ms"] > latency_ceiling:
+        fail(f"{reference['name']}: write p95 latency regression exceeds budget")
+    if result["workload_p95_latency_ms"] > workload_latency_ceiling:
+        fail(f"{reference['name']}: workload p95 latency regression exceeds budget")
     if result["peak_rss_kib"] > rss_ceiling:
         fail(f"{reference['name']}: peak RSS regression exceeds budget")
 

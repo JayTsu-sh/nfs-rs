@@ -250,7 +250,7 @@ fn nfsv40_performance_gate_covers_four_workload_quadrants() {
             .expect("NFSv4.0 performance baseline readable"),
     )
     .expect("NFSv4.0 performance baseline valid JSON");
-    assert_eq!(baseline["schema_version"], 1);
+    assert_eq!(baseline["schema_version"], 2);
     assert_eq!(baseline["thresholds"]["throughput_regression_percent"], 15);
     assert_eq!(baseline["thresholds"]["p95_latency_regression_percent"], 20);
     let names = baseline["workloads"]
@@ -267,7 +267,8 @@ fn nfsv40_performance_gate_covers_four_workload_quadrants() {
         .expect("performance checker readable");
     for required in [
         "throughput_mib_s",
-        "p95_latency_ms",
+        "write_p95_latency_ms",
+        "workload_p95_latency_ms",
         "peak_rss_kib",
         "liveness",
     ] {
@@ -300,6 +301,23 @@ fn nfsv40_performance_gate_rejects_regressions() {
         .status()
         .expect("run performance checker");
     assert!(!status.success(), "regressed performance was accepted");
+    current["workloads"] = baseline["workloads"].clone();
+    current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
+    fs::write(
+        &current_path,
+        serde_json::to_vec(&current).expect("encode workload latency regression"),
+    )
+    .expect("write workload latency regression");
+    let status = Command::new("python3")
+        .arg(workspace_path("tests/lab/check-nfsv40-performance.py"))
+        .arg(&baseline_path)
+        .arg(&current_path)
+        .status()
+        .expect("run workload latency checker");
+    assert!(
+        !status.success(),
+        "regressed workload p95 latency was accepted"
+    );
     fs::remove_file(current_path).expect("remove current report");
     fs::remove_dir(temp).expect("remove temporary gate directory");
 }

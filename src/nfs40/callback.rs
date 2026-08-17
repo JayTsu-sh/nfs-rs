@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, watch};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::error::{NfsError, Result};
@@ -25,6 +25,8 @@ const CALLBACK_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
 const CALLBACK_REPLAY_CACHE_SIZE: usize = 128;
 const MAX_CALLBACK_OPERATIONS: u32 = 64;
+const MAX_CALLBACK_CONNECTIONS: usize = 32;
+const CALLBACK_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct CallbackService {
     universal_addr: String,
@@ -127,6 +129,7 @@ impl CallbackService {
             replies: Mutex::new(VecDeque::new()),
         });
         let service_state = Arc::clone(&state);
+        let connection_slots = Arc::new(Semaphore::new(MAX_CALLBACK_CONNECTIONS));
         let (stop, mut stopping) = watch::channel(false);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -146,8 +149,13 @@ impl CallbackService {
                             drop(stream);
                             continue;
                         }
+                        let Ok(slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
                         let state = Arc::clone(&service_state);
                         connections.spawn(async move {
+                            let _slot = slot;
                             let _ = serve_connection(stream, state).await;
                         });
                     }
@@ -564,8 +572,24 @@ async fn serve_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<CallbackState>,
 ) -> Result<()> {
+    serve_connection_with_idle_timeout(&mut stream, state, CALLBACK_CONNECTION_IDLE_TIMEOUT).await
+}
+
+async fn serve_connection_with_idle_timeout(
+    stream: &mut tokio::net::TcpStream,
+    state: Arc<CallbackState>,
+    idle_timeout: Duration,
+) -> Result<()> {
     loop {
-        let Some(call) = read_record(&mut stream).await? else {
+        let Some(call) = tokio::time::timeout(idle_timeout, read_record(stream))
+            .await
+            .map_err(|_| {
+                NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "NFSv4.0 callback connection idle timeout",
+                ))
+            })??
+        else {
             return Ok(());
         };
         let reply = handle_rpc_call(&call, &state)?;
@@ -1177,6 +1201,54 @@ mod tests {
         let mut byte = [0; 1];
         assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_callback_connection_is_closed_at_its_deadline() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = service.state();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            serve_connection_with_idle_timeout(&mut stream, state, Duration::from_millis(20)).await
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(error, NfsError::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut));
+        let mut byte = [0; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn callback_service_rejects_connections_above_its_bound() {
+        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+            .await
+            .unwrap();
+        let address = socket_addr(service.universal_addr());
+        let mut retained = Vec::new();
+        for xid in 0..MAX_CALLBACK_CONNECTIONS {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            assert_eq!(
+                round_trip(&mut stream, &cb_null_call(xid as u32)).await,
+                [xid as u32, 1, 0, 0, 0, 0]
+            );
+            retained.push(stream);
+        }
+
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+            .await
+            .expect("excess callback connection was not rejected")
+            .unwrap();
+        assert_eq!(read, 0);
+        drop(retained);
+        service.stop().await;
     }
 
     #[tokio::test]

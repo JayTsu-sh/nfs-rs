@@ -596,10 +596,14 @@ async fn reader_loop(
                 // Connection broken: fail all pending requests.
                 if let Ok(mut map) = pending.lock() {
                     for (_, tx) in map.drain() {
-                        let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            e.to_string(),
-                        ))));
+                        let error = match &e {
+                            NfsError::Rpc(message) => NfsError::Rpc(message.clone()),
+                            _ => NfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                e.to_string(),
+                            )),
+                        };
+                        let _ = tx.send(Err(error));
                     }
                 }
                 break;
@@ -690,6 +694,13 @@ async fn read_one_response(reader: &mut BufReader<OwnedReadHalf>) -> Result<(u32
                 break;
             }
         }
+    }
+
+    if buf.len() < std::mem::size_of::<u32>() {
+        return Err(NfsError::Rpc(format!(
+            "RPC record size {} is shorter than XID",
+            buf.len()
+        )));
     }
 
     let xid = BigEndian::read_u32(&buf[0..4]);
@@ -1121,6 +1132,66 @@ mod tests {
             .await?;
         stream.write_all(&reply).await?;
         stream.write_all(payload).await
+    }
+
+    #[tokio::test]
+    async fn short_rpc_records_are_rejected_without_panicking() {
+        for payload_len in 0..4usize {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream
+                    .write_u32(0x8000_0000 | payload_len as u32)
+                    .await
+                    .unwrap();
+                stream.write_all(&vec![0xa5; payload_len]).await.unwrap();
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (reader, _) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+
+            let error = read_one_response(&mut reader)
+                .await
+                .expect_err("an RPC record without an XID must be rejected");
+            assert!(
+                matches!(error, NfsError::Rpc(ref message) if message.contains("shorter than XID")),
+                "short RPC record must produce a framing error, got: {error}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_call_preserves_short_rpc_record_as_a_protocol_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_test_record(&mut stream).await.unwrap();
+            stream.write_u32(0x8000_0003).await.unwrap();
+            stream.write_all(&[0xa5; 3]).await.unwrap();
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        let client = Client::new(mux, None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        let error = client
+            .call(
+                body,
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("short record must fail the pending RPC call");
+        assert!(
+            matches!(error, NfsError::Rpc(ref message) if message.contains("shorter than XID")),
+            "RPC framing type was not preserved: {error}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
