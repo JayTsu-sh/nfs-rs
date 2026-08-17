@@ -1459,16 +1459,22 @@ impl Mount for Mount40 {
             .putfh(&fh)
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
-        let response = self
-            .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
-            .await?;
-        let mut data = decode_getattr_compound(response)?;
-        acl::decode_getattr_acl(&mut data)
+        let result = async {
+            let response = self
+                .activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+                .await?;
+            let mut data = decode_getattr_compound(response)?;
+            acl::decode_getattr_acl(&mut data)
+        }
+        .await;
+        acl::attrnotsupp_as_unsupported("GETACL", result)
     }
     async fn setacl(&self, fh: Bytes, acl_value: &mount::Acl) -> Result<()> {
         let (bitmap, values) = acl::encode_setattr_acl(acl_value);
-        self.set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
-            .await
+        let result = self
+            .set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
+            .await;
+        acl::attrnotsupp_as_unsupported("SETACL", result)
     }
     async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
         let bitmap = [1 << 13];
@@ -4013,6 +4019,103 @@ mod tests {
             mount.getacl(Bytes::from_static(b"file")).await.unwrap(),
             expected
         );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn getacl_attrnotsupp_is_per_call_and_preserves_aclsupport() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let support_request = read_record(&mut stream).await?;
+            let mut getattr = Vec::new();
+            getattr.extend_from_slice(&1u32.to_be_bytes());
+            getattr.extend_from_slice(&(1u32 << 13).to_be_bytes());
+            xdr_opaque(&mut getattr, &mount::AclSupport::ALLOW.to_be_bytes());
+            reply(
+                &mut stream,
+                &support_request,
+                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
+            )
+            .await?;
+            let request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &request,
+                &failed_lock_result("getacl", 9, 10032),
+            )
+            .await?;
+            let support_request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &support_request,
+                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
+            )
+            .await?;
+            let request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &request,
+                &failed_lock_result("getacl", 9, 10032),
+            )
+            .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        assert_eq!(
+            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
+            mount::AclSupport(mount::AclSupport::ALLOW)
+        );
+        let first = mount.getacl(Bytes::from_static(b"file")).await.unwrap_err();
+        assert!(matches!(first, NfsError::Unsupported(_)));
+        assert!(mount.capabilities().acl);
+        assert_eq!(
+            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
+            mount::AclSupport(mount::AclSupport::ALLOW)
+        );
+        let second = mount
+            .getacl(Bytes::from_static(b"other"))
+            .await
+            .unwrap_err();
+        assert!(matches!(second, NfsError::Unsupported(_)));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setacl_attrnotsupp_does_not_suppress_a_later_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &request,
+                &failed_lock_result("setacl", 34, 10032),
+            )
+            .await?;
+            let request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &request,
+                &failed_lock_result("setacl", 34, 10032),
+            )
+            .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let first = mount
+            .setacl(Bytes::from_static(b"file"), &mount::Acl::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(first, NfsError::Unsupported(_)));
+        assert!(mount.capabilities().acl);
+        let second = mount
+            .setacl(Bytes::from_static(b"other"), &mount::Acl::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(second, NfsError::Unsupported(_)));
         server.await.unwrap().unwrap();
     }
 

@@ -12,7 +12,8 @@ impl Mount41 {
         let bitmap: [u32; 1] = [1 << 12]; // FATTR4_ACL
         let resp = self
             .compound("getacl", |b| b.putfh(&fh).getattr(&bitmap))
-            .await?;
+            .await;
+        let resp = acl::attrnotsupp_as_unsupported("GETACL", resp)?;
         resp.op_ok(1)?; // PUTFH
         let getattr = resp.op_ok(2)?;
         let mut data = getattr.data.clone();
@@ -28,7 +29,8 @@ impl Mount41 {
             .compound("setacl", |b| {
                 b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
             })
-            .await?;
+            .await;
+        let resp = acl::attrnotsupp_as_unsupported("SETACL", resp)?;
         resp.op_ok(1)?; // PUTFH
         let setattr_op = resp
             .results

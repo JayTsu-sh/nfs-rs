@@ -338,12 +338,34 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             acl_support.supports(nfs_rs::AclSupport::ALLOW),
             format!("NFSv4.0 ACLSUPPORT omitted ALLOW through {url}"),
         )?;
-        let original_acl = mount.getacl(created_file.fh.clone()).await?;
-        mount.setacl(created_file.fh.clone(), &original_acl).await?;
-        ensure(
-            mount.getacl(created_file.fh.clone()).await? == original_acl,
-            format!("NFSv4.0 ACL round trip mismatch through {url}"),
-        )?;
+        match mount.getacl(created_file.fh.clone()).await {
+            Ok(original_acl) => match mount.setacl(created_file.fh.clone(), &original_acl).await {
+                Ok(()) => ensure(
+                    mount.getacl(created_file.fh.clone()).await? == original_acl,
+                    format!("NFSv4.0 ACL round trip mismatch through {url}"),
+                )?,
+                Err(NfsError::Unsupported(_)) => ensure(
+                    mount.capabilities().acl
+                        && mount
+                            .aclsupport(created_file.fh.clone())
+                            .await?
+                            .supports(nfs_rs::AclSupport::ALLOW),
+                    format!(
+                        "NFSv4.0 SETACL rejection incorrectly disabled readable ACL capability through {url}"
+                    ),
+                )?,
+                Err(error) => return Err(error.into()),
+            },
+            Err(NfsError::Unsupported(_)) => ensure(
+                mount.capabilities().acl
+                    && mount
+                        .aclsupport(created_file.fh.clone())
+                        .await?
+                        .supports(nfs_rs::AclSupport::ALLOW),
+                format!("NFSv4.0 GETACL rejection incorrectly changed ACLSUPPORT through {url}"),
+            )?,
+            Err(error) => return Err(error.into()),
+        }
         ensure(
             !mount.capabilities().named_attributes
                 && matches!(

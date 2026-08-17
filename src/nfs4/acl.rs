@@ -10,6 +10,20 @@ use super::attrs::{decode_getattr_envelope, decode_utf8str};
 use crate::error::{NfsError, Result};
 use crate::mount::{AceFlags, AceMask, AceType, Acl, AclSupport, NfsAce};
 
+/// Translate an operation-local FATTR4_ACL rejection without caching it.
+/// ATTRNOTSUPP can depend on the object or ACL contents, while ACLSUPPORT is
+/// independently a per-filesystem set of supported ACE types.
+pub(crate) fn attrnotsupp_as_unsupported<T>(operation: &str, result: Result<T>) -> Result<T> {
+    match result {
+        Err(NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ATTRNOTSUPP)) => {
+            Err(NfsError::Unsupported(format!(
+                "{operation} is unavailable for this request: server returned NFS4ERR_ATTRNOTSUPP"
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Maximum number of ACEs we'll decode from a single response.
 /// Prevents unbounded allocation from a malformed server response.
 const MAX_ACES: usize = 8192;
