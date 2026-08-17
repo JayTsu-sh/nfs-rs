@@ -131,6 +131,31 @@ fn lab_capability_probe_is_read_only() {
 }
 
 #[test]
+fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-kernel-v40-e2e.sh"))
+        .expect("kernel NFSv4.0 runner must be readable");
+    let nightly = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    let release = fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
+        .expect("release workflow must be readable");
+
+    for required in [
+        "vers=4.0",
+        "findmnt",
+        "trap cleanup EXIT INT TERM",
+        "NFS_RS_LAB_V40_LIF_A",
+        "NFS_RS_LAB_V40_LIF_B",
+        "sha256sum",
+        "flock",
+    ] {
+        assert!(runner.contains(required), "kernel NFSv4.0 runner lacks {required}");
+    }
+    assert!(!runner.contains("rm -rf"));
+    assert!(nightly.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
+    assert!(release.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
+}
+
+#[test]
 fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
