@@ -3827,9 +3827,7 @@ mod tests {
             let lease_time = read_record(&mut first).await?;
             let mut attrs = Vec::new();
             attrs.extend_from_slice(&1u32.to_be_bytes());
-            attrs.extend_from_slice(
-                &((1u32 << 10) | (1u32 << 30) | (1u32 << 31)).to_be_bytes(),
-            );
+            attrs.extend_from_slice(&((1u32 << 10) | (1u32 << 30) | (1u32 << 31)).to_be_bytes());
             let values = [
                 60u32.to_be_bytes().as_slice(),
                 65536u64.to_be_bytes().as_slice(),
