@@ -11,6 +11,10 @@ pub(crate) struct OwnerLane {
     pub fh: Bytes,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
+    /// Fences the owner once CLOSE has started. NFSv4.0 CLOSE is a modifying
+    /// operation and must never be issued twice when the first outcome may be
+    /// uncertain.
+    pub closing: bool,
 }
 
 #[derive(Debug)]
@@ -213,6 +217,7 @@ mod tests {
                         crate::OPEN_WRITE
                     },
                     write_verifier: None,
+                    closing: false,
                 })
                 .await;
         }

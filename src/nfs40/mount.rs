@@ -40,6 +40,7 @@ const NFS4_DEFAULT_PORT: u16 = 2049;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
 const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
+const MAX_CONCURRENT_RECLAIMS: usize = 16;
 
 fn decode_callback_attributes(mut data: Bytes) -> Result<(u64, u64)> {
     let (bitmap, mut values) = decode_fattr4_envelope(&mut data, "delegation getattr")?;
@@ -345,7 +346,7 @@ impl RecoveryContext {
                 .into_iter()
                 .map(Ok::<_, NfsError>),
         )
-        .try_for_each_concurrent(None, |lane| async move {
+        .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
             let mut open = lane.lock().await;
             let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
             let response = self
@@ -397,7 +398,7 @@ impl RecoveryContext {
             lock_groups.entry(open_owner).or_default().push(lane);
         }
         stream::iter(lock_groups.into_values().map(Ok::<_, NfsError>))
-            .try_for_each_concurrent(None, |lanes| async move {
+            .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lanes| async move {
                 for lane in lanes {
                     let (open_owner, old_stateid) = {
                         let lock = lane.lock().await;
@@ -664,27 +665,42 @@ impl Mount40 {
                     .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 next_seqid += 1;
             }
+            // OPEN has succeeded on the server. Track it before any follow-up
+            // delegation work so a failed DELEGRETURN remains closeable and
+            // reclaimable instead of becoming an orphaned server-side state.
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid,
+                    stateid,
+                    fh: fh.clone(),
+                    access,
+                    write_verifier: None,
+                    closing: false,
+                })
+                .await;
             if callback_state.is_none()
                 && let Some(delegation) = opened.delegation
             {
-                let return_rpc = rpc.clone();
-                let return_auth = auth.clone();
-                let return_fh = fh.clone();
-                tokio::spawn(async move {
-                    let response = return_rpc
-                        .call(
-                            CompoundBuilder::new("delegreturn")
-                                .putfh(&return_fh)
-                                .delegreturn(&delegation.stateid)
-                                .encode_with_header(&return_auth),
-                            ReplayPolicy::ONE_ATTEMPT,
-                            METADATA_TIMEOUT,
-                        )
-                        .await;
-                    if let Ok(response) = response {
-                        let _ = decode_delegreturn_response(response);
-                    }
-                });
+                let (class, ctx) = context(
+                    "delegreturn-after-open",
+                    owner,
+                    next_seqid,
+                    OperationClass::ReplaySensitive,
+                );
+                let response = rpc
+                    .call(
+                        CompoundBuilder::new("delegreturn")
+                            .putfh(&fh)
+                            .delegreturn(&delegation.stateid)
+                            .encode_with_header(&auth),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        METADATA_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                decode_delegreturn_response(response)
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
             }
             let delegation_attributes = if callback_state.is_some()
                 && matches!(
@@ -700,16 +716,6 @@ impl Mount40 {
             };
             let _publication = lease.publication_guard().await;
             lease.finish_stateful(expected_generation, "open")?;
-            state
-                .register(OwnerLane {
-                    owner,
-                    next_seqid,
-                    stateid,
-                    fh: fh.clone(),
-                    access,
-                    write_verifier: None,
-                })
-                .await;
             if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
                 callback_state.register_delegation(
                     fh.clone(),
@@ -749,16 +755,27 @@ impl Mount40 {
 
     async fn close_lane(&self, lane: Arc<tokio::sync::Mutex<OwnerLane>>) -> Result<()> {
         let expected_generation = self.lease.begin_stateful("close")?;
-        let close_fh = lane.lock().await.fh.clone();
-        let io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.recall_io(&close_fh).await)
-        } else {
-            None
-        };
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
+        let lease = Arc::clone(&self.lease);
+        let callback_state = self.callback_state.clone();
         tokio::spawn(async move {
+            let close_fh = {
+                let mut lane = lane.lock().await;
+                if lane.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is already closing or closed".into(),
+                    ));
+                }
+                lane.closing = true;
+                lane.fh.clone()
+            };
+            let io_guard = if let Some(callback_state) = &callback_state {
+                Some(callback_state.recall_io(&close_fh).await)
+            } else {
+                None
+            };
             let _io_guard = io_guard;
             let mut lane = lane.lock().await;
             let request = CompoundBuilder::new("close")
@@ -782,11 +799,11 @@ impl Mount40 {
             let fh = lane.fh.clone();
             drop(lane);
             state.remove(owner, &fh).await;
+            lease.finish_stateful(expected_generation, "close")?;
             Ok::<_, NfsError>(())
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 close task failed: {error}")))??;
-        self.lease.finish_stateful(expected_generation, "close")?;
         Ok(())
     }
 
@@ -2737,6 +2754,7 @@ mod tests {
                 fh: Bytes::from_static(b"fh"),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                closing: false,
             })
             .await;
         let locks = Arc::new(LockState::default());
@@ -3030,6 +3048,164 @@ mod tests {
             callback_addr: None,
         };
         context.recover().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_bounds_concurrent_open_reclaims() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        for owner in 100..117 {
+            register_scripted_open(&mount, owner, b"fh").await;
+        }
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let identity_data = [31u64.to_be_bytes().as_slice(), &[0x7c; 8]].concat();
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+
+            let mut first_window = Vec::new();
+            for _ in 0..16 {
+                first_window.push(read_record(&mut stream).await?);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "recovery exceeded its 16-owner concurrency bound"
+            );
+            for request in first_window {
+                reply(&mut stream, &request, &open_result(0, [0x88; 16], b"fh")).await?;
+            }
+            let final_request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &final_request,
+                &open_result(0, [0x89; 16], b"fh"),
+            )
+            .await
+        });
+        mount.lease.mark_recovering();
+        RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5c; 8],
+                owner: "bounded-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        }
+        .recover()
+        .await
+        .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_bounds_concurrent_lock_owner_reclaims() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        for owner in 200..217u64 {
+            register_scripted_open(&mount, owner, b"fh").await;
+            register_scripted_lock(&mount, owner, [owner as u8; 16]).await;
+        }
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let identity_data = [32u64.to_be_bytes().as_slice(), &[0x7d; 8]].concat();
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+
+            let mut open_window = Vec::new();
+            for _ in 0..MAX_CONCURRENT_RECLAIMS {
+                open_window.push(read_record(&mut stream).await?);
+            }
+            for (index, request) in open_window.into_iter().enumerate() {
+                reply(
+                    &mut stream,
+                    &request,
+                    &open_result(0, [index as u8; 16], b"fh"),
+                )
+                .await?;
+            }
+            let final_open = read_record(&mut stream).await?;
+            reply(&mut stream, &final_open, &open_result(0, [0xf0; 16], b"fh")).await?;
+
+            let mut lock_window = Vec::new();
+            for _ in 0..MAX_CONCURRENT_RECLAIMS {
+                lock_window.push(read_record(&mut stream).await?);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "recovery exceeded its lock-owner concurrency bound"
+            );
+            for (index, request) in lock_window.into_iter().enumerate() {
+                reply(
+                    &mut stream,
+                    &request,
+                    &compound_result(
+                        "reclaim-lock",
+                        &[(22, &[]), (12, &[(index as u8).wrapping_add(1); 16])],
+                    ),
+                )
+                .await?;
+            }
+            let final_lock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &final_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0xf1; 16])]),
+            )
+            .await
+        });
+        mount.lease.mark_recovering();
+        RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x5d; 8],
+                owner: "bounded-lock-reclaim".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        }
+        .recover()
+        .await
+        .unwrap();
         server.await.unwrap().unwrap();
     }
 
@@ -3442,6 +3618,50 @@ mod tests {
             .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
             .await
             .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_retention_reports_unsolicited_delegreturn_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
+            )
+            .await?;
+            let delegreturn = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &delegreturn,
+                &failed_lock_result("delegreturn", 8, 10006),
+            )
+            .await?;
+            let close = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .map_err(|_| std::io::Error::other("OPEN state was not retained for CLOSE"))??;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
+            )
+            .await
+        });
+
+        let error = mount
+            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .await
+            .expect_err("OPEN must not publish a delegation the client failed to return");
+        assert!(matches!(error, NfsError::Nfs4(_)) || error.operation_outcome().is_some());
+        mount
+            .close(Bytes::from_static(b"delegated-fh"))
+            .await
+            .expect("failed DELEGRETURN must retain a closeable OPEN state");
+        assert!(mount.state.snapshot().await.is_empty());
         server.await.unwrap().unwrap();
     }
 
@@ -4395,6 +4615,7 @@ mod tests {
                 fh: Bytes::from_static(fh),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
+                closing: false,
             })
             .await;
     }
@@ -4831,5 +5052,87 @@ mod tests {
         );
         assert!(a.is_ok() && b.is_ok());
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_public_closes_emit_one_wire_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 64, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &first,
+                &compound_result("close", &[(22, &[]), (4, &[0x96; 16])]),
+            )
+            .await?;
+            Ok::<bool, std::io::Error>(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_ok(),
+            )
+        });
+
+        let fh = Bytes::from_static(b"fh");
+        let (first, second) = tokio::join!(mount.close(fh.clone()), mount.close(fh));
+        assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
+        let rejected = if first.is_err() { first } else { second }.unwrap_err();
+        assert!(
+            matches!(rejected, NfsError::InvalidInput(ref message) if message.contains("closing or closed")),
+            "the losing close must receive a typed local error: {rejected}"
+        );
+        assert!(!server.await.unwrap().unwrap(), "CLOSE was emitted twice");
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_waiting_for_recall_gate_still_settles() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let callback = CallbackService::bind_for(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let callback_state = callback.state();
+        let mut mount = direct_mount(rpc::Client::new(mux, None));
+        Arc::get_mut(&mut mount).unwrap().callback_state = Some(Arc::clone(&callback_state));
+        register_scripted_open(&mount, 65, b"fh").await;
+        let io_guard = callback_state
+            .foreground_io(&Bytes::from_static(b"fh"))
+            .await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream))
+                .await
+                .map_err(|_| std::io::Error::other("cancelled CLOSE was never settled"))??;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x97; 16])]),
+            )
+            .await
+        });
+
+        let closing_mount = Arc::clone(&mount);
+        let close =
+            tokio::spawn(async move { closing_mount.close(Bytes::from_static(b"fh")).await });
+        tokio::task::yield_now().await;
+        close.abort();
+        let _ = close.await;
+        drop(io_guard);
+        server.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if mount.state.snapshot().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled CLOSE did not remove settled owner state");
+        callback.stop().await;
     }
 }
