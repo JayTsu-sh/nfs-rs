@@ -20,6 +20,12 @@ test_dir_a="$mount_a/$test_name"
 test_dir_b="$mount_b/$test_name"
 mounted_a=false
 mounted_b=false
+mount_helper="${NFS_RS_LAB_KERNEL_V40_MOUNT_HELPER:-/usr/local/sbin/nfsrs-lab-kernel-v40-mount}"
+
+[[ -x "$mount_helper" ]] || {
+  echo "missing privileged kernel NFSv4.0 mount helper: $mount_helper" >&2
+  exit 1
+}
 
 cleanup() {
   status=$?
@@ -33,21 +39,19 @@ cleanup() {
     rmdir "$test_dir_b"
   fi
   if [[ "$mounted_b" == true ]]; then
-    sudo -n umount "$mount_b"
+    sudo -n "$mount_helper" umount "$mount_b"
   fi
   if [[ "$mounted_a" == true ]]; then
-    sudo -n umount "$mount_a"
+    sudo -n "$mount_helper" umount "$mount_a"
   fi
   rmdir "$mount_a" "$mount_b" 2>/dev/null || true
   return "$status"
 }
 trap cleanup EXIT INT TERM
 
-sudo -n mount -t nfs -o vers=4.0,proto=tcp,hard,timeo=600,retrans=2,actimeo=0 \
-  "$lif_a:$export_path" "$mount_a"
+sudo -n "$mount_helper" mount-a "$mount_a" "$lif_a" "$export_path"
 mounted_a=true
-sudo -n mount -t nfs -o vers=4.0,proto=tcp,hard,timeo=600,retrans=2,actimeo=0 \
-  "$lif_b:$export_path" "$mount_b"
+sudo -n "$mount_helper" mount-b "$mount_b" "$lif_b" "$export_path"
 mounted_b=true
 
 for mountpoint in "$mount_a" "$mount_b"; do
