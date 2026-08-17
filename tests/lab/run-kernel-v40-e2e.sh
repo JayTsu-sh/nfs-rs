@@ -31,12 +31,10 @@ cleanup() {
   status=$?
   trap - EXIT INT TERM
   set +e
-  if [[ -d "$test_dir_a" ]]; then
-    find "$test_dir_a" -mindepth 1 -delete
-    rmdir "$test_dir_a"
-  elif [[ -d "$test_dir_b" ]]; then
-    find "$test_dir_b" -mindepth 1 -delete
-    rmdir "$test_dir_b"
+  if [[ "$mounted_a" == true ]] && [[ -d "$test_dir_a" ]]; then
+    sudo -n "$mount_helper" cleanup "$mount_a" "$test_name"
+  elif [[ "$mounted_b" == true ]] && [[ -d "$test_dir_b" ]]; then
+    sudo -n "$mount_helper" cleanup "$mount_b" "$test_name"
   fi
   if [[ "$mounted_b" == true ]]; then
     sudo -n "$mount_helper" umount "$mount_b"
