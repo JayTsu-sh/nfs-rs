@@ -59,7 +59,7 @@ for mountpoint in "$mount_a" "$mount_b"; do
   findmnt -n -o OPTIONS --target "$mountpoint" | tr ',' '\n' | grep -qx 'vers=4.0'
 done
 
-mkdir "$test_dir_a"
+sudo -n "$mount_helper" prepare "$mount_a" "$test_name"
 [[ -d "$test_dir_b" ]]
 
 printf 'nfs-rs kernel NFSv4.0\n' >"$test_dir_a/small.bin"
