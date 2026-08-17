@@ -33,7 +33,8 @@ cleanup() {
   set +e
   if [[ "$mounted_a" == true ]] && [[ -d "$test_dir_a" ]]; then
     sudo -n "$mount_helper" cleanup "$mount_a" "$test_name"
-  elif [[ "$mounted_b" == true ]] && [[ -d "$test_dir_b" ]]; then
+  fi
+  if [[ "$mounted_b" == true ]] && [[ -d "$test_dir_b" ]]; then
     sudo -n "$mount_helper" cleanup "$mount_b" "$test_name"
   fi
   if [[ "$mounted_b" == true ]]; then
@@ -58,41 +59,49 @@ for mountpoint in "$mount_a" "$mount_b"; do
 done
 
 sudo -n "$mount_helper" prepare "$mount_a" "$test_name"
+sudo -n "$mount_helper" prepare "$mount_b" "$test_name"
 [[ -d "$test_dir_b" ]]
 
-printf 'nfs-rs kernel NFSv4.0\n' >"$test_dir_a/small.bin"
-dd if=/dev/urandom of="$test_dir_a/large.bin" bs=1M count=8 status=none
-sync "$test_dir_a/small.bin" "$test_dir_a/large.bin"
-[[ "$(sha256sum "$test_dir_a/small.bin" | cut -d' ' -f1)" == \
-   "$(sha256sum "$test_dir_b/small.bin" | cut -d' ' -f1)" ]]
-[[ "$(sha256sum "$test_dir_a/large.bin" | cut -d' ' -f1)" == \
-   "$(sha256sum "$test_dir_b/large.bin" | cut -d' ' -f1)" ]]
+exercise_server() {
+  local test_dir="$1"
+  local expected_small expected_large
 
-chmod 0640 "$test_dir_a/small.bin"
-touch -m -d '@1700000000' "$test_dir_a/small.bin"
-[[ "$(stat -c '%a' "$test_dir_b/small.bin")" == "640" ]]
-[[ "$(stat -c '%Y' "$test_dir_b/small.bin")" == "1700000000" ]]
+  printf 'nfs-rs kernel NFSv4.0\n' >"$test_dir/small.bin"
+  dd if=/dev/urandom of="$test_dir/large.bin" bs=1M count=8 status=none
+  sync "$test_dir/small.bin" "$test_dir/large.bin"
+  expected_small="$(printf 'nfs-rs kernel NFSv4.0\n' | sha256sum | cut -d' ' -f1)"
+  expected_large="$(sha256sum "$test_dir/large.bin" | cut -d' ' -f1)"
+  [[ "$(sha256sum "$test_dir/small.bin" | cut -d' ' -f1)" == "$expected_small" ]]
+  [[ "$(sha256sum "$test_dir/large.bin" | cut -d' ' -f1)" == "$expected_large" ]]
 
-mv "$test_dir_a/small.bin" "$test_dir_a/renamed.bin"
-ln "$test_dir_a/renamed.bin" "$test_dir_a/hardlink.bin"
-ln -s renamed.bin "$test_dir_a/symlink.bin"
-[[ "$(readlink "$test_dir_b/symlink.bin")" == "renamed.bin" ]]
-[[ "$(stat -c '%i' "$test_dir_b/renamed.bin")" == \
-   "$(stat -c '%i' "$test_dir_b/hardlink.bin")" ]]
+  chmod 0640 "$test_dir/small.bin"
+  touch -m -d '@1700000000' "$test_dir/small.bin"
+  [[ "$(stat -c '%a' "$test_dir/small.bin")" == "640" ]]
+  [[ "$(stat -c '%Y' "$test_dir/small.bin")" == "1700000000" ]]
 
-export test_dir_a
-seq 1 16 | xargs -P 8 -I '{}' sh -c \
-  'dd if=/dev/zero of="$test_dir_a/concurrent-{}.bin" bs=64K count=4 conv=fsync status=none'
-[[ "$(find "$test_dir_b" -maxdepth 1 -type f -name 'concurrent-*.bin' -size 256k | wc -l)" -eq 16 ]]
+  mv "$test_dir/small.bin" "$test_dir/renamed.bin"
+  ln "$test_dir/renamed.bin" "$test_dir/hardlink.bin"
+  ln -s renamed.bin "$test_dir/symlink.bin"
+  [[ "$(readlink "$test_dir/symlink.bin")" == "renamed.bin" ]]
+  [[ "$(stat -c '%i' "$test_dir/renamed.bin")" == \
+     "$(stat -c '%i' "$test_dir/hardlink.bin")" ]]
 
-lock_file="$test_dir_a/lock.bin"
-: >"$lock_file"
-flock "$lock_file" sh -c \
-  'if flock -n "$1" true; then echo "conflicting NFS lock unexpectedly succeeded" >&2; exit 1; fi' \
-  sh "$test_dir_b/lock.bin"
+  export test_dir
+  seq 1 16 | xargs -P 8 -I '{}' sh -c \
+    'dd if=/dev/zero of="$test_dir/concurrent-{}.bin" bs=64K count=4 conv=fsync status=none'
+  [[ "$(find "$test_dir" -maxdepth 1 -type f -name 'concurrent-*.bin' -size 256k | wc -l)" -eq 16 ]]
 
-if command -v getfacl >/dev/null 2>&1; then
-  getfacl -cp "$test_dir_b/renamed.bin" | grep -q '^user::rw-'
-fi
+  : >"$test_dir/lock.bin"
+  flock "$test_dir/lock.bin" sh -c \
+    'if flock -n "$1" true; then echo "conflicting NFS lock unexpectedly succeeded" >&2; exit 1; fi' \
+    sh "$test_dir/lock.bin"
+
+  if command -v getfacl >/dev/null 2>&1; then
+    getfacl -cp "$test_dir/renamed.bin" | grep -q '^user::rw-'
+  fi
+}
+
+exercise_server "$test_dir_a"
+exercise_server "$test_dir_b"
 
 echo "kernel NFSv4.0 E2E passed for $server_a,$server_b:$export_path"
