@@ -134,6 +134,10 @@ fn lab_capability_probe_is_read_only() {
 fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
     let runner = fs::read_to_string(workspace_path("tests/lab/run-kernel-v40-e2e.sh"))
         .expect("kernel NFSv4.0 runner must be readable");
+    let helper = fs::read_to_string(workspace_path(
+        "tests/lab/admin/nfsrs-lab-kernel-v40-mount",
+    ))
+    .expect("kernel NFSv4.0 privileged helper must be readable");
     let nightly = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
     let release = fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
@@ -147,6 +151,10 @@ fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
         "NFS_RS_LAB_KERNEL_V40_SERVER_B",
         "LAB_NFS41_EXPORT",
         "sha256sum",
+        "sha256sum --check",
+        "local_oracle",
+        "concurrent-manifest.sha256",
+        "peer_mount",
         "flock",
     ] {
         assert!(runner.contains(required), "kernel NFSv4.0 runner lacks {required}");
@@ -154,6 +162,15 @@ fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
     assert!(!runner.contains("rm -rf"));
     assert!(!runner.contains("10.128.61.200"));
     assert!(!runner.contains("10.128.61.201"));
+    for required in [
+        "mount-source:10.10.1.12:/srv/nfs/v4",
+        "mount-dest:10.10.1.13:/srv/nfs/v4",
+        "vers=4.0",
+        "validate_test_name",
+    ] {
+        assert!(helper.contains(required), "kernel mount helper lacks {required}");
+    }
+    assert!(!helper.contains("rm -rf"));
     assert!(nightly.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
     assert!(release.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
 }

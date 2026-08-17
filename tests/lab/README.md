@@ -39,6 +39,13 @@ over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,
 directory and file creation, chunked write/commit/read, attributes, READDIR,
 READDIRPLUS, rename, hard links, symbolic links, removal, and unmount.
 
+`run-kernel-v40-e2e.sh` mounts each Linux knfsd export twice with the kernel
+client and exact `vers=4.0`. It verifies independent local-oracle checksums for
+small, large, and concurrent files, cross-mount metadata and namespace
+visibility, and cross-mount lock exclusion. The audited privileged entry point
+is `admin/nfsrs-lab-kernel-v40-mount`; the runner sudo allow-list must expose
+only its installed `/usr/local/sbin/nfsrs-lab-kernel-v40-mount` copy.
+
 The Rust integration test is ignored by default and requires both
 `NFS_RS_LAB_E2E=1` and a whitespace-separated `NFS_RS_LAB_URLS` value. This
 keeps normal CI from accidentally accessing the private lab.

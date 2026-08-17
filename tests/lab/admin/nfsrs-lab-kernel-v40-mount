@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: nfsrs-lab-kernel-v40-mount {mount-source|mount-dest|prepare|cleanup|umount} TARGET [ARGS]" >&2
+  exit 2
+}
+
+[[ $# -ge 2 ]] || usage
+action="$1"
+target="$2"
+[[ "$target" =~ ^/tmp/nfsrs-kernel-v40-(s1|s2|d1|d2)\.[A-Za-z0-9]{6,12}$ ]] || {
+  echo "unsafe mount target: $target" >&2
+  exit 2
+}
+[[ -d "$target" && ! -L "$target" ]] || {
+  echo "mount target is not a directory: $target" >&2
+  exit 2
+}
+
+validate_source() {
+  source="$(findmnt -n -o SOURCE --target "$target")"
+  case "$source" in
+    10.10.1.12:/srv/nfs/v4|10.10.1.13:/srv/nfs/v4) ;;
+    *) echo "unexpected NFS source: $source" >&2; exit 2 ;;
+  esac
+}
+
+validate_test_name() {
+  test_name="$1"
+  [[ "$test_name" =~ ^kernel-v40-(nightly|release)-[A-Za-z0-9._-]{1,80}$ ]] || {
+    echo "unsafe test directory name" >&2
+    exit 2
+  }
+}
+
+case "$action" in
+  mount-source|mount-dest)
+    [[ $# -eq 4 ]] || usage
+    [[ "$(stat -c %U "$target")" == github-runner ]] || {
+      echo "mount target has unexpected owner" >&2
+      exit 2
+    }
+    server="$3"
+    export_path="$4"
+    case "$action:$server:$export_path" in
+      mount-source:10.10.1.12:/srv/nfs/v4|mount-dest:10.10.1.13:/srv/nfs/v4) ;;
+      *) echo "unapproved Linux NFSv4.0 endpoint" >&2; exit 2 ;;
+    esac
+    mountpoint -q "$target" && { echo "target already mounted" >&2; exit 2; }
+    mount -t nfs -o vers=4.0,proto=tcp,hard,timeo=600,retrans=2,actimeo=0 \
+      "$server:$export_path" "$target"
+    ;;
+  prepare)
+    [[ $# -eq 3 ]] || usage
+    validate_source
+    validate_test_name "$3"
+    test_dir="$target/$test_name"
+    [[ ! -e "$test_dir" ]] || { echo "test directory already exists" >&2; exit 2; }
+    mkdir -- "$test_dir"
+    chmod 0777 -- "$test_dir"
+    ;;
+  cleanup)
+    [[ $# -eq 3 ]] || usage
+    validate_source
+    validate_test_name "$3"
+    test_dir="$target/$test_name"
+    if [[ -d "$test_dir" && ! -L "$test_dir" ]]; then
+      find "$test_dir" -mindepth 1 -delete
+      rmdir -- "$test_dir"
+    fi
+    ;;
+  umount)
+    [[ $# -eq 2 ]] || usage
+    validate_source
+    umount "$target"
+    ;;
+  *) usage ;;
+esac
