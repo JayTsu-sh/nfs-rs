@@ -13,6 +13,18 @@ def fail(message):
     raise SystemExit(1)
 
 
+def metric_diagnostic(workload, metric, baseline, actual, limit, direction):
+    if direction == "minimum":
+        regression = (baseline - actual) / baseline * 100
+    else:
+        regression = (actual - baseline) / baseline * 100
+    return (
+        f"{workload}: {metric} regression exceeds budget; "
+        f"baseline={baseline:.6f} actual={actual:.6f} limit={limit:.6f} "
+        f"regression_percent={regression:.2f}"
+    )
+
+
 if len(sys.argv) != 3:
     fail("usage: check-nfsv40-performance.py BASELINE CURRENT")
 
@@ -29,6 +41,7 @@ observed = {entry["name"]: entry for entry in current["workloads"]}
 if set(observed) != expected_names:
     fail("performance workload matrix is incomplete")
 
+violations = []
 for reference in baseline["workloads"]:
     result = observed[reference["name"]]
     throughput_floor = reference["throughput_mib_s"] * (
@@ -44,12 +57,28 @@ for reference in baseline["workloads"]:
         1 + thresholds["peak_rss_regression_percent"] / 100
     )
     if result["throughput_mib_s"] < throughput_floor:
-        fail(f"{reference['name']}: throughput regression exceeds budget")
+        violations.append(metric_diagnostic(
+            reference["name"], "throughput_mib_s", reference["throughput_mib_s"],
+            result["throughput_mib_s"], throughput_floor, "minimum"
+        ))
     if result["write_p95_latency_ms"] > latency_ceiling:
-        fail(f"{reference['name']}: write p95 latency regression exceeds budget")
+        violations.append(metric_diagnostic(
+            reference["name"], "write_p95_latency_ms", reference["write_p95_latency_ms"],
+            result["write_p95_latency_ms"], latency_ceiling, "maximum"
+        ))
     if result["workload_p95_latency_ms"] > workload_latency_ceiling:
-        fail(f"{reference['name']}: workload p95 latency regression exceeds budget")
+        violations.append(metric_diagnostic(
+            reference["name"], "workload_p95_latency_ms",
+            reference["workload_p95_latency_ms"], result["workload_p95_latency_ms"],
+            workload_latency_ceiling, "maximum"
+        ))
     if result["peak_rss_kib"] > rss_ceiling:
-        fail(f"{reference['name']}: peak RSS regression exceeds budget")
+        violations.append(metric_diagnostic(
+            reference["name"], "peak_rss_kib", reference["peak_rss_kib"],
+            result["peak_rss_kib"], rss_ceiling, "maximum"
+        ))
+
+if violations:
+    fail("\n".join(violations))
 
 print("NFSv4.0 performance gate passed")

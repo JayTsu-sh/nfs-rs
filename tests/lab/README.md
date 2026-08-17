@@ -5,8 +5,8 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Role | Management | Data | Services |
 |---|---|---|---|
 | Controller | 10.131.9.11 | 10.10.1.11 | GitHub Actions Runner |
-| Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.1, RustFS |
-| Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.1, RustFS |
+| Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
+| Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
 | NetApp pNFS MDS | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y` |
 | NetApp pNFS DS | — | 10.128.56.161 | Independent NFSv4.1 data LIF |
@@ -38,6 +38,13 @@ LAYOUTCOMMIT/LAYOUTRETURN cleanup in the real NetApp lab.
 over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,
 directory and file creation, chunked write/commit/read, attributes, READDIR,
 READDIRPLUS, rename, hard links, symbolic links, removal, and unmount.
+
+`run-kernel-v40-e2e.sh` mounts each Linux knfsd export twice with the kernel
+client and exact `vers=4.0`. It verifies independent local-oracle checksums for
+small, large, and concurrent files, cross-mount metadata and namespace
+visibility, and cross-mount lock exclusion. The audited privileged entry point
+is `admin/nfsrs-lab-kernel-v40-mount`; the runner sudo allow-list must expose
+only its installed `/usr/local/sbin/nfsrs-lab-kernel-v40-mount` copy.
 
 The Rust integration test is ignored by default and requires both
 `NFS_RS_LAB_E2E=1` and a whitespace-separated `NFS_RS_LAB_URLS` value. This

@@ -58,6 +58,8 @@ jobs:
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Linux kernel NFSv4.0 E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-kernel-v40-e2e.sh "$RUN_ID"
       - name: Record complete NetApp NFSv4.0 release matrix
         run: tests/lab/run-netapp-v40-release-matrix.sh "$RUN_ID" "$NFS_RS_LAB_V40_EVIDENCE_DIR"
       - name: NetApp NFSv4.1 compatibility E2E

@@ -131,6 +131,55 @@ fn lab_capability_probe_is_read_only() {
 }
 
 #[test]
+fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-kernel-v40-e2e.sh"))
+        .expect("kernel NFSv4.0 runner must be readable");
+    let helper = fs::read_to_string(workspace_path("tests/lab/admin/nfsrs-lab-kernel-v40-mount"))
+        .expect("kernel NFSv4.0 privileged helper must be readable");
+    let nightly = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+    let release = fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
+        .expect("release workflow must be readable");
+
+    for required in [
+        "vers=4.0",
+        "findmnt",
+        "trap cleanup EXIT INT TERM",
+        "NFS_RS_LAB_KERNEL_V40_SERVER_A",
+        "NFS_RS_LAB_KERNEL_V40_SERVER_B",
+        "LAB_NFS41_EXPORT",
+        "sha256sum",
+        "sha256sum --check",
+        "local_oracle",
+        "concurrent-manifest.sha256",
+        "peer_mount",
+        "flock",
+    ] {
+        assert!(
+            runner.contains(required),
+            "kernel NFSv4.0 runner lacks {required}"
+        );
+    }
+    assert!(!runner.contains("rm -rf"));
+    assert!(!runner.contains("10.128.61.200"));
+    assert!(!runner.contains("10.128.61.201"));
+    for required in [
+        "mount-source:10.10.1.12:/srv/nfs/v4",
+        "mount-dest:10.10.1.13:/srv/nfs/v4",
+        "vers=4.0",
+        "validate_test_name",
+    ] {
+        assert!(
+            helper.contains(required),
+            "kernel mount helper lacks {required}"
+        );
+    }
+    assert!(!helper.contains("rm -rf"));
+    assert!(nightly.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
+    assert!(release.contains("tests/lab/run-kernel-v40-e2e.sh \"$RUN_ID\""));
+}
+
+#[test]
 fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
@@ -289,18 +338,35 @@ fn nfsv40_performance_gate_rejects_regressions() {
         "workloads": baseline["workloads"].clone(),
     });
     current["workloads"][0]["throughput_mib_s"] = serde_json::json!(0.0);
+    current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
     fs::write(
         &current_path,
         serde_json::to_vec(&current).expect("encode current report"),
     )
     .expect("write current report");
-    let status = Command::new("python3")
+    let output = Command::new("python3")
         .arg(workspace_path("tests/lab/check-nfsv40-performance.py"))
         .arg(&baseline_path)
         .arg(&current_path)
-        .status()
+        .output()
         .expect("run performance checker");
-    assert!(!status.success(), "regressed performance was accepted");
+    assert!(
+        !output.status.success(),
+        "regressed performance was accepted"
+    );
+    let diagnostic = String::from_utf8(output.stderr).expect("UTF-8 performance diagnostic");
+    for field in ["baseline=", "actual=", "limit=", "regression_percent="] {
+        assert!(
+            diagnostic.contains(field),
+            "diagnostic lacks {field}: {diagnostic}"
+        );
+    }
+    for metric in ["throughput_mib_s", "workload_p95_latency_ms"] {
+        assert!(
+            diagnostic.contains(metric),
+            "diagnostic lacks {metric}: {diagnostic}"
+        );
+    }
     current["workloads"] = baseline["workloads"].clone();
     current["workloads"][0]["workload_p95_latency_ms"] = serde_json::json!(f64::MAX);
     fs::write(
@@ -320,6 +386,34 @@ fn nfsv40_performance_gate_rejects_regressions() {
     );
     fs::remove_file(current_path).expect("remove current report");
     fs::remove_dir(temp).expect("remove temporary gate directory");
+}
+
+#[test]
+fn nfsv40_evidence_preserves_raw_performance_report_on_gate_failure() {
+    let temp = std::env::temp_dir().join(format!("nfsrs-perf-evidence-{}", std::process::id()));
+    let records = temp.join("records");
+    let output = temp.join("output");
+    let performance = temp.join("performance.json");
+    fs::create_dir_all(&records).expect("create empty evidence records");
+    fs::write(&performance, br#"{"liveness":"pass","workloads":[]}"#)
+        .expect("write raw performance report");
+    let status = Command::new("bash")
+        .arg(workspace_path(
+            "tests/lab/collect-nfsv40-release-evidence.sh",
+        ))
+        .arg("nightly-evidence-preservation")
+        .arg(&output)
+        .env("NFS_RS_LAB_V40_EVIDENCE_DIR", &records)
+        .env("NFS_RS_LAB_V40_PERF_OUTPUT", &performance)
+        .env("NFS_RS_LAB_V40_EVIDENCE_COMMIT", "test-commit")
+        .status()
+        .expect("run incomplete evidence collection");
+    assert!(!status.success(), "incomplete evidence unexpectedly passed");
+    assert_eq!(
+        fs::read(output.join("performance-report.json")).expect("preserved performance report"),
+        fs::read(&performance).expect("source performance report"),
+    );
+    fs::remove_dir_all(temp).expect("remove evidence test directory");
 }
 
 #[test]

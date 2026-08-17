@@ -1,10 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
     Mount, MountLifecycleState, NFSVersion, NfsError, OPEN_BOTH, OPEN_READ, Time,
     parse_url_and_mount,
@@ -26,6 +29,27 @@ const CALLBACK_FILE: &str = "callback-recall.bin";
 const PNFS_PAYLOAD_SIZE: usize = 8 * 1024 * 1024 + 37;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[tokio::test]
+#[ignore = "requires an NFSv4.0 server for raw MAXREAD/MAXWRITE observation"]
+async fn nfs_v40_server_max_io_attributes() -> TestResult {
+    for configured_url in env::var(LAB_V40_URLS_ENV)?.split(',') {
+        let mut url = url::Url::parse(configured_url)?;
+        url.query_pairs_mut()
+            .append_pair("rsize", &u32::MAX.to_string())
+            .append_pair("wsize", &u32::MAX.to_string());
+        let mount = parse_url_and_mount(url.as_str()).await?;
+        let fsinfo = mount.fsinfo().await?;
+        println!(
+            "{} MAXREAD={} MAXWRITE={}",
+            url.host_str().unwrap_or("unknown"),
+            fsinfo.rtmax,
+            fsinfo.wtmax
+        );
+        mount.umount().await?;
+    }
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires the NetApp NFSv4.0 reference fixture"]
@@ -564,7 +588,6 @@ struct V40PerfWorkload {
     name: &'static str,
     file_count: usize,
     payload_size: usize,
-    chunk_size: usize,
     tasks: usize,
 }
 
@@ -573,28 +596,24 @@ const V40_PERF_WORKLOADS: [V40PerfWorkload; 4] = [
         name: "small-single",
         file_count: 128,
         payload_size: 4 * 1024,
-        chunk_size: 4 * 1024,
         tasks: 1,
     },
     V40PerfWorkload {
         name: "small-multi",
         file_count: 128,
         payload_size: 4 * 1024,
-        chunk_size: 4 * 1024,
         tasks: 4,
     },
     V40PerfWorkload {
         name: "large-single",
         file_count: 4,
         payload_size: 16 * 1024 * 1024,
-        chunk_size: 1024 * 1024,
         tasks: 1,
     },
     V40PerfWorkload {
         name: "large-multi",
         file_count: 4,
         payload_size: 16 * 1024 * 1024,
-        chunk_size: 1024 * 1024,
         tasks: 4,
     },
 ];
@@ -604,8 +623,11 @@ async fn run_v40_performance_task(
     run_id: String,
     workload: V40PerfWorkload,
     task: usize,
-) -> TestResult<(u64, Vec<f64>, Vec<f64>)> {
+) -> TestResult<(u64, Vec<f64>, Vec<f64>, u32, u32)> {
     let mount = parse_url_and_mount(&url).await?;
+    let negotiated_read_size = mount.get_max_read_size();
+    let negotiated_write_size = mount.get_max_write_size();
+    let write_chunk_size = negotiated_io_chunk_size(negotiated_write_size)?;
     let payload = Bytes::from(
         (0..workload.payload_size)
             .map(|index| ((index * 17 + task * 13 + 29) % 251) as u8)
@@ -620,12 +642,18 @@ async fn run_v40_performance_task(
         let _ = mount.remove_path(&name).await;
         let created = mount.create_path(&name, Some(0o600)).await?;
         let started = Instant::now();
-        if workload.payload_size <= workload.chunk_size {
-            write_all(mount.as_ref(), created.fh.clone(), &payload).await?;
+        if workload.payload_size <= write_chunk_size {
+            write_all_with_chunk_size(
+                mount.as_ref(),
+                created.fh.clone(),
+                &payload,
+                write_chunk_size,
+            )
+            .await?;
             write_latencies.push(started.elapsed().as_secs_f64() * 1_000.0);
         } else {
-            for offset in (0..payload.len()).step_by(workload.chunk_size) {
-                let end = (offset + workload.chunk_size).min(payload.len());
+            for offset in (0..payload.len()).step_by(write_chunk_size) {
+                let end = (offset + write_chunk_size).min(payload.len());
                 let chunk = payload.slice(offset..end);
                 let chunk_started = Instant::now();
                 let written = mount
@@ -648,7 +676,13 @@ async fn run_v40_performance_task(
         transferred += payload.len() as u64;
     }
     mount.umount().await?;
-    Ok((transferred, write_latencies, workload_latencies))
+    Ok((
+        transferred,
+        write_latencies,
+        workload_latencies,
+        negotiated_read_size,
+        negotiated_write_size,
+    ))
 }
 
 fn peak_rss_kib() -> u64 {
@@ -683,6 +717,8 @@ async fn measure_v40_performance_workload(
     let mut write_p95_samples = Vec::new();
     let mut workload_p95_samples = Vec::new();
     let mut bytes_per_sample = 0u64;
+    let mut negotiated_read_sizes = BTreeSet::new();
+    let mut negotiated_write_sizes = BTreeSet::new();
     for _ in 0..3 {
         let started = Instant::now();
         let mut joins = tokio::task::JoinSet::new();
@@ -698,22 +734,25 @@ async fn measure_v40_performance_workload(
         let mut workload_latencies = Vec::new();
         bytes_per_sample = 0;
         while let Some(joined) = joins.join_next().await {
-            let (task_bytes, mut task_write, mut task_workload) = match joined {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    joins.abort_all();
-                    while joins.join_next().await.is_some() {}
-                    return Err(error);
-                }
-                Err(error) => {
-                    joins.abort_all();
-                    while joins.join_next().await.is_some() {}
-                    return Err(error.into());
-                }
-            };
+            let (task_bytes, mut task_write, mut task_workload, task_read_size, task_write_size) =
+                match joined {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        joins.abort_all();
+                        while joins.join_next().await.is_some() {}
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        joins.abort_all();
+                        while joins.join_next().await.is_some() {}
+                        return Err(error.into());
+                    }
+                };
             bytes_per_sample += task_bytes;
             write_latencies.append(&mut task_write);
             workload_latencies.append(&mut task_workload);
+            negotiated_read_sizes.insert(task_read_size);
+            negotiated_write_sizes.insert(task_write_size);
         }
         throughput_samples
             .push(bytes_per_sample as f64 / 1_048_576.0 / started.elapsed().as_secs_f64());
@@ -732,6 +771,8 @@ async fn measure_v40_performance_workload(
         "bytes_per_sample": bytes_per_sample,
         "samples": 3,
         "tasks": workload.tasks,
+        "negotiated_read_sizes": negotiated_read_sizes,
+        "negotiated_write_sizes": negotiated_write_sizes,
     }))
 }
 
@@ -812,6 +853,306 @@ async fn nfs_v40_small_large_single_multi_performance() -> TestResult {
         "workloads": results,
     });
     std::fs::write(output, serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires writable NFSv4.0 reference fixtures"]
+async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure(!urls.is_empty(), "concurrent I/O validation requires a URL")?;
+    let run_id = env::var("NFS_RS_LAB_V40_PERF_RUN_ID")
+        .unwrap_or_else(|_| format!("e2e-{}", std::process::id()));
+
+    for (server, url) in urls.into_iter().enumerate() {
+        let mount = Arc::<dyn Mount>::from(parse_url_and_mount(&url).await?);
+        let chunk_size =
+            negotiated_io_chunk_size(mount.get_max_read_size().min(mount.get_max_write_size()))?;
+        let chunk_count = 8usize;
+        let payload = Bytes::from(
+            (0..chunk_size * chunk_count)
+                .map(|index| ((index * 31 + server * 17 + 11) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let name = format!("nfsrs-concurrent-io-{run_id}-{server}.bin");
+        let _ = mount.remove_path(&name).await;
+        let created = mount.create_path(&name, Some(0o600)).await?;
+
+        let mut writes = tokio::task::JoinSet::new();
+        for chunk in 0..chunk_count {
+            let mount = Arc::clone(&mount);
+            let fh = created.fh.clone();
+            let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
+            writes.spawn(async move {
+                let written = mount.write(fh, (chunk * chunk_size) as u64, data).await?;
+                ensure(
+                    written as usize == chunk_size,
+                    format!("short concurrent WRITE for chunk {chunk}"),
+                )
+            });
+        }
+        while let Some(write) = writes.join_next().await {
+            write??;
+        }
+        mount
+            .commit(created.fh.clone(), 0, payload.len() as u32)
+            .await?;
+        mount.close(created.fh).await?;
+
+        let opened = mount.open_path(&name, OPEN_READ).await?;
+        let mut reads = tokio::task::JoinSet::new();
+        for chunk in 0..chunk_count {
+            let mount = Arc::clone(&mount);
+            let fh = opened.fh.clone();
+            reads.spawn(async move {
+                let base = chunk * chunk_size;
+                let mut data = Vec::with_capacity(chunk_size);
+                while data.len() < chunk_size {
+                    let part = mount
+                        .read(
+                            fh.clone(),
+                            (base + data.len()) as u64,
+                            (chunk_size - data.len()) as u32,
+                        )
+                        .await?;
+                    ensure(
+                        !part.is_empty(),
+                        format!("unexpected EOF in concurrent READ chunk {chunk}"),
+                    )?;
+                    data.extend_from_slice(&part);
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((chunk, Bytes::from(data)))
+            });
+        }
+        let mut actual = vec![Bytes::new(); chunk_count];
+        while let Some(read) = reads.join_next().await {
+            let (chunk, data) = read??;
+            actual[chunk] = data;
+        }
+        mount.close(opened.fh).await?;
+        ensure(
+            actual.iter().enumerate().all(|(chunk, data)| {
+                *data == payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size)
+            }),
+            format!("concurrent I/O payload mismatch on server {server}"),
+        )?;
+        mount.remove_path(&name).await?;
+        mount.umount().await?;
+    }
+    Ok(())
+}
+
+async fn measure_data_mover_same_file_sample(
+    url: &str,
+    run_id: &str,
+    sample: usize,
+    payload_mib: usize,
+    read_depth: usize,
+    write_depth: usize,
+) -> TestResult<(f64, f64, u32, u32, usize, BTreeMap<usize, usize>, usize)> {
+    let mount = Arc::<dyn Mount>::from(parse_url_and_mount(url).await?);
+    let negotiated_read_size = mount.get_max_read_size();
+    let negotiated_write_size = mount.get_max_write_size();
+    let chunk_size = negotiated_io_chunk_size(negotiated_read_size.min(negotiated_write_size))?;
+    let chunk_count = (payload_mib * 1024 * 1024 / chunk_size).max(1);
+    let payload = Bytes::from(
+        (0..chunk_size * chunk_count)
+            .map(|index| ((index * 37 + sample * 19 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let name = format!("nfsrs-data-mover-perf-{run_id}-{read_depth}-{write_depth}-{sample}.bin");
+    let _ = mount.remove_path(&name).await;
+
+    let write_started = Instant::now();
+    let created = mount.create_path(&name, Some(0o600)).await?;
+    let mut writes = FuturesUnordered::new();
+    for chunk in 0..chunk_count {
+        let mount = Arc::clone(&mount);
+        let fh = created.fh.clone();
+        let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
+        writes.push(async move {
+            let written = mount.write(fh, (chunk * chunk_size) as u64, data).await?;
+            ensure(
+                written as usize == chunk_size,
+                format!("short data-mover WRITE for chunk {chunk}"),
+            )
+        });
+        if writes.len() >= write_depth {
+            writes.next().await.expect("non-empty write window")?;
+        }
+    }
+    while let Some(write) = writes.next().await {
+        write?;
+    }
+    mount.close(created.fh).await?;
+    let write_seconds = write_started.elapsed().as_secs_f64();
+
+    let read_started = Instant::now();
+    let opened = mount.open_path(&name, OPEN_READ).await?;
+    let mut reads = FuturesOrdered::new();
+    let mut next_chunk = 0usize;
+    let mut verified_bytes = 0usize;
+    let mut read_response_lengths = BTreeMap::new();
+    let mut non_eof_short_reads = 0usize;
+    loop {
+        while reads.len() < read_depth && next_chunk < chunk_count {
+            let mount = Arc::clone(&mount);
+            let fh = opened.fh.clone();
+            let chunk = next_chunk;
+            reads.push_back(async move {
+                let data = mount
+                    .read(fh, (chunk * chunk_size) as u64, chunk_size as u32)
+                    .await;
+                (chunk, data)
+            });
+            next_chunk += 1;
+        }
+        let Some(read) = reads.next().await else {
+            break;
+        };
+        let (chunk, first) = read;
+        let range_start = chunk * chunk_size;
+        let mut range_bytes = 0usize;
+        let mut part = first?;
+        loop {
+            ensure(!part.is_empty(), "unexpected EOF in data-mover READ range")?;
+            let requested = chunk_size - range_bytes;
+            *read_response_lengths.entry(part.len()).or_insert(0) += 1;
+            if part.len() < requested && range_start + range_bytes + part.len() < payload.len() {
+                non_eof_short_reads += 1;
+            }
+            let part_end = range_start + range_bytes + part.len();
+            ensure(
+                part == payload.slice(range_start + range_bytes..part_end),
+                "data-mover performance payload mismatch",
+            )?;
+            range_bytes += part.len();
+            verified_bytes += part.len();
+            if range_bytes >= chunk_size {
+                break;
+            }
+            part = mount
+                .read(
+                    opened.fh.clone(),
+                    (range_start + range_bytes) as u64,
+                    (chunk_size - range_bytes) as u32,
+                )
+                .await?;
+        }
+    }
+    mount.close(opened.fh).await?;
+    let read_seconds = read_started.elapsed().as_secs_f64();
+    ensure(
+        verified_bytes == payload.len(),
+        format!(
+            "data-mover READ verified {verified_bytes} of {} bytes",
+            payload.len()
+        ),
+    )?;
+    mount.remove_path(&name).await?;
+    mount.umount().await?;
+
+    let mib = payload.len() as f64 / 1_048_576.0;
+    Ok((
+        mib / write_seconds,
+        mib / read_seconds,
+        negotiated_read_size,
+        negotiated_write_size,
+        chunk_size,
+        read_response_lengths,
+        non_eof_short_reads,
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a writable NFSv4.0 performance fixture"]
+async fn nfs_v40_data_mover_same_file_concurrency_performance() -> TestResult {
+    let url = env::var(LAB_V40_URLS_ENV)?
+        .split(',')
+        .next()
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| io::Error::other("data-mover performance requires a URL"))?
+        .to_string();
+    let run_id = env::var("NFS_RS_LAB_V40_PERF_RUN_ID")?;
+    let output = env::var("NFS_RS_LAB_V40_PERF_OUTPUT")?;
+    let payload_mib = env::var("NFS_RS_LAB_V40_DATA_MOVER_PAYLOAD_MIB")
+        .map_or(Ok(16), |value| value.parse::<usize>())?;
+    let sample_count = env::var("NFS_RS_LAB_V40_DATA_MOVER_SAMPLES")
+        .map_or(Ok(3), |value| value.parse::<usize>())?;
+    ensure(payload_mib > 0, "data-mover payload must be non-zero")?;
+    ensure(
+        sample_count > 0 && sample_count % 2 == 1,
+        "data-mover sample count must be a non-zero odd number",
+    )?;
+    let mut modes = Vec::new();
+    let mut negotiated_read_sizes = BTreeSet::new();
+    let mut negotiated_write_sizes = BTreeSet::new();
+    let mut effective_block_sizes = BTreeSet::new();
+    for (name, read_depth, write_depth) in [("sequential", 1, 1), ("data-mover", 4, 8)] {
+        let mut write_samples = Vec::new();
+        let mut read_samples = Vec::new();
+        let mut read_response_lengths = BTreeMap::new();
+        let mut non_eof_short_reads = 0usize;
+        for sample in 0..sample_count {
+            let (
+                write,
+                read,
+                negotiated_read,
+                negotiated_write,
+                effective_block,
+                sample_response_lengths,
+                sample_short_reads,
+            ) = measure_data_mover_same_file_sample(
+                &url,
+                &run_id,
+                sample,
+                payload_mib,
+                read_depth,
+                write_depth,
+            )
+            .await?;
+            write_samples.push(write);
+            read_samples.push(read);
+            negotiated_read_sizes.insert(negotiated_read);
+            negotiated_write_sizes.insert(negotiated_write);
+            effective_block_sizes.insert(effective_block);
+            for (length, count) in sample_response_lengths {
+                *read_response_lengths.entry(length).or_insert(0) += count;
+            }
+            non_eof_short_reads += sample_short_reads;
+        }
+        write_samples.sort_by(f64::total_cmp);
+        read_samples.sort_by(f64::total_cmp);
+        modes.push(serde_json::json!({
+            "name": name,
+            "read_depth": read_depth,
+            "write_depth": write_depth,
+            "write_mib_s": write_samples[sample_count / 2],
+            "read_mib_s": read_samples[sample_count / 2],
+            "combined_mib_s": 2.0 * payload_mib as f64
+                / (payload_mib as f64 / write_samples[sample_count / 2]
+                    + payload_mib as f64 / read_samples[sample_count / 2]),
+            "samples": sample_count,
+            "read_response_length_histogram": read_response_lengths,
+            "non_eof_short_reads": non_eof_short_reads,
+        }));
+    }
+    std::fs::write(
+        output,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "run_id": run_id,
+            "url": url,
+            "payload_mib": payload_mib,
+            "negotiated_read_sizes": negotiated_read_sizes,
+            "negotiated_write_sizes": negotiated_write_sizes,
+            "effective_block_sizes": effective_block_sizes,
+            "modes": modes,
+            "peak_rss_kib": peak_rss_kib(),
+        }))?,
+    )?;
     Ok(())
 }
 
@@ -999,8 +1340,13 @@ async fn recover_pnfs_file_from_checkpoint(
 }
 
 async fn write_all(mount: &dyn Mount, fh: Bytes, data: &Bytes) -> TestResult {
-    let chunk_size = (mount.get_max_write_size() as usize).min(64 * 1024);
+    let chunk_size = negotiated_io_chunk_size(mount.get_max_write_size())?;
     write_all_with_chunk_size(mount, fh, data, chunk_size).await
+}
+
+fn negotiated_io_chunk_size(server_max: u32) -> TestResult<usize> {
+    ensure(server_max > 0, "server reported a zero maximum I/O size")?;
+    Ok(server_max as usize)
 }
 
 async fn write_all_with_chunk_size(
@@ -1029,8 +1375,7 @@ async fn write_all_with_chunk_size(
 }
 
 async fn read_all(mount: &dyn Mount, fh: Bytes, expected_len: usize) -> TestResult<Bytes> {
-    let chunk_size = (mount.get_max_read_size() as usize).min(64 * 1024);
-    ensure(chunk_size > 0, "server reported a zero maximum read size")?;
+    let chunk_size = negotiated_io_chunk_size(mount.get_max_read_size())?;
 
     let mut output = Vec::with_capacity(expected_len);
     while output.len() < expected_len {
@@ -1043,6 +1388,19 @@ async fn read_all(mount: &dyn Mount, fh: Bytes, expected_len: usize) -> TestResu
         output.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(output))
+}
+
+#[test]
+fn lab_io_chunk_uses_the_server_negotiated_limit_by_default() -> TestResult {
+    ensure(
+        negotiated_io_chunk_size(1024 * 1024)? == 1024 * 1024,
+        "default lab I/O chunk did not use the negotiated server limit",
+    )
+}
+
+#[test]
+fn lab_io_chunk_rejects_a_zero_server_limit() {
+    assert!(negotiated_io_chunk_size(0).is_err());
 }
 
 async fn recover_file_from_checkpoint(url: &str, expected: &Bytes) -> TestResult {

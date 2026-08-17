@@ -12,7 +12,8 @@ export NFS_RS_LAB_V40_LARGE_FILE="${NFS_RS_LAB_V40_LARGE_FILE:-nfs-rs-large.bin}
 for test_name in \
   nfs_v40_mount_null_and_traversal_on_both_lifs \
   nfs_v40_delegation_recall_across_both_lifs \
-  nfs_v40_open_io_commit_close_on_both_lifs; do
+  nfs_v40_open_io_commit_close_on_both_lifs \
+  nfs_v40_same_open_state_supports_concurrent_io; do
   cargo test --locked --test lab_e2e \
     "$test_name" \
     -- --ignored --exact --nocapture
