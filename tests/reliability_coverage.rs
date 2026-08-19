@@ -180,6 +180,38 @@ fn kernel_nfsv40_e2e_is_safe_and_wired_into_lab_gates() {
 }
 
 #[test]
+fn dxn_nfsv40_e2e_is_exact_and_wired_into_nightly() {
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-dxn-v40-e2e.sh"))
+        .expect("DXN NFSv4.0 runner must be readable");
+    let common = fs::read_to_string(workspace_path("tests/lab/common.sh"))
+        .expect("lab defaults must be readable");
+    let capability = fs::read_to_string(workspace_path("tests/lab/capability-report.sh"))
+        .expect("capability report must be readable");
+    let nightly = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
+        .expect("nightly workflow must be readable");
+
+    for required in [
+        "validate_run_id",
+        "validate_ipv4",
+        "validate_export_path",
+        "version=4.0",
+        "/dev/tcp/$1/2049",
+        "nfs_v40_server_max_io_attributes",
+        "nfs_v40_single_export_end_to_end",
+        "nfs_v40_same_open_state_supports_concurrent_io",
+        "NFS_RS_LAB_V40_RUN_ID",
+    ] {
+        assert!(runner.contains(required), "DXN runner lacks {required}");
+    }
+    assert!(common.contains("LAB_DXN_V40_DATA=\"${LAB_DXN_V40_DATA:-10.131.7.201}\""));
+    assert!(common.contains("LAB_DXN_V40_EXPORT=\"${LAB_DXN_V40_EXPORT:-/jay_nfs}\""));
+    assert!(capability.contains("dxn-nfsv40.txt"));
+    assert!(capability.contains("BLOCKED_CAPABILITY(dxn-nfsv40)"));
+    assert!(nightly.contains("DXN NFSv4.0 E2E"));
+    assert!(nightly.contains("tests/lab/run-dxn-v40-e2e.sh \"$RUN_ID\""));
+}
+
+#[test]
 fn nightly_uses_only_a_verified_preprovisioned_toolchain() {
     let workflow = fs::read_to_string(workspace_path(".github/workflows/nightly.yml"))
         .expect("nightly workflow must be readable");
@@ -221,7 +253,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let nightly = include_str!("../.github/workflows/nightly.yml");
     let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
-    assert!(cargo.contains("version = \"0.5.0\""));
+    assert!(cargo.contains("version = \"0.5.1\""));
     for required in [
         "NFSv4.0 (experimental)",
         "AUTH_SYS",
