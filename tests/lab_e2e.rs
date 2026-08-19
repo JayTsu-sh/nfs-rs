@@ -150,10 +150,10 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
 
     let mut cleanup_error = None;
     for path in [&symlink, &hardlink, &renamed, &original] {
-        if let Err(error) = mount.remove_path(path).await {
-            if !error.is_not_found() {
-                cleanup_error.get_or_insert_with(|| Box::new(error) as _);
-            }
+        if let Err(error) = mount.remove_path(path).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
     }
     if let Err(error) = mount.umount().await {
