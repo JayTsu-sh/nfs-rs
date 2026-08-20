@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept NFSv4 PATHCONF responses that omit RECOMMENDED attributes, expose
+  per-field availability and filesystem scope, and retain one-RPC discovery.
+
 ## [0.5.1] - 2026-08-19
 
 ### Testing

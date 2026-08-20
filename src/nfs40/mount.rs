@@ -916,6 +916,54 @@ impl Mount40 {
         decode_fattr4_envelope(&mut data, label)
     }
 
+    async fn query_pathconf(&self, fh: &Bytes) -> Result<mount::SupportedPathconf> {
+        let requested = [
+            (1 << 0) | (1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+            1 << 2,
+        ];
+        let (bitmap, mut values) = self.query_fattrs(fh, &requested, "pathconf").await?;
+        require_fattrs(&bitmap, &[0, 8], "PATHCONF")?;
+        let _supported_attrs = take_bitmap4_attr(&mut values, "supported_attrs")?;
+        let fsid = (
+            take_u64_attr(&mut values, "fsid.major")?,
+            take_u64_attr(&mut values, "fsid.minor")?,
+        );
+        let available = pathconf_support(&bitmap);
+        let mut result = mount::Pathconf {
+            attr: None,
+            linkmax: 32767,
+            name_max: 255,
+            no_trunc: true,
+            chown_restricted: true,
+            case_insensitive: false,
+            case_preserving: true,
+        };
+        if available.case_insensitive {
+            result.case_insensitive = take_bool_attr(&mut values, "case_insensitive")?;
+        }
+        if available.case_preserving {
+            result.case_preserving = take_bool_attr(&mut values, "case_preserving")?;
+        }
+        if available.chown_restricted {
+            result.chown_restricted = take_bool_attr(&mut values, "chown_restricted")?;
+        }
+        if available.linkmax {
+            result.linkmax = take_u32_attr(&mut values, "maxlink")?;
+        }
+        if available.name_max {
+            result.name_max = take_u32_attr(&mut values, "maxname")?;
+        }
+        if available.no_trunc {
+            result.no_trunc = take_bool_attr(&mut values, "no_trunc")?;
+        }
+        ensure_attr_values_consumed(&values, "pathconf")?;
+        Ok(mount::SupportedPathconf {
+            values: result,
+            available,
+            fsid: Some(fsid),
+        })
+    }
+
     async fn refresh_callback_attributes(&self, fh: &Bytes) {
         let Some(state) = &self.callback_state else {
             return;
@@ -1096,6 +1144,25 @@ fn take_u64_attr(values: &mut Bytes, label: &str) -> Result<u64> {
         return Err(NfsError::Xdr(format!("{label} truncated")));
     }
     Ok(values.get_u64())
+}
+
+fn take_bitmap4_attr(values: &mut Bytes, label: &str) -> Result<Vec<u32>> {
+    let word_count = take_u32_attr(values, label)? as usize;
+    if values.remaining() < word_count.saturating_mul(4) {
+        return Err(NfsError::Xdr(format!("{label} truncated")));
+    }
+    Ok((0..word_count).map(|_| values.get_u32()).collect())
+}
+
+fn pathconf_support(bitmap: &[u32]) -> mount::PathconfSupport {
+    mount::PathconfSupport {
+        linkmax: fattr4_has(bitmap, 28),
+        name_max: fattr4_has(bitmap, 29),
+        no_trunc: fattr4_has(bitmap, 34),
+        chown_restricted: fattr4_has(bitmap, 18),
+        case_insensitive: fattr4_has(bitmap, 16),
+        case_preserving: fattr4_has(bitmap, 17),
+    }
 }
 
 fn take_u32_attr(values: &mut Bytes, label: &str) -> Result<u32> {
@@ -1910,23 +1977,12 @@ impl Mount for Mount40 {
     }
     async fn pathconf(&self, fh: Bytes) -> Result<mount::Pathconf> {
         let fh = if fh.is_empty() { &self.root_fh } else { &fh };
-        let requested = [
-            (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
-            1 << 2,
-        ];
-        let (bitmap, mut values) = self.query_fattrs(fh, &requested, "pathconf").await?;
-        require_fattrs(&bitmap, &[16, 17, 18, 28, 29, 34], "PATHCONF")?;
-        let result = mount::Pathconf {
-            attr: None,
-            case_insensitive: take_bool_attr(&mut values, "case_insensitive")?,
-            case_preserving: take_bool_attr(&mut values, "case_preserving")?,
-            chown_restricted: take_bool_attr(&mut values, "chown_restricted")?,
-            linkmax: take_u32_attr(&mut values, "maxlink")?,
-            name_max: take_u32_attr(&mut values, "maxname")?,
-            no_trunc: take_bool_attr(&mut values, "no_trunc")?,
-        };
-        ensure_attr_values_consumed(&values, "pathconf")?;
-        Ok(result)
+        Ok(self.query_pathconf(fh).await?.values)
+    }
+
+    async fn pathconf_with_support(&self, fh: Bytes) -> Result<mount::SupportedPathconf> {
+        let fh = if fh.is_empty() { &self.root_fh } else { &fh };
+        self.query_pathconf(fh).await
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
@@ -4666,6 +4722,15 @@ mod tests {
         result
     }
 
+    fn bitmap4_value(bitmap: &[u32]) -> Vec<u8> {
+        let mut value = Vec::new();
+        value.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
+        for word in bitmap {
+            value.extend_from_slice(&word.to_be_bytes());
+        }
+        value
+    }
+
     #[tokio::test]
     async fn scripted_public_getattr_and_filesystem_metadata_succeed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4717,18 +4782,18 @@ mod tests {
             .await?;
             let pathconf = read_record(&mut stream).await?;
             let bm = [
-                (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+                (1 << 0) | (1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
                 1 << 2,
             ];
-            let values = [
-                0u32.to_be_bytes(),
-                1u32.to_be_bytes(),
-                1u32.to_be_bytes(),
-                1024u32.to_be_bytes(),
-                255u32.to_be_bytes(),
-                1u32.to_be_bytes(),
-            ]
-            .concat();
+            let mut values = bitmap4_value(&bm);
+            values.extend_from_slice(&7u64.to_be_bytes());
+            values.extend_from_slice(&9u64.to_be_bytes());
+            values.extend_from_slice(&0u32.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
+            values.extend_from_slice(&1024u32.to_be_bytes());
+            values.extend_from_slice(&255u32.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
             let data = fattr_result(&bm, &values);
             reply(
                 &mut stream,
@@ -4744,6 +4809,47 @@ mod tests {
         assert_eq!((stat.afiles, stat.tbytes), (1, 6));
         let pathconf = mount.pathconf(Bytes::from_static(b"fh")).await.unwrap();
         assert_eq!((pathconf.linkmax, pathconf.name_max), (1024, 255));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pathconf_tolerates_an_omitted_recommended_case_attribute() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let bitmap = [
+                (1 << 0) | (1 << 8) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+                1 << 2,
+            ];
+            let mut values = bitmap4_value(&bitmap);
+            values.extend_from_slice(&7u64.to_be_bytes());
+            values.extend_from_slice(&9u64.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
+            values.extend_from_slice(&1024u32.to_be_bytes());
+            values.extend_from_slice(&255u32.to_be_bytes());
+            values.extend_from_slice(&1u32.to_be_bytes());
+            let data = fattr_result(&bitmap, &values);
+            reply(
+                &mut stream,
+                &request,
+                &compound_result("pathconf", &[(22, &[]), (9, &data)]),
+            )
+            .await
+        });
+
+        let result = mount
+            .pathconf_with_support(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!result.available.case_insensitive);
+        assert!(result.available.case_preserving);
+        assert_eq!(result.fsid, Some((7, 9)));
+        assert!(!result.values.case_insensitive);
+        assert!(result.values.case_preserving);
+        assert_eq!((result.values.linkmax, result.values.name_max), (1024, 255));
         server.await.unwrap().unwrap();
     }
 

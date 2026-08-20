@@ -2020,16 +2020,20 @@ impl crate::Mount for Mount41Wrapper {
         Ok(stat)
     }
     async fn pathconf(&self, fh: Bytes) -> Result<mount::Pathconf> {
+        Ok(self.pathconf_with_support(fh).await?.values)
+    }
+
+    async fn pathconf_with_support(&self, fh: Bytes) -> Result<mount::SupportedPathconf> {
         let target_fh = if fh.is_empty() {
             self.m.root_fh.clone()
         } else {
             fh
         };
-        // NFSv4.1: case_insensitive(16), case_preserving(17), chown_restricted(18),
-        //          maxlink(28), maxname(29)
+        // Include supported_attrs(0) and fsid(8) so capability discovery stays
+        // scoped to this object and does not add a second RPC.
         // word1: no_trunc(#34 = bit 2)
         let bitmap = [
-            (1u32 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
+            (1u32 << 0) | (1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
             1u32 << 2,
         ];
         let resp = self
@@ -2065,6 +2069,34 @@ impl crate::Mount for Mount41Wrapper {
             w < bm.len() && (bm[w] & (1 << (attr % 32))) != 0
         };
 
+        if bm_has(0) {
+            if vals.remaining() < 4 {
+                return Err(NfsError::Xdr("supported_attrs truncated".to_string()));
+            }
+            let words = vals.get_u32() as usize;
+            let bytes = words.saturating_mul(4);
+            if vals.remaining() < bytes {
+                return Err(NfsError::Xdr("supported_attrs truncated".to_string()));
+            }
+            vals.advance(bytes);
+        }
+        let fsid = if bm_has(8) {
+            if vals.remaining() < 16 {
+                return Err(NfsError::Xdr("fsid truncated".to_string()));
+            }
+            Some((vals.get_u64(), vals.get_u64()))
+        } else {
+            None
+        };
+
+        let available = mount::PathconfSupport {
+            linkmax: bm_has(28),
+            name_max: bm_has(29),
+            no_trunc: bm_has(34),
+            chown_restricted: bm_has(18),
+            case_insensitive: bm_has(16),
+            case_preserving: bm_has(17),
+        };
         let mut pc = mount::Pathconf {
             attr: None,
             linkmax: 32767,
@@ -2095,7 +2127,11 @@ impl crate::Mount for Mount41Wrapper {
             pc.no_trunc = vals.get_u32() != 0;
         }
 
-        Ok(pc)
+        Ok(mount::SupportedPathconf {
+            values: pc,
+            available,
+            fsid,
+        })
     }
     async fn pathconf_path(&self, path: &str) -> Result<mount::Pathconf> {
         let obj = self.m.lookup_path(path).await?;
