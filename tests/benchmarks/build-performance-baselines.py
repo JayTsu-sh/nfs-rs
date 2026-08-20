@@ -11,6 +11,18 @@ def percentile(values, fraction):
     return ordered[index]
 
 
+def operation_values(captures, name):
+    if name in ("mount_ms", "umount_ms"):
+        return [capture["lifs"][0][name] for capture in captures]
+    return [
+        value
+        for capture in captures
+        for sample in capture["lifs"][0]["samples"]
+        for value in [sample.get(name)]
+        if isinstance(value, (int, float))
+    ]
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--captures-root", required=True)
@@ -57,16 +69,8 @@ for environment in manifest["environments"]:
         "link_ms", "symlink_ms", "readlink_ms", "readdir_ms", "remove_ms",
         "rmdir_ms", "write_mib_s", "read_mib_s"
     ]}
-    for capture in captures:
-        operation_samples["mount_ms"].append(capture["lifs"][0]["mount_ms"])
-        operation_samples["umount_ms"].append(capture["lifs"][0]["umount_ms"])
-        for sample in capture["lifs"][0]["samples"]:
-            for name in operation_samples:
-                if name in ("mount_ms", "umount_ms"):
-                    continue
-                value = sample.get(name)
-                if isinstance(value, (int, float)):
-                    operation_samples[name].append(value)
+    for name in operation_samples:
+        operation_samples[name] = operation_values(captures, name)
     metrics = {}
     for name, values in operation_samples.items():
         if not values:
@@ -78,6 +82,18 @@ for environment in manifest["environments"]:
             "median": statistics.median(values),
             "mean": statistics.fmean(values),
             "sample_count": len(values),
+        }
+        window_p95_values = [
+            percentile(window_values, 0.95)
+            for window in windows.values()
+            for window_values in [operation_values(window, name)]
+            if window_values
+        ]
+        metrics[name]["window_p95"] = {
+            "p50": percentile(window_p95_values, 0.50),
+            "p95": percentile(window_p95_values, 0.95),
+            "p99": percentile(window_p95_values, 0.99),
+            "sample_count": len(window_p95_values),
         }
     pathconf_statuses = sorted({
         sample.get("pathconf_status", "pass")

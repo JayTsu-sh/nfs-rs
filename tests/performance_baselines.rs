@@ -200,6 +200,75 @@ fn report_fails_closed_and_still_renders_when_a_baseline_is_incomplete() {
 }
 
 #[test]
+fn gate_compares_a_candidate_window_with_baseline_window_p95() {
+    let fixture_dir =
+        std::env::temp_dir().join(format!("nfsrs-window-p95-gate-{}", std::process::id()));
+    fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
+    let baseline_path = fixture_dir.join("windowed.json");
+    fs::write(
+        &baseline_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "accepted",
+            "capture_runs": 45,
+            "capture_windows": 9,
+            "capabilities": {"pathconf": "pass"},
+            "thresholds": {
+                "throughput_regression_percent": 15,
+                "p95_latency_regression_percent": 30
+            },
+            "benchmarks": {"storage_path": {
+                "write_mib_s": {"median": 10.0},
+                "read_mib_s": {"median": 10.0},
+                "create_ms": {"p95": 10.0, "window_p95": {"p95": 50.0}}
+            }}
+        }))
+        .expect("windowed baseline must serialize"),
+    )
+    .expect("windowed baseline must be written");
+    let manifest_path = fixture_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "minimum_capture_runs": 45,
+            "minimum_capture_windows": 9,
+            "environments": [{"id": "windowed", "baseline": baseline_path}]
+        }))
+        .expect("gate manifest must serialize"),
+    )
+    .expect("gate manifest must be written");
+    for run in 1..=4 {
+        fs::write(
+            fixture_dir.join(format!("windowed-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 10.0,
+                    "read_mib_s": 10.0,
+                    "create_ms": 50.0
+                }]}]
+            }))
+            .expect("gate run must serialize"),
+        )
+        .expect("gate run must be written");
+    }
+    let status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--output")
+        .arg(fixture_dir.join("gate.json"))
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("performance gate should start");
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
 fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock() {
     let capture = fs::read_to_string(workspace_path(
         ".github/workflows/performance-baselines.yml",
@@ -231,6 +300,7 @@ fn baseline_builder_covers_every_benchmarked_interface() {
         "tests/benchmarks/build-performance-baselines.py",
     ))
     .expect("baseline builder must exist");
+    assert!(builder.contains("window_p95"));
     for operation in [
         "mount_ms",
         "umount_ms",

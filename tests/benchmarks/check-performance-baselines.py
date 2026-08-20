@@ -72,7 +72,13 @@ for environment in manifest["environments"]:
                 values = [run["lifs"][0][metric] for run in valid_runs]
                 checks.append((metric, percentile(values, 0.95), "maximum"))
         for metric, actual, direction in checks:
-            reference_value = reference[metric]["median" if direction == "minimum" else "p95"]
+            if direction == "minimum":
+                reference_value = reference[metric]["median"]
+            else:
+                reference_value = (
+                    reference[metric].get("window_p95", {}).get("p95")
+                    or reference[metric]["p95"]
+                )
             budget = thresholds[
                 "throughput_regression_percent" if direction == "minimum"
                 else "p95_latency_regression_percent"
