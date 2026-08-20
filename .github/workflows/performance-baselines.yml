@@ -1,0 +1,56 @@
+name: Performance baseline capture
+
+on:
+  schedule:
+    - cron: "0 2,10,18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terrasync-performance-baselines
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: [self-hosted, linux, x64, terrasync-lab, nfs-rs]
+    timeout-minutes: 240
+    env:
+      RUN_ID: nightly-performance-${{ github.run_id }}-${{ github.run_attempt }}
+      NFS_RS_BENCHMARK_CAPTURE_RUNS: 5
+      NFS_RS_BENCHMARK_SAMPLES: 20
+      NFS_RS_BENCHMARK_PAYLOAD_MIB: 4
+    steps:
+      - uses: actions/checkout@v5
+      - name: Discover persisted Rust toolchain
+        run: |
+          toolchain_bin=""
+          for candidate in \
+            "${RUSTUP_HOME:-$HOME/.rustup}/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin" \
+            "/home/github-runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin" \
+            "/opt/rust/1.95.0/bin"; do
+            if [[ -x "$candidate/rustc" && -x "$candidate/cargo" ]]; then
+              toolchain_bin="$candidate"
+              break
+            fi
+          done
+          [[ -n "$toolchain_bin" ]] || { echo "Rust 1.95.0 not found" >&2; exit 1; }
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+      - run: rustc --version | grep -q '^rustc 1\.95\.0 '
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - run: tests/lab/health-check.sh
+      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - name: Capture every storage environment and protocol
+        run: tests/benchmarks/run-storage-benchmark-suite.sh capture "$RUN_ID" "$RUNNER_TEMP/storage-performance-captures"
+      - name: Upload baseline captures and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-performance-captures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/storage-performance-captures
+      - name: Cleanup
+        if: always()
+        run: tests/lab/cleanup-run.sh "$RUN_ID"

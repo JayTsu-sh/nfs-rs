@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "minimum_capture_runs": 45,
+  "minimum_capture_windows": 9,
+  "maximum_runs_per_window": 5,
+  "environments": [
+    {"id":"linux-source-v3","endpoint":"10.10.1.12:/srv/nfs/v3","protocol":"3","url_template":"nfs://10.10.1.12/srv/nfs/v3/ci/${RUN_ID}?version=3&noresvport=true","baseline":"tests/benchmarks/baselines/linux-source-v3.json"},
+    {"id":"linux-source-v40","endpoint":"10.10.1.12:/srv/nfs/v4","protocol":"4.0","url_template":"nfs://10.10.1.12/srv/nfs/v4/ci/${RUN_ID}?version=4.0&noresvport=true","baseline":"tests/benchmarks/baselines/linux-source-v40.json"},
+    {"id":"linux-source-v41","endpoint":"10.10.1.12:/srv/nfs/v4","protocol":"4.1","url_template":"nfs://10.10.1.12/srv/nfs/v4/ci/${RUN_ID}?version=4.1&noresvport=true","baseline":"tests/benchmarks/baselines/linux-source-v41.json"},
+    {"id":"linux-destination-v3","endpoint":"10.10.1.13:/srv/nfs/v3","protocol":"3","url_template":"nfs://10.10.1.13/srv/nfs/v3/ci/${RUN_ID}?version=3&noresvport=true","baseline":"tests/benchmarks/baselines/linux-destination-v3.json"},
+    {"id":"linux-destination-v40","endpoint":"10.10.1.13:/srv/nfs/v4","protocol":"4.0","url_template":"nfs://10.10.1.13/srv/nfs/v4/ci/${RUN_ID}?version=4.0&noresvport=true","baseline":"tests/benchmarks/baselines/linux-destination-v40.json"},
+    {"id":"linux-destination-v41","endpoint":"10.10.1.13:/srv/nfs/v4","protocol":"4.1","url_template":"nfs://10.10.1.13/srv/nfs/v4/ci/${RUN_ID}?version=4.1&noresvport=true","baseline":"tests/benchmarks/baselines/linux-destination-v41.json"},
+    {"id":"dxn-v40","endpoint":"10.131.7.201:/jay_nfs","protocol":"4.0","url_template":"nfs://10.131.7.201/jay_nfs?version=4.0&noresvport=true&uid=0&gid=0","baseline":"tests/benchmarks/baselines/dxn-v40.json"},
+    {"id":"fas2750-v40-lif-a","endpoint":"10.128.61.200:/nfsrs_v40_test","protocol":"4.0","url_template":"nfs://10.128.61.200/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0","baseline":"tests/benchmarks/baselines/fas2750-v40-lif-a.json"},
+    {"id":"fas2750-v40-lif-b","endpoint":"10.128.61.201:/nfsrs_v40_test","protocol":"4.0","url_template":"nfs://10.128.61.201/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0","baseline":"tests/benchmarks/baselines/fas2750-v40-lif-b.json"},
+    {"id":"netapp-pnfs-mds","endpoint":"10.128.56.160:/nfsrs_pnfs_b","protocol":"4.1","url_template":"nfs://10.128.56.160/nfsrs_pnfs_b?version=4.1&noresvport=true","baseline":"tests/benchmarks/baselines/netapp-pnfs-mds.json"},
+    {"id":"netapp-pnfs-ds","endpoint":"10.128.56.161:/nfsrs_pnfs_b","protocol":"4.1","url_template":"nfs://10.128.56.161/nfsrs_pnfs_b?version=4.1&noresvport=true","baseline":"tests/benchmarks/baselines/netapp-pnfs-ds.json"}
+  ]
+}

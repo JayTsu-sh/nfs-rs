@@ -52,6 +52,121 @@ async fn nfs_v40_server_max_io_attributes() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "requires a writable single-export NFSv4.0 fixture"]
+async fn nfs_v40_single_export_end_to_end() -> TestResult {
+    let urls = env::var(LAB_V40_URLS_ENV)?;
+    let urls = urls
+        .split(',')
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    ensure(urls.len() == 1, "single-export validation requires one URL")?;
+    let url = urls[0];
+    ensure(
+        url.contains("version=4.0"),
+        format!("not an exact v4.0 URL: {url}"),
+    )?;
+
+    let run_id = env::var("NFS_RS_LAB_V40_RUN_ID")
+        .unwrap_or_else(|_| format!("single-export-{}", std::process::id()));
+    let original = format!("nfs-rs-{run_id}-payload.bin");
+    let renamed = format!("nfs-rs-{run_id}-renamed.bin");
+    let hardlink = format!("nfs-rs-{run_id}-hardlink.bin");
+    let symlink = format!("nfs-rs-{run_id}-symlink");
+    let payload = Bytes::from(
+        (0..(4 * 1024 * 1024 + 37))
+            .map(|index| ((index * 17 + 29) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+
+    let mount = parse_url_and_mount(url).await?;
+    ensure(
+        mount.version() == NFSVersion::NFSv4p0,
+        "single-export fixture negotiated the wrong protocol",
+    )?;
+    mount.null().await?;
+    ensure(!mount.getfh().await.is_empty(), "empty export filehandle")?;
+    for residual in [&original, &renamed, &hardlink, &symlink] {
+        let _ = mount.remove_path(residual).await;
+    }
+
+    let result: TestResult = async {
+        let created = mount.create_path(&original, Some(0o600)).await?;
+        let mut written = 0usize;
+        while written < payload.len() {
+            let end = (written + mount.get_max_write_size() as usize).min(payload.len());
+            let count = mount
+                .write(
+                    created.fh.clone(),
+                    written as u64,
+                    payload.slice(written..end),
+                )
+                .await? as usize;
+            ensure(count != 0 && count <= end - written, "invalid WRITE count")?;
+            written += count;
+        }
+        mount
+            .commit(created.fh.clone(), 0, payload.len() as u32)
+            .await?;
+        mount.close(created.fh).await?;
+
+        let reopened = mount.open_path(&original, OPEN_READ).await?;
+        ensure(
+            mount.getattr(reopened.fh.clone()).await?.filesize == payload.len() as u64,
+            "single-export GETATTR size mismatch",
+        )?;
+        ensure(
+            read_all(mount.as_ref(), reopened.fh.clone(), payload.len()).await? == payload,
+            "single-export payload checksum mismatch",
+        )?;
+        mount.close(reopened.fh).await?;
+
+        mount.rename_path(&original, &renamed).await?;
+        let renamed_object = mount.lookup_path(&renamed).await?;
+        let linked = mount.link_path(&renamed, &hardlink).await?;
+        ensure(
+            linked.nlink >= 2 && mount.lookup_path(&hardlink).await?.fh == renamed_object.fh,
+            "single-export hard-link identity mismatch",
+        )?;
+        let symbolic = mount.symlink_path(&renamed, &symlink).await?;
+        ensure(
+            mount.readlink(symbolic.fh).await? == renamed,
+            "single-export symbolic-link target mismatch",
+        )?;
+        let names = mount
+            .readdir(mount.getfh().await)
+            .await
+            .map_ok(|entry| entry.file_name)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for expected in [&renamed, &hardlink, &symlink] {
+            ensure(
+                names.contains(expected),
+                format!("single-export READDIR omitted {expected}"),
+            )?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_error = None;
+    for path in [&symlink, &hardlink, &renamed, &original] {
+        if let Err(error) = mount.remove_path(path).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+    }
+    if let Err(error) = mount.umount().await {
+        cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+    }
+    result?;
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires the NetApp NFSv4.0 reference fixture"]
 async fn nfs_v40_mount_null_and_traversal_on_both_lifs() -> TestResult {
     let urls = env::var(LAB_V40_URLS_ENV)?;

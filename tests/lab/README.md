@@ -10,6 +10,7 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
 | NetApp pNFS MDS | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y` |
 | NetApp pNFS DS | — | 10.128.56.161 | Independent NFSv4.1 data LIF |
+| DXN NFSv4.0 | — | 10.131.7.201 | NFSv4.0 export `/jay_nfs` |
 
 Every run must call `prepare-run.sh` with a unique `nightly-*` or `release-*`
 identifier and call `cleanup-run.sh` from an `always()` step.
@@ -24,6 +25,59 @@ evidence. `run-pnfs-e2e.sh` then mounts the second export through
 the `.160` MDS LIF, performs an 8 MiB+ multi-chunk write through `nfs-rs`, and
 requires a new established connection to the `.161` DS LIF before accepting the
 full-payload checksum. ONTAP management credentials are not needed by nightly.
+
+The DXN baseline uses `10.131.7.201:/jay_nfs` with an exact NFSv4.0 client URL.
+Nightly fails closed if TCP/2049 is unavailable, then exercises server I/O
+limits, writable namespace and metadata semantics, chunked read/write/commit,
+and concurrent I/O through one OPEN state. NetApp-specific dual-LIF,
+delegation, and fault-injection assumptions are intentionally not applied to
+DXN.
+
+`fas2750-storage-check` is an independent NFSv4.0 storage-path diagnostic. It
+does not invoke the lab test harness. For each FAS2750 LIF it samples CREATE,
+WRITE, COMMIT, READ, and REMOVE, verifies the complete read-back payload, and
+prints JSON. Thresholds are explicit so a diagnostic run cannot silently
+redefine the accepted release baseline:
+
+```bash
+cargo run --release --locked --bin fas2750-storage-check -- \
+  --url 'nfs://10.128.61.200/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0' \
+  --url 'nfs://10.128.61.201/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0' \
+  --samples 20 --payload-mib 4 \
+  --max-metadata-p95-ms 10 --max-commit-p95-ms 10 \
+  --min-write-mib-s 20 --min-read-mib-s 20
+```
+
+Exit status `0` means all requested thresholds and integrity checks passed,
+`2` means a measurement crossed a threshold, and `1` means the probe itself
+failed.
+
+## Cross-environment performance baselines
+
+`tests/benchmarks/baselines/manifest.json` is the authoritative list of every
+real storage endpoint and protocol. Each entry owns a distinct baseline file;
+sharing a baseline across LIFs, servers, or protocol versions is forbidden.
+The scheduled `Performance baseline capture` workflow runs at 02:00, 10:00,
+and 18:00 UTC, records five independent captures for all eleven combinations,
+and uploads the raw JSON and generated report. Three complete days yield the
+required 45 unique run identities per environment.
+
+Build candidate baselines from downloaded capture artifacts with:
+
+```bash
+python3 tests/benchmarks/build-performance-baselines.py \
+  --manifest tests/benchmarks/baselines/manifest.json \
+  --captures-root captures \
+  --output-dir candidate-baselines
+```
+
+The candidate release gate runs five measurements per environment and requires
+at least four valid runs. It remains intentionally unwired during baseline
+bootstrap. After all eleven accepted baselines are committed, wire
+`run-storage-benchmark-suite.sh gate` into release validation; a missing,
+under-sampled, or regressed baseline then fails closed.
+`tests/benchmarks/report/performance-baselines.{json,md}` is the generated
+machine- and human-readable baseline status report.
 
 `capability-report.sh` performs read-only discovery of the NFS implementation,
 pNFS configuration, installed fault tools, repository-owned lab commands, and

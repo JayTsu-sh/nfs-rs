@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-19
+
+### Testing
+
+- Add fail-closed nightly NFSv4.0 validation against the DXN
+  `10.131.7.201:/jay_nfs` fixture, including negotiated I/O limits,
+  self-contained namespace and data integrity checks, and concurrent I/O.
+- Add independent cross-environment performance baselines for every real
+  Linux, DXN, FAS2750, and NetApp pNFS endpoint/protocol combination, with
+  scheduled multi-window capture, candidate release-gate tooling, and
+  JSON/Markdown reports.
+
 ## [0.5.0] - 2026-08-14
 
 ### Added
@@ -74,7 +86,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.0...v0.3.1

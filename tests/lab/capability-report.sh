@@ -106,4 +106,18 @@ validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
   done
 } >"$report_dir/netapp-pnfs.txt"
 
+validate_ipv4 "$LAB_DXN_V40_DATA"
+validate_export_path "$LAB_DXN_V40_EXPORT"
+{
+  printf 'data_endpoint=%s\n' "$LAB_DXN_V40_DATA"
+  printf 'export=%s\n' "$LAB_DXN_V40_EXPORT"
+  echo 'protocol=4.0'
+  if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/2049' _ "$LAB_DXN_V40_DATA"; then
+    echo 'nfs_port=reachable'
+  else
+    echo 'nfs_port=BLOCKED_CAPABILITY(dxn-nfsv40)'
+    exit 1
+  fi
+} >"$report_dir/dxn-nfsv40.txt"
+
 echo "lab capability report written to $report_dir"
