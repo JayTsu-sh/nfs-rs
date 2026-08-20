@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
-use nfs_rs::{NFSVersion, OPEN_READ, parse_url_and_mount};
+use nfs_rs::{NFSVersion, OPEN_READ, PathconfSupport, parse_url_and_mount};
 use serde_json::json;
 use thiserror::Error;
 
@@ -176,18 +176,9 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 mount.access(created.fh.clone(), 1).await?;
                 let access_ms = millis(started);
                 let started = Instant::now();
-                let (pathconf_ms, pathconf_status) = match mount.pathconf(created.fh.clone()).await
-                {
-                    Ok(_) => (Some(millis(started)), "pass".to_string()),
-                    Err(error)
-                        if error
-                            .to_string()
-                            .contains("PATHCONF server omitted required attributes") =>
-                    {
-                        (None, format!("unsupported: {error}"))
-                    }
-                    Err(error) => return Err(error.into()),
-                };
+                let pathconf = mount.pathconf_with_support(created.fh.clone()).await?;
+                let pathconf_ms = Some(millis(started));
+                let pathconf_status = pathconf_status(pathconf.available);
 
                 let started = Instant::now();
                 let mut offset = 0usize;
@@ -399,6 +390,26 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
         }))?
     );
     Ok(healthy)
+}
+
+fn pathconf_status(support: PathconfSupport) -> String {
+    let missing = [
+        ("linkmax", support.linkmax),
+        ("name_max", support.name_max),
+        ("no_trunc", support.no_trunc),
+        ("chown_restricted", support.chown_restricted),
+        ("case_insensitive", support.case_insensitive),
+        ("case_preserving", support.case_preserving),
+    ]
+    .into_iter()
+    .filter_map(|(name, available)| (!available).then_some(name))
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        "pass".to_string()
+    } else {
+        format!("pass_with_defaults: {}", missing.join(","))
+    }
 }
 
 fn parse_config(

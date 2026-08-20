@@ -845,6 +845,17 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     async fn pathconf(&self, fh: Bytes) -> Result<Pathconf>;
 
+    /// Returns path configuration together with the fields that were actually
+    /// available. NFSv3 reports every field because PATHCONF3 has a fixed
+    /// response shape; NFSv4 reports the GETATTR response bitmap and `fsid`.
+    async fn pathconf_with_support(&self, fh: Bytes) -> Result<SupportedPathconf> {
+        Ok(SupportedPathconf {
+            values: self.pathconf(fh).await?,
+            available: PathconfSupport::all(),
+            fsid: None,
+        })
+    }
+
     /// Same as [`Mount::pathconf`] but instead of taking in a file handle, takes in a path for which file handle is
     /// obtained by performing one or more LOOKUP procedures.
     ///
@@ -1692,6 +1703,43 @@ pub struct Pathconf {
     pub chown_restricted: bool,
     pub case_insensitive: bool,
     pub case_preserving: bool,
+}
+
+/// Availability of the optional NFSv4 attributes represented by [`Pathconf`].
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct PathconfSupport {
+    pub linkmax: bool,
+    pub name_max: bool,
+    pub no_trunc: bool,
+    pub chown_restricted: bool,
+    pub case_insensitive: bool,
+    pub case_preserving: bool,
+}
+
+impl PathconfSupport {
+    pub const fn all() -> Self {
+        Self {
+            linkmax: true,
+            name_max: true,
+            no_trunc: true,
+            chown_restricted: true,
+            case_insensitive: true,
+            case_preserving: true,
+        }
+    }
+}
+
+/// PATHCONF values plus explicit availability for optional NFSv4 attributes.
+///
+/// When an availability field is false, the corresponding value is a
+/// conservative compatibility default and must not be interpreted as a
+/// server-reported value.
+#[derive(Debug, Default, PartialEq)]
+pub struct SupportedPathconf {
+    pub values: Pathconf,
+    pub available: PathconfSupport,
+    /// NFSv4 filesystem identifier that scopes `supported_attrs`.
+    pub fsid: Option<(u64, u64)>,
 }
 
 /// Struct describing a single NFS entry as returned by [`Mount::readdir`] and [`Mount::readdir_path`].
