@@ -2,7 +2,10 @@ name: Performance baseline capture
 
 on:
   schedule:
-    - cron: "0 2,10,18 * * *"
+    # A complete window takes under ten minutes on the dedicated runner. Odd
+    # UTC hours avoid the 18:00 UTC Nightly lab slot while providing enough
+    # temporal separation to bootstrap nine windows in about 18 hours.
+    - cron: "17 1,3,5,7,9,11,13,15,17,19,21,23 * * *"
   workflow_dispatch:
 
 permissions:

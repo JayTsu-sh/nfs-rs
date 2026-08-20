@@ -105,7 +105,7 @@ fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock(
         "tests/benchmarks/run-storage-benchmark-suite.sh",
     ))
     .expect("benchmark suite runner must exist");
-    assert!(capture.contains("0 2,10,18 * * *"));
+    assert!(capture.contains("17 1,3,5,7,9,11,13,15,17,19,21,23 * * *"));
     assert!(capture.contains("NFS_RS_BENCHMARK_CAPTURE_RUNS: 5"));
     assert!(capture.contains("run-storage-benchmark-suite.sh capture"));
     assert!(
