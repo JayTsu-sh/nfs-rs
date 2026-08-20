@@ -2,10 +2,9 @@ name: Performance baseline capture
 
 on:
   schedule:
-    # A complete window takes about eleven minutes on the dedicated runner.
-    # Twenty-minute spacing bootstraps nine windows in about 160 minutes;
-    # concurrency queues any overlap with lab or slower preceding jobs.
-    - cron: "7,27,47 * * * *"
+    # Accepted baselines only need periodic drift samples. The release workflow
+    # independently gates candidate commits against the committed baselines.
+    - cron: "0 2,10,18 * * *"
   workflow_dispatch:
 
 permissions:

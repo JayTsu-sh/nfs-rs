@@ -70,7 +70,7 @@ fn every_real_storage_protocol_has_an_independent_baseline() {
 }
 
 #[test]
-fn report_marks_uncaptured_environments_and_fails_closed() {
+fn report_accepts_every_fully_captured_environment() {
     let output_dir =
         std::env::temp_dir().join(format!("nfsrs-performance-report-{}", std::process::id()));
     fs::create_dir_all(&output_dir).expect("temporary report directory must be created");
@@ -87,12 +87,116 @@ fn report_marks_uncaptured_environments_and_fails_closed() {
         .current_dir(workspace_path("."))
         .status()
         .expect("report generator should start");
-    assert_eq!(status.code(), Some(2));
+    assert_eq!(status.code(), Some(0));
     let markdown = fs::read_to_string(output_dir.join("performance-baselines.md"))
-        .expect("Markdown report must be generated even when incomplete");
-    assert!(markdown.contains("baseline_missing"));
-    assert!(markdown.contains("dxn-v40"));
-    assert!(markdown.contains("netapp-pnfs-ds"));
+        .expect("Markdown report must be generated for accepted baselines");
+    assert!(markdown.contains("Overall status: `complete`"));
+    assert!(markdown.contains(
+        "| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 35.158 | 99.908 |"
+    ));
+    assert!(
+        markdown
+            .contains("| netapp-pnfs-ds | `10.128.56.161:/nfsrs_pnfs_b` | 4.1 | `accepted` | 45 |")
+    );
+    assert!(markdown.contains("## Baseline analysis summary"));
+    assert!(markdown.contains("### Linux protocol comparison"));
+    assert!(markdown.contains("### Highest baseline p95 latency observations"));
+    let html = fs::read_to_string(output_dir.join("performance-baselines.html"))
+        .expect("HTML report must be generated for accepted baselines");
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("Overall status:"));
+    assert!(html.contains("35.158"));
+    assert!(html.contains("pass_with_defaults: case_insensitive"));
+    assert!(html.contains("Baseline analysis summary"));
+    assert!(html.contains("Write-throughput ranking"));
+    assert!(html.contains("Read-throughput ranking"));
+    assert!(html.contains("Linux protocol comparison"));
+    assert!(html.contains("Per-interface latency"));
+    let json: Value = serde_json::from_slice(
+        &fs::read(output_dir.join("performance-baselines.json"))
+            .expect("JSON report must be generated for accepted baselines"),
+    )
+    .expect("performance baseline report must be JSON");
+    assert_eq!(
+        json["analysis"]["write_throughput_ranking"][0]["environment"],
+        "netapp-pnfs-ds"
+    );
+    assert_eq!(
+        json["analysis"]["protocol_comparisons"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        json["analysis"]["tail_latency_hotspots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+#[test]
+fn report_fails_closed_and_still_renders_when_a_baseline_is_incomplete() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "nfsrs-incomplete-performance-report-{}",
+        std::process::id()
+    ));
+    let output_dir = fixture_dir.join("report");
+    fs::create_dir_all(&fixture_dir).expect("temporary fixture directory must be created");
+    let baseline_path = fixture_dir.join("partial.json");
+    fs::write(
+        &baseline_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "environment": "partial",
+            "endpoint": "127.0.0.1:/partial",
+            "protocol": "4.0",
+            "status": "bootstrap_required",
+            "capture_runs": 0,
+            "capture_windows": 0,
+            "benchmarks": {"storage_path": {}}
+        }))
+        .expect("partial baseline fixture must serialize"),
+    )
+    .expect("partial baseline fixture must be written");
+    let manifest_path = fixture_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "minimum_capture_runs": 45,
+            "minimum_capture_windows": 9,
+            "environments": [{
+                "id": "partial",
+                "endpoint": "127.0.0.1:/partial",
+                "protocol": "4.0",
+                "baseline": baseline_path
+            }]
+        }))
+        .expect("partial manifest fixture must serialize"),
+    )
+    .expect("partial manifest fixture must be written");
+
+    let status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/generate-baseline-report.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("report generator should start");
+    assert_eq!(status.code(), Some(2));
+    for extension in ["json", "md", "html"] {
+        let report =
+            fs::read_to_string(output_dir.join(format!("performance-baselines.{extension}")))
+                .expect("fail-closed report must still be rendered");
+        assert!(report.contains("baseline_missing"));
+    }
 }
 
 #[test]
@@ -105,11 +209,11 @@ fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock(
         "tests/benchmarks/run-storage-benchmark-suite.sh",
     ))
     .expect("benchmark suite runner must exist");
-    assert!(capture.contains("7,27,47 * * * *"));
+    assert!(capture.contains("0 2,10,18 * * *"));
     assert!(capture.contains("NFS_RS_BENCHMARK_CAPTURE_RUNS: 5"));
     assert!(capture.contains("run-storage-benchmark-suite.sh capture"));
     assert!(
-        !fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
+        fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
             .expect("release workflow must exist")
             .contains("run-storage-benchmark-suite.sh gate")
     );

@@ -57,12 +57,11 @@ failed.
 `tests/benchmarks/baselines/manifest.json` is the authoritative list of every
 real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
-During baseline bootstrap, the scheduled `Performance baseline capture`
-workflow runs every 20 minutes at 7, 27, and 47 minutes past the hour, records five independent
+With accepted baselines committed, the scheduled `Performance baseline
+capture` workflow runs at 02:00, 10:00, and 18:00 UTC, records five independent
 captures for all eleven combinations, and uploads the raw JSON and generated
-report. Nine successful windows yield the required 45 unique run identities
-per environment in about 160 minutes. Reduce the cadence after the initial
-accepted baselines are committed.
+report. The reduced cadence monitors drift without retaining the temporary
+20-minute bootstrap schedule.
 
 Build candidate baselines from downloaded capture artifacts with:
 
@@ -73,13 +72,12 @@ python3 tests/benchmarks/build-performance-baselines.py \
   --output-dir candidate-baselines
 ```
 
-The candidate release gate runs five measurements per environment and requires
-at least four valid runs. It remains intentionally unwired during baseline
-bootstrap. After all eleven accepted baselines are committed, wire
-`run-storage-benchmark-suite.sh gate` into release validation; a missing,
-under-sampled, or regressed baseline then fails closed.
-`tests/benchmarks/report/performance-baselines.{json,md}` is the generated
-machine- and human-readable baseline status report.
+The release-validation performance gate runs five measurements per environment
+and requires at least four valid runs. A missing, under-sampled, or regressed
+baseline fails closed.
+`tests/benchmarks/report/performance-baselines.{json,md,html}` is the generated
+machine-readable and human-readable baseline status report. All three formats
+include the data-derived baseline analysis summary.
 
 `capability-report.sh` performs read-only discovery of the NFS implementation,
 pNFS configuration, installed fault tools, repository-owned lab commands, and

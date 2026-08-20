@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Performance baseline report</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #0b1020; color: #e8edf7; }
+    main { width: min(1500px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 64px; }
+    h1 { margin-bottom: 8px; } h2 { margin-top: 40px; }
+    .summary { color: #aebbd0; margin: 0 0 24px; }
+    .status { display: inline-block; padding: 3px 9px; border-radius: 999px; font-weight: 700; }
+    .complete, .accepted, .pass { background: #153d2b; color: #70e1a1; }
+    .baseline_missing { background: #4a251d; color: #ff9b82; }
+    .table-wrap { overflow-x: auto; border: 1px solid #26324a; border-radius: 10px; }
+    table { width: 100%; border-collapse: collapse; background: #11182a; }
+    th, td { padding: 9px 12px; border-bottom: 1px solid #26324a; text-align: left; white-space: nowrap; }
+    th { background: #172138; color: #b8c7df; position: sticky; top: 0; }
+    td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
+    code { color: #9fc5ff; }
+    section.environment { margin-top: 28px; padding: 20px; background: #10182a; border: 1px solid #26324a; border-radius: 12px; }
+    .metadata { color: #aebbd0; margin-top: -8px; }
+    @media print { body { background: white; color: black; } main { width: 100%; } table, section.environment { background: white; } th { background: #eee; color: black; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Performance baseline report</h1>
+  <p class="summary">Overall status: <span class="status complete">complete</span> · 9 windows · 45 captures per environment</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Environment</th><th>Endpoint</th><th>Protocol</th><th>Status</th><th class="number">Captures</th><th class="number">Write median MiB/s</th><th class="number">Read median MiB/s</th><th>PATHCONF</th></tr></thead>
+    <tbody>
+      <tr><td><code>linux-source-v3</code></td><td><code>10.10.1.12:/srv/nfs/v3</code></td><td>3</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">28.030</td><td class="number">1176.835</td><td>pass</td></tr>
+      <tr><td><code>linux-source-v40</code></td><td><code>10.10.1.12:/srv/nfs/v4</code></td><td>4.0</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">26.831</td><td class="number">1150.028</td><td>pass</td></tr>
+      <tr><td><code>linux-source-v41</code></td><td><code>10.10.1.12:/srv/nfs/v4</code></td><td>4.1</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">23.094</td><td class="number">941.643</td><td>pass</td></tr>
+      <tr><td><code>linux-destination-v3</code></td><td><code>10.10.1.13:/srv/nfs/v3</code></td><td>3</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">27.408</td><td class="number">1118.429</td><td>pass</td></tr>
+      <tr><td><code>linux-destination-v40</code></td><td><code>10.10.1.13:/srv/nfs/v4</code></td><td>4.0</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">27.131</td><td class="number">1110.925</td><td>pass</td></tr>
+      <tr><td><code>linux-destination-v41</code></td><td><code>10.10.1.13:/srv/nfs/v4</code></td><td>4.1</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">23.877</td><td class="number">928.453</td><td>pass</td></tr>
+      <tr><td><code>dxn-v40</code></td><td><code>10.131.7.201:/jay_nfs</code></td><td>4.0</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">35.158</td><td class="number">99.908</td><td>pass</td></tr>
+      <tr><td><code>fas2750-v40-lif-a</code></td><td><code>10.128.61.200:/nfsrs_v40_test</code></td><td>4.0</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">46.417</td><td class="number">52.299</td><td>pass_with_defaults: case_insensitive</td></tr>
+      <tr><td><code>fas2750-v40-lif-b</code></td><td><code>10.128.61.201:/nfsrs_v40_test</code></td><td>4.0</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">37.875</td><td class="number">44.337</td><td>pass_with_defaults: case_insensitive</td></tr>
+      <tr><td><code>netapp-pnfs-mds</code></td><td><code>10.128.56.160:/nfsrs_pnfs_b</code></td><td>4.1</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">82.735</td><td class="number">87.439</td><td>pass_with_defaults: case_insensitive</td></tr>
+      <tr><td><code>netapp-pnfs-ds</code></td><td><code>10.128.56.161:/nfsrs_pnfs_b</code></td><td>4.1</td><td><span class="status accepted">accepted</span></td><td class="number">45</td><td class="number">82.745</td><td class="number">88.310</td><td>pass_with_defaults: case_insensitive</td></tr>
+    </tbody>
+  </table></div>
+  <h2>Baseline analysis summary</h2>
+  <section class="environment">
+    <h3>Key observations</h3>
+    <ul>
+      <li>netapp-pnfs-ds has the highest median write throughput at 82.745 MiB/s, 258.3% above linux-source-v41 (23.094 MiB/s).</li>
+      <li>linux-source-v3 has the highest median read throughput at 1176.835 MiB/s, 2554.3% above fas2750-v40-lif-b (44.337 MiB/s).</li>
+      <li>FAS2750 LIF A exceeds LIF B by 22.6% for median write throughput and 18.0% for median read throughput; retain per-LIF baselines rather than combining them.</li>
+      <li>linux-source: NFS 3 leads median writes (28.030 MiB/s), while NFS 3 leads median reads (1176.835 MiB/s).</li>
+      <li>linux-destination: NFS 3 leads median writes (27.408 MiB/s), while NFS 3 leads median reads (1118.429 MiB/s).</li>
+      <li>PATHCONF uses the interoperable case-insensitive default on fas2750-v40-lif-a, fas2750-v40-lif-b, netapp-pnfs-mds, netapp-pnfs-ds; this is an accepted capability difference, not a benchmark failure.</li>
+    </ul>
+  </section>
+  <section class="environment">
+    <h3>Write-throughput ranking</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th class="number">Rank</th><th>Environment</th><th class="number">Write median MiB/s</th></tr></thead>
+      <tbody>
+        <tr><td class="number">1</td><td><code>netapp-pnfs-ds</code></td><td class="number">82.745</td></tr>
+        <tr><td class="number">2</td><td><code>netapp-pnfs-mds</code></td><td class="number">82.735</td></tr>
+        <tr><td class="number">3</td><td><code>fas2750-v40-lif-a</code></td><td class="number">46.417</td></tr>
+        <tr><td class="number">4</td><td><code>fas2750-v40-lif-b</code></td><td class="number">37.875</td></tr>
+        <tr><td class="number">5</td><td><code>dxn-v40</code></td><td class="number">35.158</td></tr>
+        <tr><td class="number">6</td><td><code>linux-source-v3</code></td><td class="number">28.030</td></tr>
+        <tr><td class="number">7</td><td><code>linux-destination-v3</code></td><td class="number">27.408</td></tr>
+        <tr><td class="number">8</td><td><code>linux-destination-v40</code></td><td class="number">27.131</td></tr>
+        <tr><td class="number">9</td><td><code>linux-source-v40</code></td><td class="number">26.831</td></tr>
+        <tr><td class="number">10</td><td><code>linux-destination-v41</code></td><td class="number">23.877</td></tr>
+        <tr><td class="number">11</td><td><code>linux-source-v41</code></td><td class="number">23.094</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>Read-throughput ranking</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th class="number">Rank</th><th>Environment</th><th class="number">Read median MiB/s</th></tr></thead>
+      <tbody>
+        <tr><td class="number">1</td><td><code>linux-source-v3</code></td><td class="number">1176.835</td></tr>
+        <tr><td class="number">2</td><td><code>linux-source-v40</code></td><td class="number">1150.028</td></tr>
+        <tr><td class="number">3</td><td><code>linux-destination-v3</code></td><td class="number">1118.429</td></tr>
+        <tr><td class="number">4</td><td><code>linux-destination-v40</code></td><td class="number">1110.925</td></tr>
+        <tr><td class="number">5</td><td><code>linux-source-v41</code></td><td class="number">941.643</td></tr>
+        <tr><td class="number">6</td><td><code>linux-destination-v41</code></td><td class="number">928.453</td></tr>
+        <tr><td class="number">7</td><td><code>dxn-v40</code></td><td class="number">99.908</td></tr>
+        <tr><td class="number">8</td><td><code>netapp-pnfs-ds</code></td><td class="number">88.310</td></tr>
+        <tr><td class="number">9</td><td><code>netapp-pnfs-mds</code></td><td class="number">87.439</td></tr>
+        <tr><td class="number">10</td><td><code>fas2750-v40-lif-a</code></td><td class="number">52.299</td></tr>
+        <tr><td class="number">11</td><td><code>fas2750-v40-lif-b</code></td><td class="number">44.337</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>Linux protocol comparison</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Site</th><th>Protocol</th><th class="number">Write median MiB/s</th><th class="number">Read median MiB/s</th></tr></thead>
+      <tbody>
+        <tr><td>linux-source</td><td>3</td><td class="number">28.030</td><td class="number">1176.835</td></tr>
+        <tr><td>linux-source</td><td>4.0</td><td class="number">26.831</td><td class="number">1150.028</td></tr>
+        <tr><td>linux-source</td><td>4.1</td><td class="number">23.094</td><td class="number">941.643</td></tr>
+        <tr><td>linux-destination</td><td>3</td><td class="number">27.408</td><td class="number">1118.429</td></tr>
+        <tr><td>linux-destination</td><td>4.0</td><td class="number">27.131</td><td class="number">1110.925</td></tr>
+        <tr><td>linux-destination</td><td>4.1</td><td class="number">23.877</td><td class="number">928.453</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>Highest baseline p95 latency observations</h3>
+    <p class="metadata">These are ranking observations across unlike operations, not causal diagnoses.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th class="number">Rank</th><th>Environment</th><th>Interface</th><th class="number">p95 ms</th><th class="number">p99 ms</th></tr></thead>
+      <tbody>
+        <tr><td class="number">1</td><td><code>fas2750-v40-lif-b</code></td><td>READ</td><td class="number">388.999</td><td class="number">680.464</td></tr>
+        <tr><td class="number">2</td><td><code>fas2750-v40-lif-a</code></td><td>READ</td><td class="number">347.594</td><td class="number">633.940</td></tr>
+        <tr><td class="number">3</td><td><code>linux-destination-v41</code></td><td>WRITE</td><td class="number">325.605</td><td class="number">554.489</td></tr>
+        <tr><td class="number">4</td><td><code>linux-source-v41</code></td><td>WRITE</td><td class="number">287.533</td><td class="number">572.170</td></tr>
+        <tr><td class="number">5</td><td><code>linux-source-v41</code></td><td>MOUNT</td><td class="number">265.356</td><td class="number">395.567</td></tr>
+        <tr><td class="number">6</td><td><code>linux-source-v40</code></td><td>WRITE</td><td class="number">262.842</td><td class="number">486.825</td></tr>
+        <tr><td class="number">7</td><td><code>dxn-v40</code></td><td>WRITE</td><td class="number">257.021</td><td class="number">308.052</td></tr>
+        <tr><td class="number">8</td><td><code>linux-destination-v40</code></td><td>WRITE</td><td class="number">232.206</td><td class="number">456.930</td></tr>
+        <tr><td class="number">9</td><td><code>linux-destination-v3</code></td><td>WRITE</td><td class="number">232.155</td><td class="number">555.489</td></tr>
+        <tr><td class="number">10</td><td><code>linux-source-v3</code></td><td>WRITE</td><td class="number">228.979</td><td class="number">398.241</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>PATHCONF capability groups</h3>
+    <ul>
+      <li><code>pass</code>: linux-source-v3, linux-source-v40, linux-source-v41, linux-destination-v3, linux-destination-v40, linux-destination-v41, dxn-v40</li>
+      <li><code>pass_with_defaults: case_insensitive</code>: fas2750-v40-lif-a, fas2750-v40-lif-b, netapp-pnfs-mds, netapp-pnfs-ds</li>
+    </ul>
+  </section>
+  <h2>Per-interface latency</h2>
+  <section class="environment">
+    <h3>linux-source-v3</h3>
+    <p class="metadata"><code>10.10.1.12:/srv/nfs/v3</code> · NFS 3 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">1.539</td><td class="number">2.138</td><td class="number">2.569</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.465</td><td class="number">0.801</td><td class="number">1.232</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.097</td><td class="number">0.130</td><td class="number">0.163</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.099</td><td class="number">0.129</td><td class="number">0.155</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.100</td><td class="number">0.127</td><td class="number">0.144</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">23.782</td><td class="number">69.241</td><td class="number">121.729</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">19.469</td><td class="number">50.067</td><td class="number">103.089</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.185</td><td class="number">0.370</td><td class="number">0.452</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.126</td><td class="number">0.257</td><td class="number">0.321</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.111</td><td class="number">0.206</td><td class="number">0.269</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.106</td><td class="number">0.159</td><td class="number">0.208</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">142.576</td><td class="number">228.979</td><td class="number">398.241</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.330</td><td class="number">0.614</td><td class="number">0.734</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.002</td><td class="number">0.004</td><td class="number">0.005</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.246</td><td class="number">0.428</td><td class="number">0.546</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">3.399</td><td class="number">6.746</td><td class="number">8.160</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">20.924</td><td class="number">51.093</td><td class="number">120.168</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">22.277</td><td class="number">51.847</td><td class="number">132.184</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">22.476</td><td class="number">52.327</td><td class="number">104.840</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.181</td><td class="number">0.389</td><td class="number">0.468</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.150</td><td class="number">0.316</td><td class="number">0.404</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">24.117</td><td class="number">59.006</td><td class="number">127.938</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">20.166</td><td class="number">59.207</td><td class="number">112.821</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>linux-source-v40</h3>
+    <p class="metadata"><code>10.10.1.12:/srv/nfs/v4</code> · NFS 4.0 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">1.058</td><td class="number">1.619</td><td class="number">1.902</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.098</td><td class="number">0.192</td><td class="number">0.221</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.099</td><td class="number">0.129</td><td class="number">0.151</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.108</td><td class="number">0.137</td><td class="number">0.154</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.104</td><td class="number">0.132</td><td class="number">0.160</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">44.164</td><td class="number">98.595</td><td class="number">268.429</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">38.780</td><td class="number">113.160</td><td class="number">261.604</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.137</td><td class="number">0.289</td><td class="number">0.371</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.117</td><td class="number">0.215</td><td class="number">0.283</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.111</td><td class="number">0.172</td><td class="number">0.240</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.110</td><td class="number">0.154</td><td class="number">0.207</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">149.076</td><td class="number">262.842</td><td class="number">486.825</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.399</td><td class="number">0.717</td><td class="number">0.839</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.186</td><td class="number">0.285</td><td class="number">0.356</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.425</td><td class="number">0.529</td><td class="number">0.636</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">3.477</td><td class="number">7.039</td><td class="number">8.457</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">21.058</td><td class="number">53.460</td><td class="number">131.222</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">22.873</td><td class="number">50.882</td><td class="number">134.891</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">21.943</td><td class="number">50.820</td><td class="number">97.187</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.188</td><td class="number">0.383</td><td class="number">0.485</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.157</td><td class="number">0.339</td><td class="number">0.398</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">23.977</td><td class="number">59.374</td><td class="number">134.599</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">19.898</td><td class="number">58.299</td><td class="number">100.168</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>linux-source-v41</h3>
+    <p class="metadata"><code>10.10.1.12:/srv/nfs/v4</code> · NFS 4.1 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">102.959</td><td class="number">265.356</td><td class="number">395.567</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">63.103</td><td class="number">132.029</td><td class="number">454.003</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.099</td><td class="number">0.129</td><td class="number">0.153</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.109</td><td class="number">0.137</td><td class="number">0.158</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.108</td><td class="number">0.141</td><td class="number">0.161</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">43.748</td><td class="number">100.128</td><td class="number">226.400</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">39.115</td><td class="number">92.014</td><td class="number">190.329</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.199</td><td class="number">0.406</td><td class="number">0.493</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.134</td><td class="number">0.262</td><td class="number">0.319</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.125</td><td class="number">0.214</td><td class="number">0.266</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.115</td><td class="number">0.167</td><td class="number">0.232</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">173.027</td><td class="number">287.533</td><td class="number">572.170</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.327</td><td class="number">0.623</td><td class="number">0.751</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.134</td><td class="number">0.259</td><td class="number">0.341</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.278</td><td class="number">0.392</td><td class="number">0.533</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">4.248</td><td class="number">7.587</td><td class="number">9.398</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">23.066</td><td class="number">66.463</td><td class="number">158.954</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">18.473</td><td class="number">48.925</td><td class="number">92.898</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">22.208</td><td class="number">53.108</td><td class="number">118.149</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.184</td><td class="number">0.385</td><td class="number">0.469</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.156</td><td class="number">0.311</td><td class="number">0.419</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">24.794</td><td class="number">60.551</td><td class="number">134.824</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">19.865</td><td class="number">67.556</td><td class="number">122.445</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>linux-destination-v3</h3>
+    <p class="metadata"><code>10.10.1.13:/srv/nfs/v3</code> · NFS 3 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">1.649</td><td class="number">2.148</td><td class="number">3.411</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.479</td><td class="number">0.836</td><td class="number">0.956</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.100</td><td class="number">0.132</td><td class="number">0.153</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.101</td><td class="number">0.131</td><td class="number">0.156</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.102</td><td class="number">0.131</td><td class="number">0.154</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">24.117</td><td class="number">70.869</td><td class="number">140.464</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">19.479</td><td class="number">51.524</td><td class="number">108.638</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.174</td><td class="number">0.362</td><td class="number">0.451</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.124</td><td class="number">0.266</td><td class="number">0.311</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.112</td><td class="number">0.206</td><td class="number">0.284</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.107</td><td class="number">0.165</td><td class="number">0.215</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">145.858</td><td class="number">232.155</td><td class="number">555.489</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.333</td><td class="number">0.598</td><td class="number">0.768</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.002</td><td class="number">0.004</td><td class="number">0.009</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.247</td><td class="number">0.410</td><td class="number">0.509</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">3.575</td><td class="number">6.887</td><td class="number">8.075</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">21.071</td><td class="number">61.024</td><td class="number">124.913</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">23.019</td><td class="number">57.029</td><td class="number">177.096</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">23.467</td><td class="number">53.598</td><td class="number">172.680</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.184</td><td class="number">0.387</td><td class="number">0.466</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.154</td><td class="number">0.305</td><td class="number">0.367</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">24.251</td><td class="number">67.425</td><td class="number">130.912</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">20.357</td><td class="number">61.546</td><td class="number">113.339</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>linux-destination-v40</h3>
+    <p class="metadata"><code>10.10.1.13:/srv/nfs/v4</code> · NFS 4.0 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">1.072</td><td class="number">1.660</td><td class="number">1.759</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.076</td><td class="number">0.203</td><td class="number">0.249</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.099</td><td class="number">0.128</td><td class="number">0.146</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.106</td><td class="number">0.137</td><td class="number">0.164</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.104</td><td class="number">0.136</td><td class="number">0.159</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">44.862</td><td class="number">107.422</td><td class="number">262.684</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">40.159</td><td class="number">102.458</td><td class="number">209.855</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.139</td><td class="number">0.288</td><td class="number">0.373</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.116</td><td class="number">0.202</td><td class="number">0.264</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.111</td><td class="number">0.160</td><td class="number">0.195</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.109</td><td class="number">0.147</td><td class="number">0.185</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">147.423</td><td class="number">232.206</td><td class="number">456.930</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.406</td><td class="number">0.759</td><td class="number">0.828</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.188</td><td class="number">0.309</td><td class="number">0.420</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.425</td><td class="number">0.542</td><td class="number">0.717</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">3.599</td><td class="number">7.061</td><td class="number">8.322</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">23.021</td><td class="number">59.720</td><td class="number">174.311</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">23.574</td><td class="number">52.965</td><td class="number">142.754</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">23.896</td><td class="number">52.860</td><td class="number">118.457</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.188</td><td class="number">0.378</td><td class="number">0.452</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.158</td><td class="number">0.325</td><td class="number">0.440</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">24.625</td><td class="number">70.022</td><td class="number">162.334</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">20.412</td><td class="number">68.283</td><td class="number">124.072</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>linux-destination-v41</h3>
+    <p class="metadata"><code>10.10.1.13:/srv/nfs/v4</code> · NFS 4.1 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">89.712</td><td class="number">166.446</td><td class="number">320.162</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">47.297</td><td class="number">119.052</td><td class="number">218.483</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.100</td><td class="number">0.129</td><td class="number">0.153</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.109</td><td class="number">0.139</td><td class="number">0.160</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.107</td><td class="number">0.138</td><td class="number">0.157</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">43.597</td><td class="number">99.719</td><td class="number">236.627</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">38.598</td><td class="number">89.500</td><td class="number">263.138</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.206</td><td class="number">0.426</td><td class="number">0.482</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.140</td><td class="number">0.291</td><td class="number">0.372</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.126</td><td class="number">0.227</td><td class="number">0.301</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.115</td><td class="number">0.179</td><td class="number">0.227</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">167.485</td><td class="number">325.605</td><td class="number">554.489</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.329</td><td class="number">0.637</td><td class="number">0.775</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.134</td><td class="number">0.250</td><td class="number">0.330</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.279</td><td class="number">0.381</td><td class="number">0.550</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">4.307</td><td class="number">7.993</td><td class="number">9.664</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">23.049</td><td class="number">59.985</td><td class="number">171.305</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">18.523</td><td class="number">44.766</td><td class="number">98.302</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">23.270</td><td class="number">55.933</td><td class="number">130.192</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.185</td><td class="number">0.392</td><td class="number">0.471</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.159</td><td class="number">0.319</td><td class="number">0.401</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">24.245</td><td class="number">69.643</td><td class="number">126.137</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">20.371</td><td class="number">64.032</td><td class="number">123.097</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>dxn-v40</h3>
+    <p class="metadata"><code>10.131.7.201:/jay_nfs</code> · NFS 4.0 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">1.510</td><td class="number">3.446</td><td class="number">3.989</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.136</td><td class="number">0.215</td><td class="number">0.243</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.151</td><td class="number">0.246</td><td class="number">0.350</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.188</td><td class="number">0.274</td><td class="number">0.424</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.187</td><td class="number">0.267</td><td class="number">0.430</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">3.690</td><td class="number">5.278</td><td class="number">8.336</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">3.630</td><td class="number">4.791</td><td class="number">6.265</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.272</td><td class="number">0.466</td><td class="number">0.594</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.219</td><td class="number">0.358</td><td class="number">0.463</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.188</td><td class="number">0.296</td><td class="number">0.449</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.183</td><td class="number">0.265</td><td class="number">0.443</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">113.754</td><td class="number">257.021</td><td class="number">308.052</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.344</td><td class="number">0.532</td><td class="number">0.990</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.285</td><td class="number">0.449</td><td class="number">0.915</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.910</td><td class="number">1.369</td><td class="number">2.669</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">40.029</td><td class="number">78.230</td><td class="number">107.206</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">2.916</td><td class="number">4.276</td><td class="number">7.498</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">2.906</td><td class="number">4.016</td><td class="number">7.463</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">1.828</td><td class="number">2.810</td><td class="number">4.774</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.238</td><td class="number">0.347</td><td class="number">0.558</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.339</td><td class="number">0.547</td><td class="number">0.760</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">1.874</td><td class="number">2.623</td><td class="number">6.154</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">2.373</td><td class="number">3.810</td><td class="number">6.400</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>fas2750-v40-lif-a</h3>
+    <p class="metadata"><code>10.128.61.200:/nfsrs_v40_test</code> · NFS 4.0 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">21.243</td><td class="number">41.591</td><td class="number">41.652</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.092</td><td class="number">0.184</td><td class="number">0.216</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.203</td><td class="number">0.411</td><td class="number">0.708</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.298</td><td class="number">0.660</td><td class="number">1.475</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.287</td><td class="number">0.539</td><td class="number">0.858</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">1.287</td><td class="number">1.705</td><td class="number">2.640</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">2.072</td><td class="number">2.651</td><td class="number">4.421</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.419</td><td class="number">0.668</td><td class="number">1.087</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.327</td><td class="number">0.552</td><td class="number">0.890</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.292</td><td class="number">0.476</td><td class="number">0.939</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.282</td><td class="number">0.532</td><td class="number">0.777</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">86.172</td><td class="number">128.479</td><td class="number">164.791</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.300</td><td class="number">0.574</td><td class="number">1.991</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.395</td><td class="number">0.727</td><td class="number">1.763</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">0.977</td><td class="number">1.448</td><td class="number">3.014</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">76.478</td><td class="number">347.594</td><td class="number">633.940</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">1.594</td><td class="number">2.340</td><td class="number">4.753</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">2.294</td><td class="number">3.100</td><td class="number">6.218</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">1.195</td><td class="number">1.581</td><td class="number">2.471</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.306</td><td class="number">0.520</td><td class="number">0.845</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.396</td><td class="number">0.629</td><td class="number">1.030</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">1.139</td><td class="number">1.532</td><td class="number">3.015</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">0.683</td><td class="number">2.731</td><td class="number">2.903</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>fas2750-v40-lif-b</h3>
+    <p class="metadata"><code>10.128.61.201:/nfsrs_v40_test</code> · NFS 4.0 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">21.589</td><td class="number">41.990</td><td class="number">42.731</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">0.108</td><td class="number">0.189</td><td class="number">0.235</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.257</td><td class="number">0.393</td><td class="number">0.631</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.472</td><td class="number">0.671</td><td class="number">1.018</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.471</td><td class="number">0.677</td><td class="number">1.022</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">1.703</td><td class="number">2.230</td><td class="number">3.083</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">2.750</td><td class="number">3.461</td><td class="number">5.389</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.682</td><td class="number">0.928</td><td class="number">1.284</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.486</td><td class="number">0.710</td><td class="number">0.980</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.468</td><td class="number">0.658</td><td class="number">1.025</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.466</td><td class="number">0.706</td><td class="number">1.148</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">105.607</td><td class="number">142.290</td><td class="number">173.695</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.350</td><td class="number">0.608</td><td class="number">1.105</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.570</td><td class="number">0.854</td><td class="number">1.537</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">1.406</td><td class="number">1.958</td><td class="number">3.605</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">90.217</td><td class="number">388.999</td><td class="number">680.464</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">2.271</td><td class="number">3.066</td><td class="number">5.454</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">3.338</td><td class="number">4.412</td><td class="number">9.657</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">1.699</td><td class="number">2.276</td><td class="number">3.635</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.465</td><td class="number">0.709</td><td class="number">1.203</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.540</td><td class="number">0.788</td><td class="number">1.436</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">1.534</td><td class="number">2.077</td><td class="number">3.746</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">0.837</td><td class="number">2.732</td><td class="number">2.870</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>netapp-pnfs-mds</h3>
+    <p class="metadata"><code>10.128.56.160:/nfsrs_pnfs_b</code> · NFS 4.1 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">2.669</td><td class="number">3.275</td><td class="number">10.120</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">5.477</td><td class="number">16.518</td><td class="number">18.050</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.216</td><td class="number">0.387</td><td class="number">0.757</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.429</td><td class="number">0.649</td><td class="number">1.011</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.424</td><td class="number">0.678</td><td class="number">1.428</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">2.208</td><td class="number">3.437</td><td class="number">4.378</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">3.085</td><td class="number">6.080</td><td class="number">7.244</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.654</td><td class="number">1.916</td><td class="number">2.129</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.451</td><td class="number">0.657</td><td class="number">1.118</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.431</td><td class="number">0.676</td><td class="number">1.279</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.433</td><td class="number">0.685</td><td class="number">1.013</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">48.347</td><td class="number">67.715</td><td class="number">98.199</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.291</td><td class="number">0.681</td><td class="number">1.723</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.810</td><td class="number">1.364</td><td class="number">3.934</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">1.948</td><td class="number">2.745</td><td class="number">6.270</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">45.739</td><td class="number">84.037</td><td class="number">329.075</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">2.504</td><td class="number">3.508</td><td class="number">6.207</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">3.290</td><td class="number">5.511</td><td class="number">12.071</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">2.447</td><td class="number">3.111</td><td class="number">5.746</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.436</td><td class="number">0.659</td><td class="number">1.335</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.548</td><td class="number">0.774</td><td class="number">1.276</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">2.288</td><td class="number">3.058</td><td class="number">4.372</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">1.771</td><td class="number">3.078</td><td class="number">3.995</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+  <section class="environment">
+    <h3>netapp-pnfs-ds</h3>
+    <p class="metadata"><code>10.128.56.161:/nfsrs_pnfs_b</code> · NFS 4.1 · 45 captures</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Interface</th><th class="number">Baseline p50 ms</th><th class="number">Baseline p95 ms</th><th class="number">Baseline p99 ms</th><th class="number">Current p95 ms</th><th>Current status</th></tr></thead>
+      <tbody>
+        <tr><td>MOUNT</td><td class="number">2.701</td><td class="number">3.613</td><td class="number">6.109</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>UMOUNT</td><td class="number">6.063</td><td class="number">7.987</td><td class="number">11.139</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>NULL</td><td class="number">0.253</td><td class="number">0.421</td><td class="number">0.673</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSINFO</td><td class="number">0.339</td><td class="number">0.563</td><td class="number">0.830</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>FSSTAT</td><td class="number">0.310</td><td class="number">0.553</td><td class="number">0.882</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>MKDIR</td><td class="number">2.216</td><td class="number">3.158</td><td class="number">3.519</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CREATE</td><td class="number">2.436</td><td class="number">3.226</td><td class="number">3.604</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LOOKUP</td><td class="number">0.433</td><td class="number">0.595</td><td class="number">0.900</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>GETATTR</td><td class="number">0.346</td><td class="number">0.529</td><td class="number">0.798</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>ACCESS</td><td class="number">0.316</td><td class="number">0.510</td><td class="number">0.772</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>PATHCONF</td><td class="number">0.301</td><td class="number">0.505</td><td class="number">0.754</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>WRITE</td><td class="number">48.337</td><td class="number">68.176</td><td class="number">83.353</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>COMMIT</td><td class="number">0.291</td><td class="number">0.636</td><td class="number">1.522</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>CLOSE</td><td class="number">0.364</td><td class="number">0.650</td><td class="number">1.366</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>OPEN</td><td class="number">1.463</td><td class="number">1.999</td><td class="number">3.499</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READ</td><td class="number">45.289</td><td class="number">76.885</td><td class="number">318.179</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RENAME</td><td class="number">1.923</td><td class="number">2.574</td><td class="number">3.752</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>LINK</td><td class="number">2.436</td><td class="number">3.187</td><td class="number">3.998</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>SYMLINK</td><td class="number">2.004</td><td class="number">2.627</td><td class="number">3.076</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READLINK</td><td class="number">0.349</td><td class="number">0.521</td><td class="number">0.857</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>READDIR</td><td class="number">0.463</td><td class="number">0.658</td><td class="number">0.922</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>REMOVE</td><td class="number">1.948</td><td class="number">2.485</td><td class="number">2.832</td><td class="number">—</td><td>—</td></tr>
+        <tr><td>RMDIR</td><td class="number">1.687</td><td class="number">3.073</td><td class="number">3.874</td><td class="number">—</td><td>—</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+</main>
+</body>
+</html>
