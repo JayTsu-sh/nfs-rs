@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Testing
+
+- Run performance baseline capture every 20 minutes during bootstrap, reducing
+  the expected nine-window collection period from about 18 hours to 160 minutes.
+
 ### Fixed
 
 - Accept NFSv4 PATHCONF responses that omit RECOMMENDED attributes, expose

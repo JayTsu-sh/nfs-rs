@@ -58,10 +58,10 @@ failed.
 real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
 During baseline bootstrap, the scheduled `Performance baseline capture`
-workflow runs every two hours at odd UTC hours, records five independent
+workflow runs every 20 minutes at 7, 27, and 47 minutes past the hour, records five independent
 captures for all eleven combinations, and uploads the raw JSON and generated
 report. Nine successful windows yield the required 45 unique run identities
-per environment in about 18 hours. Reduce the cadence after the initial
+per environment in about 160 minutes. Reduce the cadence after the initial
 accepted baselines are committed.
 
 Build candidate baselines from downloaded capture artifacts with:
