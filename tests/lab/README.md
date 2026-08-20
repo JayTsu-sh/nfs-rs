@@ -71,10 +71,13 @@ python3 tests/benchmarks/build-performance-baselines.py \
   --output-dir candidate-baselines
 ```
 
-Release validation runs five measurements per environment and requires at
-least four valid runs. A missing, under-sampled, or regressed baseline fails
-closed. `tests/benchmarks/report/performance-baselines.{json,md}` is the
-generated machine- and human-readable baseline status report.
+The candidate release gate runs five measurements per environment and requires
+at least four valid runs. It remains intentionally unwired during baseline
+bootstrap. After all eleven accepted baselines are committed, wire
+`run-storage-benchmark-suite.sh gate` into release validation; a missing,
+under-sampled, or regressed baseline then fails closed.
+`tests/benchmarks/report/performance-baselines.{json,md}` is the generated
+machine- and human-readable baseline status report.
 
 `capability-report.sh` performs read-only discovery of the NFS implementation,
 pNFS configuration, installed fault tools, repository-owned lab commands, and

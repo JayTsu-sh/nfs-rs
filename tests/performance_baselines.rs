@@ -96,13 +96,11 @@ fn report_marks_uncaptured_environments_and_fails_closed() {
 }
 
 #[test]
-fn scheduled_capture_and_release_gate_use_the_global_performance_lock() {
+fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock() {
     let capture = fs::read_to_string(workspace_path(
         ".github/workflows/performance-baselines.yml",
     ))
     .expect("performance capture workflow must exist");
-    let release = fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
-        .expect("release workflow must exist");
     let runner = fs::read_to_string(workspace_path(
         "tests/benchmarks/run-storage-benchmark-suite.sh",
     ))
@@ -110,7 +108,12 @@ fn scheduled_capture_and_release_gate_use_the_global_performance_lock() {
     assert!(capture.contains("0 2,10,18 * * *"));
     assert!(capture.contains("NFS_RS_BENCHMARK_CAPTURE_RUNS: 5"));
     assert!(capture.contains("run-storage-benchmark-suite.sh capture"));
-    assert!(release.contains("run-storage-benchmark-suite.sh gate"));
+    assert!(
+        !fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
+            .expect("release workflow must exist")
+            .contains("run-storage-benchmark-suite.sh gate")
+    );
+    assert!(runner.contains("check-performance-baselines.py"));
     assert!(runner.contains("/tmp/terrasync-lab-tests.lock"));
     assert!(runner.contains("/tmp/terrasync-lab-performance.lock"));
     assert!(runner.contains("--window-id"));

@@ -16,7 +16,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   self-contained namespace and data integrity checks, and concurrent I/O.
 - Add independent cross-environment performance baselines for every real
   Linux, DXN, FAS2750, and NetApp pNFS endpoint/protocol combination, with
-  scheduled multi-window capture, release gating, and JSON/Markdown reports.
+  scheduled multi-window capture, candidate release-gate tooling, and
+  JSON/Markdown reports.
 
 ## [0.5.0] - 2026-08-14
 
