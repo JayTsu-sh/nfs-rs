@@ -133,7 +133,11 @@ for row in rows:
                 if metric in lif
             ]
         else:
-            current_values = [sample[metric] for sample in current_samples if metric in sample]
+            current_values = [
+                sample[metric]
+                for sample in current_samples
+                if isinstance(sample.get(metric), (int, float))
+            ]
         current = percentile(current_values, 0.95)
         reference_text = f"{reference:.3f}" if isinstance(reference, (int, float)) else "—"
         current_text = f"{current:.3f}" if isinstance(current, (int, float)) else "—"

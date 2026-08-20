@@ -57,10 +57,12 @@ failed.
 `tests/benchmarks/baselines/manifest.json` is the authoritative list of every
 real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
-The scheduled `Performance baseline capture` workflow runs at 02:00, 10:00,
-and 18:00 UTC, records five independent captures for all eleven combinations,
-and uploads the raw JSON and generated report. Three complete days yield the
-required 45 unique run identities per environment.
+During baseline bootstrap, the scheduled `Performance baseline capture`
+workflow runs every two hours at odd UTC hours, records five independent
+captures for all eleven combinations, and uploads the raw JSON and generated
+report. Nine successful windows yield the required 45 unique run identities
+per environment in about 18 hours. Reduce the cadence after the initial
+accepted baselines are committed.
 
 Build candidate baselines from downloaded capture artifacts with:
 
