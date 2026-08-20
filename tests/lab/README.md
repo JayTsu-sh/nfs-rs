@@ -33,6 +33,49 @@ and concurrent I/O through one OPEN state. NetApp-specific dual-LIF,
 delegation, and fault-injection assumptions are intentionally not applied to
 DXN.
 
+`fas2750-storage-check` is an independent NFSv4.0 storage-path diagnostic. It
+does not invoke the lab test harness. For each FAS2750 LIF it samples CREATE,
+WRITE, COMMIT, READ, and REMOVE, verifies the complete read-back payload, and
+prints JSON. Thresholds are explicit so a diagnostic run cannot silently
+redefine the accepted release baseline:
+
+```bash
+cargo run --release --locked --bin fas2750-storage-check -- \
+  --url 'nfs://10.128.61.200/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0' \
+  --url 'nfs://10.128.61.201/nfsrs_v40_test?version=4.0&noresvport=true&uid=0&gid=0' \
+  --samples 20 --payload-mib 4 \
+  --max-metadata-p95-ms 10 --max-commit-p95-ms 10 \
+  --min-write-mib-s 20 --min-read-mib-s 20
+```
+
+Exit status `0` means all requested thresholds and integrity checks passed,
+`2` means a measurement crossed a threshold, and `1` means the probe itself
+failed.
+
+## Cross-environment performance baselines
+
+`tests/benchmarks/baselines/manifest.json` is the authoritative list of every
+real storage endpoint and protocol. Each entry owns a distinct baseline file;
+sharing a baseline across LIFs, servers, or protocol versions is forbidden.
+The scheduled `Performance baseline capture` workflow runs at 02:00, 10:00,
+and 18:00 UTC, records five independent captures for all eleven combinations,
+and uploads the raw JSON and generated report. Three complete days yield the
+required 45 unique run identities per environment.
+
+Build candidate baselines from downloaded capture artifacts with:
+
+```bash
+python3 tests/benchmarks/build-performance-baselines.py \
+  --manifest tests/benchmarks/baselines/manifest.json \
+  --captures-root captures \
+  --output-dir candidate-baselines
+```
+
+Release validation runs five measurements per environment and requires at
+least four valid runs. A missing, under-sampled, or regressed baseline fails
+closed. `tests/benchmarks/report/performance-baselines.{json,md}` is the
+generated machine- and human-readable baseline status report.
+
 `capability-report.sh` performs read-only discovery of the NFS implementation,
 pNFS configuration, installed fault tools, repository-owned lab commands, and
 the `ci-runner` sudo allow-list. Nightly uploads its output as an artifact. It

@@ -1,0 +1,888 @@
+{
+  "schema_version": 1,
+  "status": "baseline_missing",
+  "minimum_capture_runs": 45,
+  "minimum_capture_windows": 9,
+  "environments": [
+    {
+      "id": "linux-source-v3",
+      "endpoint": "10.10.1.12:/srv/nfs/v3",
+      "protocol": "3",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-source-v3",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197246,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-source-v3",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.12",
+              "max_read": 1048576,
+              "max_write": 1048576,
+              "mount_ms": 1.7601520000000002,
+              "samples": [
+                {
+                  "access_ms": 0.11846200000000001,
+                  "close_ms": 0.001106,
+                  "commit_ms": 0.251181,
+                  "create_ms": 20.573726,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.102218,
+                  "fsstat_ms": 0.100374,
+                  "getattr_ms": 0.140254,
+                  "link_ms": 18.402492,
+                  "lookup_ms": 0.372407,
+                  "mkdir_ms": 36.079584999999994,
+                  "null_ms": 0.09515,
+                  "open_ms": 0.261093,
+                  "pathconf_ms": 0.111996,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 299.70709625483016,
+                  "read_ms": 3.336591,
+                  "readdir_ms": 0.14169099999999998,
+                  "readlink_ms": 0.416072,
+                  "remove_ms": 20.768858,
+                  "rename_ms": 21.016443,
+                  "rmdir_ms": 21.905528,
+                  "symlink_ms": 21.343121999999997,
+                  "write_mib_s": 40.33921569189036,
+                  "write_ms": 24.789773
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.251181,
+                "create_p95_ms": 20.573726,
+                "read_median_mib_s": 299.70709625483016,
+                "remove_p95_ms": 20.768858,
+                "write_median_mib_s": 40.33921569189036
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "3",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "linux-source-v40",
+      "endpoint": "10.10.1.12:/srv/nfs/v4",
+      "protocol": "4.0",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-source-v40",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197246,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-source-v40",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.12",
+              "max_read": 1048576,
+              "max_write": 1048576,
+              "mount_ms": 1.04604,
+              "samples": [
+                {
+                  "access_ms": 0.098484,
+                  "close_ms": 0.220822,
+                  "commit_ms": 0.39585,
+                  "create_ms": 97.75317,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.105087,
+                  "fsstat_ms": 0.125726,
+                  "getattr_ms": 0.104603,
+                  "link_ms": 20.703052,
+                  "lookup_ms": 0.144818,
+                  "mkdir_ms": 43.187372,
+                  "null_ms": 0.098331,
+                  "open_ms": 0.453767,
+                  "pathconf_ms": 0.103073,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 351.208067951737,
+                  "read_ms": 2.847315,
+                  "readdir_ms": 0.186223,
+                  "readlink_ms": 0.172664,
+                  "remove_ms": 23.08568,
+                  "rename_ms": 20.989821,
+                  "rmdir_ms": 23.593867,
+                  "symlink_ms": 20.037182,
+                  "write_mib_s": 40.05780020106612,
+                  "write_ms": 24.963927
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.39585,
+                "create_p95_ms": 97.75317,
+                "read_median_mib_s": 351.208067951737,
+                "remove_p95_ms": 23.08568,
+                "write_median_mib_s": 40.05780020106612
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.0",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "linux-source-v41",
+      "endpoint": "10.10.1.12:/srv/nfs/v4",
+      "protocol": "4.1",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-source-v41",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197247,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-source-v41",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.12",
+              "max_read": 1044480,
+              "max_write": 1044480,
+              "mount_ms": 67.46415999999999,
+              "samples": [
+                {
+                  "access_ms": 0.11959900000000001,
+                  "close_ms": 0.15452400000000002,
+                  "commit_ms": 0.24853199999999998,
+                  "create_ms": 41.478047999999994,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.122583,
+                  "fsstat_ms": 0.119189,
+                  "getattr_ms": 0.137348,
+                  "link_ms": 20.347343,
+                  "lookup_ms": 0.232208,
+                  "mkdir_ms": 43.439311000000004,
+                  "null_ms": 0.114619,
+                  "open_ms": 0.298043,
+                  "pathconf_ms": 0.104656,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 310.39060484885994,
+                  "read_ms": 3.221747,
+                  "readdir_ms": 0.199454,
+                  "readlink_ms": 0.29218700000000003,
+                  "remove_ms": 21.032254000000002,
+                  "rename_ms": 19.148774,
+                  "rmdir_ms": 24.389988000000002,
+                  "symlink_ms": 21.33621,
+                  "write_mib_s": 23.304235276762846,
+                  "write_ms": 42.910655
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.24853199999999998,
+                "create_p95_ms": 41.478047999999994,
+                "read_median_mib_s": 310.39060484885994,
+                "remove_p95_ms": 21.032254000000002,
+                "write_median_mib_s": 23.304235276762846
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.1",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "linux-destination-v3",
+      "endpoint": "10.10.1.13:/srv/nfs/v3",
+      "protocol": "3",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-destination-v3",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197248,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-destination-v3",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.13",
+              "max_read": 1048576,
+              "max_write": 1048576,
+              "mount_ms": 1.5582930000000002,
+              "samples": [
+                {
+                  "access_ms": 0.13286,
+                  "close_ms": 0.000913,
+                  "commit_ms": 0.237069,
+                  "create_ms": 20.687303,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.109495,
+                  "fsstat_ms": 0.097014,
+                  "getattr_ms": 0.160825,
+                  "link_ms": 96.797467,
+                  "lookup_ms": 0.166247,
+                  "mkdir_ms": 30.465602,
+                  "null_ms": 0.099925,
+                  "open_ms": 0.25881899999999997,
+                  "pathconf_ms": 0.097894,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 397.70286823308567,
+                  "read_ms": 2.51444,
+                  "readdir_ms": 0.159682,
+                  "readlink_ms": 0.18264799999999998,
+                  "remove_ms": 21.231019,
+                  "rename_ms": 57.202861,
+                  "rmdir_ms": 20.969745000000003,
+                  "symlink_ms": 89.012914,
+                  "write_mib_s": 30.304270941516425,
+                  "write_ms": 32.998649
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.237069,
+                "create_p95_ms": 20.687303,
+                "read_median_mib_s": 397.70286823308567,
+                "remove_p95_ms": 21.231019,
+                "write_median_mib_s": 30.304270941516425
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "3",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "linux-destination-v40",
+      "endpoint": "10.10.1.13:/srv/nfs/v4",
+      "protocol": "4.0",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-destination-v40",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197248,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-destination-v40",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.13",
+              "max_read": 1048576,
+              "max_write": 1048576,
+              "mount_ms": 1.094324,
+              "samples": [
+                {
+                  "access_ms": 0.110777,
+                  "close_ms": 0.18147000000000002,
+                  "commit_ms": 0.282801,
+                  "create_ms": 83.810519,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.11084899999999999,
+                  "fsstat_ms": 0.12299699999999998,
+                  "getattr_ms": 0.10360499999999999,
+                  "link_ms": 20.09278,
+                  "lookup_ms": 0.121623,
+                  "mkdir_ms": 48.37467,
+                  "null_ms": 0.12756399999999998,
+                  "open_ms": 0.41229299999999997,
+                  "pathconf_ms": 0.09805399999999999,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 383.9305116488357,
+                  "read_ms": 2.604638,
+                  "readdir_ms": 0.384261,
+                  "readlink_ms": 0.385301,
+                  "remove_ms": 20.56553,
+                  "rename_ms": 18.679907,
+                  "rmdir_ms": 21.094479,
+                  "symlink_ms": 20.827358,
+                  "write_mib_s": 39.32018544972266,
+                  "write_ms": 25.43223
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.282801,
+                "create_p95_ms": 83.810519,
+                "read_median_mib_s": 383.9305116488357,
+                "remove_p95_ms": 20.56553,
+                "write_median_mib_s": 39.32018544972266
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.0",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "linux-destination-v41",
+      "endpoint": "10.10.1.13:/srv/nfs/v4",
+      "protocol": "4.1",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "linux-destination-v41",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197249,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "linux-destination-v41",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.10.1.13",
+              "max_read": 1044480,
+              "max_write": 1044480,
+              "mount_ms": 84.954419,
+              "samples": [
+                {
+                  "access_ms": 0.140736,
+                  "close_ms": 0.16758499999999998,
+                  "commit_ms": 0.566542,
+                  "create_ms": 41.319112999999994,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.10935399999999999,
+                  "fsstat_ms": 0.110296,
+                  "getattr_ms": 0.12342899999999998,
+                  "link_ms": 20.54854,
+                  "lookup_ms": 0.146854,
+                  "mkdir_ms": 43.257059,
+                  "null_ms": 0.100581,
+                  "open_ms": 0.249956,
+                  "pathconf_ms": 0.121355,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 262.0077496652196,
+                  "read_ms": 3.816681,
+                  "readdir_ms": 0.162589,
+                  "readlink_ms": 0.141989,
+                  "remove_ms": 19.136208,
+                  "rename_ms": 19.971746,
+                  "rmdir_ms": 20.795209,
+                  "symlink_ms": 20.564023000000002,
+                  "write_mib_s": 24.130046084285915,
+                  "write_ms": 41.442108999999995
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.566542,
+                "create_p95_ms": 41.319112999999994,
+                "read_median_mib_s": 262.0077496652196,
+                "remove_p95_ms": 19.136208,
+                "write_median_mib_s": 24.130046084285915
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.1",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "dxn-v40",
+      "endpoint": "10.131.7.201:/jay_nfs",
+      "protocol": "4.0",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "dxn-v40",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197249,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "dxn-v40",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.131.7.201",
+              "max_read": 1048576,
+              "max_write": 1048576,
+              "mount_ms": 1.433059,
+              "samples": [
+                {
+                  "access_ms": 0.203316,
+                  "close_ms": 0.29623,
+                  "commit_ms": 0.42115199999999997,
+                  "create_ms": 4.822089,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.208771,
+                  "fsstat_ms": 0.211048,
+                  "getattr_ms": 0.26898,
+                  "link_ms": 2.9402600000000003,
+                  "lookup_ms": 0.350134,
+                  "mkdir_ms": 6.0747800000000005,
+                  "null_ms": 0.178069,
+                  "open_ms": 0.9424910000000001,
+                  "pathconf_ms": 0.209155,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 89.4120886932155,
+                  "read_ms": 11.18417,
+                  "readdir_ms": 0.328802,
+                  "readlink_ms": 0.23248,
+                  "remove_ms": 2.0552740000000003,
+                  "rename_ms": 3.427997,
+                  "rmdir_ms": 2.738133,
+                  "symlink_ms": 2.005468,
+                  "write_mib_s": 25.757534896759037,
+                  "write_ms": 38.823591
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.42115199999999997,
+                "create_p95_ms": 4.822089,
+                "read_median_mib_s": 89.4120886932155,
+                "remove_p95_ms": 2.0552740000000003,
+                "write_median_mib_s": 25.757534896759037
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.0",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "fas2750-v40-lif-a",
+      "endpoint": "10.128.61.200:/nfsrs_v40_test",
+      "protocol": "4.0",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "fas2750-v40-lif-a",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197249,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "fas2750-v40-lif-a",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.128.61.200",
+              "max_read": 65536,
+              "max_write": 65536,
+              "mount_ms": 21.633705,
+              "samples": [
+                {
+                  "access_ms": 0.266918,
+                  "close_ms": 0.381593,
+                  "commit_ms": 0.271831,
+                  "create_ms": 2.580581,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.277592,
+                  "fsstat_ms": 0.27775,
+                  "getattr_ms": 0.33664900000000003,
+                  "link_ms": 2.4594970000000003,
+                  "lookup_ms": 0.417034,
+                  "mkdir_ms": 1.686622,
+                  "null_ms": 0.18304,
+                  "open_ms": 1.071939,
+                  "pathconf_ms": null,
+                  "pathconf_status": "unsupported: NFSv4.0 PATHCONF server omitted required attributes [16]",
+                  "read_mib_s": 51.81146347281463,
+                  "read_ms": 19.300748,
+                  "readdir_ms": 0.466592,
+                  "readlink_ms": 0.264924,
+                  "remove_ms": 1.347232,
+                  "rename_ms": 1.565839,
+                  "rmdir_ms": 0.763303,
+                  "symlink_ms": 1.222049,
+                  "write_mib_s": 43.485802820323926,
+                  "write_ms": 22.996011
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.271831,
+                "create_p95_ms": 2.580581,
+                "read_median_mib_s": 51.81146347281463,
+                "remove_p95_ms": 1.347232,
+                "write_median_mib_s": 43.485802820323926
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.0",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "fas2750-v40-lif-b",
+      "endpoint": "10.128.61.201:/nfsrs_v40_test",
+      "protocol": "4.0",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "fas2750-v40-lif-b",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197249,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "fas2750-v40-lif-b",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.128.61.201",
+              "max_read": 65536,
+              "max_write": 65536,
+              "mount_ms": 21.983651,
+              "samples": [
+                {
+                  "access_ms": 0.387198,
+                  "close_ms": 0.636944,
+                  "commit_ms": 0.38325099999999995,
+                  "create_ms": 2.301722,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.383942,
+                  "fsstat_ms": 0.395249,
+                  "getattr_ms": 0.414447,
+                  "link_ms": 3.4835249999999998,
+                  "lookup_ms": 0.6105,
+                  "mkdir_ms": 1.500877,
+                  "null_ms": 0.195101,
+                  "open_ms": 1.477363,
+                  "pathconf_ms": null,
+                  "pathconf_status": "unsupported: NFSv4.0 PATHCONF server omitted required attributes [16]",
+                  "read_mib_s": 37.617493067190075,
+                  "read_ms": 26.583377,
+                  "readdir_ms": 0.598413,
+                  "readlink_ms": 0.596973,
+                  "remove_ms": 1.6096540000000001,
+                  "rename_ms": 2.180257,
+                  "rmdir_ms": 0.8238219999999999,
+                  "symlink_ms": 1.591617,
+                  "write_mib_s": 32.06082631265359,
+                  "write_ms": 31.190711999999998
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.38325099999999995,
+                "create_p95_ms": 2.301722,
+                "read_median_mib_s": 37.617493067190075,
+                "remove_p95_ms": 1.6096540000000001,
+                "write_median_mib_s": 32.06082631265359
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.0",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "netapp-pnfs-mds",
+      "endpoint": "10.128.56.160:/nfsrs_pnfs_b",
+      "protocol": "4.1",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "netapp-pnfs-mds",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197249,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "netapp-pnfs-mds",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.128.56.160",
+              "max_read": 1044480,
+              "max_write": 1044480,
+              "mount_ms": 2.5007610000000002,
+              "samples": [
+                {
+                  "access_ms": 0.39150300000000005,
+                  "close_ms": 0.7649980000000001,
+                  "commit_ms": 0.257226,
+                  "create_ms": 2.151232,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.55304,
+                  "fsstat_ms": 0.494957,
+                  "getattr_ms": 0.45153800000000005,
+                  "link_ms": 2.2089459999999996,
+                  "lookup_ms": 0.614564,
+                  "mkdir_ms": 1.611387,
+                  "null_ms": 0.269724,
+                  "open_ms": 1.702947,
+                  "pathconf_ms": 0.364877,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 72.80999547267449,
+                  "read_ms": 13.734378,
+                  "readdir_ms": 0.483768,
+                  "readlink_ms": 0.40870700000000004,
+                  "remove_ms": 1.3869749999999998,
+                  "rename_ms": 2.131993,
+                  "rmdir_ms": 0.7314729999999999,
+                  "symlink_ms": 1.463327,
+                  "write_mib_s": 40.578768482259505,
+                  "write_ms": 24.643429
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.257226,
+                "create_p95_ms": 2.151232,
+                "read_median_mib_s": 72.80999547267449,
+                "remove_p95_ms": 1.3869749999999998,
+                "write_median_mib_s": 40.578768482259505
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.1",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    },
+    {
+      "id": "netapp-pnfs-ds",
+      "endpoint": "10.128.56.161:/nfsrs_pnfs_b",
+      "protocol": "4.1",
+      "status": "baseline_missing",
+      "capture_runs": 0,
+      "baseline": {
+        "schema_version": 1,
+        "environment": "netapp-pnfs-ds",
+        "status": "bootstrap_required",
+        "capture_runs": 0,
+        "benchmarks": {}
+      },
+      "current_runs": [
+        {
+          "captured_at_unix": 1787197250,
+          "commit": "a633215c2f7a23f2c9c646aa37b9ac9f152c652a",
+          "environment": "netapp-pnfs-ds",
+          "lifs": [
+            {
+              "healthy": true,
+              "host": "10.128.56.161",
+              "max_read": 1044480,
+              "max_write": 1044480,
+              "mount_ms": 2.521725,
+              "samples": [
+                {
+                  "access_ms": 0.235337,
+                  "close_ms": 0.300996,
+                  "commit_ms": 0.218505,
+                  "create_ms": 2.839027,
+                  "data_integrity": "pass",
+                  "fsinfo_ms": 0.357603,
+                  "fsstat_ms": 0.253112,
+                  "getattr_ms": 0.34893,
+                  "link_ms": 2.7638990000000003,
+                  "lookup_ms": 0.537148,
+                  "mkdir_ms": 2.587941,
+                  "null_ms": 0.421579,
+                  "open_ms": 1.413259,
+                  "pathconf_ms": 0.264015,
+                  "pathconf_status": "pass",
+                  "read_mib_s": 75.72640172220012,
+                  "read_ms": 13.205434,
+                  "readdir_ms": 0.42881,
+                  "readlink_ms": 0.310347,
+                  "remove_ms": 2.058796,
+                  "rename_ms": 2.0895279999999996,
+                  "rmdir_ms": 1.732708,
+                  "symlink_ms": 2.329008,
+                  "write_mib_s": 72.51789379029276,
+                  "write_ms": 13.7897
+                }
+              ],
+              "summary": {
+                "commit_p95_ms": 0.218505,
+                "create_p95_ms": 2.839027,
+                "read_median_mib_s": 75.72640172220012,
+                "remove_p95_ms": 2.058796,
+                "write_median_mib_s": 72.51789379029276
+              }
+            }
+          ],
+          "payload_mib": 1,
+          "protocol": "4.1",
+          "run_id": "nightly-interface-smoke-3-1",
+          "runner": "unknown",
+          "sample_count": 1,
+          "schema_version": 2,
+          "status": "pass",
+          "thresholds": {
+            "max_commit_p95_ms": null,
+            "max_metadata_p95_ms": null,
+            "min_read_mib_s": null,
+            "min_write_mib_s": null
+          }
+        }
+      ],
+      "gate": null
+    }
+  ]
+}
