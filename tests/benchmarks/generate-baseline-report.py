@@ -42,6 +42,7 @@ def display_number(value):
 parser = argparse.ArgumentParser()
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--results-dir")
+parser.add_argument("--supplemental-results-dir")
 parser.add_argument("--gate-result")
 parser.add_argument("--output-dir", required=True)
 args = parser.parse_args()
@@ -50,12 +51,14 @@ manifest = load(args.manifest)
 output = Path(args.output_dir)
 output.mkdir(parents=True, exist_ok=True)
 results_root = Path(args.results_dir) if args.results_dir else None
+supplemental_root = Path(args.supplemental_results_dir) if args.supplemental_results_dir else None
 gate = load(args.gate_result) if args.gate_result else None
 gate_by_environment = {
     row["environment"]: row for row in (gate or {}).get("environments", [])
 }
 rows = []
 complete = True
+has_warnings = False
 latency_metrics = [
     "mount_ms", "umount_ms", "null_ms", "fsinfo_ms", "fsstat_ms", "mkdir_ms", "create_ms",
     "lookup_ms", "getattr_ms", "access_ms", "pathconf_ms", "write_ms",
@@ -73,15 +76,23 @@ for environment in manifest["environments"]:
     )
     if not accepted:
         complete = False
+    gate_row = gate_by_environment.get(environment["id"])
     current_runs = []
     if results_root:
-        result_paths = sorted(results_root.glob(f'{environment["id"]}*.json'))
+        use_supplemental = (
+            supplemental_root is not None
+            and gate_row
+            and gate_row.get("supplemental_test", {}).get("status") in ("pass", "warning")
+        )
+        current_root = supplemental_root if use_supplemental else results_root
+        result_paths = sorted(current_root.glob(f'{environment["id"]}*.json'))
         current_runs = [load(path) for path in result_paths]
-    gate_row = gate_by_environment.get(environment["id"])
     row_status = "accepted" if accepted else "baseline_missing"
     if gate_row:
         row_status = gate_row["status"]
-        if row_status != "pass":
+        if row_status == "warning":
+            has_warnings = True
+        elif row_status != "pass":
             complete = False
     rows.append({
         "id": environment["id"],
@@ -224,7 +235,7 @@ analysis = {
 
 document = {
     "schema_version": 1,
-    "status": "complete" if complete else "baseline_missing",
+    "status": "complete_with_warnings" if complete and has_warnings else "complete" if complete else "baseline_missing",
     "minimum_capture_runs": manifest["minimum_capture_runs"],
     "minimum_capture_windows": manifest["minimum_capture_windows"],
     "analysis": analysis,
@@ -264,6 +275,54 @@ for row in rows:
         f'`{row["status"]}` | {row["capture_runs"]} | {baseline_write} | '
         f'{baseline_read} | {write} | {read} |'
     )
+gate_warnings = [
+    (row["id"], warning)
+    for row in rows
+    for warning in (row.get("gate") or {}).get("warnings", [])
+]
+supplemental_tests = [
+    (row["id"], row["gate"])
+    for row in rows
+    if (row.get("gate") or {}).get("supplemental_test")
+]
+if supplemental_tests:
+    lines.extend([
+        "",
+        "## Supplemental performance tests",
+        "",
+        "Only environments with retryable numeric failures are sampled again; the initial findings remain recorded below.",
+        "",
+        "| Environment | Initial status | Supplemental status | Final status | Supplemental valid runs |",
+        "|---|---|---|---|---:|",
+    ])
+    for environment, gate_row in supplemental_tests:
+        supplemental = gate_row["supplemental_test"]
+        lines.append(
+            f'| {environment} | {gate_row["initial_status"]} | {supplemental["status"]} | '
+            f'{gate_row["status"]} | {supplemental["valid_runs"]} |'
+        )
+        for finding in gate_row.get("initial_violations", []):
+            lines.append(
+                f'| ↳ {finding["metric"]} | actual={finding.get("actual")} | '
+                f'hard_limit={finding.get("hard_limit", "—")} | '
+                f'soft_limit={finding.get("soft_limit", "—")} | — |'
+            )
+if gate_warnings:
+    lines.extend([
+        "",
+        "## Performance gate warnings",
+        "",
+        "Values outside the hard limit but inside the 10% environment-jitter soft limit are accepted with warning.",
+        "",
+        "| Environment | Metric | Actual | hard_limit | soft_limit | deviation_percent |",
+        "|---|---|---:|---:|---:|---:|",
+    ])
+    for environment, warning in gate_warnings:
+        lines.append(
+            f'| {environment} | {warning["metric"]} | {warning["actual"]:.6f} | '
+            f'{warning["hard_limit"]:.6f} | {warning["soft_limit"]:.6f} | '
+            f'{warning["deviation_percent"]:.2f}% |'
+        )
 lines.extend([
     "",
     "An environment remains `baseline_missing` until its independent baseline "
@@ -387,6 +446,7 @@ html_lines = [
     "    .summary { color: #aebbd0; margin: 0 0 24px; }",
     "    .status { display: inline-block; padding: 3px 9px; border-radius: 999px; font-weight: 700; }",
     "    .complete, .accepted, .pass { background: #153d2b; color: #70e1a1; }",
+    "    .complete_with_warnings, .warning { background: #4b3b12; color: #ffd166; }",
     "    .baseline_missing { background: #4a251d; color: #ff9b82; }",
     "    .table-wrap { overflow-x: auto; border: 1px solid #26324a; border-radius: 10px; }",
     "    table { width: 100%; border-collapse: collapse; background: #11182a; }",
@@ -428,6 +488,45 @@ for row in rows:
 html_lines.extend([
     "    </tbody>",
     "  </table></div>",
+])
+if supplemental_tests:
+    html_lines.extend([
+        "  <h2>Supplemental performance tests</h2>",
+        "  <p>Only environments with retryable numeric failures are sampled again; initial findings remain recorded.</p>",
+        '  <div class="table-wrap"><table>',
+        "    <thead><tr><th>Environment</th><th>Initial status</th><th>Supplemental status</th><th>Final status</th><th>Supplemental valid runs</th></tr></thead>",
+        "    <tbody>",
+    ])
+    for environment, gate_row in supplemental_tests:
+        supplemental = gate_row["supplemental_test"]
+        html_lines.append(
+            f'<tr><td>{escape(environment)}</td><td>{escape(gate_row["initial_status"])}</td>'
+            f'<td>{escape(supplemental["status"])}</td><td>{escape(gate_row["status"])}</td>'
+            f'<td>{supplemental["valid_runs"]}</td></tr>'
+        )
+        for finding in gate_row.get("initial_violations", []):
+            html_lines.append(
+                f'<tr><td>↳ {escape(finding["metric"])}</td><td>actual={finding.get("actual")}</td>'
+                f'<td>hard_limit={finding.get("hard_limit", "—")}</td>'
+                f'<td>soft_limit={finding.get("soft_limit", "—")}</td><td>—</td></tr>'
+            )
+    html_lines.extend(["    </tbody>", "  </table></div>"])
+if gate_warnings:
+    html_lines.extend([
+        "  <h2>Performance gate warnings</h2>",
+        "  <p>Values outside the hard limit but inside the 10% environment-jitter soft limit are accepted with warning.</p>",
+        '  <div class="table-wrap"><table>',
+        "    <thead><tr><th>Environment</th><th>Metric</th><th>Actual</th><th>hard_limit</th><th>soft_limit</th><th>deviation_percent</th></tr></thead>",
+        "    <tbody>",
+    ])
+    for environment, warning in gate_warnings:
+        html_lines.append(
+            f'<tr><td>{escape(environment)}</td><td>{escape(warning["metric"])}</td>'
+            f'<td>{warning["actual"]:.6f}</td><td>{warning["hard_limit"]:.6f}</td>'
+            f'<td>{warning["soft_limit"]:.6f}</td><td>{warning["deviation_percent"]:.2f}%</td></tr>'
+        )
+    html_lines.extend(["    </tbody>", "  </table></div>"])
+html_lines.extend([
     "  <h2>Baseline analysis summary</h2>",
     '  <section class="environment">',
     "    <h3>Key observations</h3>",

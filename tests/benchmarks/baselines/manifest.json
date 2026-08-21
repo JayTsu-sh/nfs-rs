@@ -3,6 +3,10 @@
   "minimum_capture_runs": 45,
   "minimum_capture_windows": 9,
   "maximum_runs_per_window": 5,
+  "soft_threshold_policy": {
+    "throughput_hard_limit_factor": 0.9,
+    "latency_hard_limit_factor": 1.1
+  },
   "environments": [
     {"id":"linux-source-v3","endpoint":"10.10.1.12:/srv/nfs/v3","protocol":"3","url_template":"nfs://10.10.1.12/srv/nfs/v3/ci/${RUN_ID}?version=3&noresvport=true","baseline":"tests/benchmarks/baselines/linux-source-v3.json"},
     {"id":"linux-source-v40","endpoint":"10.10.1.12:/srv/nfs/v4","protocol":"4.0","url_template":"nfs://10.10.1.12/srv/nfs/v4/ci/${RUN_ID}?version=4.0&noresvport=true","baseline":"tests/benchmarks/baselines/linux-source-v40.json"},

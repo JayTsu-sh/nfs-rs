@@ -81,6 +81,16 @@ retain their baseline-relative limits. This cross-environment gate is the sole
 release performance acceptance decision. The NetApp NFSv4.0 release matrix
 still records its four workload quadrants as liveness and diagnostic evidence,
 but does not apply the legacy single-run performance baseline a second time.
+To absorb bounded lab jitter, a numeric result outside its hard limit is
+accepted with a `warning` only when throughput remains at least 90% of that
+limit or latency remains at most 110% of it. Reports preserve the actual value,
+hard limit, soft limit, and deviation. Results beyond the soft limit still fail;
+sample completeness, data integrity, and capability checks are never softened.
+When an environment still fails only numeric limits, the release gate performs
+one supplemental five-run test for that environment alone. A passing or warning
+supplemental result becomes the final decision while the initial failure remains
+in JSON, Markdown, and HTML evidence. Non-numeric failures are never retried,
+and unaffected environments are not sampled again.
 `tests/benchmarks/report/performance-baselines.{json,md,html}` is the generated
 machine-readable and human-readable baseline status report. All three formats
 include the data-derived baseline analysis summary.

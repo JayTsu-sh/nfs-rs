@@ -283,6 +283,166 @@ fn gate_floors_metadata_latency_without_masking_data_path_regressions() {
 }
 
 #[test]
+fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
+    let fixture_dir =
+        std::env::temp_dir().join(format!("nfsrs-soft-performance-gate-{}", std::process::id()));
+    let report_dir = fixture_dir.join("report");
+    fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
+    let baseline_path = fixture_dir.join("soft.json");
+    fs::write(
+        &baseline_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "accepted",
+            "capture_runs": 45,
+            "capture_windows": 9,
+            "endpoint": "127.0.0.1:/soft",
+            "protocol": "4.1",
+            "capabilities": {"pathconf": "pass"},
+            "thresholds": {
+                "throughput_regression_percent": 15,
+                "p95_latency_regression_percent": 30,
+                "metadata_p95_absolute_floor_ms": 10
+            },
+            "benchmarks": {"storage_path": {
+                "write_mib_s": {"median": 10.0},
+                "read_mib_s": {"median": 10.0},
+                "write_ms": {"p95": 1.0, "window_p95": {"p95": 1.0}}
+            }}
+        }))
+        .expect("baseline must serialize"),
+    )
+    .expect("baseline must be written");
+    let manifest_path = fixture_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "minimum_capture_runs": 45,
+            "minimum_capture_windows": 9,
+            "soft_threshold_policy": {
+                "throughput_hard_limit_factor": 0.9,
+                "latency_hard_limit_factor": 1.1
+            },
+            "environments": [{
+                "id": "soft",
+                "endpoint": "127.0.0.1:/soft",
+                "protocol": "4.1",
+                "baseline": baseline_path
+            }]
+        }))
+        .expect("manifest must serialize"),
+    )
+    .expect("manifest must be written");
+    for run in 1..=4 {
+        fs::write(
+            fixture_dir.join(format!("soft-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"summary": {
+                    "write_median_mib_s": 5.0,
+                    "read_median_mib_s": 5.0
+                }, "samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 5.0,
+                    "read_mib_s": 5.0,
+                    "write_ms": 2.0
+                }]}]
+            }))
+            .expect("gate run must serialize"),
+        )
+        .expect("gate run must be written");
+    }
+    let gate_path = fixture_dir.join("gate.json");
+    let gate_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--output")
+        .arg(&gate_path)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("performance gate should start");
+    assert_eq!(gate_status.code(), Some(2));
+
+    let supplemental_dir = fixture_dir.join("supplemental");
+    fs::create_dir_all(&supplemental_dir).expect("supplemental directory must be created");
+    for run in 1..=4 {
+        fs::write(
+            supplemental_dir.join(format!("soft-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"summary": {
+                    "write_median_mib_s": 8.0,
+                    "read_median_mib_s": 8.0
+                }, "samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 8.0,
+                    "read_mib_s": 8.0,
+                    "write_ms": 1.4
+                }]}]
+            }))
+            .expect("supplemental run must serialize"),
+        )
+        .expect("supplemental run must be written");
+    }
+    let gate_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--supplemental-results-dir")
+        .arg(&supplemental_dir)
+        .arg("--output")
+        .arg(&gate_path)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("supplemental performance gate should start");
+    assert_eq!(gate_status.code(), Some(0));
+    let gate: Value = serde_json::from_slice(&fs::read(&gate_path).expect("gate JSON"))
+        .expect("gate report must be JSON");
+    assert_eq!(gate["status"], "pass_with_warnings");
+    assert_eq!(gate["environments"][0]["status"], "warning");
+    assert_eq!(gate["environments"][0]["initial_status"], "fail");
+    assert_eq!(gate["environments"][0]["supplemental_test"]["status"], "warning");
+    assert_eq!(gate["environments"][0]["warnings"][0]["hard_limit"], 8.5);
+    assert_eq!(gate["environments"][0]["warnings"][0]["soft_limit"], 7.65);
+
+    let report_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/generate-baseline-report.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--supplemental-results-dir")
+        .arg(&supplemental_dir)
+        .arg("--gate-result")
+        .arg(&gate_path)
+        .arg("--output-dir")
+        .arg(&report_dir)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("performance report should start");
+    assert_eq!(report_status.code(), Some(0));
+    for extension in ["json", "md", "html"] {
+        let report = fs::read_to_string(
+            report_dir.join(format!("performance-baselines.{extension}")),
+        )
+        .expect("warning report must be generated");
+        assert!(report.contains("warning"));
+        assert!(report.contains("soft_limit"));
+        assert!(report.to_lowercase().contains("supplemental"));
+    }
+}
+
+#[test]
 fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock() {
     let capture = fs::read_to_string(workspace_path(
         ".github/workflows/performance-baselines.yml",
@@ -301,6 +461,10 @@ fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock(
             .contains("run-storage-benchmark-suite.sh gate")
     );
     assert!(runner.contains("check-performance-baselines.py"));
+    assert!(runner.contains("gate-initial.json"));
+    assert!(runner.contains("select(.supplemental_eligible)"));
+    assert!(runner.contains("--supplemental-results-dir"));
+    assert!(runner.contains("run_environment \"$environment\" \"$template\""));
     assert!(runner.contains("/tmp/terrasync-lab-tests.lock"));
     assert!(runner.contains("/tmp/terrasync-lab-performance.lock"));
     assert!(runner.contains("--window-id"));
