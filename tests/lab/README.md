@@ -74,7 +74,10 @@ python3 tests/benchmarks/build-performance-baselines.py \
 
 The release-validation performance gate runs five measurements per environment
 and requires at least four valid runs. A missing, under-sampled, or regressed
-baseline fails closed.
+baseline fails closed. Metadata and mount-control p95 latency use the greater
+of the baseline-relative limit and a committed 10 ms absolute floor, avoiding
+false regressions from sub-millisecond jitter. Data-path latency and throughput
+retain their baseline-relative limits.
 `tests/benchmarks/report/performance-baselines.{json,md,html}` is the generated
 machine-readable and human-readable baseline status report. All three formats
 include the data-derived baseline analysis summary.

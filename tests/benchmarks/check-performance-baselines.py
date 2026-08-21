@@ -49,12 +49,15 @@ for environment in manifest["environments"]:
                 "actual": sorted(actual_pathconf),
                 "expected": expected_pathconf,
             })
-        latency_metrics = [
+        metadata_latency_metrics = [
             "null_ms", "fsinfo_ms", "fsstat_ms", "mkdir_ms", "create_ms",
-            "lookup_ms", "getattr_ms", "access_ms", "pathconf_ms", "write_ms",
-            "commit_ms", "close_ms", "open_ms", "read_ms", "rename_ms",
+            "lookup_ms", "getattr_ms", "access_ms", "pathconf_ms", "rename_ms",
             "link_ms", "symlink_ms", "readlink_ms", "readdir_ms", "remove_ms",
-            "rmdir_ms",
+            "rmdir_ms", "mount_ms", "umount_ms",
+        ]
+        metadata_latency_metric_set = set(metadata_latency_metrics)
+        latency_metrics = metadata_latency_metrics + [
+            "write_ms", "commit_ms", "close_ms", "open_ms", "read_ms",
         ]
         checks = [
             ("write_mib_s", statistics.median(row["write_mib_s"] for row in samples), "minimum"),
@@ -84,6 +87,8 @@ for environment in manifest["environments"]:
                 else "p95_latency_regression_percent"
             ] / 100
             limit = reference_value * (1 - budget if direction == "minimum" else 1 + budget)
+            if metric in metadata_latency_metric_set:
+                limit = max(limit, thresholds["metadata_p95_absolute_floor_ms"])
             violated = actual < limit if direction == "minimum" else actual > limit
             if violated:
                 violations.append({"metric": metric, "actual": actual, "limit": limit})

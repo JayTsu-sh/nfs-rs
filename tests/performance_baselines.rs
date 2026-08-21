@@ -200,7 +200,7 @@ fn report_fails_closed_and_still_renders_when_a_baseline_is_incomplete() {
 }
 
 #[test]
-fn gate_compares_a_candidate_window_with_baseline_window_p95() {
+fn gate_floors_metadata_latency_without_masking_data_path_regressions() {
     let fixture_dir =
         std::env::temp_dir().join(format!("nfsrs-window-p95-gate-{}", std::process::id()));
     fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
@@ -214,12 +214,15 @@ fn gate_compares_a_candidate_window_with_baseline_window_p95() {
             "capabilities": {"pathconf": "pass"},
             "thresholds": {
                 "throughput_regression_percent": 15,
-                "p95_latency_regression_percent": 30
+                "p95_latency_regression_percent": 30,
+                "metadata_p95_absolute_floor_ms": 10
             },
             "benchmarks": {"storage_path": {
                 "write_mib_s": {"median": 10.0},
                 "read_mib_s": {"median": 10.0},
-                "create_ms": {"p95": 10.0, "window_p95": {"p95": 50.0}}
+                "create_ms": {"p95": 10.0, "window_p95": {"p95": 50.0}},
+                "null_ms": {"p95": 0.5, "window_p95": {"p95": 0.5}},
+                "write_ms": {"p95": 0.5, "window_p95": {"p95": 0.5}}
             }}
         }))
         .expect("windowed baseline must serialize"),
@@ -245,7 +248,9 @@ fn gate_compares_a_candidate_window_with_baseline_window_p95() {
                     "pathconf_status": "pass",
                     "write_mib_s": 10.0,
                     "read_mib_s": 10.0,
-                    "create_ms": 50.0
+                    "create_ms": 50.0,
+                    "null_ms": 9.0,
+                    "write_ms": 9.0
                 }]}]
             }))
             .expect("gate run must serialize"),
@@ -265,7 +270,16 @@ fn gate_compares_a_candidate_window_with_baseline_window_p95() {
         .current_dir(workspace_path("."))
         .status()
         .expect("performance gate should start");
-    assert_eq!(status.code(), Some(0));
+    assert_eq!(status.code(), Some(2));
+    let gate: Value = serde_json::from_slice(
+        &fs::read(fixture_dir.join("gate.json")).expect("gate report must be generated"),
+    )
+    .expect("gate report must be JSON");
+    let violations = gate["environments"][0]["violations"]
+        .as_array()
+        .expect("violations must be an array");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["metric"], "write_ms");
 }
 
 #[test]

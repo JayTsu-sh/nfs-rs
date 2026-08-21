@@ -118,6 +118,7 @@ for environment in manifest["environments"]:
             "throughput_regression_percent": 15,
             "p95_latency_regression_percent": 30,
             "p99_latency_regression_percent": 50,
+            "metadata_p95_absolute_floor_ms": 10,
         },
         "benchmarks": {"storage_path": metrics},
     }
