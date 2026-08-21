@@ -284,8 +284,10 @@ fn gate_floors_metadata_latency_without_masking_data_path_regressions() {
 
 #[test]
 fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
-    let fixture_dir =
-        std::env::temp_dir().join(format!("nfsrs-soft-performance-gate-{}", std::process::id()));
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "nfsrs-soft-performance-gate-{}",
+        std::process::id()
+    ));
     let report_dir = fixture_dir.join("report");
     fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
     let baseline_path = fixture_dir.join("soft.json");
@@ -409,7 +411,10 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
     assert_eq!(gate["status"], "pass_with_warnings");
     assert_eq!(gate["environments"][0]["status"], "warning");
     assert_eq!(gate["environments"][0]["initial_status"], "fail");
-    assert_eq!(gate["environments"][0]["supplemental_test"]["status"], "warning");
+    assert_eq!(
+        gate["environments"][0]["supplemental_test"]["status"],
+        "warning"
+    );
     assert_eq!(gate["environments"][0]["warnings"][0]["hard_limit"], 8.5);
     assert_eq!(gate["environments"][0]["warnings"][0]["soft_limit"], 7.65);
 
@@ -432,10 +437,9 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
         .expect("performance report should start");
     assert_eq!(report_status.code(), Some(0));
     for extension in ["json", "md", "html"] {
-        let report = fs::read_to_string(
-            report_dir.join(format!("performance-baselines.{extension}")),
-        )
-        .expect("warning report must be generated");
+        let report =
+            fs::read_to_string(report_dir.join(format!("performance-baselines.{extension}")))
+                .expect("warning report must be generated");
         assert!(report.contains("warning"));
         assert!(report.contains("soft_limit"));
         assert!(report.to_lowercase().contains("supplemental"));
