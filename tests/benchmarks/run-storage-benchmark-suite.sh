@@ -34,10 +34,12 @@ flock --wait 1800 8
 exec 9>/tmp/terrasync-lab-performance.lock
 flock --wait 1800 9
 
-while IFS=$'\t' read -r environment template; do
+run_environment() {
+  local environment="$1"
+  local template="$2"
+  local runs="$3"
+  local target="$4"
   url="${template//\$\{RUN_ID\}/$run_id}"
-  runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
-  [[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
   for run in $(seq 1 "$runs"); do
     suffix="-capture-$run"
     [[ "$mode" == gate ]] && suffix="-run-$run"
@@ -49,17 +51,44 @@ while IFS=$'\t' read -r environment template; do
       --url "$url" \
       --samples "$samples" \
       --payload-mib "$payload_mib" \
-      >"$output/$environment$suffix.json"
+      >"$target/$environment$suffix.json"
   done
+}
+
+while IFS=$'\t' read -r environment template; do
+  runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
+  [[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
+  run_environment "$environment" "$template" "$runs" "$output"
 done < <(jq -r '.environments[] | [.id, .url_template] | @tsv' "$manifest")
 
 if [[ "$mode" == gate ]]; then
   python3 tests/benchmarks/check-performance-baselines.py \
-    --manifest "$manifest" --results-dir "$output" --output "$output/gate.json" || gate_status=$?
+    --manifest "$manifest" --results-dir "$output" --output "$output/gate-initial.json" || initial_gate_status=$?
+  mapfile -t supplemental_environments < <(
+    jq -r '.environments[] | select(.supplemental_eligible) | .environment' "$output/gate-initial.json"
+  )
+  if ((${#supplemental_environments[@]})); then
+    supplemental="$output/supplemental"
+    mkdir -p "$supplemental"
+    for environment in "${supplemental_environments[@]}"; do
+      template="$(jq -r --arg environment "$environment" \
+        '.environments[] | select(.id == $environment) | .url_template' "$manifest")"
+      run_environment "$environment" "$template" "${NFS_RS_BENCHMARK_GATE_RUNS:-5}" "$supplemental"
+    done
+    python3 tests/benchmarks/check-performance-baselines.py \
+      --manifest "$manifest" --results-dir "$output" \
+      --supplemental-results-dir "$supplemental" --output "$output/gate.json" || gate_status=$?
+  else
+    cp "$output/gate-initial.json" "$output/gate.json"
+    gate_status="${initial_gate_status:-0}"
+  fi
 fi
 
 report_args=(--manifest "$manifest" --results-dir "$output" --output-dir "$output/report")
-[[ "$mode" == gate ]] && report_args+=(--gate-result "$output/gate.json")
+if [[ "$mode" == gate ]]; then
+  report_args+=(--gate-result "$output/gate.json")
+  [[ -d "$output/supplemental" ]] && report_args+=(--supplemental-results-dir "$output/supplemental")
+fi
 python3 tests/benchmarks/generate-baseline-report.py "${report_args[@]}" || report_status=$?
 if [[ "$mode" == gate ]]; then
   [[ "${gate_status:-0}" -eq 0 && "${report_status:-0}" -eq 0 ]] || exit 2

@@ -57,6 +57,14 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
+      - name: Gate every real storage performance baseline
+        run: tests/benchmarks/run-storage-benchmark-suite.sh gate "$RUN_ID" "$RUNNER_TEMP/storage-performance-gate"
+      - name: Upload storage performance gate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-performance-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/storage-performance-gate
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Linux kernel NFSv4.0 E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-kernel-v40-e2e.sh "$RUN_ID"

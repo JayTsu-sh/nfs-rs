@@ -31,7 +31,7 @@ record lease-fault runner-outbound-destination-lif-tcp2049 flock --wait 10800 \
 performance_output="${NFS_RS_LAB_V40_PERF_OUTPUT:-nfsv40-performance.json}"
 rm -f -- "$performance_output"
 record performance none flock --wait 10800 /tmp/terrasync-lab-tests.lock \
-  tests/lab/run-netapp-v40-performance.sh "$run_id"
+  tests/lab/run-netapp-v40-performance.sh "$run_id" --observe-only
 record cleanup runner-run-owned tests/lab/verify-netapp-v40-cleanup.sh "$run_id"
 NFS_RS_LAB_V40_EXPECTED_OUTCOME=EXCEPTION \
 NFS_RS_LAB_V40_OUTCOME_REASON="dedicated restart fixture unavailable on shared lizy" \
