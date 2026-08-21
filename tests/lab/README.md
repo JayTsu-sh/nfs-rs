@@ -77,7 +77,10 @@ and requires at least four valid runs. A missing, under-sampled, or regressed
 baseline fails closed. Metadata and mount-control p95 latency use the greater
 of the baseline-relative limit and a committed 10 ms absolute floor, avoiding
 false regressions from sub-millisecond jitter. Data-path latency and throughput
-retain their baseline-relative limits.
+retain their baseline-relative limits. This cross-environment gate is the sole
+release performance acceptance decision. The NetApp NFSv4.0 release matrix
+still records its four workload quadrants as liveness and diagnostic evidence,
+but does not apply the legacy single-run performance baseline a second time.
 `tests/benchmarks/report/performance-baselines.{json,md,html}` is the generated
 machine-readable and human-readable baseline status report. All three formats
 include the data-derived baseline analysis summary.

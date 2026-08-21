@@ -358,6 +358,19 @@ fn nfsv40_performance_gate_covers_four_workload_quadrants() {
 }
 
 #[test]
+fn nfsv40_release_matrix_records_performance_without_duplicate_gate() {
+    let matrix = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-release-matrix.sh"))
+        .expect("NFSv4.0 release matrix readable");
+    let runner = fs::read_to_string(workspace_path("tests/lab/run-netapp-v40-performance.sh"))
+        .expect("NFSv4.0 performance runner readable");
+
+    assert!(matrix.contains("run-netapp-v40-performance.sh \"$run_id\" --observe-only"));
+    assert!(runner.contains("nfs_v40_small_large_single_multi_performance"));
+    assert!(runner.contains("if [[ \"$mode\" == \"gate\" ]]"));
+    assert!(runner.contains("check-nfsv40-performance.py"));
+}
+
+#[test]
 fn nfsv40_performance_gate_rejects_regressions() {
     let baseline_path = workspace_path("tests/lab/nfsv40-performance-baseline.json");
     let baseline: Value = serde_json::from_slice(&fs::read(&baseline_path).expect("baseline"))
