@@ -43,6 +43,15 @@ jobs:
           python -m mypy.stubtest nfs_rs --ignore-missing-stub
           --allowlist python/stubtest-allowlist.txt
       - run: NFS_RS_TEST_INSTALLED=1 python -m pytest -q python/tests
+        env:
+          NFS_RS_CONTRACT_ENVIRONMENT: github-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}
+          NFS_RS_TEST_SEED: "0"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-failure-${{ matrix.python-version }}-${{ runner.arch }}
+          path: target/python-failure-artifacts/
+          if-no-files-found: warn
 
   python-artifacts:
     strategy:

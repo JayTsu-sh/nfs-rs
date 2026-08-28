@@ -55,6 +55,20 @@ struct OperationTestBarrier {
 static OPERATION_TEST_BARRIER: OnceLock<Mutex<Option<Arc<OperationTestBarrier>>>> = OnceLock::new();
 
 #[cfg(feature = "python-test-support")]
+#[derive(Debug)]
+struct FaultTestBarrier {
+    operation: String,
+    phase: String,
+    claimed: AtomicBool,
+    entered: Notify,
+    released: AtomicBool,
+    release: Notify,
+}
+
+#[cfg(feature = "python-test-support")]
+static FAULT_TEST_BARRIER: OnceLock<Mutex<Option<Arc<FaultTestBarrier>>>> = OnceLock::new();
+
+#[cfg(feature = "python-test-support")]
 fn open_test_barrier() -> &'static Mutex<Option<Arc<OpenTestBarrier>>> {
     OPEN_TEST_BARRIER.get_or_init(|| Mutex::new(None))
 }
@@ -62,6 +76,57 @@ fn open_test_barrier() -> &'static Mutex<Option<Arc<OpenTestBarrier>>> {
 #[cfg(feature = "python-test-support")]
 fn operation_test_barrier() -> &'static Mutex<Option<Arc<OperationTestBarrier>>> {
     OPERATION_TEST_BARRIER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "python-test-support")]
+fn fault_test_barrier() -> &'static Mutex<Option<Arc<FaultTestBarrier>>> {
+    FAULT_TEST_BARRIER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "python-test-support")]
+async fn injected_fault(operation: &str, phase: &str) -> Option<NfsError> {
+    let barrier = fault_test_barrier()
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .filter(|barrier| barrier.operation == operation && barrier.phase == phase)
+        .filter(|barrier| !barrier.claimed.swap(true, Ordering::AcqRel));
+    let barrier = barrier?;
+    barrier.entered.notify_one();
+    loop {
+        let released = barrier.release.notified();
+        if barrier.released.load(Ordering::Acquire) {
+            break;
+        }
+        released.await;
+    }
+    let context = crate::RequestContext {
+        operation: operation.to_string(),
+        protocol: NFSVersion::NFSv4p1,
+        request_id: None,
+    };
+    let source = NfsError::Rpc(format!("injected {} fault", barrier.phase));
+    Some(if barrier.phase == "before-send" {
+        NfsError::before_send_failure(
+            crate::OperationClass::ReplaySensitive,
+            context,
+            None,
+            source,
+        )
+    } else {
+        NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
+            crate::OperationOutcome::Uncertain,
+            crate::OperationClass::ReplaySensitive,
+            crate::RecoveryAction::VerifyThenResume,
+            context,
+            source,
+        )))
+    })
+}
+
+#[cfg(not(feature = "python-test-support"))]
+async fn injected_fault(_operation: &str, _phase: &str) -> Option<NfsError> {
+    None
 }
 
 #[cfg(feature = "python-test-support")]
@@ -549,6 +614,22 @@ impl FileResource {
     }
 
     async fn read_chunk(&self, offset: u64, count: u32) -> Result<Bytes> {
+        #[cfg(feature = "python-test-support")]
+        if self.safe_path == "__pnfs_data_path_failure__" {
+            return Err(NfsError::OperationOutcome(Box::new(
+                crate::OperationOutcomeError::new(
+                    crate::OperationOutcome::SafeToRetry,
+                    crate::OperationClass::ReadOnly,
+                    crate::RecoveryAction::Retry,
+                    crate::RequestContext {
+                        operation: "pNFS data read".to_string(),
+                        protocol: NFSVersion::NFSv4p1,
+                        request_id: None,
+                    },
+                    NfsError::Nfs4(NFS4ERR_LAYOUTTRYLATER),
+                ),
+            )));
+        }
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
@@ -729,6 +810,9 @@ impl FileResource {
         if !self.mode.writable {
             return Err(NfsError::ModeViolation("file is not writable".to_string()));
         }
+        if let Some(error) = injected_fault("write", "before-send").await {
+            return Err(error);
+        }
         let mut current = offset;
         let mut confirmed = 0_u64;
         while confirmed < data.len() as u64 {
@@ -765,6 +849,13 @@ impl FileResource {
             }
             current = current.saturating_add(written);
             confirmed = confirmed.saturating_add(written);
+        }
+        if let Some(error) = injected_fault("write", "after-send-before-response").await {
+            return Err(with_confirmed_bytes(
+                error,
+                confirmed,
+                self.protocol_version(),
+            ));
         }
         Ok(confirmed)
     }
@@ -815,6 +906,9 @@ impl FileResource {
         if !self.mode.writable {
             return Err(NfsError::ModeViolation("file is not writable".to_string()));
         }
+        if let Some(error) = injected_fault("truncate", "before-send").await {
+            return Err(error);
+        }
         let size = size.unwrap_or_else(|| self.position.load(Ordering::Acquire));
         match &self.backend {
             FileBackend::Mount {
@@ -849,6 +943,9 @@ impl FileResource {
         if dirty.ranges.is_empty() {
             dirty.verifier = None;
         }
+        if let Some(error) = injected_fault("truncate", "after-send-before-response").await {
+            return Err(error);
+        }
         Ok(size)
     }
 
@@ -856,6 +953,9 @@ impl FileResource {
         wait_at_operation_test_barrier("flush").await;
         if !self.mode.writable {
             return Ok(());
+        }
+        if let Some(error) = injected_fault("commit", "before-send").await {
+            return Err(error);
         }
         let mut dirty = self.dirty_state.lock().await;
         let expected_verifier = dirty.verifier;
@@ -897,6 +997,9 @@ impl FileResource {
                 }
                 offset = offset.saturating_add(u64::from(count));
             }
+        }
+        if let Some(error) = injected_fault("commit", "after-send-before-response").await {
+            return Err(error);
         }
         dirty.ranges.clear();
         dirty.verifier = None;
@@ -1735,6 +1838,9 @@ fn test_attr(path: &str) -> Option<Result<Attr>> {
             )));
         }
         "__stale__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_STALE))),
+        "__lease_lost__" => return Some(Err(NfsError::Nfs4(NFS4ERR_EXPIRED))),
+        "__session_lost__" => return Some(Err(NfsError::Nfs4(NFS4ERR_BADSESSION))),
+        "__callback_failure__" => return Some(Err(NfsError::Nfs4(NFS4ERR_BACK_CHAN_BUSY))),
         "__retry__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX))),
         "__unsupported__" => {
             return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTSUPP)));
@@ -1827,6 +1933,9 @@ async fn namespace_operation(
 ) -> Result<()> {
     wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
+    if let Some(error) = injected_fault(operation.name(), "before-send").await {
+        return Err(error);
+    }
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
         if first.contains("__notdir__") {
@@ -1864,6 +1973,9 @@ async fn namespace_operation(
                     NfsError::Rpc("injected after-send failure".to_string()),
                 ),
             )));
+        }
+        if let Some(error) = injected_fault(operation.name(), "after-send-before-response").await {
+            return Err(error);
         }
         return Ok(());
     }
@@ -1965,6 +2077,9 @@ async fn metadata_operation(
 ) -> Result<()> {
     wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
+    if let Some(error) = injected_fault(operation.name(), "before-send").await {
+        return Err(error);
+    }
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
         if path == "denied" {
@@ -1972,6 +2087,9 @@ async fn metadata_operation(
         }
         if path == "protocol-error" {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_IO));
+        }
+        if let Some(error) = injected_fault(operation.name(), "after-send-before-response").await {
+            return Err(error);
         }
         return Ok(());
     }
@@ -2584,6 +2702,10 @@ async fn open_file(
     mode: String,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
     let mode = FileMode::parse(&mode)?;
+    let fault_operation = if mode.create { "create" } else { "open" };
+    if let Some(error) = injected_fault(fault_operation, "before-send").await {
+        return Err(error);
+    }
     let resource = if let Some(mount) = mount {
         let file = match mount.open_path_stateful(&path, mode.access()).await {
             Ok(file) => file,
@@ -2650,6 +2772,9 @@ async fn open_file(
             return Err(NfsError::Unsupported("mount is unavailable".to_string()));
         }
     };
+    if let Some(error) = injected_fault(fault_operation, "after-send-before-response").await {
+        return Err(error);
+    }
     #[cfg(feature = "python-test-support")]
     let barrier = if matches!(
         path.as_str(),
@@ -2816,6 +2941,56 @@ fn _wait_operation_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         barrier.settled.notified().await;
         Ok(())
     })
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _arm_fault_test_barrier(operation: String, phase: String) -> PyResult<()> {
+    if !matches!(phase.as_str(), "before-send" | "after-send-before-response") {
+        return Err(PyValueError::new_err(
+            "phase must be before-send or after-send-before-response",
+        ));
+    }
+    *fault_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("fault test barrier lock poisoned"))? =
+        Some(Arc::new(FaultTestBarrier {
+            operation,
+            phase,
+            claimed: AtomicBool::new(false),
+            entered: Notify::new(),
+            released: AtomicBool::new(false),
+            release: Notify::new(),
+        }));
+    Ok(())
+}
+
+#[cfg(feature = "python-test-support")]
+fn current_fault_test_barrier() -> PyResult<Arc<FaultTestBarrier>> {
+    fault_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("fault test barrier lock poisoned"))?
+        .clone()
+        .ok_or_else(|| PyRuntimeError::new_err("fault test barrier is not armed"))
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_fault_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_fault_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.entered.notified().await;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _release_fault_test_barrier() -> PyResult<()> {
+    let barrier = current_fault_test_barrier()?;
+    barrier.released.store(true, Ordering::Release);
+    barrier.release.notify_waiters();
+    Ok(())
 }
 
 async fn cancellation_safe_open_file(
@@ -4306,6 +4481,9 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_function(wrap_pyfunction!(_wait_operation_test_entered, module)?)?;
         module.add_function(wrap_pyfunction!(_release_operation_test_barrier, module)?)?;
         module.add_function(wrap_pyfunction!(_wait_operation_test_settled, module)?)?;
+        module.add_function(wrap_pyfunction!(_arm_fault_test_barrier, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_fault_test_entered, module)?)?;
+        module.add_function(wrap_pyfunction!(_release_fault_test_barrier, module)?)?;
     }
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
