@@ -522,8 +522,6 @@ class File(io.RawIOBase):
         raise io.UnsupportedOperation("nfs-rs files do not expose OS file descriptors")
 
     def close(self) -> None:
-        if self.closed:
-            return
         self._inner.close()
         super().close()
 

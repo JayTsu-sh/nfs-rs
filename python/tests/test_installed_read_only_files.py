@@ -95,3 +95,24 @@ def test_async_file_has_relative_and_positional_parity() -> None:
             file.tell()
 
     asyncio.run(scenario())
+
+
+def test_cancelled_open_finishes_registration_under_client_ownership() -> None:
+    from nfs_rs import AsyncClient
+    from nfs_rs import _internal
+
+    async def scenario() -> None:
+        client = await AsyncClient.connect("nfs-test://fixture/export")
+        _internal._arm_open_test_barrier()
+        opening = asyncio.create_task(client.open("__blocked_open__"))
+        await _internal._wait_open_test_entered()
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+
+        _internal._release_open_test_barrier()
+        await _internal._wait_open_test_registered()
+        await client.close()
+        assert client.closed
+
+    asyncio.run(scenario())

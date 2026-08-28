@@ -11,6 +11,8 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
 use std::collections::HashMap;
+#[cfg(feature = "python-test-support")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +22,22 @@ use tokio::sync::mpsc;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 type DirectoryItem = std::result::Result<Py<PyDict>, NfsError>;
+
+#[cfg(feature = "python-test-support")]
+#[derive(Debug, Default)]
+struct OpenTestBarrier {
+    entered: Notify,
+    release: Notify,
+    registered: Notify,
+}
+
+#[cfg(feature = "python-test-support")]
+static OPEN_TEST_BARRIER: OnceLock<Mutex<Option<Arc<OpenTestBarrier>>>> = OnceLock::new();
+
+#[cfg(feature = "python-test-support")]
+fn open_test_barrier() -> &'static Mutex<Option<Arc<OpenTestBarrier>>> {
+    OPEN_TEST_BARRIER.get_or_init(|| Mutex::new(None))
+}
 
 async fn send_directory_item(
     sender: &mpsc::Sender<DirectoryItem>,
@@ -83,7 +101,6 @@ enum ReadBackend {
 #[derive(Debug)]
 struct FileResource {
     backend: ReadBackend,
-    size: u64,
     operation_gate: Arc<RwLock<()>>,
     lifecycle: AtomicU64,
     relative_gate: tokio::sync::Mutex<()>,
@@ -97,53 +114,30 @@ struct FileResource {
 struct FileCloseState {
     started: bool,
     file: Option<OpenFile>,
-    result: Option<std::result::Result<(), SharedCloseError>>,
+    result: Option<std::result::Result<(), Arc<NfsError>>>,
 }
 
-#[derive(Clone, Debug)]
-enum SharedCloseError {
-    NotFound(String),
-    PermissionDenied(String),
-    Other(String),
+#[derive(Debug)]
+struct SharedNfsFailure(Arc<NfsError>);
+
+impl std::fmt::Display for SharedNfsFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
-impl SharedCloseError {
-    fn from_nfs(error: NfsError) -> Self {
-        let message = error.to_string();
-        if error.is_not_found() {
-            Self::NotFound(message)
-        } else if matches!(
-            error,
-            NfsError::Nfs3(
-                crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
-            ) | NfsError::Nfs4(
-                crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
-            )
-        ) || error.kind() == std::io::ErrorKind::PermissionDenied
-        {
-            Self::PermissionDenied(message)
-        } else {
-            Self::Other(message)
-        }
+impl std::error::Error for SharedNfsFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
     }
+}
 
-    fn into_nfs(self) -> NfsError {
-        match self {
-            Self::NotFound(message) => {
-                NfsError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, message))
-            }
-            Self::PermissionDenied(message) => NfsError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                message,
-            )),
-            Self::Other(message) => NfsError::Rpc(message),
-        }
-    }
+fn shared_nfs_error(error: Arc<NfsError>) -> NfsError {
+    NfsError::Io(std::io::Error::new(error.kind(), SharedNfsFailure(error)))
 }
 
 impl FileResource {
-    fn mount(mount: Arc<dyn Mount>, file: OpenFile, size: u64) -> Arc<Self> {
+    fn mount(mount: Arc<dyn Mount>, file: OpenFile) -> Arc<Self> {
         let max_read = mount.get_max_read_size().max(1);
         let file_handle = file.file_handle();
         Arc::new(Self {
@@ -152,7 +146,6 @@ impl FileResource {
                 file_handle,
                 max_read,
             },
-            size,
             operation_gate: Arc::new(RwLock::new(())),
             lifecycle: AtomicU64::new(0),
             relative_gate: tokio::sync::Mutex::new(()),
@@ -171,7 +164,6 @@ impl FileResource {
     fn test() -> Arc<Self> {
         let data: Arc<[u8]> = Arc::from(&b"abcdefghijklmnopqrstuvwxyz"[..]);
         Arc::new(Self {
-            size: data.len() as u64,
             operation_gate: Arc::new(RwLock::new(())),
             lifecycle: AtomicU64::new(0),
             backend: ReadBackend::Test { data, max_read: 4 },
@@ -203,7 +195,7 @@ impl FileResource {
         }
     }
 
-    async fn close(self: &Arc<Self>) -> std::result::Result<(), SharedCloseError> {
+    async fn close(self: &Arc<Self>) -> std::result::Result<(), Arc<NfsError>> {
         self.lifecycle.store(1, Ordering::Release);
         self.close_started.notify_one();
         let file = self
@@ -217,16 +209,15 @@ impl FileResource {
                     Some(state.file.take())
                 }
             })
-            .map_err(|_| SharedCloseError::Other("file close state lock poisoned".to_string()))?;
+            .map_err(|_| Arc::new(NfsError::Rpc("file close state lock poisoned".to_string())))?;
         if let Some(file) = file {
             let resource = self.clone();
             tokio::spawn(async move {
                 let _operation_guard = resource.operation_gate.clone().write_owned().await;
                 let result = match (&resource.backend, file) {
-                    (ReadBackend::Mount { mount, .. }, Some(file)) => mount
-                        .close_stateful(file)
-                        .await
-                        .map_err(SharedCloseError::from_nfs),
+                    (ReadBackend::Mount { mount, .. }, Some(file)) => {
+                        mount.close_stateful(file).await.map_err(Arc::new)
+                    }
                     _ => Ok(()),
                 };
                 if let Ok(mut state) = resource.close_state.lock() {
@@ -279,11 +270,7 @@ impl FileResource {
                 "read size must be -1 or non-negative".to_string(),
             ));
         }
-        let requested = if size == -1 {
-            self.size.saturating_sub(offset)
-        } else {
-            size as u64
-        };
+        let requested = if size == -1 { u64::MAX } else { size as u64 };
         let mut result = Vec::new();
         let mut current = offset;
         let mut remaining = requested;
@@ -372,7 +359,7 @@ impl ClientDriver for TestDriver {
 
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         if let Some(resource) = self.resources.remove(key)? {
-            resource.close().await.map_err(SharedCloseError::into_nfs)?;
+            resource.close().await.map_err(shared_nfs_error)?;
         }
         Ok(())
     }
@@ -392,7 +379,7 @@ impl ClientDriver for MountDriver {
 
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         if let Some(resource) = self.resources.remove(key)? {
-            resource.close().await.map_err(SharedCloseError::into_nfs)?;
+            resource.close().await.map_err(shared_nfs_error)?;
         }
         Ok(())
     }
@@ -412,8 +399,12 @@ fn python_error(error: impl std::fmt::Display) -> PyErr {
 }
 
 fn nfs_error(error: NfsError) -> PyErr {
+    nfs_error_ref(&error)
+}
+
+fn nfs_error_ref(error: &NfsError) -> PyErr {
     let permission_denied = matches!(
-        &error,
+        error,
         NfsError::Nfs3(
             crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
         ) | NfsError::Nfs4(
@@ -854,11 +845,8 @@ async fn open_file(
     path: String,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
     let resource = if let Some(mount) = mount {
-        // Resolve size before acquiring protocol-owned open state. Once open
-        // succeeds, registration is synchronous so cancellation cannot orphan it.
-        let size = mount.getattr_path(&path).await?.filesize;
         let file = mount.open_path_stateful(&path, crate::OPEN_READ).await?;
-        FileResource::mount(mount, file, size)
+        FileResource::mount(mount, file)
     } else {
         #[cfg(feature = "python-test-support")]
         {
@@ -869,6 +857,20 @@ async fn open_file(
             return Err(NfsError::Unsupported("mount is unavailable".to_string()));
         }
     };
+    #[cfg(feature = "python-test-support")]
+    let barrier = if path == "__blocked_open__" {
+        open_test_barrier()
+            .lock()
+            .map_err(|_| NfsError::Rpc("open test barrier lock poisoned".to_string()))?
+            .clone()
+    } else {
+        None
+    };
+    #[cfg(feature = "python-test-support")]
+    if let Some(barrier) = &barrier {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+    }
     let key = core.allocate_resource_key()?;
     resources.insert(key, resource.clone())?;
     if let Err(error) = core.publish_resource(key) {
@@ -876,7 +878,57 @@ async fn open_file(
         let _ = resource.close().await;
         return Err(error);
     }
+    #[cfg(feature = "python-test-support")]
+    if let Some(barrier) = barrier {
+        barrier.registered.notify_one();
+    }
     Ok((key, resource))
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _arm_open_test_barrier() -> PyResult<()> {
+    *open_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("open test barrier lock poisoned"))? =
+        Some(Arc::new(OpenTestBarrier::default()));
+    Ok(())
+}
+
+#[cfg(feature = "python-test-support")]
+fn current_open_test_barrier() -> PyResult<Arc<OpenTestBarrier>> {
+    open_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("open test barrier lock poisoned"))?
+        .clone()
+        .ok_or_else(|| PyRuntimeError::new_err("open test barrier is not armed"))
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_open_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_open_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.entered.notified().await;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _release_open_test_barrier() -> PyResult<()> {
+    current_open_test_barrier()?.release.notify_one();
+    Ok(())
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_open_test_registered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_open_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.registered.notified().await;
+        Ok(())
+    })
 }
 
 async fn cancellation_safe_open_file(
@@ -902,10 +954,10 @@ async fn close_file(
     resources: Arc<AdapterResources>,
     key: ResourceKey,
     resource: Arc<FileResource>,
-) -> Result<()> {
-    let result = resource.close().await.map_err(SharedCloseError::into_nfs);
-    core.unregister_resource(key)?;
-    let _ = resources.remove(key)?;
+) -> std::result::Result<(), Arc<NfsError>> {
+    let result = resource.close().await;
+    core.unregister_resource(key).map_err(Arc::new)?;
+    let _ = resources.remove(key).map_err(Arc::new)?;
     result
 }
 
@@ -977,7 +1029,7 @@ impl SyncFile {
                 self.resource.seek(offset, whence).await
             })
         })
-        .map_err(nfs_error)
+        .map_err(|error| nfs_error_ref(&error))
     }
 
     fn tell(&self) -> PyResult<u64> {
@@ -993,7 +1045,7 @@ impl SyncFile {
                 self.resource.clone(),
             ))
         })
-        .map_err(nfs_error)
+        .map_err(|error| nfs_error_ref(&error))
     }
 }
 
@@ -1064,7 +1116,7 @@ impl AsyncFile {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             close_file(core, resources, key, resource)
                 .await
-                .map_err(nfs_error)
+                .map_err(|error| nfs_error_ref(&error))
         })
     }
 }
@@ -1437,6 +1489,13 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AsyncFile>()?;
     module.add_function(wrap_pyfunction!(python_list_exports, module)?)?;
     module.add_function(wrap_pyfunction!(python_async_list_exports, module)?)?;
+    #[cfg(feature = "python-test-support")]
+    {
+        module.add_function(wrap_pyfunction!(_arm_open_test_barrier, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_open_test_entered, module)?)?;
+        module.add_function(wrap_pyfunction!(_release_open_test_barrier, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_open_test_registered, module)?)?;
+    }
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
