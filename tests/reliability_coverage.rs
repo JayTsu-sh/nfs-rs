@@ -239,8 +239,18 @@ fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
     assert!(workflow.contains("complete pre-provisioned Rust 1.95.0 toolchain not found"));
     assert!(workflow.contains("rustc --version | grep -q '^rustc 1\\.95\\.0 '"));
     assert!(workflow.contains("cache-bin: false"));
-    assert_eq!(workflow.matches("Discover pre-provisioned Zig 0.13.0").count(), 1);
-    assert_eq!(workflow.matches("test \"$(zig version)\" = \"0.13.0\"").count(), 1);
+    assert_eq!(
+        workflow
+            .matches("Discover pre-provisioned Zig 0.13.0")
+            .count(),
+        1
+    );
+    assert_eq!(
+        workflow
+            .matches("test \"$(zig version)\" = \"0.13.0\"")
+            .count(),
+        1
+    );
     assert!(!workflow.contains("goto-bus-stop/setup-zig"));
     assert!(!workflow.contains("aarch64-python-real-protocol"));
     assert!(!workflow.contains("runs-on: [self-hosted, linux, ARM64"));
