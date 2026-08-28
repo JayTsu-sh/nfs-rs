@@ -4,10 +4,10 @@
 
 **Blocked by:** 03 — Deliver minimal installable sync and async clients; 04 — Deliver paths, metadata, and directory browsing
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Read-only open validates mode, acquires and registers state before returning, and cannot orphan state on cancellation.
-- [ ] Read, readinto, positional variants, seek, tell, and close have sync/async parity and negotiated chunking.
-- [ ] Relative operations serialize while positional reads do not alter logical position and may overlap.
-- [ ] Synchronous files implement the required raw-I/O contract and async files provide equivalent async behavior.
-- [ ] Buffer targets are never retained across detached or suspended network work.
+- [x] Read-only open validates mode, acquires and registers state before returning, and cannot orphan state on cancellation.
+- [x] Read, readinto, positional variants, seek, tell, and close have sync/async parity and negotiated chunking.
+- [x] Relative operations serialize while positional reads do not alter logical position and may overlap.
+- [x] Synchronous files implement the required raw-I/O contract and async files provide equivalent async behavior.
+- [x] Buffer targets are never retained across detached or suspended network work.
