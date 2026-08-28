@@ -250,6 +250,8 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     )))
 }
 
+#[doc(hidden)]
+pub mod client_core;
 pub mod error;
 mod mount;
 mod nfs3;
