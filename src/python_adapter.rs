@@ -1,4 +1,6 @@
-use crate::client_core::{ClientCore, ClientDriver, CoreOperation, OperationGuard, ResourceKey};
+use crate::client_core::{
+    ClientCore, ClientDriver, CoreOperation, CoreRecoveryEvent, OperationGuard, ResourceKey,
+};
 use crate::nfs4::Nfs4ErrorCode::*;
 use crate::{
     Attr, Mount, MountHealth, NFSVersion, NfsError, OpenFile, Result, parse_url_and_mount,
@@ -10,6 +12,7 @@ use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple, PyType};
 use std::collections::HashMap;
+use std::future::Future;
 #[cfg(feature = "python-test-support")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,15 +31,49 @@ struct OpenTestBarrier {
     entered: Notify,
     release: Notify,
     registered: Notify,
+    settled: Notify,
 }
 
 #[cfg(feature = "python-test-support")]
 static OPEN_TEST_BARRIER: OnceLock<Mutex<Option<Arc<OpenTestBarrier>>>> = OnceLock::new();
 
 #[cfg(feature = "python-test-support")]
+#[derive(Debug)]
+struct OperationTestBarrier {
+    operation: String,
+    entered: Notify,
+    release: Notify,
+    settled: Notify,
+}
+
+#[cfg(feature = "python-test-support")]
+static OPERATION_TEST_BARRIER: OnceLock<Mutex<Option<Arc<OperationTestBarrier>>>> = OnceLock::new();
+
+#[cfg(feature = "python-test-support")]
 fn open_test_barrier() -> &'static Mutex<Option<Arc<OpenTestBarrier>>> {
     OPEN_TEST_BARRIER.get_or_init(|| Mutex::new(None))
 }
+
+#[cfg(feature = "python-test-support")]
+fn operation_test_barrier() -> &'static Mutex<Option<Arc<OperationTestBarrier>>> {
+    OPERATION_TEST_BARRIER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "python-test-support")]
+async fn wait_at_operation_test_barrier(operation: &str) {
+    let barrier = operation_test_barrier()
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .filter(|barrier| barrier.operation == operation);
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(not(feature = "python-test-support"))]
+async fn wait_at_operation_test_barrier(_operation: &str) {}
 
 async fn send_directory_item(
     sender: &mpsc::Sender<DirectoryItem>,
@@ -169,6 +206,7 @@ impl FileMode {
 
 #[derive(Debug)]
 struct FileResource {
+    safe_path: String,
     backend: FileBackend,
     mode: FileMode,
     operation_gate: Arc<RwLock<()>>,
@@ -176,6 +214,8 @@ struct FileResource {
     relative_gate: tokio::sync::Mutex<()>,
     position: AtomicU64,
     position_uncertain: AtomicBool,
+    open_state_lost: AtomicBool,
+    recovery_generation: u64,
     dirty_state: tokio::sync::Mutex<DirtyState>,
     close_state: Mutex<FileCloseState>,
     close_started: Notify,
@@ -299,11 +339,19 @@ fn commit_uncertain_error(message: &str, protocol: NFSVersion) -> NfsError {
 }
 
 impl FileResource {
-    fn mount(mount: Arc<dyn Mount>, file: OpenFile, mode: FileMode, position: u64) -> Arc<Self> {
+    fn mount(
+        safe_path: String,
+        mount: Arc<dyn Mount>,
+        file: OpenFile,
+        mode: FileMode,
+        position: u64,
+    ) -> Arc<Self> {
         let max_read = mount.get_max_read_size().max(1);
         let max_write = mount.get_max_write_size().max(1);
         let file_handle = file.file_handle();
+        let recovery_generation = mount.health().generation;
         Arc::new(Self {
+            safe_path,
             backend: FileBackend::Mount {
                 mount,
                 file_handle,
@@ -316,6 +364,8 @@ impl FileResource {
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(position),
             position_uncertain: AtomicBool::new(false),
+            open_state_lost: AtomicBool::new(false),
+            recovery_generation,
             dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
             close_state: Mutex::new(FileCloseState {
                 started: false,
@@ -337,6 +387,7 @@ impl FileResource {
 
     #[cfg(feature = "python-test-support")]
     async fn test(
+        safe_path: String,
         mode: FileMode,
         data: Arc<tokio::sync::Mutex<Vec<u8>>>,
         fail_commit: bool,
@@ -353,6 +404,7 @@ impl FileResource {
             0
         };
         Arc::new(Self {
+            safe_path,
             operation_gate: Arc::new(RwLock::new(())),
             lifecycle: AtomicU64::new(0),
             backend: FileBackend::Test {
@@ -365,6 +417,8 @@ impl FileResource {
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(position),
             position_uncertain: AtomicBool::new(false),
+            open_state_lost: AtomicBool::new(false),
+            recovery_generation: 0,
             dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
             close_state: Mutex::new(FileCloseState::default()),
             close_started: Notify::new(),
@@ -387,7 +441,16 @@ impl FileResource {
             ));
         }
         let guard = self.operation_gate.clone().read_owned().await;
-        if self.lifecycle.load(Ordering::Acquire) == 0 {
+        if let FileBackend::Mount { mount, .. } = &self.backend
+            && mount.health().generation != self.recovery_generation
+        {
+            self.open_state_lost.store(true, Ordering::Release);
+        }
+        if self.open_state_lost.load(Ordering::Acquire) {
+            Err(NfsError::LostOpenState(
+                "open file state or remote identity was lost; reopen the file".to_string(),
+            ))
+        } else if self.lifecycle.load(Ordering::Acquire) == 0 {
             Ok(guard)
         } else {
             Err(NfsError::ClosedResource(
@@ -414,6 +477,7 @@ impl FileResource {
         if let Some(file) = file {
             let resource = self.clone();
             tokio::spawn(async move {
+                wait_at_operation_test_barrier("close").await;
                 let _operation_guard = resource.operation_gate.clone().write_owned().await;
                 let mut errors = Vec::new();
                 if let Err(error) = resource.flush_inner().await {
@@ -518,6 +582,7 @@ impl FileResource {
     }
 
     async fn read(&self, size: i64) -> Result<Vec<u8>> {
+        wait_at_operation_test_barrier("read").await;
         let _guard = self.relative_gate.lock().await;
         if self.position_uncertain.load(Ordering::Acquire) {
             return Err(NfsError::PositionUncertain(
@@ -693,6 +758,7 @@ impl FileResource {
     }
 
     async fn write(&self, data: Bytes) -> Result<u64> {
+        wait_at_operation_test_barrier("write").await;
         let _guard = self.relative_gate.lock().await;
         if self.position_uncertain.load(Ordering::Acquire) {
             return Err(NfsError::PositionUncertain(
@@ -766,6 +832,7 @@ impl FileResource {
     }
 
     async fn flush_inner(&self) -> Result<()> {
+        wait_at_operation_test_barrier("flush").await;
         if !self.mode.writable {
             return Ok(());
         }
@@ -856,7 +923,11 @@ impl FileResource {
     }
 
     fn tell(&self) -> Result<u64> {
-        if self.lifecycle.load(Ordering::Acquire) == 0 {
+        if self.open_state_lost.load(Ordering::Acquire) {
+            Err(NfsError::LostOpenState(
+                "open file state or remote identity was lost; reopen the file".to_string(),
+            ))
+        } else if self.lifecycle.load(Ordering::Acquire) == 0 {
             Ok(self.position.load(Ordering::Acquire))
         } else {
             Err(NfsError::ClosedResource(
@@ -1706,6 +1777,26 @@ enum NamespaceOperation {
     Symlink,
 }
 
+impl NamespaceOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mkdir(_) => "mkdir",
+            Self::Remove => "remove",
+            Self::Rmdir => "rmdir",
+            Self::Rename => "rename",
+            Self::Link => "link",
+            Self::Symlink => "symlink",
+        }
+    }
+
+    fn recovery_path(self, first: &str, second: Option<&str>) -> Option<String> {
+        match self {
+            Self::Symlink => second.map(str::to_owned),
+            _ => Some(first.to_owned()),
+        }
+    }
+}
+
 async fn namespace_operation(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
@@ -1713,6 +1804,7 @@ async fn namespace_operation(
     first: String,
     second: Option<String>,
 ) -> Result<()> {
+    wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
@@ -1833,12 +1925,24 @@ enum MetadataOperation {
     Truncate(u64),
 }
 
+impl MetadataOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Chmod(_) => "chmod",
+            Self::Chown(_, _) => "chown",
+            Self::Utime(_, _) => "utime",
+            Self::Truncate(_) => "truncate",
+        }
+    }
+}
+
 async fn metadata_operation(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     operation: MetadataOperation,
     path: String,
 ) -> Result<()> {
+    wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
@@ -2001,9 +2105,25 @@ async fn xattr_set(
     name: String,
     value: Vec<u8>,
 ) -> Result<()> {
+    wait_at_operation_test_barrier("setxattr").await;
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
+        if path == "__after_send__" {
+            return Err(NfsError::OperationOutcome(Box::new(
+                crate::OperationOutcomeError::new(
+                    crate::OperationOutcome::Uncertain,
+                    crate::OperationClass::ReplaySensitive,
+                    crate::RecoveryAction::VerifyThenResume,
+                    crate::RequestContext {
+                        operation: "setxattr".to_string(),
+                        protocol: NFSVersion::NFSv3,
+                        request_id: None,
+                    },
+                    NfsError::Rpc("injected after-send failure".to_string()),
+                ),
+            )));
+        }
         if path == "unsupported" {
             return Err(NfsError::Unsupported(
                 "named attributes are not supported".to_string(),
@@ -2064,6 +2184,7 @@ async fn xattr_remove(
     path: String,
     name: String,
 ) -> Result<()> {
+    wait_at_operation_test_barrier("removexattr").await;
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
@@ -2294,6 +2415,50 @@ fn health_dict<'py>(py: Python<'py>, health: MountHealth) -> PyResult<Bound<'py,
     Ok(result)
 }
 
+fn recovery_event_dict<'py>(
+    py: Python<'py>,
+    event: CoreRecoveryEvent,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("operation", event.operation)?;
+    result.set_item("path", event.safe_path)?;
+    result.set_item("protocol", protocol_name(event.protocol))?;
+    result.set_item("outcome", outcome_name(event.outcome))?;
+    result.set_item("recovery_action", recovery_name(event.recovery))?;
+    result.set_item("completed_bytes", event.completed_bytes)?;
+    result.set_item("message", event.message)?;
+    Ok(result)
+}
+
+fn recovery_event_dicts<'py>(
+    py: Python<'py>,
+    events: Vec<CoreRecoveryEvent>,
+) -> PyResult<Vec<Bound<'py, PyDict>>> {
+    events
+        .into_iter()
+        .map(|event| recovery_event_dict(py, event))
+        .collect()
+}
+
+#[cfg(feature = "python-test-support")]
+fn record_test_recovery_event(
+    core: &ClientCore,
+    protocol: NFSVersion,
+    operation: String,
+    path: Option<String>,
+) -> PyResult<()> {
+    core.record_recovery_event(CoreRecoveryEvent {
+        operation,
+        safe_path: path,
+        protocol,
+        outcome: crate::OperationOutcome::Uncertain,
+        recovery: crate::RecoveryAction::VerifyThenResume,
+        completed_bytes: Some(0),
+        message: "redacted recovery event".to_string(),
+    })
+    .map_err(nfs_error)
+}
+
 fn current_health(
     initial: MountHealth,
     source: Option<&Arc<dyn Mount>>,
@@ -2440,11 +2605,12 @@ async fn open_file(
         } else {
             0
         };
-        FileResource::mount(mount, file, mode, position)
+        FileResource::mount(path.clone(), mount, file, mode, position)
     } else {
         #[cfg(feature = "python-test-support")]
         {
             FileResource::test(
+                path.clone(),
                 mode,
                 resources.test_file(&path)?,
                 matches!(path.as_str(), "__commit_error__" | "__commit_close_error__"),
@@ -2464,7 +2630,10 @@ async fn open_file(
         }
     };
     #[cfg(feature = "python-test-support")]
-    let barrier = if path == "__blocked_open__" {
+    let barrier = if matches!(
+        path.as_str(),
+        "__blocked_open__" | "__blocked_open_uncertain__"
+    ) {
         open_test_barrier()
             .lock()
             .map_err(|_| NfsError::Rpc("open test barrier lock poisoned".to_string()))?
@@ -2476,6 +2645,22 @@ async fn open_file(
     if let Some(barrier) = &barrier {
         barrier.entered.notify_one();
         barrier.release.notified().await;
+    }
+    #[cfg(feature = "python-test-support")]
+    if path == "__blocked_open_uncertain__" {
+        return Err(NfsError::OperationOutcome(Box::new(
+            crate::OperationOutcomeError::new(
+                crate::OperationOutcome::Uncertain,
+                crate::OperationClass::ReplaySensitive,
+                crate::RecoveryAction::VerifyThenResume,
+                crate::RequestContext {
+                    operation: "open".to_string(),
+                    protocol: NFSVersion::NFSv4p1,
+                    request_id: None,
+                },
+                NfsError::Rpc("scripted abandoned open failure".to_string()),
+            ),
+        )));
     }
     let key = core.allocate_resource_key()?;
     resources.insert(key, resource.clone())?;
@@ -2537,6 +2722,67 @@ fn _wait_open_test_registered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     })
 }
 
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_open_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_open_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.settled.notified().await;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _arm_operation_test_barrier(operation: String) -> PyResult<()> {
+    *operation_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("operation test barrier lock poisoned"))? =
+        Some(Arc::new(OperationTestBarrier {
+            operation,
+            entered: Notify::new(),
+            release: Notify::new(),
+            settled: Notify::new(),
+        }));
+    Ok(())
+}
+
+#[cfg(feature = "python-test-support")]
+fn current_operation_test_barrier() -> PyResult<Arc<OperationTestBarrier>> {
+    operation_test_barrier()
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("operation test barrier lock poisoned"))?
+        .clone()
+        .ok_or_else(|| PyRuntimeError::new_err("operation test barrier is not armed"))
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_operation_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_operation_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.entered.notified().await;
+        Ok(())
+    })
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _release_operation_test_barrier() -> PyResult<()> {
+    current_operation_test_barrier()?.release.notify_one();
+    Ok(())
+}
+
+#[cfg(feature = "python-test-support")]
+#[pyfunction]
+fn _wait_operation_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let barrier = current_operation_test_barrier()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        barrier.settled.notified().await;
+        Ok(())
+    })
+}
+
 async fn cancellation_safe_open_file(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
@@ -2547,14 +2793,171 @@ async fn cancellation_safe_open_file(
     let operation = core.begin_operation()?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task_core = core.clone();
+    let event_core = core.clone();
+    let safe_path = path.clone();
+    #[cfg(feature = "python-test-support")]
+    let settlement_barrier = open_test_barrier()
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
     core.spawn_owned(async move {
         let result = open_file(task_core, operation, mount, resources, path, mode).await;
-        let _ = sender.send(result);
+        if let Err(result) = sender.send(result)
+            && let Err(error) = result
+        {
+            record_abandoned_error(&event_core, Some(safe_path), &error);
+        }
+        #[cfg(feature = "python-test-support")]
+        if let Some(barrier) = settlement_barrier {
+            barrier.settled.notify_one();
+        }
     })?;
     receiver
         .await
         .map_err(|_| NfsError::Rpc("open task ended without a result".to_string()))?
 }
+
+fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &NfsError) {
+    let event = match error {
+        NfsError::OperationOutcome(details)
+            if matches!(
+                details.outcome,
+                crate::OperationOutcome::Uncertain | crate::OperationOutcome::SafeToRetry
+            ) =>
+        {
+            Some(CoreRecoveryEvent {
+                operation: details.context().operation.clone(),
+                safe_path,
+                protocol: details.context().protocol,
+                outcome: details.outcome,
+                recovery: details.recovery,
+                completed_bytes: details.completed_bytes,
+                message: "abandoned operation completed with a recovery-relevant failure"
+                    .to_string(),
+            })
+        }
+        NfsError::LostOpenState(_) => Some(CoreRecoveryEvent {
+            operation: "open state".to_string(),
+            safe_path,
+            protocol: NFSVersion::Unknown,
+            outcome: crate::OperationOutcome::Uncertain,
+            recovery: crate::RecoveryAction::Reopen,
+            completed_bytes: None,
+            message: "abandoned operation lost open state".to_string(),
+        }),
+        _ => None,
+    };
+    if let Some(event) = event {
+        let _ = core.record_recovery_event(event);
+    }
+}
+
+fn error_loses_open_state(error: &NfsError) -> bool {
+    match error {
+        NfsError::LostOpenState(_) => true,
+        NfsError::Nfs3(
+            crate::nfs3::ErrorCode::NFS3ERR_STALE | crate::nfs3::ErrorCode::NFS3ERR_BADHANDLE,
+        ) => true,
+        NfsError::Nfs4(status) => matches!(
+            status,
+            NFS4ERR_STALE
+                | NFS4ERR_BADHANDLE
+                | NFS4ERR_FHEXPIRED
+                | NFS4ERR_STALE_STATEID
+                | NFS4ERR_OLD_STATEID
+                | NFS4ERR_BAD_STATEID
+                | NFS4ERR_EXPIRED
+                | NFS4ERR_ADMIN_REVOKED
+                | NFS4ERR_DELEG_REVOKED
+        ),
+        NfsError::OperationOutcome(details) => error_loses_open_state(details.source.as_ref()),
+        NfsError::Io(io) => io
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<SharedNfsFailure>())
+            .is_some_and(|shared| error_loses_open_state(shared.0.as_ref())),
+        NfsError::FileClose(errors) => errors
+            .iter()
+            .any(|failure| error_loses_open_state(failure.error.as_ref())),
+        _ => false,
+    }
+}
+
+fn observe_file_result<T>(resource: &FileResource, result: Result<T>) -> Result<T> {
+    if result.as_ref().err().is_some_and(error_loses_open_state) {
+        resource.open_state_lost.store(true, Ordering::Release);
+    }
+    result
+}
+
+async fn cancellation_safe_file_operation<T, F>(
+    core: Arc<ClientCore>,
+    resource: Arc<FileResource>,
+    operation_name: &'static str,
+    future: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    let operation = core.begin_operation()?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let event_core = core.clone();
+    let safe_path = resource.safe_path.clone();
+    core.spawn_owned(async move {
+        let _operation = operation;
+        let result = observe_file_result(&resource, future.await);
+        if let Err(result) = sender.send(result)
+            && let Err(error) = result
+        {
+            record_abandoned_error(&event_core, Some(safe_path), &error);
+        }
+        notify_operation_test_settled(operation_name);
+    })?;
+    receiver
+        .await
+        .map_err(|_| NfsError::Rpc("file operation task ended without a result".to_string()))?
+}
+
+async fn cancellation_safe_owned_operation<T, F>(
+    core: Arc<ClientCore>,
+    safe_path: Option<String>,
+    operation_name: &'static str,
+    future: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let event_core = core.clone();
+    core.spawn_owned(async move {
+        let result = future.await;
+        if let Err(result) = sender.send(result)
+            && let Err(error) = result
+        {
+            record_abandoned_error(&event_core, safe_path, &error);
+        }
+        notify_operation_test_settled(operation_name);
+    })?;
+    receiver
+        .await
+        .map_err(|_| NfsError::Rpc("owned operation task ended without a result".to_string()))?
+}
+
+#[cfg(feature = "python-test-support")]
+fn notify_operation_test_settled(operation: &str) {
+    if let Ok(mut value) = operation_test_barrier().lock()
+        && value
+            .as_ref()
+            .is_some_and(|barrier| barrier.operation == operation)
+        && let Some(barrier) = value.take()
+    {
+        barrier.settled.notify_one();
+    }
+}
+
+#[cfg(not(feature = "python-test-support"))]
+fn notify_operation_test_settled(_operation: &str) {}
 
 async fn close_file(
     core: Arc<ClientCore>,
@@ -2566,6 +2969,43 @@ async fn close_file(
     core.unregister_resource(key).map_err(Arc::new)?;
     let _ = resources.remove(key).map_err(Arc::new)?;
     result
+}
+
+async fn cancellation_safe_close_file(
+    core: Arc<ClientCore>,
+    resources: Arc<AdapterResources>,
+    key: ResourceKey,
+    resource: Arc<FileResource>,
+) -> std::result::Result<(), Arc<NfsError>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let task_core = core.clone();
+    let event_core = core.clone();
+    let safe_path = resource.safe_path.clone();
+    core.spawn_owned(async move {
+        let result = close_file(task_core, resources, key, resource).await;
+        if let Err(result) = sender.send(result)
+            && let Err(error) = result
+        {
+            record_abandoned_close_error(&event_core, safe_path, error.as_ref());
+        }
+        notify_operation_test_settled("close");
+    })
+    .map_err(Arc::new)?;
+    receiver.await.map_err(|_| {
+        Arc::new(NfsError::Rpc(
+            "file close task ended without a result".to_string(),
+        ))
+    })?
+}
+
+fn record_abandoned_close_error(core: &ClientCore, safe_path: String, error: &NfsError) {
+    if let NfsError::FileClose(errors) = error {
+        for failure in errors {
+            record_abandoned_error(core, Some(safe_path.clone()), failure.error.as_ref());
+        }
+    } else {
+        record_abandoned_error(core, Some(safe_path), error);
+    }
 }
 
 fn validate_file_mode(mode: &str) -> PyResult<()> {
@@ -2593,44 +3033,47 @@ impl SyncFile {
         self.resource.max_read()
     }
 
+    #[cfg(feature = "python-test-support")]
+    fn _lose_open_state(&self) {
+        self.resource.open_state_lost.store(true, Ordering::Release);
+    }
+
     #[pyo3(signature = (size = -1))]
     fn read(&self, py: Python<'_>, size: i64) -> PyResult<Py<PyBytes>> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let data = py
-            .detach(|| {
-                self.runtime.block_on(async {
-                    let _file_operation = self.resource.begin_operation().await?;
-                    self.resource.read(size).await
-                })
+        let result = py.detach(|| {
+            self.runtime.block_on(async {
+                let _file_operation = self.resource.begin_operation().await?;
+                self.resource.read(size).await
             })
-            .map_err(nfs_error)?;
+        });
+        let data = observe_file_result(&self.resource, result).map_err(nfs_error)?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, size = -1))]
     fn read_at(&self, py: Python<'_>, offset: u64, size: i64) -> PyResult<Py<PyBytes>> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let data = py
-            .detach(|| {
-                self.runtime.block_on(async {
-                    let _file_operation = self.resource.begin_operation().await?;
-                    self.resource.read_at(offset, size).await
-                })
+        let result = py.detach(|| {
+            self.runtime.block_on(async {
+                let _file_operation = self.resource.begin_operation().await?;
+                self.resource.read_at(offset, size).await
             })
-            .map_err(nfs_error)?;
+        });
+        let data = observe_file_result(&self.resource, result).map_err(nfs_error)?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, whence = 0))]
     fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        py.detach(|| {
+        let result = py.detach(|| {
             self.runtime.block_on(async {
                 let _file_operation = self.resource.begin_operation().await?;
                 self.resource.seek(offset, whence).await
             })
-        })
-        .map_err(|error| nfs_error_ref(&error))
+        });
+        observe_file_result(&self.resource, result).map_err(|error| nfs_error_ref(&error))
     }
 
     fn tell(&self) -> PyResult<u64> {
@@ -2639,47 +3082,47 @@ impl SyncFile {
 
     fn write(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<u64> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        py.detach(|| {
+        let result = py.detach(|| {
             self.runtime.block_on(async {
                 let _file_operation = self.resource.begin_operation().await?;
                 self.resource.write(Bytes::from(data)).await
             })
-        })
-        .map_err(nfs_error)
+        });
+        observe_file_result(&self.resource, result).map_err(nfs_error)
     }
 
     fn write_at(&self, py: Python<'_>, data: Vec<u8>, offset: u64) -> PyResult<u64> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        py.detach(|| {
+        let result = py.detach(|| {
             self.runtime.block_on(async {
                 let _file_operation = self.resource.begin_operation().await?;
                 self.resource.write_at(offset, Bytes::from(data)).await
             })
-        })
-        .map_err(nfs_error)
+        });
+        observe_file_result(&self.resource, result).map_err(nfs_error)
     }
 
     #[pyo3(signature = (size = None))]
     fn truncate(&self, py: Python<'_>, size: Option<u64>) -> PyResult<u64> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        py.detach(|| {
+        let result = py.detach(|| {
             self.runtime.block_on(async {
                 let _file_operation = self.resource.begin_operation().await?;
                 self.resource.truncate(size).await
             })
-        })
-        .map_err(nfs_error)
+        });
+        observe_file_result(&self.resource, result).map_err(nfs_error)
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        py.detach(|| {
+        let result = py.detach(|| {
             self.runtime.block_on(async {
                 let _file_operation = self.resource.begin_operation().await?;
                 self.resource.flush_inner().await
             })
-        })
-        .map_err(nfs_error)
+        });
+        observe_file_result(&self.resource, result).map_err(nfs_error)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -2715,38 +3158,55 @@ impl AsyncFile {
         self.resource.max_read()
     }
 
+    #[cfg(feature = "python-test-support")]
+    fn _lose_open_state(&self) {
+        self.resource.open_state_lost.store(true, Ordering::Release);
+    }
+
     #[pyo3(signature = (size = -1))]
     fn read<'py>(&self, py: Python<'py>, size: i64) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            let data = resource.read(size).await.map_err(nfs_error)?;
+            let data = cancellation_safe_file_operation(core, resource, "read", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.read(size).await
+            })
+            .await
+            .map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
     }
 
     #[pyo3(signature = (offset, size = -1))]
     fn read_at<'py>(&self, py: Python<'py>, offset: u64, size: i64) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            let data = resource.read_at(offset, size).await.map_err(nfs_error)?;
+            let data = cancellation_safe_file_operation(core, resource, "read_at", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.read_at(offset, size).await
+            })
+            .await
+            .map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
     }
 
     #[pyo3(signature = (offset, whence = 0))]
     fn seek<'py>(&self, py: Python<'py>, offset: i64, whence: i32) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            resource.seek(offset, whence).await.map_err(nfs_error)
+            cancellation_safe_file_operation(core, resource, "seek", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.seek(offset, whence).await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -2755,12 +3215,16 @@ impl AsyncFile {
     }
 
     fn write<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            resource.write(Bytes::from(data)).await.map_err(nfs_error)
+            cancellation_safe_file_operation(core, resource, "write", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.write(Bytes::from(data)).await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -2770,36 +3234,45 @@ impl AsyncFile {
         data: Vec<u8>,
         offset: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            resource
-                .write_at(offset, Bytes::from(data))
-                .await
-                .map_err(nfs_error)
+            cancellation_safe_file_operation(core, resource, "write_at", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.write_at(offset, Bytes::from(data)).await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
     #[pyo3(signature = (size = None))]
     fn truncate<'py>(&self, py: Python<'py>, size: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            resource.truncate(size).await.map_err(nfs_error)
+            cancellation_safe_file_operation(core, resource, "truncate", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.truncate(size).await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
     fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _core_operation = core_operation;
-            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
-            resource.flush_inner().await.map_err(nfs_error)
+            cancellation_safe_file_operation(core, resource, "flush", async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.flush_inner().await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -2809,7 +3282,7 @@ impl AsyncFile {
         let key = self.key;
         let resource = self.resource.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            close_file(core, resources, key, resource)
+            cancellation_safe_close_file(core, resources, key, resource)
                 .await
                 .map_err(|error| nfs_error_ref(&error))
         })
@@ -3001,6 +3474,24 @@ impl SyncClient {
                 report.errors(),
             ))
         }
+    }
+
+    fn recovery_events<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        recovery_event_dicts(py, self.core.recovery_events().map_err(nfs_error)?)
+    }
+
+    fn drain_recovery_events<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        recovery_event_dicts(py, self.core.drain_recovery_events().map_err(nfs_error)?)
+    }
+
+    #[getter]
+    fn dropped_recovery_event_count(&self) -> PyResult<u64> {
+        self.core.dropped_recovery_event_count().map_err(nfs_error)
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
+        record_test_recovery_event(&self.core, self.version, operation, path)
     }
 
     fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
@@ -3303,11 +3794,19 @@ impl AsyncClient {
         second: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
+        let work_core = core.clone();
         let mount = self.health_source.clone();
+        let safe_path = operation.recovery_path(&first, second.as_deref());
+        let operation_name = operation.name();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            namespace_operation(core, mount, operation, first, second)
-                .await
-                .map_err(nfs_error)
+            cancellation_safe_owned_operation(
+                core,
+                safe_path,
+                operation_name,
+                namespace_operation(work_core, mount, operation, first, second),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -3318,11 +3817,19 @@ impl AsyncClient {
         path: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
+        let work_core = core.clone();
         let mount = self.health_source.clone();
+        let safe_path = path.clone();
+        let operation_name = operation.name();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            metadata_operation(core, mount, operation, path)
-                .await
-                .map_err(nfs_error)
+            cancellation_safe_owned_operation(
+                core,
+                Some(safe_path),
+                operation_name,
+                metadata_operation(work_core, mount, operation, path),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 }
@@ -3432,6 +3939,34 @@ impl AsyncClient {
                     report.errors(),
                 ))
             }
+        })
+    }
+
+    fn recovery_events<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        recovery_event_dicts(py, self.core.recovery_events().map_err(nfs_error)?)
+    }
+
+    fn drain_recovery_events<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        recovery_event_dicts(py, self.core.drain_recovery_events().map_err(nfs_error)?)
+    }
+
+    #[getter]
+    fn dropped_recovery_event_count(&self) -> PyResult<u64> {
+        self.core.dropped_recovery_event_count().map_err(nfs_error)
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
+        record_test_recovery_event(&self.core, self.version, operation, path)
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _wait_closing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
+                .await;
+            Ok(())
         })
     }
 
@@ -3563,12 +4098,19 @@ impl AsyncClient {
         value: Vec<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
+        let work_core = core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
+        let safe_path = path.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            xattr_set(core, mount, resources, path, name, value)
-                .await
-                .map_err(nfs_error)
+            cancellation_safe_owned_operation(
+                core,
+                Some(safe_path),
+                "setxattr",
+                xattr_set(work_core, mount, resources, path, name, value),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -3590,12 +4132,19 @@ impl AsyncClient {
         name: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
+        let work_core = core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
+        let safe_path = path.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            xattr_remove(core, mount, resources, path, name)
-                .await
-                .map_err(nfs_error)
+            cancellation_safe_owned_operation(
+                core,
+                Some(safe_path),
+                "removexattr",
+                xattr_remove(work_core, mount, resources, path, name),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -3668,6 +4217,11 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add_function(wrap_pyfunction!(_wait_open_test_entered, module)?)?;
         module.add_function(wrap_pyfunction!(_release_open_test_barrier, module)?)?;
         module.add_function(wrap_pyfunction!(_wait_open_test_registered, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_open_test_settled, module)?)?;
+        module.add_function(wrap_pyfunction!(_arm_operation_test_barrier, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_operation_test_entered, module)?)?;
+        module.add_function(wrap_pyfunction!(_release_operation_test_barrier, module)?)?;
+        module.add_function(wrap_pyfunction!(_wait_operation_test_settled, module)?)?;
     }
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
@@ -3697,6 +4251,7 @@ mod read_only_file_tests {
 
     async fn test_file(mode: FileMode) -> Arc<FileResource> {
         FileResource::test(
+            "fixture.bin".to_string(),
             mode,
             Arc::new(tokio::sync::Mutex::new(
                 b"abcdefghijklmnopqrstuvwxyz".to_vec(),
@@ -3797,6 +4352,7 @@ mod read_only_file_tests {
     async fn failed_flush_preserves_dirty_state_and_close_reuses_terminal_result() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
+            "fixture.bin".to_string(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             true,
@@ -3847,6 +4403,7 @@ mod read_only_file_tests {
     async fn definite_partial_write_advances_position_to_confirmed_boundary() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
+            "fixture.bin".to_string(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
@@ -3872,6 +4429,7 @@ mod read_only_file_tests {
     async fn zero_write_reply_poisons_relative_position() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
+            "fixture.bin".to_string(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
@@ -3922,6 +4480,7 @@ mod read_only_file_tests {
     async fn commit_verifier_change_fails_flush_without_clearing_dirty_state() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
+            "fixture.bin".to_string(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,

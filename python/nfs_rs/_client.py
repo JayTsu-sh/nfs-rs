@@ -14,7 +14,10 @@ from types import ModuleType
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar
 
-from ._errors import NfsClosedResourceError, NfsError, NfsFileCloseError, NfsModeError
+from ._errors import (
+    NfsClosedResourceError, NfsError, NfsFileCloseError, NfsModeError,
+    OperationOutcome, RecoveryAction,
+)
 
 _CONSTRUCTION_TOKEN = object()
 
@@ -92,6 +95,29 @@ class Health:
     lifecycle: Lifecycle
     generation: int
     lease_healthy: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEvent:
+    operation: str
+    path: str | None
+    protocol: str
+    outcome: OperationOutcome
+    recovery_action: RecoveryAction
+    completed_bytes: int | None
+    message: str
+
+
+def _recovery_event(values: dict[str, Any]) -> RecoveryEvent:
+    return RecoveryEvent(
+        operation=values["operation"],
+        path=values["path"],
+        protocol=values["protocol"],
+        outcome=OperationOutcome(values["outcome"]),
+        recovery_action=RecoveryAction(values["recovery_action"]),
+        completed_bytes=values["completed_bytes"],
+        message=values["message"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +435,16 @@ class Client(_ClientOptions):
     def closed(self) -> bool:
         return self._inner.closed
 
+    @property
+    def dropped_recovery_event_count(self) -> int:
+        return self._inner.dropped_recovery_event_count
+
+    def recovery_events(self) -> tuple[RecoveryEvent, ...]:
+        return tuple(_recovery_event(values) for values in self._inner.recovery_events())
+
+    def drain_recovery_events(self) -> tuple[RecoveryEvent, ...]:
+        return tuple(_recovery_event(values) for values in self._inner.drain_recovery_events())
+
     def close(self) -> None:
         self._inner.close()
 
@@ -618,6 +654,16 @@ class AsyncClient(_ClientOptions):
     @property
     def closed(self) -> bool:
         return self._inner.closed
+
+    @property
+    def dropped_recovery_event_count(self) -> int:
+        return self._inner.dropped_recovery_event_count
+
+    def recovery_events(self) -> tuple[RecoveryEvent, ...]:
+        return tuple(_recovery_event(values) for values in self._inner.recovery_events())
+
+    def drain_recovery_events(self) -> tuple[RecoveryEvent, ...]:
+        return tuple(_recovery_event(values) for values in self._inner.drain_recovery_events())
 
     async def close(self) -> None:
         self._check_loop()
