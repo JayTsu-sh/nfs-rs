@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
+import os
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
 from types import ModuleType
+from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar
 
 _CONSTRUCTION_TOKEN = object()
@@ -26,11 +29,92 @@ class Lifecycle(str, Enum):
     CLOSED = "closed"
 
 
+class FileType(str, Enum):
+    FILE = "file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+    BLOCK_DEVICE = "block_device"
+    CHARACTER_DEVICE = "character_device"
+    FIFO = "fifo"
+    SOCKET = "socket"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class Health:
     lifecycle: Lifecycle
     generation: int
     lease_healthy: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class FileInfo:
+    type: FileType
+    mode: int
+    nlink: int
+    uid: int
+    gid: int
+    size: int
+    used: int
+    fsid: int
+    fileid: int
+    atime_ns: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryEntry:
+    name: str
+    path: str
+    info: FileInfo
+
+
+@dataclass(frozen=True, slots=True)
+class Export:
+    path: str
+    groups: tuple[str, ...]
+
+
+def _normalize_path(path: os.PathLike[str] | str) -> str:
+    raw = os.fspath(path)
+    if isinstance(raw, bytes):
+        raise TypeError("NFS paths must be strings, not bytes")
+    if "\0" in raw:
+        raise ValueError("NFS paths may not contain NUL")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ValueError("NFS path escapes the export root")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts) or "."
+
+
+def _file_info(values: dict[str, Any]) -> FileInfo:
+    return FileInfo(
+        type=FileType(values["type"]),
+        mode=values["mode"],
+        nlink=values["nlink"],
+        uid=values["uid"],
+        gid=values["gid"],
+        size=values["size"],
+        used=values["used"],
+        fsid=values["fsid"],
+        fileid=values["fileid"],
+        atime_ns=values["atime_ns"],
+        mtime_ns=values["mtime_ns"],
+        ctime_ns=values["ctime_ns"],
+    )
+
+
+def _directory_entry(parent: str, values: dict[str, Any]) -> DirectoryEntry:
+    path = values["name"] if parent == "." else f"{parent}/{values['name']}"
+    return DirectoryEntry(values["name"], path, _file_info(values["info"]))
 
 
 def _adapter() -> ModuleType:
@@ -71,6 +155,11 @@ def _configured_url(url: str, options: dict[str, Any]) -> str:
             value = str(value).lower()
         query[query_name] = str(value)
     return urlunsplit(parsed._replace(query=urlencode(query)))
+
+
+def _export_url(host: str, options: dict[str, Any]) -> str:
+    url = host if "://" in host else f"nfs://{host}/."
+    return _configured_url(url, options)
 
 
 def _options(
@@ -199,6 +288,23 @@ class Client(_ClientOptions):
     def close(self) -> None:
         self._inner.close()
 
+    def stat(self, path: os.PathLike[str] | str) -> FileInfo:
+        return _file_info(self._inner.stat(_normalize_path(path)))
+
+    def exists(self, path: os.PathLike[str] | str) -> bool:
+        try:
+            self.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def scandir(self, path: os.PathLike[str] | str = ".") -> Iterator[DirectoryEntry]:
+        normalized = _normalize_path(path)
+        return (_directory_entry(normalized, values) for values in self._inner.scandir(normalized))
+
+    def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
+        return [entry.name for entry in self.scandir(path)]
+
     def __enter__(self) -> Client:
         return self
 
@@ -260,6 +366,29 @@ class AsyncClient(_ClientOptions):
         self._check_loop()
         await self._inner.close()
 
+    async def stat(self, path: os.PathLike[str] | str) -> FileInfo:
+        self._check_loop()
+        return _file_info(await self._inner.stat(_normalize_path(path)))
+
+    async def exists(self, path: os.PathLike[str] | str) -> bool:
+        try:
+            await self.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
+
+    async def scandir(self, path: os.PathLike[str] | str = ".") -> AsyncIterator[DirectoryEntry]:
+        self._check_loop()
+        normalized = _normalize_path(path)
+        cursor = self._inner.scandir(normalized)
+        if inspect.isawaitable(cursor):
+            cursor = await cursor
+        async for values in cursor:
+            yield _directory_entry(normalized, values)
+
+    async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
+        return [entry.name async for entry in self.scandir(path)]
+
     async def __aenter__(self) -> AsyncClient:
         self._check_loop()
         return self
@@ -274,3 +403,25 @@ class AsyncClient(_ClientOptions):
 
     def __repr__(self) -> str:
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"
+
+
+def list_exports(host: str, **options: Any) -> tuple[Export, ...]:
+    validated = Client._connection_options(**options)
+    values = _adapter().list_exports(_export_url(host, validated), **validated)
+    return tuple(
+        Export(value["path"], tuple(value["groups"]))
+        if isinstance(value, dict)
+        else Export(value[0], tuple(value[1]))
+        for value in values
+    )
+
+
+async def async_list_exports(host: str, **options: Any) -> tuple[Export, ...]:
+    validated = AsyncClient._connection_options(**options)
+    values = await _adapter().async_list_exports(_export_url(host, validated), **validated)
+    return tuple(
+        Export(value["path"], tuple(value["groups"]))
+        if isinstance(value, dict)
+        else Export(value[0], tuple(value[1]))
+        for value in values
+    )

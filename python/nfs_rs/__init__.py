@@ -2,9 +2,33 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._client import AsyncClient, Client, Health, Lifecycle, Version
+from ._client import (
+    AsyncClient,
+    Client,
+    DirectoryEntry,
+    Export,
+    FileInfo,
+    FileType,
+    Health,
+    Lifecycle,
+    Version,
+    async_list_exports,
+    list_exports,
+)
 
-__all__ = ["AsyncClient", "Client", "Health", "Lifecycle", "Version"]
+__all__ = [
+    "AsyncClient",
+    "Client",
+    "DirectoryEntry",
+    "Export",
+    "FileInfo",
+    "FileType",
+    "Health",
+    "Lifecycle",
+    "Version",
+    "async_list_exports",
+    "list_exports",
+]
 try:
     __version__ = version("nfs-rs")
 except PackageNotFoundError:
