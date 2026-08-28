@@ -45,8 +45,15 @@ impl fmt::Display for ResourceKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreOperation {
+    pub name: String,
+    pub safe_path: Option<String>,
+}
+
 #[async_trait]
 pub trait ClientDriver: fmt::Debug + Send + Sync + 'static {
+    async fn execute(&self, operation: CoreOperation) -> Result<()>;
     async fn close_resource(&self, key: ResourceKey) -> Result<()>;
     async fn umount(&self) -> Result<()>;
 }
@@ -194,12 +201,9 @@ impl ClientCore {
         }
     }
 
-    pub async fn execute<T, F>(self: &Arc<Self>, future: F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
+    pub async fn execute(self: &Arc<Self>, operation: CoreOperation) -> Result<()> {
         let _operation = self.begin_operation()?;
-        future.await
+        self.driver.execute(operation).await
     }
 
     pub fn record_recovery_event(&self, event: CoreRecoveryEvent) -> Result<()> {

@@ -26,7 +26,7 @@ include = [
 
 [features]
 default = []
-python-bindings-internal = []
+python-bindings = []
 
 [dependencies]
 byteorder = "1.5.0"
@@ -53,8 +53,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bench]]
 name = "xdr_decode"
 harness = false
-
-[[test]]
-name = "client_core_contract"
-path = "tests/client_core_contract.rs"
-required-features = ["python-bindings-internal"]

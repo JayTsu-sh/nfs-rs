@@ -250,9 +250,10 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     )))
 }
 
-#[cfg(feature = "python-bindings-internal")]
-#[doc(hidden)]
-pub mod client_core;
+#[cfg(any(test, feature = "python-bindings"))]
+mod client_core;
+#[cfg(test)]
+mod client_core_contract;
 pub mod error;
 mod mount;
 mod nfs3;

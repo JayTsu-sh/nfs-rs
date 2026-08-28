@@ -1,9 +1,9 @@
-use async_trait::async_trait;
-use nfs_rs::client_core::{ClientCore, ClientDriver, ClientLifecycle, ResourceKey};
-use nfs_rs::{
+use crate::client_core::{ClientCore, ClientDriver, ClientLifecycle, CoreOperation, ResourceKey};
+use crate::{
     NFSVersion, NfsError, OperationClass, OperationOutcome, RecoveryAction, RequestContext,
     RequestTransmission, Result,
 };
+use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -19,10 +19,14 @@ struct FailingDriver {
 
 #[async_trait]
 impl ClientDriver for FailingDriver {
+    async fn execute(&self, _operation: CoreOperation) -> Result<()> {
+        Ok(())
+    }
+
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         self.events.lock().unwrap().push(format!("close:{key}"));
         if key.to_string() == "1" {
-            Err(nfs_rs::NfsError::Rpc("first close failed".to_string()))
+            Err(NfsError::Rpc("first close failed".to_string()))
         } else {
             Ok(())
         }
@@ -30,12 +34,20 @@ impl ClientDriver for FailingDriver {
 
     async fn umount(&self) -> Result<()> {
         self.events.lock().unwrap().push("umount".to_string());
-        Err(nfs_rs::NfsError::Rpc("umount failed".to_string()))
+        Err(NfsError::Rpc("umount failed".to_string()))
     }
 }
 
 #[async_trait]
 impl ClientDriver for RecordingDriver {
+    async fn execute(&self, operation: CoreOperation) -> Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("execute:{}", operation.name));
+        Ok(())
+    }
+
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         self.events.lock().unwrap().push(format!("close:{key}"));
         Ok(())
@@ -214,29 +226,65 @@ async fn cancelling_a_close_waiter_does_not_cancel_core_owned_cleanup() {
     assert_eq!(*driver.events.lock().unwrap(), vec!["umount".to_string()]);
 }
 
-#[tokio::test]
-async fn injected_operation_has_explicit_barriers_and_gates_close() {
-    let core = ClientCore::new(Arc::new(RecordingDriver::default()));
+#[derive(Debug)]
+struct BarrierDriver {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    transmission: RequestTransmission,
+}
+
+#[async_trait]
+impl ClientDriver for BarrierDriver {
+    async fn execute(&self, operation: CoreOperation) -> Result<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        let context = RequestContext {
+            operation: operation.name,
+            protocol: NFSVersion::NFSv3,
+            request_id: None,
+        };
+        let source = NfsError::Rpc("injected failure".to_string());
+        match self.transmission {
+            RequestTransmission::NotSent => Err(NfsError::before_send_failure(
+                OperationClass::ReplaySensitive,
+                context,
+                None,
+                source,
+            )),
+            RequestTransmission::Sent => Err(Box::new(crate::OperationOutcomeError::new(
+                OperationOutcome::Uncertain,
+                OperationClass::ReplaySensitive,
+                RecoveryAction::VerifyThenResume,
+                context,
+                source,
+            ))
+            .into()),
+        }
+    }
+
+    async fn close_resource(&self, _key: ResourceKey) -> Result<()> {
+        Ok(())
+    }
+
+    async fn umount(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn assert_transport_barrier(transmission: RequestTransmission) {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    let core = ClientCore::new(Arc::new(BarrierDriver {
+        entered: entered.clone(),
+        release: release.clone(),
+        transmission,
+    }));
     let operation = {
         let core = core.clone();
-        let entered = entered.clone();
-        let release = release.clone();
         tokio::spawn(async move {
-            core.execute(async move {
-                entered.notify_one();
-                release.notified().await;
-                Err::<(), _>(NfsError::before_send_failure(
-                    OperationClass::ReadOnly,
-                    RequestContext {
-                        operation: "injected".to_string(),
-                        protocol: NFSVersion::NFSv3,
-                        request_id: None,
-                    },
-                    None,
-                    NfsError::Rpc("injected failure".to_string()),
-                ))
+            core.execute(CoreOperation {
+                name: "injected".to_string(),
+                safe_path: Some("/safe/path".to_string()),
             })
             .await
         })
@@ -251,15 +299,18 @@ async fn injected_operation_has_explicit_barriers_and_gates_close() {
 
     release.notify_one();
     let error = operation.await.unwrap().unwrap_err();
-    assert_eq!(
-        error.request_transmission(),
-        Some(RequestTransmission::NotSent)
-    );
+    assert_eq!(error.request_transmission(), Some(transmission));
     assert!(close.await.unwrap().errors().is_empty());
 }
 
-fn recovery_event(operation: &str) -> nfs_rs::client_core::CoreRecoveryEvent {
-    nfs_rs::client_core::CoreRecoveryEvent {
+#[tokio::test]
+async fn fake_protocol_stops_at_before_and_after_send_barriers() {
+    assert_transport_barrier(RequestTransmission::NotSent).await;
+    assert_transport_barrier(RequestTransmission::Sent).await;
+}
+
+fn recovery_event(operation: &str) -> crate::client_core::CoreRecoveryEvent {
+    crate::client_core::CoreRecoveryEvent {
         operation: operation.to_string(),
         safe_path: Some("/safe/path".to_string()),
         protocol: NFSVersion::NFSv3,
