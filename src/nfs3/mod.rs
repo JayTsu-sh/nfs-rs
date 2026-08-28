@@ -41,7 +41,7 @@ mod write;
 
 pub(crate) use mount::{mount, query_exports};
 
-use crate::error::{NfsError, Result};
+use crate::error::{NfsError, RequestContext, Result, classify_sent_nfs3_error};
 use crate::{Auth, ObjRes, Time, rpc};
 use bytes::Bytes;
 
@@ -153,6 +153,7 @@ enum MountProc3 {
     Export = 5,
 }
 
+#[derive(Clone, Copy)]
 enum NFSProc3 {
     Null = 0,
     GetAttr = 1,
@@ -175,6 +176,127 @@ enum NFSProc3 {
     FSInfo = 19,
     Pathconf = 20,
     Commit = 21,
+}
+
+impl NFSProc3 {
+    const fn operation_class(&self) -> crate::OperationClass {
+        match self {
+            Self::Null
+            | Self::GetAttr
+            | Self::Lookup
+            | Self::Access
+            | Self::Readlink
+            | Self::Read
+            | Self::Readdir
+            | Self::Readdirplus
+            | Self::FSStat
+            | Self::FSInfo
+            | Self::Pathconf => crate::OperationClass::ReadOnly,
+            Self::SetAttr
+            | Self::Write
+            | Self::Create
+            | Self::Mkdir
+            | Self::Symlink
+            | Self::Remove
+            | Self::Rmdir
+            | Self::Rename
+            | Self::Link
+            | Self::Commit => crate::OperationClass::ReplaySensitive,
+        }
+    }
+
+    const fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::GetAttr => "getattr",
+            Self::SetAttr => "setattr",
+            Self::Lookup => "lookup",
+            Self::Access => "access",
+            Self::Readlink => "readlink",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Create => "create",
+            Self::Mkdir => "mkdir",
+            Self::Symlink => "symlink",
+            Self::Remove => "remove",
+            Self::Rmdir => "rmdir",
+            Self::Rename => "rename",
+            Self::Link => "link",
+            Self::Readdir => "readdir",
+            Self::Readdirplus => "readdirplus",
+            Self::FSStat => "fsstat",
+            Self::FSInfo => "fsinfo",
+            Self::Pathconf => "pathconf",
+            Self::Commit => "commit",
+        }
+    }
+
+    const fn replay_policy(&self) -> crate::rpc::ReplayPolicy {
+        match self.operation_class() {
+            crate::OperationClass::ReadOnly => NFS_REPLAY,
+            crate::OperationClass::SessionControl | crate::OperationClass::ReplaySensitive => {
+                crate::rpc::ReplayPolicy::ONE_ATTEMPT
+            }
+        }
+    }
+
+    fn request_context(&self) -> RequestContext {
+        RequestContext {
+            operation: self.operation_name().to_string(),
+            protocol: crate::NFSVersion::NFSv3,
+            request_id: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod operation_class_tests {
+    use super::NFSProc3;
+    use crate::OperationClass;
+
+    #[test]
+    fn every_supported_procedure_has_an_explicit_operation_class() {
+        let cases = [
+            (NFSProc3::Null, OperationClass::ReadOnly),
+            (NFSProc3::GetAttr, OperationClass::ReadOnly),
+            (NFSProc3::SetAttr, OperationClass::ReplaySensitive),
+            (NFSProc3::Lookup, OperationClass::ReadOnly),
+            (NFSProc3::Access, OperationClass::ReadOnly),
+            (NFSProc3::Readlink, OperationClass::ReadOnly),
+            (NFSProc3::Read, OperationClass::ReadOnly),
+            (NFSProc3::Write, OperationClass::ReplaySensitive),
+            (NFSProc3::Create, OperationClass::ReplaySensitive),
+            (NFSProc3::Mkdir, OperationClass::ReplaySensitive),
+            (NFSProc3::Symlink, OperationClass::ReplaySensitive),
+            (NFSProc3::Remove, OperationClass::ReplaySensitive),
+            (NFSProc3::Rmdir, OperationClass::ReplaySensitive),
+            (NFSProc3::Rename, OperationClass::ReplaySensitive),
+            (NFSProc3::Link, OperationClass::ReplaySensitive),
+            (NFSProc3::Readdir, OperationClass::ReadOnly),
+            (NFSProc3::Readdirplus, OperationClass::ReadOnly),
+            (NFSProc3::FSStat, OperationClass::ReadOnly),
+            (NFSProc3::FSInfo, OperationClass::ReadOnly),
+            (NFSProc3::Pathconf, OperationClass::ReadOnly),
+            (NFSProc3::Commit, OperationClass::ReplaySensitive),
+        ];
+
+        for (procedure, expected) in cases {
+            assert_eq!(procedure.operation_class(), expected);
+        }
+    }
+
+    #[test]
+    fn replay_sensitive_procedures_never_use_transport_replay() {
+        assert_eq!(
+            NFSProc3::Write.replay_policy(),
+            crate::rpc::ReplayPolicy::ONE_ATTEMPT
+        );
+        assert_eq!(
+            NFSProc3::Rename.replay_policy(),
+            crate::rpc::ReplayPolicy::ONE_ATTEMPT
+        );
+        assert_eq!(NFSProc3::Read.replay_policy(), super::NFS_REPLAY);
+    }
 }
 
 // XDR encoding trait for request argument types.
@@ -249,24 +371,28 @@ macro_rules! nfs3_call {
     };
     ($name:ident, $proc:ident, $args:ty, $resok:ty, $err_level:ident) => {
         async fn $name(&self, args: $args) -> Result<$resok> {
+            let procedure = NFSProc3::$proc;
+            let operation_class = procedure.operation_class();
+            let context = procedure.request_context();
             let mut buf = Vec::<u8>::new();
-            self.pack_nfs3(NFSProc3::$proc, &args, &mut buf);
+            self.pack_nfs3(procedure, &args, &mut buf);
             tracing::debug!(proc = stringify!($proc), "NFS3 call");
             let mut bytes = self
                 .rpc
                 .call(
                     buf,
-                    NFS_REPLAY,
+                    procedure.replay_policy(),
                     METADATA_TIMEOUT,
                 )
-                .await?;
+                .await
+                .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
             let status = nfsstat3::try_from(&mut bytes)
-                .map_err(|e| NfsError::Xdr(e.to_string()))?;
+                .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), NfsError::Xdr(error.to_string())))?;
             match status {
                 nfsstat3::NFS3_OK => {
                     tracing::trace!(proc = stringify!($proc), "NFS3 call succeeded");
                     <$resok>::try_from(&mut bytes)
-                        .map_err(|e| NfsError::Xdr(e.to_string()))
+                        .map_err(|error| classify_sent_nfs3_error(operation_class, context, NfsError::Xdr(error.to_string())))
                 }
                 e => {
                     tracing::$err_level!(proc = stringify!($proc), status = ?e, "NFS3 call returned error status");
@@ -303,10 +429,21 @@ impl Mount {
 
     // Special-cased: NULL returns no body to decode.
     async fn _null(&self, args: NULL3args) -> Result<()> {
+        let procedure = NFSProc3::Null;
         let mut buf = Vec::<u8>::new();
-        self.pack_nfs3(NFSProc3::Null, &args, &mut buf);
+        self.pack_nfs3(procedure, &args, &mut buf);
         tracing::debug!(proc = "Null", "NFS3 call");
-        let _ = self.rpc.call(buf, NFS_REPLAY, METADATA_TIMEOUT).await?;
+        let _ = self
+            .rpc
+            .call(buf, procedure.replay_policy(), METADATA_TIMEOUT)
+            .await
+            .map_err(|error| {
+                classify_sent_nfs3_error(
+                    procedure.operation_class(),
+                    procedure.request_context(),
+                    error,
+                )
+            })?;
         tracing::trace!(proc = "Null", "NFS3 call succeeded");
         Ok(())
     }
@@ -323,16 +460,35 @@ impl Mount {
     nfs3_call!(_pathconf, Pathconf, PATHCONF3args, PATHCONF3resok);
     // _read is special-cased: timeout scales with requested read size.
     async fn _read(&self, args: READ3args) -> Result<READ3resok> {
+        let procedure = NFSProc3::Read;
+        let operation_class = procedure.operation_class();
+        let context = procedure.request_context();
         let timeout = data_timeout(args.count as usize);
         let mut buf = Vec::<u8>::new();
-        self.pack_nfs3(NFSProc3::Read, &args, &mut buf);
+        self.pack_nfs3(procedure, &args, &mut buf);
         tracing::debug!(proc = "Read", "NFS3 call");
-        let mut bytes = self.rpc.call(buf, NFS_REPLAY, timeout).await?;
-        let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
+        let mut bytes = self
+            .rpc
+            .call(buf, procedure.replay_policy(), timeout)
+            .await
+            .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
+        let status = nfsstat3::try_from(&mut bytes).map_err(|error| {
+            classify_sent_nfs3_error(
+                operation_class,
+                context.clone(),
+                NfsError::Xdr(error.to_string()),
+            )
+        })?;
         match status {
             nfsstat3::NFS3_OK => {
                 tracing::trace!(proc = "Read", "NFS3 call succeeded");
-                READ3resok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))
+                READ3resok::try_from(&mut bytes).map_err(|error| {
+                    classify_sent_nfs3_error(
+                        operation_class,
+                        context,
+                        NfsError::Xdr(error.to_string()),
+                    )
+                })
             }
             e => {
                 tracing::warn!(proc = "Read", status = ?e, "NFS3 call returned error status");
@@ -357,20 +513,36 @@ impl Mount {
     // WRITE3args::encode writes only the XDR length prefix; the raw data is passed to
     // call_with_data which appends it directly to the TCP stream.
     async fn _write(&self, args: WRITE3args) -> Result<WRITE3resok> {
+        let procedure = NFSProc3::Write;
+        let operation_class = procedure.operation_class();
+        let context = procedure.request_context();
         let data = args.data.clone();
         let timeout = data_timeout(data.len());
         let mut buf = Vec::<u8>::new();
-        self.pack_nfs3(NFSProc3::Write, &args, &mut buf);
+        self.pack_nfs3(procedure, &args, &mut buf);
         tracing::debug!(proc = "Write", data_len = data.len(), "NFS3 call");
         let mut bytes = self
             .rpc
-            .call_with_data(buf, data, NFS_REPLAY, timeout)
-            .await?;
-        let status = nfsstat3::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
+            .call_with_data(buf, data, procedure.replay_policy(), timeout)
+            .await
+            .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
+        let status = nfsstat3::try_from(&mut bytes).map_err(|error| {
+            classify_sent_nfs3_error(
+                operation_class,
+                context.clone(),
+                NfsError::Xdr(error.to_string()),
+            )
+        })?;
         match status {
             nfsstat3::NFS3_OK => {
                 tracing::trace!(proc = "Write", "NFS3 call succeeded");
-                WRITE3resok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))
+                WRITE3resok::try_from(&mut bytes).map_err(|error| {
+                    classify_sent_nfs3_error(
+                        operation_class,
+                        context,
+                        NfsError::Xdr(error.to_string()),
+                    )
+                })
             }
             e => {
                 tracing::warn!(proc = "Write", status = ?e, "NFS3 call returned error status");

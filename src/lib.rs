@@ -261,7 +261,7 @@ mod shared;
 
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
-    RequestContext, RequestId, Result,
+    RequestContext, RequestId, RequestTransmission, Result,
 };
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, AclSupport, Attr, CallbackStats, ExportEntry, FSInfo, FSStat,
