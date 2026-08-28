@@ -1,6 +1,12 @@
 name: Release validation
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to validate
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       ref:
@@ -26,6 +32,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+      - name: Verify release tag and version coupling
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/verify-release-version.py --tag "${GITHUB_REF_NAME}"
       - name: Allocate unique NFSv4.0 evidence directory
         run: echo "NFS_RS_LAB_V40_EVIDENCE_DIR=$RUNNER_TEMP/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - name: Discover persisted Rust toolchain
@@ -61,6 +70,17 @@ jobs:
         with:
           version: "0.13.0"
       - run: python -m pip install "maturin>=1,<2"
+      - name: Gate the installed Python contract and typing registry
+        run: |
+          python -m pip install mypy pytest
+          mkdir -p "$RUNNER_TEMP/python-contract-wheel"
+          maturin build --locked --features python-test-support --out "$RUNNER_TEMP/python-contract-wheel"
+          python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/python-contract-wheel/*.whl
+          python -m mypy.stubtest nfs_rs --ignore-missing-stub --allowlist python/stubtest-allowlist.txt
+          NFS_RS_TEST_INSTALLED=1 \
+            NFS_RS_CONTRACT_ENVIRONMENT="release-${{ runner.os }}-${{ runner.arch }}-py310" \
+            NFS_RS_TEST_SEED=0 \
+            python -m pytest -q python/tests
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
@@ -119,10 +139,21 @@ jobs:
           path: ${{ runner.temp }}/python-real-protocol
       - run: cargo build --release --locked
       - run: cargo package --locked
-      - run: cargo publish --locked --dry-run
       - run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" release-evidence
       - name: Checksums
-        run: find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum | tee release-sha256.txt
+        run: |
+          find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum > release-sha256.txt
+          sha256sum target/package/nfs-rs-*.crate target/python-release-artifacts/* >> release-sha256.txt
+      - name: Upload immutable x86_64 release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-release-x86_64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            target/package/nfs-rs-*.crate
+            target/python-release-artifacts/*
+            release-sha256.txt
       - uses: actions/upload-artifact@v4
         with:
           name: nfs-rs-release-validation-${{ github.run_id }}
@@ -197,6 +228,13 @@ jobs:
         with:
           name: python-real-protocol-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/python-real-protocol
+      - name: Upload immutable aarch64 release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-release-aarch64
+          retention-days: 14
+          if-no-files-found: error
+          path: target/python-release-artifacts/*_aarch64.whl
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

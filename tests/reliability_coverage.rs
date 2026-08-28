@@ -250,6 +250,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let readme = fs::read_to_string(workspace_path("README.md")).expect("README readable");
     let changelog = fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
     let release = include_str!("../.github/workflows/release-validation.yml");
+    let publisher = include_str!("../.github/workflows/release.yml");
     let nightly = include_str!("../.github/workflows/nightly.yml");
     let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
@@ -267,7 +268,6 @@ fn nfsv40_experimental_release_contract_is_complete() {
     assert!(changelog.contains("## [0.5.0]"));
     for command in [
         "cargo package --locked",
-        "cargo publish --locked --dry-run",
         "tests/lab/run-netapp-v40-performance.sh",
         "tests/lab/collect-nfsv40-release-evidence.sh",
     ] {
@@ -276,6 +276,9 @@ fn nfsv40_experimental_release_contract_is_complete() {
             "release matrix lacks {command}"
         );
     }
+    assert!(publisher.contains("publish-crate-artifact.py"));
+    assert!(publisher.contains("actions/download-artifact@v5"));
+    assert!(!publisher.contains("cargo publish"));
 }
 
 #[test]
