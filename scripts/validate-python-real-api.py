@@ -138,6 +138,34 @@ async def capability_call_async(operation, name: str, checks: list[str]) -> None
         checks.append(name + ":success")
 
 
+def require_namespace_capability(supported: bool, name: str, operation, checks: list[str]) -> None:
+    if supported:
+        checks.append(f"Client.capabilities.{name}")
+        return
+    try:
+        operation()
+    except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError) as error:
+        raise RuntimeError(
+            f"required real capability {name} is unavailable: {type(error).__name__}"
+        ) from error
+    raise RuntimeError(f"required real capability {name} is reported unavailable")
+
+
+async def require_namespace_capability_async(
+    supported: bool, name: str, operation, checks: list[str]
+) -> None:
+    if supported:
+        checks.append(f"AsyncClient.capabilities.{name}")
+        return
+    try:
+        await operation()
+    except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError) as error:
+        raise RuntimeError(
+            f"required real capability {name} is unavailable: {type(error).__name__}"
+        ) from error
+    raise RuntimeError(f"required real capability {name} is reported unavailable")
+
+
 def remove_tree(client: nfs_rs.Client, path: str) -> None:
     if not client.exists(path):
         return
@@ -223,16 +251,34 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         check(client.access(data, os.R_OK), "Client.access", checks)
         fs_info = client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "Client.fs_info", checks)
-        check(fs_info.supports_links and fs_info.supports_symlinks, "Client full namespace capabilities", checks)
+        require_namespace_capability(
+            fs_info.supports_links,
+            "supports_links",
+            lambda: client.link(data, hard_link),
+            checks,
+        )
+        require_namespace_capability(
+            fs_info.supports_symlinks,
+            "supports_symlinks",
+            lambda: client.symlink("data.bin", symbolic_link),
+            checks,
+        )
         fs_stat = client.fs_stat()
         check(fs_stat.total_bytes >= fs_stat.free_bytes, "Client.fs_stat", checks)
 
         client.chmod(data, 0o640)
         check(client.stat(data).mode & 0o777 == 0o640, "Client.chmod", checks)
         current = client.stat(data)
-        client.chown(data, current.uid, current.gid)
+        changed_identity = (
+            42_420 if current.uid != 42_420 else 42_421,
+            42_430 if current.gid != 42_430 else 42_431,
+        )
+        client.chown(data, *changed_identity)
         owned = client.stat(data)
-        check((owned.uid, owned.gid) == (current.uid, current.gid), "Client.chown", checks)
+        check((owned.uid, owned.gid) == changed_identity, "Client.chown", checks)
+        client.chown(data, current.uid, current.gid)
+        restored = client.stat(data)
+        check((restored.uid, restored.gid) == (current.uid, current.gid), "Client.chown restore", checks)
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         client.utime(data, ns=expected_times)
         timed = client.stat(data)
@@ -348,16 +394,34 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         check(await client.access(data, os.R_OK), "AsyncClient.access", checks)
         fs_info = await client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "AsyncClient.fs_info", checks)
-        check(fs_info.supports_links and fs_info.supports_symlinks, "AsyncClient full namespace capabilities", checks)
+        await require_namespace_capability_async(
+            fs_info.supports_links,
+            "supports_links",
+            lambda: client.link(data, hard_link),
+            checks,
+        )
+        await require_namespace_capability_async(
+            fs_info.supports_symlinks,
+            "supports_symlinks",
+            lambda: client.symlink("async-data.bin", symbolic_link),
+            checks,
+        )
         fs_stat = await client.fs_stat()
         check(fs_stat.total_bytes >= fs_stat.free_bytes, "AsyncClient.fs_stat", checks)
 
         await client.chmod(data, 0o640)
         check((await client.stat(data)).mode & 0o777 == 0o640, "AsyncClient.chmod", checks)
         current = await client.stat(data)
-        await client.chown(data, current.uid, current.gid)
+        changed_identity = (
+            42_420 if current.uid != 42_420 else 42_421,
+            42_430 if current.gid != 42_430 else 42_431,
+        )
+        await client.chown(data, *changed_identity)
         owned = await client.stat(data)
-        check((owned.uid, owned.gid) == (current.uid, current.gid), "AsyncClient.chown", checks)
+        check((owned.uid, owned.gid) == changed_identity, "AsyncClient.chown", checks)
+        await client.chown(data, current.uid, current.gid)
+        restored = await client.stat(data)
+        check((restored.uid, restored.gid) == (current.uid, current.gid), "AsyncClient.chown restore", checks)
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         await client.utime(data, ns=expected_times)
         timed = await client.stat(data)
