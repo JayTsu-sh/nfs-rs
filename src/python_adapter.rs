@@ -1,17 +1,14 @@
 use crate::client_core::{ClientCore, ClientDriver, CoreOperation, OperationGuard, ResourceKey};
+use crate::nfs4::Nfs4ErrorCode::*;
 use crate::{
     Attr, Mount, MountHealth, NFSVersion, NfsError, OpenFile, Result, parse_url_and_mount,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use pyo3::exceptions::{
-    PyFileExistsError, PyFileNotFoundError, PyIsADirectoryError, PyNotADirectoryError,
-    PyNotImplementedError, PyOSError, PyPermissionError, PyRuntimeError, PyStopAsyncIteration,
-    PyValueError,
-};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple, PyType};
 use std::collections::HashMap;
 #[cfg(feature = "python-test-support")]
 use std::sync::OnceLock;
@@ -148,7 +145,7 @@ impl FileMode {
         let update = mode.contains('+');
         let valid = matches!(mode, "rb" | "wb" | "ab" | "r+b" | "w+b" | "a+b");
         if !valid {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::ModeViolation(
                 "unsupported binary file mode".to_string(),
             ));
         }
@@ -185,6 +182,8 @@ struct FileResource {
     close_notify: Notify,
     #[cfg(feature = "python-test-support")]
     test_fail_commit: bool,
+    #[cfg(feature = "python-test-support")]
+    test_fail_close: bool,
     #[cfg(feature = "python-test-support")]
     test_commit_calls: AtomicU64,
     #[cfg(feature = "python-test-support")]
@@ -328,6 +327,8 @@ impl FileResource {
             #[cfg(feature = "python-test-support")]
             test_fail_commit: false,
             #[cfg(feature = "python-test-support")]
+            test_fail_close: false,
+            #[cfg(feature = "python-test-support")]
             test_commit_calls: AtomicU64::new(0),
             #[cfg(feature = "python-test-support")]
             test_verifier_change: false,
@@ -339,6 +340,7 @@ impl FileResource {
         mode: FileMode,
         data: Arc<tokio::sync::Mutex<Vec<u8>>>,
         fail_commit: bool,
+        fail_close: bool,
         write_fault: Option<TestWriteFault>,
         verifier_change: bool,
     ) -> Arc<Self> {
@@ -368,6 +370,7 @@ impl FileResource {
             close_started: Notify::new(),
             close_notify: Notify::new(),
             test_fail_commit: fail_commit,
+            test_fail_close: fail_close,
             test_commit_calls: AtomicU64::new(0),
             test_verifier_change: verifier_change,
         })
@@ -379,7 +382,7 @@ impl FileResource {
 
     async fn begin_operation(&self) -> Result<OwnedRwLockReadGuard<()>> {
         if self.lifecycle.load(Ordering::Acquire) != 0 {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::ClosedResource(
                 "I/O operation on closed file".to_string(),
             ));
         }
@@ -387,7 +390,7 @@ impl FileResource {
         if self.lifecycle.load(Ordering::Acquire) == 0 {
             Ok(guard)
         } else {
-            Err(NfsError::InvalidInput(
+            Err(NfsError::ClosedResource(
                 "I/O operation on closed file".to_string(),
             ))
         }
@@ -412,16 +415,34 @@ impl FileResource {
             let resource = self.clone();
             tokio::spawn(async move {
                 let _operation_guard = resource.operation_gate.clone().write_owned().await;
-                let mut result = resource.flush_inner().await.map_err(Arc::new);
+                let mut errors = Vec::new();
+                if let Err(error) = resource.flush_inner().await {
+                    errors.push(crate::error::FileCloseFailure {
+                        operation: "commit",
+                        error: Arc::new(error),
+                    });
+                }
                 let close_result = match (&resource.backend, file) {
                     (FileBackend::Mount { mount, .. }, Some(file)) => {
                         mount.close_stateful(file).await.map_err(Arc::new)
                     }
+                    #[cfg(feature = "python-test-support")]
+                    (FileBackend::Test { .. }, _) if resource.test_fail_close => {
+                        Err(Arc::new(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_IO)))
+                    }
                     _ => Ok(()),
                 };
-                if result.is_ok() {
-                    result = close_result;
+                if let Err(error) = close_result {
+                    errors.push(crate::error::FileCloseFailure {
+                        operation: "close",
+                        error,
+                    });
                 }
+                let result = if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Arc::new(NfsError::FileClose(errors)))
+                };
                 if let Ok(mut state) = resource.close_state.lock() {
                     state.result = Some(result);
                 }
@@ -469,7 +490,7 @@ impl FileResource {
 
     async fn read_at(&self, offset: u64, size: i64) -> Result<Vec<u8>> {
         if !self.mode.readable {
-            return Err(NfsError::InvalidInput("file is not readable".to_string()));
+            return Err(NfsError::ModeViolation("file is not readable".to_string()));
         }
         if size < -1 {
             return Err(NfsError::InvalidInput(
@@ -499,7 +520,7 @@ impl FileResource {
     async fn read(&self, size: i64) -> Result<Vec<u8>> {
         let _guard = self.relative_gate.lock().await;
         if self.position_uncertain.load(Ordering::Acquire) {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::PositionUncertain(
                 "file position is uncertain; seek to an absolute offset".to_string(),
             ));
         }
@@ -620,7 +641,7 @@ impl FileResource {
 
     async fn write_complete_at(&self, offset: u64, data: Bytes) -> Result<u64> {
         if !self.mode.writable {
-            return Err(NfsError::InvalidInput("file is not writable".to_string()));
+            return Err(NfsError::ModeViolation("file is not writable".to_string()));
         }
         let mut current = offset;
         let mut confirmed = 0_u64;
@@ -664,7 +685,7 @@ impl FileResource {
 
     async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
         if self.mode.append {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::ModeViolation(
                 "positional writes are unavailable in append mode".to_string(),
             ));
         }
@@ -674,7 +695,7 @@ impl FileResource {
     async fn write(&self, data: Bytes) -> Result<u64> {
         let _guard = self.relative_gate.lock().await;
         if self.position_uncertain.load(Ordering::Acquire) {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::PositionUncertain(
                 "file position is uncertain; seek to an absolute offset".to_string(),
             ));
         }
@@ -705,7 +726,7 @@ impl FileResource {
 
     async fn truncate(&self, size: Option<u64>) -> Result<u64> {
         if !self.mode.writable {
-            return Err(NfsError::InvalidInput("file is not writable".to_string()));
+            return Err(NfsError::ModeViolation("file is not writable".to_string()));
         }
         let size = size.unwrap_or_else(|| self.position.load(Ordering::Acquire));
         match &self.backend {
@@ -797,7 +818,7 @@ impl FileResource {
     async fn seek(&self, offset: i64, whence: i32) -> Result<u64> {
         let _guard = self.relative_gate.lock().await;
         if whence != 0 && self.position_uncertain.load(Ordering::Acquire) {
-            return Err(NfsError::InvalidInput(
+            return Err(NfsError::PositionUncertain(
                 "file position is uncertain; only absolute seek is allowed".to_string(),
             ));
         }
@@ -838,7 +859,7 @@ impl FileResource {
         if self.lifecycle.load(Ordering::Acquire) == 0 {
             Ok(self.position.load(Ordering::Acquire))
         } else {
-            Err(NfsError::InvalidInput(
+            Err(NfsError::ClosedResource(
                 "I/O operation on closed file".to_string(),
             ))
         }
@@ -896,7 +917,11 @@ impl ClientDriver for MountDriver {
 }
 
 fn python_error(error: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+    structured_error(PythonErrorPayload {
+        class_name: "NfsRpcError",
+        message: error.to_string(),
+        ..PythonErrorPayload::default()
+    })
 }
 
 fn nfs_error(error: NfsError) -> PyErr {
@@ -904,46 +929,526 @@ fn nfs_error(error: NfsError) -> PyErr {
 }
 
 fn nfs_error_ref(error: &NfsError) -> PyErr {
-    let permission_denied = matches!(
-        error,
-        NfsError::Nfs3(
-            crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
-        ) | NfsError::Nfs4(
-            crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
-        )
-    );
-    let not_directory = matches!(
-        error,
-        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTDIR)
-            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOTDIR)
-    );
-    let is_directory = matches!(
-        error,
-        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ISDIR)
-            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ISDIR)
-    );
-    let not_empty = matches!(
-        error,
-        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTEMPTY)
-            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOTEMPTY)
-    );
-    if error.is_not_found() {
-        PyFileNotFoundError::new_err(error.to_string())
-    } else if error.is_exist() {
-        PyFileExistsError::new_err(error.to_string())
-    } else if not_directory {
-        PyNotADirectoryError::new_err(error.to_string())
-    } else if is_directory {
-        PyIsADirectoryError::new_err(error.to_string())
-    } else if not_empty {
-        PyOSError::new_err((nix::errno::Errno::ENOTEMPTY as i32, error.to_string()))
-    } else if matches!(error, NfsError::Unsupported(_)) {
-        PyNotImplementedError::new_err(error.to_string())
-    } else if permission_denied || error.kind() == std::io::ErrorKind::PermissionDenied {
-        PyPermissionError::new_err(error.to_string())
-    } else {
-        python_error(error)
+    nfs_error_with_context(error, None, None, None)
+}
+
+#[derive(Clone, Copy)]
+struct PythonErrorKind {
+    class_name: &'static str,
+    errno: Option<i32>,
+    recovery: Option<&'static str>,
+}
+
+fn protocol_name(version: NFSVersion) -> &'static str {
+    match version {
+        NFSVersion::Unknown => "unknown",
+        NFSVersion::NFSv3 => "3",
+        NFSVersion::NFSv4p0 => "4.0",
+        #[allow(deprecated)]
+        NFSVersion::NFSv4 => "4.0",
+        NFSVersion::NFSv4p1 => "4.1",
+        NFSVersion::NFSv4p2 => "4.2",
     }
+}
+
+fn recovery_name(action: crate::RecoveryAction) -> &'static str {
+    match action {
+        crate::RecoveryAction::Retry => "retry",
+        crate::RecoveryAction::Reopen => "reopen",
+        crate::RecoveryAction::Remount => "remount",
+        crate::RecoveryAction::VerifyThenResume => "verify_then_resume",
+        crate::RecoveryAction::DoNotRetry => "do_not_retry",
+    }
+}
+
+fn outcome_name(outcome: crate::OperationOutcome) -> &'static str {
+    match outcome {
+        crate::OperationOutcome::DefiniteFailure => "definite_failure",
+        crate::OperationOutcome::SafeToRetry => "safe_to_retry",
+        crate::OperationOutcome::Uncertain => "uncertain",
+    }
+}
+
+fn operation_class_name(class: crate::OperationClass) -> &'static str {
+    match class {
+        crate::OperationClass::ReadOnly => "read_only",
+        crate::OperationClass::SessionControl => "session_control",
+        crate::OperationClass::ReplaySensitive => "replay_sensitive",
+    }
+}
+
+struct PythonErrorPayload<'a> {
+    class_name: &'a str,
+    message: String,
+    operation: Option<&'a str>,
+    protocol: Option<&'a str>,
+    code: Option<i64>,
+    code_name: Option<&'a str>,
+    recovery_action: Option<&'a str>,
+    outcome: Option<&'a str>,
+    operation_class: Option<&'a str>,
+    completed_bytes: Option<u64>,
+    errno: Option<i32>,
+    filename: Option<&'a str>,
+}
+
+impl Default for PythonErrorPayload<'_> {
+    fn default() -> Self {
+        Self {
+            class_name: "NfsError",
+            message: String::new(),
+            operation: None,
+            protocol: None,
+            code: None,
+            code_name: None,
+            recovery_action: None,
+            outcome: None,
+            operation_class: None,
+            completed_bytes: None,
+            errno: None,
+            filename: None,
+        }
+    }
+}
+
+fn structured_error(payload: PythonErrorPayload<'_>) -> PyErr {
+    Python::attach(|py| -> PyResult<PyErr> {
+        let module = PyModule::import(py, "nfs_rs._errors")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("message", payload.message)?;
+        kwargs.set_item("operation", payload.operation)?;
+        kwargs.set_item("protocol", payload.protocol)?;
+        kwargs.set_item("code", payload.code)?;
+        kwargs.set_item("code_name", payload.code_name)?;
+        kwargs.set_item("recovery_action", payload.recovery_action)?;
+        kwargs.set_item("outcome", payload.outcome)?;
+        kwargs.set_item("operation_class", payload.operation_class)?;
+        kwargs.set_item("completed_bytes", payload.completed_bytes)?;
+        kwargs.set_item("errno", payload.errno)?;
+        kwargs.set_item("filename", payload.filename)?;
+        let instance = module
+            .getattr(payload.class_name)?
+            .call((), Some(&kwargs))?;
+        Ok(PyErr::from_value(instance))
+    })
+    .unwrap_or_else(|failure| {
+        PyRuntimeError::new_err(format!(
+            "failed to construct {}: {failure}",
+            payload.class_name
+        ))
+    })
+}
+
+fn aggregate_python_error(class_name: &str, message: &str, errors: &[Arc<NfsError>]) -> PyErr {
+    Python::attach(|py| -> PyResult<PyErr> {
+        let module = PyModule::import(py, "nfs_rs._errors")?;
+        let mut flattened = Vec::new();
+        for error in errors {
+            collect_close_errors(error, &mut flattened);
+        }
+        let children = PyTuple::new(
+            py,
+            flattened.into_iter().map(|(error, operation)| {
+                nfs_error_with_context(error, operation.or(Some("close")), None, None)
+                    .value(py)
+                    .clone()
+            }),
+        )?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("message", message)?;
+        kwargs.set_item("operation", "close")?;
+        kwargs.set_item("errors", children)?;
+        let instance = module.getattr(class_name)?.call((), Some(&kwargs))?;
+        Ok(PyErr::from_value(instance))
+    })
+    .unwrap_or_else(|failure| {
+        PyRuntimeError::new_err(format!("failed to construct {class_name}: {failure}"))
+    })
+}
+
+fn file_close_python_error(message: &str, errors: &[crate::error::FileCloseFailure]) -> PyErr {
+    Python::attach(|py| -> PyResult<PyErr> {
+        let module = PyModule::import(py, "nfs_rs._errors")?;
+        let children = PyTuple::new(
+            py,
+            errors.iter().map(|failure| {
+                nfs_error_with_context(failure.error.as_ref(), Some(failure.operation), None, None)
+                    .value(py)
+                    .clone()
+            }),
+        )?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("message", message)?;
+        kwargs.set_item("operation", "close")?;
+        kwargs.set_item("errors", children)?;
+        let instance = module
+            .getattr("NfsFileCloseError")?
+            .call((), Some(&kwargs))?;
+        Ok(PyErr::from_value(instance))
+    })
+    .unwrap_or_else(|failure| {
+        PyRuntimeError::new_err(format!("failed to construct NfsFileCloseError: {failure}"))
+    })
+}
+
+fn collect_close_errors<'a>(
+    error: &'a NfsError,
+    output: &mut Vec<(&'a NfsError, Option<&'static str>)>,
+) {
+    if let NfsError::Io(io) = error
+        && let Some(shared) = io
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<SharedNfsFailure>())
+    {
+        collect_close_errors(shared.0.as_ref(), output);
+    } else if let NfsError::FileClose(errors) = error {
+        for failure in errors {
+            let start = output.len();
+            collect_close_errors(failure.error.as_ref(), output);
+            for (_, operation) in &mut output[start..] {
+                *operation = Some(failure.operation);
+            }
+        }
+    } else {
+        output.push((error, None));
+    }
+}
+
+mod nfs3_python_mapping {
+    pub(super) fn descriptor(code: &crate::nfs3::ErrorCode) -> (super::PythonErrorKind, i64) {
+        type S = crate::nfs3::ErrorCode;
+        let (class_name, errno, recovery, number) = match code {
+            S::NFS3_OK => ("NfsProtocolError", None, None, 0),
+            S::NFS3ERR_PERM => ("NfsPermissionError", Some(nix::libc::EACCES), None, 1),
+            S::NFS3ERR_NOENT => ("NfsNotFoundError", Some(nix::libc::ENOENT), None, 2),
+            S::NFS3ERR_IO => ("NfsProtocolError", None, None, 5),
+            S::NFS3ERR_NXIO => ("NfsOSError", Some(nix::libc::ENXIO), None, 6),
+            S::NFS3ERR_ACCES => ("NfsPermissionError", Some(nix::libc::EACCES), None, 13),
+            S::NFS3ERR_EXIST => ("NfsAlreadyExistsError", Some(nix::libc::EEXIST), None, 17),
+            S::NFS3ERR_XDEV => ("NfsOSError", Some(nix::libc::EXDEV), None, 18),
+            S::NFS3ERR_NODEV => ("NfsOSError", Some(nix::libc::ENODEV), None, 19),
+            S::NFS3ERR_NOTDIR => ("NfsNotADirectoryError", Some(nix::libc::ENOTDIR), None, 20),
+            S::NFS3ERR_ISDIR => ("NfsIsADirectoryError", Some(nix::libc::EISDIR), None, 21),
+            S::NFS3ERR_INVAL => ("NfsProtocolError", None, None, 22),
+            S::NFS3ERR_FBIG => ("NfsOSError", Some(nix::libc::EFBIG), None, 27),
+            S::NFS3ERR_NOSPC => ("NfsOSError", Some(nix::libc::ENOSPC), None, 28),
+            S::NFS3ERR_ROFS => ("NfsOSError", Some(nix::libc::EROFS), None, 30),
+            S::NFS3ERR_MLINK => ("NfsOSError", Some(nix::libc::EMLINK), None, 31),
+            S::NFS3ERR_NAMETOOLONG => ("NfsOSError", Some(nix::libc::ENAMETOOLONG), None, 63),
+            S::NFS3ERR_NOTEMPTY => ("NfsOSError", Some(nix::libc::ENOTEMPTY), None, 66),
+            S::NFS3ERR_DQUOT => ("NfsOSError", Some(nix::libc::EDQUOT), None, 69),
+            S::NFS3ERR_STALE => ("NfsStateLostError", None, Some("remount"), 70),
+            S::NFS3ERR_REMOTE => ("NfsProtocolError", None, None, 71),
+            S::NFS3ERR_BADHANDLE => ("NfsStateLostError", None, Some("remount"), 10001),
+            S::NFS3ERR_NOT_SYNC => ("NfsProtocolError", None, None, 10002),
+            S::NFS3ERR_BAD_COOKIE => ("NfsProtocolError", None, None, 10003),
+            S::NFS3ERR_NOTSUPP => ("NfsUnsupportedError", Some(nix::libc::ENOTSUP), None, 10004),
+            S::NFS3ERR_TOOSMALL => ("NfsProtocolError", None, None, 10005),
+            S::NFS3ERR_SERVERFAULT => ("NfsProtocolError", None, None, 10006),
+            S::NFS3ERR_BADTYPE => ("NfsUnsupportedError", Some(nix::libc::ENOTSUP), None, 10007),
+            S::NFS3ERR_JUKEBOX => (
+                "NfsRetryableError",
+                Some(nix::libc::EAGAIN),
+                Some("retry"),
+                10008,
+            ),
+        };
+        (
+            super::PythonErrorKind {
+                class_name,
+                errno,
+                recovery,
+            },
+            number,
+        )
+    }
+}
+
+fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
+    let (class_name, errno, recovery) = match code {
+        NFS4ERR_NOENT => ("NfsNotFoundError", Some(nix::libc::ENOENT), None),
+        NFS4ERR_EXIST => ("NfsAlreadyExistsError", Some(nix::libc::EEXIST), None),
+        NFS4ERR_PERM | NFS4ERR_ACCESS => ("NfsPermissionError", Some(nix::libc::EACCES), None),
+        NFS4ERR_NOTDIR => ("NfsNotADirectoryError", Some(nix::libc::ENOTDIR), None),
+        NFS4ERR_ISDIR => ("NfsIsADirectoryError", Some(nix::libc::EISDIR), None),
+        NFS4ERR_XDEV => ("NfsOSError", Some(nix::libc::EXDEV), None),
+        NFS4ERR_NXIO => ("NfsOSError", Some(nix::libc::ENXIO), None),
+        NFS4ERR_FBIG => ("NfsOSError", Some(nix::libc::EFBIG), None),
+        NFS4ERR_NOSPC => ("NfsOSError", Some(nix::libc::ENOSPC), None),
+        NFS4ERR_ROFS => ("NfsOSError", Some(nix::libc::EROFS), None),
+        NFS4ERR_MLINK => ("NfsOSError", Some(nix::libc::EMLINK), None),
+        NFS4ERR_NAMETOOLONG => ("NfsOSError", Some(nix::libc::ENAMETOOLONG), None),
+        NFS4ERR_NOTEMPTY => ("NfsOSError", Some(nix::libc::ENOTEMPTY), None),
+        NFS4ERR_DQUOT => ("NfsOSError", Some(nix::libc::EDQUOT), None),
+        NFS4ERR_STALE
+        | NFS4ERR_BADHANDLE
+        | NFS4ERR_FHEXPIRED
+        | NFS4ERR_STALE_CLIENTID
+        | NFS4ERR_STALE_STATEID
+        | NFS4ERR_OLD_STATEID
+        | NFS4ERR_BAD_STATEID
+        | NFS4ERR_BADSESSION
+        | NFS4ERR_DEADSESSION
+        | NFS4ERR_EXPIRED
+        | NFS4ERR_ADMIN_REVOKED
+        | NFS4ERR_DELEG_REVOKED => ("NfsStateLostError", None, Some("reopen")),
+        NFS4ERR_DELAY
+        | NFS4ERR_GRACE
+        | NFS4ERR_RETRY_UNCACHED_REP
+        | NFS4ERR_LAYOUTTRYLATER
+        | NFS4ERR_RECALLCONFLICT
+        | NFS4ERR_BACK_CHAN_BUSY => ("NfsRetryableError", Some(nix::libc::EAGAIN), Some("retry")),
+        NFS4ERR_NOTSUPP
+        | NFS4ERR_ATTRNOTSUPP
+        | NFS4ERR_LOCK_NOTSUPP
+        | NFS4ERR_OP_ILLEGAL
+        | NFS4ERR_UNKNOWN_LAYOUTTYPE
+        | NFS4ERR_LAYOUTUNAVAILABLE
+        | NFS4ERR_ENCR_ALG_UNSUPP
+        | NFS4ERR_HASH_ALG_UNSUPP => ("NfsUnsupportedError", Some(nix::libc::ENOTSUP), None),
+        NFS4_OK
+        | NFS4ERR_IO
+        | NFS4ERR_INVAL
+        | NFS4ERR_SAME
+        | NFS4ERR_DENIED
+        | NFS4ERR_LOCKED
+        | NFS4ERR_SHARE_DENIED
+        | NFS4ERR_WRONGSEC
+        | NFS4ERR_CLID_INUSE
+        | NFS4ERR_MOVED
+        | NFS4ERR_NOFILEHANDLE
+        | NFS4ERR_MINOR_VERS_MISMATCH
+        | NFS4ERR_BAD_SEQID
+        | NFS4ERR_NOT_SAME
+        | NFS4ERR_LOCK_RANGE
+        | NFS4ERR_SYMLINK
+        | NFS4ERR_RESTOREFH
+        | NFS4ERR_LEASE_MOVED
+        | NFS4ERR_NO_GRACE
+        | NFS4ERR_RECLAIM_BAD
+        | NFS4ERR_RECLAIM_CONFLICT
+        | NFS4ERR_BADXDR
+        | NFS4ERR_LOCKS_HELD
+        | NFS4ERR_OPENMODE
+        | NFS4ERR_BADOWNER
+        | NFS4ERR_BADCHAR
+        | NFS4ERR_BADNAME
+        | NFS4ERR_BAD_RANGE
+        | NFS4ERR_DEADLOCK
+        | NFS4ERR_FILE_OPEN
+        | NFS4ERR_CB_PATH_DOWN
+        | NFS4ERR_BADIOMODE
+        | NFS4ERR_BADLAYOUT
+        | NFS4ERR_NOMATCHING_LAYOUT
+        | NFS4ERR_REJECT_DELEG
+        | NFS4ERR_RETURNCONFLICT
+        | NFS4ERR_PNFS_NO_LAYOUT
+        | NFS4ERR_NOT_ONLY_OP
+        | NFS4ERR_WRONG_CRED
+        | NFS4ERR_WRONG_TYPE
+        | NFS4ERR_DIRDELEG_UNAVAIL
+        | NFS4ERR_SEQ_MISORDERED
+        | NFS4ERR_SEQ_FALSE_RETRY
+        | NFS4ERR_BAD_HIGH_SLOT
+        | NFS4ERR_BADSLOT
+        | NFS4ERR_BAD_SESSION_DIGEST
+        | NFS4ERR_SEQUENCE_POS
+        | NFS4ERR_BAD_COOKIE
+        | NFS4ERR_REQ_TOO_BIG
+        | NFS4ERR_REP_TOO_BIG
+        | NFS4ERR_REP_TOO_BIG_TO_CACHE
+        | NFS4ERR_TOO_MANY_OPS
+        | NFS4ERR_OP_NOT_IN_SESSION
+        | NFS4ERR_CLIENTID_BUSY
+        | NFS4ERR_PNFS_IO_HOLE
+        | NFS4ERR_DELEG_ALREADY_WANTED
+        | NFS4ERR_COMPLETE_ALREADY
+        | NFS4ERR_CONN_NOT_BOUND_TO_SESSION
+        | NFS4ERR_UNSAFE_COMPOUND
+        | NFS4ERR_SERVERFAULT
+        | NFS4ERR_TOOSMALL
+        | NFS4ERR_BADTYPE => ("NfsProtocolError", None, None),
+    };
+    PythonErrorKind {
+        class_name,
+        errno,
+        recovery,
+    }
+}
+
+fn error_kind(error: &NfsError) -> PythonErrorKind {
+    if let NfsError::Io(io) = error
+        && let Some(shared) = io
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<SharedNfsFailure>())
+    {
+        return error_kind(shared.0.as_ref());
+    }
+    match error {
+        NfsError::Io(io) => PythonErrorKind {
+            class_name: match io.kind() {
+                std::io::ErrorKind::TimedOut => "NfsTimeoutError",
+                std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe => "NfsConnectionError",
+                std::io::ErrorKind::PermissionDenied => "NfsPermissionError",
+                _ => "NfsOSError",
+            },
+            errno: io.raw_os_error(),
+            recovery: None,
+        },
+        NfsError::Nfs3(code) => nfs3_python_mapping::descriptor(code).0,
+        NfsError::Nfs4(code) => nfs4_error_kind(*code),
+        NfsError::Mount(_) => PythonErrorKind {
+            class_name: "NfsMountError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::Rpc(_) => PythonErrorKind {
+            class_name: "NfsRpcError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::Xdr(_) => PythonErrorKind {
+            class_name: "NfsEncodingError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::Unsupported(_) => PythonErrorKind {
+            class_name: "NfsUnsupportedError",
+            errno: Some(nix::libc::ENOTSUP),
+            recovery: None,
+        },
+        NfsError::InvalidInput(_) => PythonErrorKind {
+            class_name: "NfsInvalidInputError",
+            errno: Some(nix::libc::EINVAL),
+            recovery: None,
+        },
+        NfsError::ClosedResource(_) => PythonErrorKind {
+            class_name: "NfsClosedResourceError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::ModeViolation(_) => PythonErrorKind {
+            class_name: "NfsModeError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::ClientClosed(_) => PythonErrorKind {
+            class_name: "NfsClientClosedError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::PositionUncertain(_) => PythonErrorKind {
+            class_name: "NfsPositionUncertainError",
+            errno: None,
+            recovery: Some("verify_then_resume"),
+        },
+        NfsError::LostOpenState(_) => PythonErrorKind {
+            class_name: "NfsLostOpenStateError",
+            errno: None,
+            recovery: Some("reopen"),
+        },
+        NfsError::FileClose(_) => PythonErrorKind {
+            class_name: "NfsFileCloseError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::RdattrError(_) => PythonErrorKind {
+            class_name: "NfsDirectoryEntryError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::LockDenied { .. } => PythonErrorKind {
+            class_name: "NfsProtocolError",
+            errno: None,
+            recovery: None,
+        },
+        NfsError::OperationOutcome(details) => PythonErrorKind {
+            class_name: match details.outcome {
+                crate::OperationOutcome::SafeToRetry => "NfsRetryableError",
+                crate::OperationOutcome::Uncertain => "NfsUncertainOutcomeError",
+                crate::OperationOutcome::DefiniteFailure => "NfsOperationOutcomeError",
+            },
+            errno: None,
+            recovery: Some(recovery_name(details.recovery)),
+        },
+    }
+}
+
+fn nfs_error_with_context(
+    error: &NfsError,
+    explicit_operation: Option<&str>,
+    explicit_protocol: Option<NFSVersion>,
+    filename: Option<&str>,
+) -> PyErr {
+    if let NfsError::FileClose(errors) = error {
+        let message = errors.first().map_or_else(
+            || "file close completed with errors".to_string(),
+            |failure| format!("file close completed with errors: {}", failure.error),
+        );
+        return file_close_python_error(&message, errors);
+    }
+    let mut operation = explicit_operation;
+    let mut protocol = explicit_protocol.map(protocol_name);
+    let mut recovery = None;
+    let mut outcome = None;
+    let mut operation_class = None;
+    let mut completed_bytes = None;
+    let mut cause_protocol = None;
+    let (kind, source) = if let NfsError::OperationOutcome(details) = error {
+        operation = Some(details.context().operation.as_str());
+        protocol = Some(protocol_name(details.context().protocol));
+        recovery = Some(recovery_name(details.recovery));
+        outcome = Some(outcome_name(details.outcome));
+        operation_class = Some(operation_class_name(details.operation_class));
+        completed_bytes = details.completed_bytes;
+        cause_protocol = Some(details.context().protocol);
+        (error_kind(error), details.source.as_ref())
+    } else {
+        (error_kind(error), error)
+    };
+    let source = if let NfsError::Io(io) = source {
+        io.get_ref()
+            .and_then(|inner| inner.downcast_ref::<SharedNfsFailure>())
+            .map_or(source, |shared| shared.0.as_ref())
+    } else {
+        source
+    };
+    let source_kind = error_kind(source);
+    recovery = recovery.or(kind.recovery).or(source_kind.recovery);
+    let (code, code_name) = match source {
+        NfsError::Nfs3(status) => {
+            protocol = protocol.or(Some("3"));
+            (
+                Some(nfs3_python_mapping::descriptor(status).1),
+                Some(format!("{status:?}")),
+            )
+        }
+        NfsError::Nfs4(status) => (Some(*status as i64), Some(format!("{status:?}"))),
+        _ => (None, None),
+    };
+    let python_error = structured_error(PythonErrorPayload {
+        class_name: kind.class_name,
+        message: error.to_string(),
+        operation,
+        protocol,
+        code,
+        code_name: code_name.as_deref(),
+        recovery_action: recovery,
+        outcome,
+        operation_class,
+        completed_bytes,
+        errno: kind.errno.or(source_kind.errno),
+        filename,
+    });
+    if matches!(error, NfsError::OperationOutcome(_)) {
+        let cause = nfs_error_with_context(source, operation, cause_protocol, filename);
+        Python::attach(|py| python_error.set_cause(py, Some(cause)));
+    }
+    python_error
 }
 
 fn file_type(type_: u32) -> &'static str {
@@ -1132,6 +1637,17 @@ fn test_attr(path: &str) -> Option<Result<Attr>> {
         "missing" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT))),
         "denied" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES))),
         "forbidden" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM))),
+        "__notempty__" => {
+            return Some(Err(NfsError::Nfs3(
+                crate::nfs3::ErrorCode::NFS3ERR_NOTEMPTY,
+            )));
+        }
+        "__stale__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_STALE))),
+        "__retry__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX))),
+        "__unsupported__" => {
+            return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTSUPP)));
+        }
+        "__xdev__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_XDEV))),
         _ => 9,
     };
     Some(Ok(Attr {
@@ -1801,7 +2317,7 @@ fn connected_parts(mount: Box<dyn Mount>, capacity: usize) -> PyResult<Connected
         mount: tokio::sync::Mutex::new(Some(mount.clone())),
         resources: resources.clone(),
     });
-    let core = ClientCore::with_recovery_event_capacity(driver, capacity).map_err(python_error)?;
+    let core = ClientCore::with_recovery_event_capacity(driver, capacity).map_err(nfs_error)?;
     Ok(ConnectedParts {
         core,
         version,
@@ -1825,7 +2341,7 @@ fn test_connected_parts(url: &str, capacity: usize) -> Option<PyResult<Connected
             }),
             capacity,
         )
-        .map_err(python_error)?;
+        .map_err(nfs_error)?;
         Ok(ConnectedParts {
             core,
             version: NFSVersion::NFSv4p1,
@@ -1931,7 +2447,8 @@ async fn open_file(
             FileResource::test(
                 mode,
                 resources.test_file(&path)?,
-                path == "__commit_error__",
+                matches!(path.as_str(), "__commit_error__" | "__commit_close_error__"),
+                path == "__commit_close_error__",
                 match path.as_str() {
                     "__partial_write_error__" => Some(TestWriteFault::DefiniteAt(2)),
                     "__zero_write__" => Some(TestWriteFault::ZeroAt(0)),
@@ -2419,7 +2936,7 @@ impl SyncClient {
         }
         let mount = py
             .detach(|| runtime.block_on(connect_mount(&url, connect_timeout)))
-            .map_err(python_error)?;
+            .map_err(nfs_error)?;
         let ConnectedParts {
             core,
             version,
@@ -2475,10 +2992,14 @@ impl SyncClient {
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let report = py.detach(|| self.runtime.block_on(self.core.close()));
-        if let Some(error) = report.errors().first() {
-            Err(python_error(error))
-        } else {
+        if report.errors().is_empty() {
             Ok(())
+        } else {
+            Err(aggregate_python_error(
+                "NfsClientCloseError",
+                &format!("client close completed with errors: {}", report.errors()[0]),
+                report.errors(),
+            ))
         }
     }
 
@@ -2844,7 +3365,7 @@ impl AsyncClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mount = connect_mount(&url, connect_timeout)
                 .await
-                .map_err(python_error)?;
+                .map_err(nfs_error)?;
             let ConnectedParts {
                 core,
                 version,
@@ -2902,10 +3423,14 @@ impl AsyncClient {
         let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = core.close().await;
-            if let Some(error) = report.errors().first() {
-                Err(python_error(error))
-            } else {
+            if report.errors().is_empty() {
                 Ok(())
+            } else {
+                Err(aggregate_python_error(
+                    "NfsClientCloseError",
+                    &format!("client close completed with errors: {}", report.errors()[0]),
+                    report.errors(),
+                ))
             }
         })
     }
@@ -3177,6 +3702,7 @@ mod read_only_file_tests {
                 b"abcdefghijklmnopqrstuvwxyz".to_vec(),
             )),
             false,
+            false,
             None,
             false,
         )
@@ -3274,6 +3800,7 @@ mod read_only_file_tests {
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             true,
+            false,
             None,
             false,
         )
@@ -3323,6 +3850,7 @@ mod read_only_file_tests {
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
+            false,
             Some(TestWriteFault::DefiniteAt(2)),
             false,
         )
@@ -3346,6 +3874,7 @@ mod read_only_file_tests {
         let file = FileResource::test(
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            false,
             false,
             Some(TestWriteFault::ZeroAt(0)),
             false,
@@ -3395,6 +3924,7 @@ mod read_only_file_tests {
         let file = FileResource::test(
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            false,
             false,
             None,
             true,

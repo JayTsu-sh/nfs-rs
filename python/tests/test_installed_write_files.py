@@ -105,7 +105,8 @@ def test_commit_verifier_change_keeps_flush_failed_and_close_terminal() -> None:
     with pytest.raises(RuntimeError, match="Uncertain") as second_close_error:
         file.close()
     assert str(first_close_error.value) == str(second_close_error.value)
-    assert str(flush_error.value) == str(first_close_error.value)
+    assert str(flush_error.value) == str(first_close_error.value.errors[0])
+    assert str(first_close_error.value.errors[0]) == str(second_close_error.value.errors[0])
     client.close()
 
 

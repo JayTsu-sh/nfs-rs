@@ -14,7 +14,51 @@ from types import ModuleType
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar
 
+from ._errors import NfsClosedResourceError, NfsError, NfsFileCloseError, NfsModeError
+
 _CONSTRUCTION_TOKEN = object()
+
+
+async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | None, filename: str | None) -> Any:
+    try:
+        return await awaitable
+    except NfsError as error:
+        raise error.with_context(operation=operation, protocol=protocol, filename=filename) from error
+
+
+class _AdapterContext:
+    __slots__ = ("_target", "_protocol", "_filename")
+
+    def __init__(self, target: Any, protocol: str | None = None, filename: str | None = None) -> None:
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_protocol", protocol)
+        object.__setattr__(self, "_filename", filename)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._target, name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._target, name)
+        if not callable(attribute):
+            return attribute
+        operation = "truncate" if name == "truncate_path" else name
+
+        def contextual_call(*args: Any, **kwargs: Any) -> Any:
+            filename = self._filename
+            if filename is None and args and isinstance(args[0], str):
+                filename = args[1] if name == "symlink" and len(args) > 1 else args[0]
+            try:
+                result = attribute(*args, **kwargs)
+            except NfsError as error:
+                raise error.with_context(operation=operation, protocol=self._protocol, filename=filename) from error
+            if inspect.isawaitable(result):
+                return _await_adapter_result(result, operation, self._protocol, filename)
+            return result
+
+        return contextual_call
 
 
 class Version(str, Enum):
@@ -331,7 +375,9 @@ class Client(_ClientOptions):
     def __init__(self, inner: Any, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("Client objects are created only by Client.connect()")
-        self._inner = inner
+        major, minor = inner.version
+        protocol = str(major) if minor is None else f"{major}.{minor}"
+        self._inner = _AdapterContext(inner, protocol)
 
     @classmethod
     def connect(cls, url: str, **options: Any) -> Client:
@@ -379,7 +425,14 @@ class Client(_ClientOptions):
 
     def scandir(self, path: os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
         normalized = _normalize_path(path)
-        return (_directory_entry(normalized, values) for values in self._inner.scandir(normalized))
+        cursor = self._inner.scandir(normalized)
+        def entries() -> Iterator[DirEntry]:
+            try:
+                for values in cursor:
+                    yield _directory_entry(normalized, values)
+            except NfsError as error:
+                raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
+        return entries()
 
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name for entry in self.scandir(path)]
@@ -525,7 +578,9 @@ class AsyncClient(_ClientOptions):
     ) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("AsyncClient objects are created only by AsyncClient.connect()")
-        self._inner = inner
+        major, minor = inner.version
+        protocol = str(major) if minor is None else f"{major}.{minor}"
+        self._inner = _AdapterContext(inner, protocol)
         self._loop = loop
 
     @classmethod
@@ -586,8 +641,11 @@ class AsyncClient(_ClientOptions):
         cursor = self._inner.scandir(normalized)
         if inspect.isawaitable(cursor):
             cursor = await cursor
-        async for values in cursor:
-            yield _directory_entry(normalized, values)
+        try:
+            async for values in cursor:
+                yield _directory_entry(normalized, values)
+        except NfsError as error:
+            raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
 
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name async for entry in self.scandir(path)]
@@ -770,8 +828,9 @@ _BINARY_MODES = frozenset({"rb", "wb", "ab", "r+b", "w+b", "a+b"})
 
 def _validate_binary_mode(mode: str) -> str:
     if mode not in _BINARY_MODES:
-        raise ValueError(
-            "mode must be one of 'rb', 'wb', 'ab', 'r+b', 'w+b', or 'a+b'"
+        raise NfsModeError(
+            message="mode must be one of 'rb', 'wb', 'ab', 'r+b', 'w+b', or 'a+b'",
+            operation="open",
         )
     return mode
 
@@ -791,7 +850,7 @@ class File(io.RawIOBase):
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("File objects are created only by Client.open()")
         super().__init__()
-        self._inner = inner
+        self._inner = _AdapterContext(inner, filename=name)
         self._name = name
         self._mode = mode
         self._closing_base = False
@@ -811,9 +870,9 @@ class File(io.RawIOBase):
     def readable(self) -> bool:
         return self._mode.startswith("r") or "+" in self._mode
 
-    def _check_closed(self) -> None:
+    def _check_closed(self, operation: str) -> None:
         if self.closed:
-            raise ValueError("I/O operation on closed file")
+            raise NfsClosedResourceError(message="I/O operation on closed file", operation=operation, filename=self.name)
 
     def writable(self) -> bool:
         return self._mode.startswith(("w", "a")) or "+" in self._mode
@@ -822,75 +881,85 @@ class File(io.RawIOBase):
         return True
 
     def read(self, size: int = -1) -> bytes:
-        self._check_closed()
+        self._check_closed("read")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="read", filename=self.name)
         return self._inner.read(size)
 
     def readinto(self, target: Any) -> int:
-        self._check_closed()
+        self._check_closed("readinto")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         return _copy_to_buffer(target, length, self._inner.read(request))
 
     def read_at(self, offset: int, size: int = -1) -> bytes:
-        self._check_closed()
+        self._check_closed("read_at")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="read_at", filename=self.name)
         return self._inner.read_at(offset, size)
 
     def readinto_at(self, target: Any, offset: int) -> int:
-        self._check_closed()
+        self._check_closed("readinto_at")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         return _copy_to_buffer(target, length, self._inner.read_at(offset, request))
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        self._check_closed()
+        self._check_closed("seek")
         return self._inner.seek(offset, whence)
 
     def tell(self) -> int:
-        self._check_closed()
+        self._check_closed("tell")
         return self._inner.tell()
 
     def write(self, data: Any) -> int:
-        self._check_closed()
+        self._check_closed("write")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="write", filename=self.name)
         return self._inner.write(_snapshot_bytes(data))
 
     def write_at(self, data: Any, offset: int) -> int:
-        self._check_closed()
+        self._check_closed("write_at")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="write_at", filename=self.name)
         if self._mode.startswith("a"):
-            raise io.UnsupportedOperation("positional writes are unavailable in append mode")
+            raise NfsModeError(message="positional writes are unavailable in append mode", operation="write_at", filename=self.name)
         return self._inner.write_at(_snapshot_bytes(data), offset)
 
     def truncate(self, size: int | None = None) -> int:
-        self._check_closed()
+        self._check_closed("truncate")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="truncate", filename=self.name)
         return self._inner.truncate(size)
 
     def flush(self) -> None:
         if self._closing_base:
             return
-        self._check_closed()
+        self._check_closed("flush")
         if self.writable():
             self._inner.flush()
 
     def fileno(self) -> int:
-        raise io.UnsupportedOperation("nfs-rs files do not expose OS file descriptors")
+        raise NfsModeError(message="nfs-rs files do not expose OS file descriptors", operation="fileno", filename=self.name)
 
     def close(self) -> None:
         error: BaseException | None = None
         try:
             self._inner.close()
+        except NfsFileCloseError as caught:
+            error = caught.with_context(operation="close", filename=self.name)
+        except NfsError as caught:
+            child = caught.with_context(operation="close", filename=self.name)
+            error = NfsFileCloseError(
+                message=f"file close completed with errors: {caught}",
+                operation="close",
+                filename=self.name,
+                errors=(child,),
+            )
         except BaseException as caught:
             error = caught
         finally:
@@ -936,7 +1005,7 @@ class AsyncFile:
     ) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("AsyncFile objects are created only by AsyncClient.open()")
-        self._inner = inner
+        self._inner = _AdapterContext(inner, filename=name)
         self._name = name
         self._mode = mode
         self._loop = loop
@@ -958,26 +1027,29 @@ class AsyncFile:
         return self._inner.closed
 
     def tell(self) -> int:
-        if self.closed:
-            raise ValueError("I/O operation on closed file")
+        self._check_closed("tell")
         return self._inner.tell()
 
-    def _check_closed(self) -> None:
+    def _check_closed(self, operation: str) -> None:
         if self.closed:
-            raise ValueError("I/O operation on closed file")
+            raise NfsClosedResourceError(
+                message="I/O operation on closed file",
+                operation=operation,
+                filename=self.name,
+            )
 
     async def read(self, size: int = -1) -> bytes:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("read")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="read", filename=self.name)
         return await self._inner.read(size)
 
     async def readinto(self, target: Any) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("readinto")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         data = await self._inner.read(request)
@@ -985,16 +1057,16 @@ class AsyncFile:
 
     async def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("read_at")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="read_at", filename=self.name)
         return await self._inner.read_at(offset, size)
 
     async def readinto_at(self, target: Any, offset: int) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("readinto_at")
         if not self.readable():
-            raise io.UnsupportedOperation("not readable")
+            raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         data = await self._inner.read_at(offset, request)
@@ -1002,7 +1074,7 @@ class AsyncFile:
 
     async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("seek")
         return await self._inner.seek(offset, whence)
 
     def readable(self) -> bool:
@@ -1013,36 +1085,51 @@ class AsyncFile:
 
     async def write(self, data: Any) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("write")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="write", filename=self.name)
         return await self._inner.write(_snapshot_bytes(data))
 
     async def write_at(self, data: Any, offset: int) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("write_at")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="write_at", filename=self.name)
         if self._mode.startswith("a"):
-            raise io.UnsupportedOperation("positional writes are unavailable in append mode")
+            raise NfsModeError(
+                message="positional writes are unavailable in append mode",
+                operation="write_at",
+                filename=self.name,
+            )
         return await self._inner.write_at(_snapshot_bytes(data), offset)
 
     async def truncate(self, size: int | None = None) -> int:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("truncate")
         if not self.writable():
-            raise io.UnsupportedOperation("not writable")
+            raise NfsModeError(message="not writable", operation="truncate", filename=self.name)
         return await self._inner.truncate(size)
 
     async def flush(self) -> None:
         self._check_loop()
-        self._check_closed()
+        self._check_closed("flush")
         if self.writable():
             await self._inner.flush()
 
     async def close(self) -> None:
         self._check_loop()
-        await self._inner.close()
+        try:
+            await self._inner.close()
+        except NfsFileCloseError as caught:
+            raise caught.with_context(operation="close", filename=self.name) from caught
+        except NfsError as caught:
+            child = caught.with_context(operation="close", filename=self.name)
+            raise NfsFileCloseError(
+                message=f"file close completed with errors: {caught}",
+                operation="close",
+                filename=self.name,
+                errors=(child,),
+            ) from caught
 
     async def __aenter__(self) -> AsyncFile:
         self._check_loop()

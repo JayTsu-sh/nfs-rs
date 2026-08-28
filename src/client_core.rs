@@ -178,7 +178,7 @@ impl ClientCore {
         if self.lifecycle.load(Ordering::Acquire) == READY {
             Ok(())
         } else {
-            Err(NfsError::InvalidInput(
+            Err(NfsError::ClientClosed(
                 "connected client is closing or closed".to_string(),
             ))
         }

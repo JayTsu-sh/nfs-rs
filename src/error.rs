@@ -209,6 +209,30 @@ pub enum NfsError {
     #[error("{0}")]
     InvalidInput(String),
 
+    /// A local operation targeted a resource that is already closed.
+    #[error("{0}")]
+    ClosedResource(String),
+
+    /// The open mode does not permit the requested operation.
+    #[error("{0}")]
+    ModeViolation(String),
+
+    /// The connected client is already closing or closed.
+    #[error("{0}")]
+    ClientClosed(String),
+
+    /// A prior uncertain mutation made the next relative position unknowable.
+    #[error("{0}")]
+    PositionUncertain(String),
+
+    /// Recovery could not prove that an open resource retained identity and state.
+    #[error("{0}")]
+    LostOpenState(String),
+
+    /// Ordered failures observed while flushing and closing one open file.
+    #[error("file close completed with errors")]
+    FileClose(Vec<FileCloseFailure>),
+
     /// Server returned rdattr_error for an entry (READDIRPLUS per-entry error).
     #[error("rdattr_error: server returned nfsstat4 {0} for entry attributes")]
     RdattrError(u32),
@@ -216,6 +240,15 @@ pub enum NfsError {
     /// An operation failed without an authoritative result and carries retry guidance.
     #[error(transparent)]
     OperationOutcome(#[from] Box<OperationOutcomeError>),
+}
+
+/// One ordered phase failure from a terminal file close.
+#[derive(Debug)]
+pub struct FileCloseFailure {
+    /// Stable operation name (`commit` or `close`).
+    pub operation: &'static str,
+    /// The original structured failure.
+    pub error: std::sync::Arc<NfsError>,
 }
 
 impl NfsError {
@@ -301,6 +334,12 @@ impl NfsError {
             NfsError::Xdr(_) => std::io::ErrorKind::Other,
             NfsError::Unsupported(_) => std::io::ErrorKind::Unsupported,
             NfsError::InvalidInput(_) => std::io::ErrorKind::InvalidInput,
+            NfsError::ClosedResource(_) => std::io::ErrorKind::NotConnected,
+            NfsError::ModeViolation(_) => std::io::ErrorKind::PermissionDenied,
+            NfsError::ClientClosed(_) => std::io::ErrorKind::NotConnected,
+            NfsError::PositionUncertain(_)
+            | NfsError::LostOpenState(_)
+            | NfsError::FileClose(_) => std::io::ErrorKind::Other,
             NfsError::RdattrError(_) => std::io::ErrorKind::Other,
             NfsError::OperationOutcome(_) => std::io::ErrorKind::Other,
         }
@@ -392,6 +431,25 @@ impl From<NfsError> for std::io::Error {
             NfsError::InvalidInput(msg) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
             }
+            NfsError::ClosedResource(msg) => {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, msg)
+            }
+            NfsError::ModeViolation(msg) => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)
+            }
+            NfsError::ClientClosed(msg) => {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, msg)
+            }
+            NfsError::PositionUncertain(msg) | NfsError::LostOpenState(msg) => {
+                std::io::Error::other(msg)
+            }
+            NfsError::FileClose(errors) => std::io::Error::other(
+                errors
+                    .first()
+                    .map_or("file close completed with errors".to_string(), |failure| {
+                        failure.error.to_string()
+                    }),
+            ),
             NfsError::RdattrError(code) => {
                 std::io::Error::other(format!("rdattr_error: nfsstat4 {}", code))
             }

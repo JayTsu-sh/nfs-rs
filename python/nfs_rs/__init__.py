@@ -2,6 +2,9 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from . import _errors as _public_errors
+from ._errors import *
+
 from ._client import (
     AsyncClient,
     Capabilities,
@@ -41,6 +44,7 @@ __all__ = [
     "list_exports",
     "list_exports_async",
 ]
+__all__ += _public_errors.__all__
 try:
     __version__ = version("nfs-rs")
 except PackageNotFoundError:

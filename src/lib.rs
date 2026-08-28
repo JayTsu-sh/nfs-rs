@@ -583,7 +583,16 @@ fn nfs_error_msg(err: &NfsError) -> String {
         NfsError::Rpc(s)
         | NfsError::Xdr(s)
         | NfsError::Unsupported(s)
-        | NfsError::InvalidInput(s) => s.clone(),
+        | NfsError::InvalidInput(s)
+        | NfsError::ClosedResource(s)
+        | NfsError::ModeViolation(s)
+        | NfsError::ClientClosed(s)
+        | NfsError::PositionUncertain(s)
+        | NfsError::LostOpenState(s) => s.clone(),
+        NfsError::FileClose(errors) => errors.first().map_or_else(
+            || "file close completed with errors".to_string(),
+            |failure| format!("file close completed with errors: {}", failure.error),
+        ),
         NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
         NfsError::OperationOutcome(error) => error.to_string(),
     }
