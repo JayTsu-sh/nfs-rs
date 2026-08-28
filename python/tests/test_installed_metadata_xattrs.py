@@ -22,7 +22,7 @@ def test_sync_metadata_xattrs_and_filesystem_snapshots() -> None:
     assert not client.access("missing", os.F_OK)
     with pytest.raises(ValueError): client.access("file", 8)
     with pytest.raises(PermissionError): client.chmod("denied", 0o600)
-    with pytest.raises(RuntimeError, match="I/O error"):
+    with pytest.raises(RuntimeError, match="(?i)i/o error"):
         client.truncate("protocol-error", 1)
     client.setxattr("file", "user.key", b"value")
     assert client.getxattr("file", "user.key") == b"value"
