@@ -472,6 +472,14 @@ def _validate_binary_mode(mode: str) -> str:
     return mode
 
 
+def _snapshot_bytes(source: Any) -> bytes:
+    view = memoryview(source)
+    try:
+        return view.tobytes()
+    finally:
+        view.release()
+
+
 class File(io.RawIOBase):
     __slots__ = ("_inner", "_name", "_mode")
 
@@ -548,13 +556,13 @@ class File(io.RawIOBase):
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
-        return self._inner.write(bytes(data))
+        return self._inner.write(_snapshot_bytes(data))
 
     def write_at(self, data: Any, offset: int) -> int:
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
-        return self._inner.write_at(bytes(data), offset)
+        return self._inner.write_at(_snapshot_bytes(data), offset)
 
     def truncate(self, size: int | None = None) -> int:
         self._check_closed()
@@ -687,14 +695,14 @@ class AsyncFile:
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
-        return await self._inner.write(bytes(data))
+        return await self._inner.write(_snapshot_bytes(data))
 
     async def write_at(self, data: Any, offset: int) -> int:
         self._check_loop()
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
-        return await self._inner.write_at(bytes(data), offset)
+        return await self._inner.write_at(_snapshot_bytes(data), offset)
 
     async def truncate(self, size: int | None = None) -> int:
         self._check_loop()

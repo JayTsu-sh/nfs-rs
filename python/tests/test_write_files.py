@@ -122,6 +122,8 @@ def test_permissions_are_enforced_locally() -> None:
     write_only = Client.connect("nfs://server/export").open("file", "wb")
     with pytest.raises(io.UnsupportedOperation, match="not readable"):
         write_only.read()
+    with pytest.raises(TypeError):
+        write_only.write(3)
 
 
 def test_sync_write_snapshots_input_and_positional_write_preserves_position() -> None:
