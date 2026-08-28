@@ -32,6 +32,27 @@ def test_release_validation_requires_both_x86_artifacts_and_aarch64() -> None:
     assert "continue-on-error" not in workflow
 
 
+def test_nightly_runs_public_python_api_conformance_on_every_real_protocol() -> None:
+    workflow = (ROOT / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
+    runner = (ROOT / "tests/lab/run-python-api-conformance.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "run-python-api-conformance.sh" in workflow
+    assert "python-api-conformance" in workflow
+    assert "--features python-test-support" not in workflow
+    assert "continue-on-error" not in workflow
+    assert all(
+        case in runner
+        for case in (
+            "linux-source-v3|3|",
+            "dxn-v40|4.0|",
+            "linux-source-v41|4.1|",
+            "netapp-pnfs-mds|4.1|",
+        )
+    )
+
+
 def test_accepted_baseline_encodes_five_of_four_and_ten_percent_policy() -> None:
     baseline = json.loads(
         (ROOT / "tests/python/performance-baselines.json").read_text(encoding="utf-8")
