@@ -1,15 +1,21 @@
 use crate::client_core::{ClientCore, ClientDriver, CoreOperation, ResourceKey};
-use crate::{Attr, Mount, MountHealth, NFSVersion, NfsError, Result, parse_url_and_mount};
+use crate::{
+    Attr, Mount, MountHealth, NFSVersion, NfsError, OpenFile, Result, parse_url_and_mount,
+};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::TryStreamExt;
 use pyo3::exceptions::{
     PyFileNotFoundError, PyPermissionError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 type DirectoryItem = std::result::Result<Py<PyDict>, NfsError>;
@@ -28,6 +34,7 @@ async fn send_directory_item(
 #[derive(Debug)]
 struct MountDriver {
     mount: tokio::sync::Mutex<Option<Arc<dyn Mount>>>,
+    resources: Arc<AdapterResources>,
 }
 
 struct ConnectedParts {
@@ -35,11 +42,242 @@ struct ConnectedParts {
     version: NFSVersion,
     health: MountHealth,
     health_source: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+}
+
+#[derive(Debug, Default)]
+struct AdapterResources {
+    files: Mutex<HashMap<ResourceKey, Arc<FileResource>>>,
+}
+
+impl AdapterResources {
+    fn insert(&self, key: ResourceKey, resource: Arc<FileResource>) -> Result<()> {
+        self.files
+            .lock()
+            .map_err(|_| NfsError::Rpc("file registry lock poisoned".to_string()))?
+            .insert(key, resource);
+        Ok(())
+    }
+
+    fn remove(&self, key: ResourceKey) -> Result<Option<Arc<FileResource>>> {
+        Ok(self
+            .files
+            .lock()
+            .map_err(|_| NfsError::Rpc("file registry lock poisoned".to_string()))?
+            .remove(&key))
+    }
+}
+
+#[derive(Debug)]
+enum ReadBackend {
+    Mount {
+        mount: Arc<dyn Mount>,
+        file_handle: Bytes,
+        max_read: u32,
+    },
+    #[cfg(feature = "python-test-support")]
+    Test { data: Arc<[u8]>, max_read: u32 },
+}
+
+#[derive(Debug)]
+struct FileResource {
+    backend: ReadBackend,
+    size: u64,
+    relative_gate: tokio::sync::Mutex<()>,
+    position: AtomicU64,
+    close_state: Mutex<FileCloseState>,
+    close_notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct FileCloseState {
+    started: bool,
+    file: Option<OpenFile>,
+    result: Option<std::result::Result<(), String>>,
+}
+
+impl FileResource {
+    fn mount(mount: Arc<dyn Mount>, file: OpenFile, size: u64) -> Arc<Self> {
+        let max_read = mount.get_max_read_size().max(1);
+        let file_handle = file.file_handle();
+        Arc::new(Self {
+            backend: ReadBackend::Mount {
+                mount,
+                file_handle,
+                max_read,
+            },
+            size,
+            relative_gate: tokio::sync::Mutex::new(()),
+            position: AtomicU64::new(0),
+            close_state: Mutex::new(FileCloseState {
+                started: false,
+                file: Some(file),
+                result: None,
+            }),
+            close_notify: Notify::new(),
+        })
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn test() -> Arc<Self> {
+        let data: Arc<[u8]> = Arc::from(&b"abcdefghijklmnopqrstuvwxyz"[..]);
+        Arc::new(Self {
+            size: data.len() as u64,
+            backend: ReadBackend::Test { data, max_read: 4 },
+            relative_gate: tokio::sync::Mutex::new(()),
+            position: AtomicU64::new(0),
+            close_state: Mutex::new(FileCloseState::default()),
+            close_notify: Notify::new(),
+        })
+    }
+
+    fn closed(&self) -> bool {
+        self.close_state
+            .lock()
+            .map(|state| state.result.is_some())
+            .unwrap_or(true)
+    }
+
+    async fn close(self: &Arc<Self>) -> std::result::Result<(), String> {
+        let file = self
+            .close_state
+            .lock()
+            .map(|mut state| {
+                if state.started {
+                    None
+                } else {
+                    state.started = true;
+                    Some(state.file.take())
+                }
+            })
+            .map_err(|_| "file close state lock poisoned".to_string())?;
+        if let Some(file) = file {
+            let resource = self.clone();
+            tokio::spawn(async move {
+                let result = match (&resource.backend, file) {
+                    (ReadBackend::Mount { mount, .. }, Some(file)) => mount
+                        .close_stateful(file)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    _ => Ok(()),
+                };
+                if let Ok(mut state) = resource.close_state.lock() {
+                    state.result = Some(result);
+                }
+                resource.close_notify.notify_waiters();
+            });
+        }
+        loop {
+            let notified = self.close_notify.notified();
+            if let Some(result) = self
+                .close_state
+                .lock()
+                .ok()
+                .and_then(|state| state.result.clone())
+            {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    async fn read_chunk(&self, offset: u64, count: u32) -> Result<Bytes> {
+        match &self.backend {
+            ReadBackend::Mount {
+                mount, file_handle, ..
+            } => mount.read(file_handle.clone(), offset, count).await,
+            #[cfg(feature = "python-test-support")]
+            ReadBackend::Test { data, .. } => {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                let end = start.saturating_add(count as usize).min(data.len());
+                Ok(Bytes::copy_from_slice(&data[start..end]))
+            }
+        }
+    }
+
+    fn max_read(&self) -> u32 {
+        match &self.backend {
+            ReadBackend::Mount { max_read, .. } => *max_read,
+            #[cfg(feature = "python-test-support")]
+            ReadBackend::Test { max_read, .. } => *max_read,
+        }
+    }
+
+    async fn read_at(&self, offset: u64, size: i64) -> Result<Vec<u8>> {
+        if size < -1 {
+            return Err(NfsError::InvalidInput(
+                "read size must be -1 or non-negative".to_string(),
+            ));
+        }
+        let requested = if size == -1 {
+            self.size.saturating_sub(offset)
+        } else {
+            size as u64
+        };
+        let mut result = Vec::new();
+        let mut current = offset;
+        let mut remaining = requested;
+        while remaining != 0 {
+            let count = remaining.min(u64::from(self.max_read())) as u32;
+            let chunk = self.read_chunk(current, count).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            current = current.saturating_add(chunk.len() as u64);
+            remaining = remaining.saturating_sub(chunk.len() as u64);
+            result.extend_from_slice(&chunk);
+            if chunk.len() < count as usize {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn read(&self, size: i64) -> Result<Vec<u8>> {
+        let _guard = self.relative_gate.lock().await;
+        let position = self.position.load(Ordering::Acquire);
+        let data = self.read_at(position, size).await?;
+        self.position.store(
+            position.saturating_add(data.len() as u64),
+            Ordering::Release,
+        );
+        Ok(data)
+    }
+
+    async fn seek(&self, offset: i64, whence: i32) -> Result<u64> {
+        let _guard = self.relative_gate.lock().await;
+        let position = self.position.load(Ordering::Acquire);
+        let base = match whence {
+            0 => 0_i128,
+            1 => i128::from(position),
+            2 => i128::from(self.size),
+            _ => {
+                return Err(NfsError::InvalidInput(
+                    "whence must be SEEK_SET, SEEK_CUR, or SEEK_END".to_string(),
+                ));
+            }
+        };
+        let next = base + i128::from(offset);
+        if !(0..=i128::from(u64::MAX)).contains(&next) {
+            return Err(NfsError::InvalidInput("negative seek position".to_string()));
+        }
+        let next = next as u64;
+        self.position.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    fn tell(&self) -> u64 {
+        self.position.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(feature = "python-test-support")]
 #[derive(Debug)]
-struct TestDriver;
+struct TestDriver {
+    resources: Arc<AdapterResources>,
+}
 
 #[cfg(feature = "python-test-support")]
 #[async_trait]
@@ -48,7 +286,10 @@ impl ClientDriver for TestDriver {
         Ok(())
     }
 
-    async fn close_resource(&self, _key: ResourceKey) -> Result<()> {
+    async fn close_resource(&self, key: ResourceKey) -> Result<()> {
+        if let Some(resource) = self.resources.remove(key)? {
+            resource.close().await.map_err(NfsError::Rpc)?;
+        }
         Ok(())
     }
 
@@ -65,7 +306,10 @@ impl ClientDriver for MountDriver {
         ))
     }
 
-    async fn close_resource(&self, _key: ResourceKey) -> Result<()> {
+    async fn close_resource(&self, key: ResourceKey) -> Result<()> {
+        if let Some(resource) = self.resources.remove(key)? {
+            resource.close().await.map_err(NfsError::Rpc)?;
+        }
         Ok(())
     }
 
@@ -441,8 +685,10 @@ fn connected_parts(mount: Box<dyn Mount>, capacity: usize) -> PyResult<Connected
     let mount: Arc<dyn Mount> = Arc::from(mount);
     let version = mount.version();
     let health = mount.health();
+    let resources = Arc::new(AdapterResources::default());
     let driver = Arc::new(MountDriver {
         mount: tokio::sync::Mutex::new(Some(mount.clone())),
+        resources: resources.clone(),
     });
     let core = ClientCore::with_recovery_event_capacity(driver, capacity).map_err(python_error)?;
     Ok(ConnectedParts {
@@ -450,6 +696,7 @@ fn connected_parts(mount: Box<dyn Mount>, capacity: usize) -> PyResult<Connected
         version,
         health,
         health_source: Some(mount),
+        resources,
     })
 }
 
@@ -460,13 +707,20 @@ fn test_connected_parts(url: &str, capacity: usize) -> Option<PyResult<Connected
         "nfs-test://fixture/export" | "nfs-test://fixture/delay"
     )
     .then(|| {
-        let core = ClientCore::with_recovery_event_capacity(Arc::new(TestDriver), capacity)
-            .map_err(python_error)?;
+        let resources = Arc::new(AdapterResources::default());
+        let core = ClientCore::with_recovery_event_capacity(
+            Arc::new(TestDriver {
+                resources: resources.clone(),
+            }),
+            capacity,
+        )
+        .map_err(python_error)?;
         Ok(ConnectedParts {
             core,
             version: NFSVersion::NFSv4p1,
             health: MountHealth::default(),
             health_source: None,
+            resources,
         })
     })
 }
@@ -505,6 +759,173 @@ async fn connect_mount(url: &str, timeout: Option<Duration>) -> Result<Box<dyn M
             .map_err(|_| NfsError::Rpc("connection deadline exceeded".to_string()))?
     } else {
         parse_url_and_mount(url).await
+    }
+}
+
+async fn open_file(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+) -> Result<(ResourceKey, Arc<FileResource>)> {
+    let _operation = core.begin_operation()?;
+    let resource = if let Some(mount) = mount {
+        // Resolve size before acquiring protocol-owned open state. Once open
+        // succeeds, registration is synchronous so cancellation cannot orphan it.
+        let size = mount.getattr_path(&path).await?.filesize;
+        let file = mount.open_path_stateful(&path, crate::OPEN_READ).await?;
+        FileResource::mount(mount, file, size)
+    } else {
+        #[cfg(feature = "python-test-support")]
+        {
+            FileResource::test()
+        }
+        #[cfg(not(feature = "python-test-support"))]
+        {
+            return Err(NfsError::Unsupported("mount is unavailable".to_string()));
+        }
+    };
+    let key = core.allocate_resource_key()?;
+    resources.insert(key, resource.clone())?;
+    if let Err(error) = core.publish_resource(key) {
+        let _ = resources.remove(key);
+        let _ = resource.close().await;
+        return Err(error);
+    }
+    Ok((key, resource))
+}
+
+async fn close_file(
+    core: Arc<ClientCore>,
+    resources: Arc<AdapterResources>,
+    key: ResourceKey,
+    resource: Arc<FileResource>,
+) -> Result<()> {
+    core.unregister_resource(key)?;
+    let _ = resources.remove(key)?;
+    resource.close().await.map_err(NfsError::Rpc)
+}
+
+fn validate_read_mode(mode: &str) -> PyResult<()> {
+    if mode == "rb" {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(
+            "Ticket 05 supports only binary read mode 'rb'",
+        ))
+    }
+}
+
+#[pyclass(name = "SyncFile", module = "nfs_rs._internal")]
+struct SyncFile {
+    key: ResourceKey,
+    resource: Arc<FileResource>,
+    resources: Arc<AdapterResources>,
+    core: Arc<ClientCore>,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl SyncFile {
+    #[getter]
+    fn closed(&self) -> bool {
+        self.resource.closed()
+    }
+
+    #[pyo3(signature = (size = -1))]
+    fn read(&self, py: Python<'_>, size: i64) -> PyResult<Py<PyBytes>> {
+        let data = py
+            .detach(|| self.runtime.block_on(self.resource.read(size)))
+            .map_err(nfs_error)?;
+        Ok(PyBytes::new(py, &data).unbind())
+    }
+
+    #[pyo3(signature = (offset, size = -1))]
+    fn read_at(&self, py: Python<'_>, offset: u64, size: i64) -> PyResult<Py<PyBytes>> {
+        let data = py
+            .detach(|| self.runtime.block_on(self.resource.read_at(offset, size)))
+            .map_err(nfs_error)?;
+        Ok(PyBytes::new(py, &data).unbind())
+    }
+
+    #[pyo3(signature = (offset, whence = 0))]
+    fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
+        py.detach(|| self.runtime.block_on(self.resource.seek(offset, whence)))
+            .map_err(nfs_error)
+    }
+
+    fn tell(&self) -> u64 {
+        self.resource.tell()
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(close_file(
+                self.core.clone(),
+                self.resources.clone(),
+                self.key,
+                self.resource.clone(),
+            ))
+        })
+        .map_err(nfs_error)
+    }
+}
+
+#[pyclass(name = "AsyncFile", module = "nfs_rs._internal")]
+struct AsyncFile {
+    key: ResourceKey,
+    resource: Arc<FileResource>,
+    resources: Arc<AdapterResources>,
+    core: Arc<ClientCore>,
+}
+
+#[pymethods]
+impl AsyncFile {
+    #[getter]
+    fn closed(&self) -> bool {
+        self.resource.closed()
+    }
+
+    #[pyo3(signature = (size = -1))]
+    fn read<'py>(&self, py: Python<'py>, size: i64) -> PyResult<Bound<'py, PyAny>> {
+        let resource = self.resource.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let data = resource.read(size).await.map_err(nfs_error)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
+        })
+    }
+
+    #[pyo3(signature = (offset, size = -1))]
+    fn read_at<'py>(&self, py: Python<'py>, offset: u64, size: i64) -> PyResult<Bound<'py, PyAny>> {
+        let resource = self.resource.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let data = resource.read_at(offset, size).await.map_err(nfs_error)?;
+            Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
+        })
+    }
+
+    #[pyo3(signature = (offset, whence = 0))]
+    fn seek<'py>(&self, py: Python<'py>, offset: i64, whence: i32) -> PyResult<Bound<'py, PyAny>> {
+        let resource = self.resource.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            resource.seek(offset, whence).await.map_err(nfs_error)
+        })
+    }
+
+    fn tell(&self) -> u64 {
+        self.resource.tell()
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let resources = self.resources.clone();
+        let key = self.key;
+        let resource = self.resource.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            close_file(core, resources, key, resource)
+                .await
+                .map_err(nfs_error)
+        })
     }
 }
 
@@ -574,6 +995,7 @@ fn python_async_list_exports<'py>(
 #[pyclass(name = "SyncClient", module = "nfs_rs._internal")]
 struct SyncClient {
     core: Arc<ClientCore>,
+    resources: Arc<AdapterResources>,
     runtime: Arc<Runtime>,
     version: NFSVersion,
     health: MountHealth,
@@ -613,9 +1035,11 @@ impl SyncClient {
                 version,
                 health,
                 health_source,
+                resources,
             } = parts?;
             return Ok(Self {
                 core,
+                resources,
                 runtime: Arc::new(runtime),
                 version,
                 health,
@@ -631,9 +1055,11 @@ impl SyncClient {
             version,
             health,
             health_source,
+            resources,
         } = connected_parts(mount, capacity)?;
         Ok(Self {
             core,
+            resources,
             runtime: Arc::new(runtime),
             version,
             health,
@@ -697,11 +1123,34 @@ impl SyncClient {
             receiver: Mutex::new(receiver),
         })
     }
+
+    #[pyo3(signature = (path, mode = "rb"))]
+    fn open(&self, py: Python<'_>, path: String, mode: &str) -> PyResult<SyncFile> {
+        validate_read_mode(mode)?;
+        let (key, resource) = py
+            .detach(|| {
+                self.runtime.block_on(open_file(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                    self.resources.clone(),
+                    path,
+                ))
+            })
+            .map_err(nfs_error)?;
+        Ok(SyncFile {
+            key,
+            resource,
+            resources: self.resources.clone(),
+            core: self.core.clone(),
+            runtime: self.runtime.clone(),
+        })
+    }
 }
 
 #[pyclass(name = "AsyncClient", module = "nfs_rs._internal")]
 struct AsyncClient {
     core: Arc<ClientCore>,
+    resources: Arc<AdapterResources>,
     version: NFSVersion,
     health: MountHealth,
     health_source: Option<Arc<dyn Mount>>,
@@ -727,6 +1176,7 @@ impl AsyncClient {
                 version,
                 health,
                 health_source,
+                resources,
             } = parts?;
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 if url.ends_with("/delay") {
@@ -734,6 +1184,7 @@ impl AsyncClient {
                 }
                 Ok(AsyncClient {
                     core,
+                    resources,
                     version,
                     health,
                     health_source,
@@ -750,9 +1201,11 @@ impl AsyncClient {
                 version,
                 health,
                 health_source,
+                resources,
             } = connected_parts(mount, capacity)?;
             Ok(AsyncClient {
                 core,
+                resources,
                 version,
                 health,
                 health_source,
@@ -812,6 +1265,25 @@ impl AsyncClient {
             })
         })
     }
+
+    #[pyo3(signature = (path, mode = "rb"))]
+    fn open<'py>(&self, py: Python<'py>, path: String, mode: &str) -> PyResult<Bound<'py, PyAny>> {
+        validate_read_mode(mode)?;
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let resources = self.resources.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (key, resource) = open_file(core.clone(), mount, resources.clone(), path)
+                .await
+                .map_err(nfs_error)?;
+            Ok(AsyncFile {
+                key,
+                resource,
+                resources,
+                core,
+            })
+        })
+    }
 }
 
 #[pymodule(gil_used = true)]
@@ -820,8 +1292,41 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AsyncClient>()?;
     module.add_class::<SyncDirectoryCursor>()?;
     module.add_class::<AsyncDirectoryCursor>()?;
+    module.add_class::<SyncFile>()?;
+    module.add_class::<AsyncFile>()?;
     module.add_function(wrap_pyfunction!(python_list_exports, module)?)?;
     module.add_function(wrap_pyfunction!(python_async_list_exports, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "python-test-support"))]
+mod read_only_file_tests {
+    use super::FileResource;
+
+    #[tokio::test]
+    async fn negotiated_chunks_are_reassembled() {
+        let file = FileResource::test();
+        assert_eq!(file.max_read(), 4);
+        let Ok(data) = file.read_at(2, 11).await else {
+            panic!("fixture read should succeed");
+        };
+        assert_eq!(data, b"cdefghijklm");
+    }
+
+    #[tokio::test]
+    async fn positional_reads_do_not_change_relative_position() {
+        let file = FileResource::test();
+        let Ok(initial) = file.read(3).await else {
+            panic!("fixture read should succeed");
+        };
+        assert_eq!(initial, b"abc");
+        let (left, right) = tokio::join!(file.read_at(4, 4), file.read_at(8, 4));
+        let (Ok(left), Ok(right)) = (left, right) else {
+            panic!("positional fixture reads should succeed");
+        };
+        assert_eq!(left, b"efgh");
+        assert_eq!(right, b"ijkl");
+        assert_eq!(file.tell(), 3);
+    }
 }

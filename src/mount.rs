@@ -129,6 +129,10 @@ impl OpenFile {
     pub(crate) fn protocol_state(&self) -> Option<&Bytes> {
         self.state.as_ref()
     }
+
+    pub(crate) fn file_handle(&self) -> Bytes {
+        self.object.fh.clone()
+    }
 }
 
 /// A byte-range lock together with everything required to release it safely.

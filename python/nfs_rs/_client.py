@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import io
 import os
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -312,6 +313,12 @@ class Client(_ClientOptions):
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name for entry in self.scandir(path)]
 
+    def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
+        normalized = _normalize_path(path)
+        if mode != "rb":
+            raise ValueError("Ticket 05 supports only binary read mode 'rb'")
+        return File(self._inner.open(normalized, mode), normalized, _CONSTRUCTION_TOKEN)
+
     def __enter__(self) -> Client:
         return self
 
@@ -397,6 +404,14 @@ class AsyncClient(_ClientOptions):
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name async for entry in self.scandir(path)]
 
+    async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
+        self._check_loop()
+        normalized = _normalize_path(path)
+        if mode != "rb":
+            raise ValueError("Ticket 05 supports only binary read mode 'rb'")
+        inner = await self._inner.open(normalized, mode)
+        return AsyncFile(inner, normalized, self._loop, _CONSTRUCTION_TOKEN)
+
     async def __aenter__(self) -> AsyncClient:
         self._check_loop()
         return self
@@ -411,6 +426,180 @@ class AsyncClient(_ClientOptions):
 
     def __repr__(self) -> str:
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"
+
+
+def _buffer_length(target: Any) -> int:
+    view = memoryview(target)
+    try:
+        if view.readonly:
+            raise TypeError("readinto target must be writable")
+        if not view.c_contiguous:
+            raise TypeError("readinto target must be C-contiguous")
+        return view.nbytes
+    finally:
+        view.release()
+
+
+def _copy_to_buffer(target: Any, expected_length: int, data: bytes) -> int:
+    view = memoryview(target)
+    try:
+        if view.readonly or not view.c_contiguous:
+            raise TypeError("readinto target must remain writable and C-contiguous")
+        if view.nbytes != expected_length:
+            raise BufferError("readinto target changed size during I/O")
+        bytes_view = view.cast("B")
+        bytes_view[: len(data)] = data
+        return len(data)
+    finally:
+        view.release()
+
+
+class File(io.RawIOBase):
+    __slots__ = ("_inner", "_name")
+
+    def __init__(self, inner: Any, name: str, token: object = None) -> None:
+        if token is not _CONSTRUCTION_TOKEN:
+            raise TypeError("File objects are created only by Client.open()")
+        super().__init__()
+        self._inner = inner
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def mode(self) -> str:
+        return "rb"
+
+    @property
+    def closed(self) -> bool:
+        return self._inner.closed
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        return self._inner.read(size)
+
+    def readinto(self, target: Any) -> int:
+        length = _buffer_length(target)
+        return _copy_to_buffer(target, length, self._inner.read(length))
+
+    def read_at(self, offset: int, size: int = -1) -> bytes:
+        return self._inner.read_at(offset, size)
+
+    def readinto_at(self, target: Any, offset: int) -> int:
+        length = _buffer_length(target)
+        return _copy_to_buffer(target, length, self._inner.read_at(offset, length))
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self._inner.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._inner.tell()
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("nfs-rs files do not expose OS file descriptors")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self._inner.close()
+        super().close()
+
+    def __enter__(self) -> File:
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, traceback: object) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            _record_cleanup_failure(exc, cleanup_error, "File")
+
+
+class AsyncFile:
+    __slots__ = ("_inner", "_name", "_loop")
+
+    def __init__(
+        self,
+        inner: Any,
+        name: str,
+        loop: asyncio.AbstractEventLoop,
+        token: object = None,
+    ) -> None:
+        if token is not _CONSTRUCTION_TOKEN:
+            raise TypeError("AsyncFile objects are created only by AsyncClient.open()")
+        self._inner = inner
+        self._name = name
+        self._loop = loop
+
+    def _check_loop(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("AsyncFile may only be used from its creating event loop")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def mode(self) -> str:
+        return "rb"
+
+    @property
+    def closed(self) -> bool:
+        return self._inner.closed
+
+    def tell(self) -> int:
+        return self._inner.tell()
+
+    async def read(self, size: int = -1) -> bytes:
+        self._check_loop()
+        return await self._inner.read(size)
+
+    async def readinto(self, target: Any) -> int:
+        self._check_loop()
+        length = _buffer_length(target)
+        data = await self._inner.read(length)
+        return _copy_to_buffer(target, length, data)
+
+    async def read_at(self, offset: int, size: int = -1) -> bytes:
+        self._check_loop()
+        return await self._inner.read_at(offset, size)
+
+    async def readinto_at(self, target: Any, offset: int) -> int:
+        self._check_loop()
+        length = _buffer_length(target)
+        data = await self._inner.read_at(offset, length)
+        return _copy_to_buffer(target, length, data)
+
+    async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._check_loop()
+        return await self._inner.seek(offset, whence)
+
+    async def close(self) -> None:
+        self._check_loop()
+        await self._inner.close()
+
+    async def __aenter__(self) -> AsyncFile:
+        self._check_loop()
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: BaseException | None, traceback: object) -> None:
+        try:
+            await self.close()
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            _record_cleanup_failure(exc, cleanup_error, "AsyncFile")
 
 
 def list_exports(host: str, **options: Any) -> tuple[ExportEntry, ...]:

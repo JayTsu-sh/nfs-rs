@@ -241,15 +241,26 @@ impl ClientCore {
     }
 
     pub fn register_resource(&self) -> Result<ResourceKey> {
+        let key = self.allocate_resource_key()?;
+        self.publish_resource(key)?;
+        Ok(key)
+    }
+
+    pub fn allocate_resource_key(&self) -> Result<ResourceKey> {
         self.ensure_ready()?;
-        let key = ResourceKey(self.next_resource_key.fetch_add(1, Ordering::Relaxed));
+        Ok(ResourceKey(
+            self.next_resource_key.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    pub fn publish_resource(&self, key: ResourceKey) -> Result<()> {
         let mut resources = self
             .resources
             .lock()
             .map_err(|_| NfsError::Rpc("client resource registry lock poisoned".to_string()))?;
         self.ensure_ready()?;
         resources.push(key);
-        Ok(key)
+        Ok(())
     }
 
     pub fn unregister_resource(&self, key: ResourceKey) -> Result<bool> {

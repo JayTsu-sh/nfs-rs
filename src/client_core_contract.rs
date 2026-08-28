@@ -176,6 +176,16 @@ async fn explicitly_unregistered_resource_is_not_closed_again_by_client_close() 
 }
 
 #[tokio::test]
+async fn allocated_resource_is_invisible_until_published() {
+    let core = ClientCore::new(Arc::new(RecordingDriver::default()));
+    let key = core.allocate_resource_key().unwrap();
+    assert_eq!(core.resource_count(), 0);
+    core.publish_resource(key).unwrap();
+    assert_eq!(core.resource_count(), 1);
+    core.close().await;
+}
+
+#[tokio::test]
 async fn cleanup_continues_after_resource_errors_and_reports_them_in_order() {
     let driver = Arc::new(FailingDriver::default());
     let core = ClientCore::new(driver.clone());
