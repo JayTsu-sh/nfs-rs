@@ -20,5 +20,8 @@ def test_failure_artifact_is_sanitized_and_reproducible(tmp_path, monkeypatch) -
     assert payload["seed"] == "seed-42"
     assert payload["barrier_phase"] == "after-send-before-response"
     assert payload["operation"] == "rename"
-    assert "10.1.2.3" not in payload["failure"]
+    assert payload["result"] == "failed"
+    assert "failure" not in payload
+    assert "10.1.2.3" not in artifact.read_text(encoding="utf-8")
+    assert "do not retain" not in artifact.read_text(encoding="utf-8")
     assert "/" not in artifact.name

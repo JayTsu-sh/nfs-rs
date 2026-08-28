@@ -278,8 +278,8 @@ impl ClientCore {
     pub fn resource_count(&self) -> usize {
         self.resources
             .lock()
-            .map(|resources| resources.len())
-            .unwrap_or_default()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub fn begin_operation(self: &Arc<Self>) -> Result<OperationGuard> {
@@ -325,18 +325,18 @@ impl ClientCore {
     }
 
     pub async fn close(self: &Arc<Self>) -> Arc<ClientCloseReport> {
-        let start_cleanup = self
-            .close_state
-            .lock()
-            .map(|mut state| {
-                if state.started {
-                    false
-                } else {
-                    state.started = true;
-                    true
-                }
-            })
-            .unwrap_or(false);
+        let start_cleanup = {
+            let mut state = self
+                .close_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.started {
+                false
+            } else {
+                state.started = true;
+                true
+            }
+        };
         if start_cleanup {
             self.lifecycle.store(CLOSING, Ordering::Release);
             self.lifecycle_notify.notify_waiters();
@@ -351,8 +351,9 @@ impl ClientCore {
             if let Some(report) = self
                 .close_state
                 .lock()
-                .ok()
-                .and_then(|state| state.report.clone())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .report
+                .clone()
             {
                 return report;
             }
@@ -364,11 +365,23 @@ impl ClientCore {
         self.in_flight.wait_for_zero().await;
         self.owned_tasks.wait_for_zero().await;
         let mut errors = Vec::new();
-        let resources = self
-            .resources
-            .lock()
-            .map(|mut resources| std::mem::take(&mut *resources))
-            .unwrap_or_default();
+        if self.close_state.is_poisoned() {
+            errors.push(Arc::new(NfsError::Rpc(
+                "client close-state lock poisoned".to_string(),
+            )));
+        }
+        if self.resources.is_poisoned() {
+            errors.push(Arc::new(NfsError::Rpc(
+                "client resource registry lock poisoned".to_string(),
+            )));
+        }
+        let resources = {
+            let mut resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *resources)
+        };
         for key in resources {
             if let Err(error) = self.driver.close_resource(key).await {
                 errors.push(Arc::new(error));
@@ -380,9 +393,10 @@ impl ClientCore {
         self.lifecycle.store(CLOSED, Ordering::Release);
         self.lifecycle_notify.notify_waiters();
         let report = Arc::new(ClientCloseReport { errors });
-        if let Ok(mut state) = self.close_state.lock() {
-            state.report = Some(report);
-        }
+        self.close_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .report = Some(report);
         self.close_notify.notify_waiters();
     }
 }
@@ -407,5 +421,72 @@ struct OwnedTaskGuard {
 impl Drop for OwnedTaskGuard {
     fn drop(&mut self) {
         self.core.finish_owned_task();
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[derive(Debug, Default)]
+    struct Driver {
+        closed: Mutex<Vec<ResourceKey>>,
+    }
+
+    #[async_trait]
+    impl ClientDriver for Driver {
+        async fn execute(&self, _operation: CoreOperation) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close_resource(&self, key: ResourceKey) -> Result<()> {
+            self.closed.lock().unwrap().push(key);
+            Ok(())
+        }
+
+        async fn umount(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_resource_registry_is_reported_without_skipping_cleanup() {
+        let driver = Arc::new(Driver::default());
+        let core = ClientCore::new(driver.clone());
+        let key = core.register_resource().unwrap();
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = core.resources.lock().unwrap();
+            panic!("poison resource registry");
+        }));
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1), core.close())
+            .await
+            .expect("poisoned close must terminate");
+        assert!(
+            report.errors()[0]
+                .to_string()
+                .contains("registry lock poisoned")
+        );
+        assert_eq!(*driver.closed.lock().unwrap(), vec![key]);
+    }
+
+    #[tokio::test]
+    async fn poisoned_close_state_is_reported_and_publishes_terminal_report() {
+        let core = ClientCore::new(Arc::new(Driver::default()));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = core.close_state.lock().unwrap();
+            panic!("poison close state");
+        }));
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1), core.close())
+            .await
+            .expect("poisoned close must terminate");
+        assert!(
+            report.errors()[0]
+                .to_string()
+                .contains("close-state lock poisoned")
+        );
+        assert_eq!(core.lifecycle(), ClientLifecycle::Closed);
     }
 }

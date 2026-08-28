@@ -63,6 +63,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+      - name: Gate formatting and Rust quality
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
       - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
@@ -81,6 +86,13 @@ jobs:
             NFS_RS_CONTRACT_ENVIRONMENT="release-${{ runner.os }}-${{ runner.arch }}-py310" \
             NFS_RS_TEST_SEED=0 \
             python -m pytest -q python/tests
+      - name: Upload non-publishable Python protocol-smoke fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-support-x86_64
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/python-contract-wheel/*.whl
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
@@ -238,3 +250,27 @@ jobs:
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
+
+  intermediate-python-smoke:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: python-test-support-x86_64
+          path: test-wheel
+      - name: Install, import, and run sync/async protocol smoke
+        run: |
+          python -m pip install --no-deps test-wheel/*.whl
+          python -c "import importlib.metadata, nfs_rs; assert nfs_rs.__version__ == importlib.metadata.version('nfs-rs')"
+          python scripts/smoke-python-artifact.py

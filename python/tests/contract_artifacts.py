@@ -10,8 +10,6 @@ from typing import Any
 
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
-_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_CREDENTIAL = re.compile(r"(?i)\b(token|password|secret)\s*=\s*\S+")
 
 
 def sanitized(value: object, *, fallback: str) -> str:
@@ -37,12 +35,14 @@ def failure_context(nodeid: str, parameters: dict[str, Any]) -> dict[str, str]:
 
 
 def write_failure_artifact(
-    directory: Path, nodeid: str, parameters: dict[str, Any], failure: str,
+    directory: Path, nodeid: str, parameters: dict[str, Any], _failure: str,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     context = failure_context(nodeid, parameters)
-    scrubbed = _CREDENTIAL.sub(r"\1=redacted", _IPV4.sub("redacted-ip", failure))
-    context["failure"] = sanitized(scrubbed, fallback="unknown-failure")
+    # Never persist pytest's free-form failure text: assertion values, URLs,
+    # headers, and third-party errors can all contain credentials. The
+    # allowlisted fields above are sufficient to reproduce deterministic gates.
+    context["result"] = "failed"
     destination = directory / f"{context['test']}.json"
     destination.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return destination

@@ -45,6 +45,20 @@ def test_release_preflight_covers_audits_checksums_and_partial_recovery() -> Non
     assert 'publish_crate = False' in registry
 
 
+def test_release_gates_rust_quality_and_intermediate_python_smoke() -> None:
+    validation = (ROOT / ".github/workflows/release-validation.yml").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "cargo fmt --all -- --check",
+        "cargo clippy --all-targets --locked -- -D warnings",
+        'python-version: ["3.11", "3.12", "3.13"]',
+        "python-test-support-x86_64",
+        "scripts/smoke-python-artifact.py",
+    ):
+        assert required in validation
+
+
 def test_python_documentation_covers_first_release_contract() -> None:
     guide = (ROOT / "docs/python-api.md").read_text(encoding="utf-8").lower()
     for required in (
