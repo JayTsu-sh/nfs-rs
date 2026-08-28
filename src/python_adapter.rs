@@ -1092,13 +1092,28 @@ async fn namespace_operation(
         NamespaceOperation::Mkdir(mode) => mount.mkdir_path(&first, mode).await.map(|_| ()),
         NamespaceOperation::Remove => mount.remove_path(&first).await,
         NamespaceOperation::Rmdir => mount.rmdir_path(&first).await,
-        NamespaceOperation::Rename => mount.rename_path(&first, second.as_deref().unwrap()).await,
+        NamespaceOperation::Rename => {
+            let destination = second.as_deref().ok_or_else(|| {
+                NfsError::InvalidInput("rename requires a destination".to_string())
+            })?;
+            mount.rename_path(&first, destination).await
+        }
         NamespaceOperation::Link => mount
-            .link_path(&first, second.as_deref().unwrap())
+            .link_path(
+                &first,
+                second.as_deref().ok_or_else(|| {
+                    NfsError::InvalidInput("link requires a destination".to_string())
+                })?,
+            )
             .await
             .map(|_| ()),
         NamespaceOperation::Symlink => mount
-            .symlink_path(&first, second.as_deref().unwrap())
+            .symlink_path(
+                &first,
+                second.as_deref().ok_or_else(|| {
+                    NfsError::InvalidInput("symlink requires a link path".to_string())
+                })?,
+            )
             .await
             .map(|_| ()),
     }
