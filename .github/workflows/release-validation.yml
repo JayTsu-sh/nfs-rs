@@ -74,9 +74,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: "0.13.0"
+      - name: Discover pre-provisioned Zig 0.13.0
+        run: |
+          zig_bin=""
+          for candidate in \
+            "/opt/zig/0.13.0" \
+            "/home/github-runner/.local/zig/0.13.0"; do
+            if [[ -x "$candidate/zig" ]]; then
+              zig_bin="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$zig_bin" ]]; then
+            echo "pre-provisioned Zig 0.13.0 not found" >&2
+            exit 1
+          fi
+          echo "$zig_bin" >> "$GITHUB_PATH"
+      - name: Use pre-provisioned Zig 0.13.0
+        run: test "$(zig version)" = "0.13.0"
       - run: python -m pip install "maturin>=1,<2"
       - name: Gate the installed Python contract and typing registry
         run: |
@@ -217,9 +232,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: "0.13.0"
+      - name: Discover pre-provisioned Zig 0.13.0
+        run: |
+          zig_bin=""
+          for candidate in \
+            "/opt/zig/0.13.0" \
+            "/home/github-runner/.local/zig/0.13.0"; do
+            if [[ -x "$candidate/zig" ]]; then
+              zig_bin="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$zig_bin" ]]; then
+            echo "pre-provisioned Zig 0.13.0 not found" >&2
+            exit 1
+          fi
+          echo "$zig_bin" >> "$GITHUB_PATH"
+      - name: Use pre-provisioned Zig 0.13.0
+        run: test "$(zig version)" = "0.13.0"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
