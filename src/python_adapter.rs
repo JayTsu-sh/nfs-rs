@@ -118,7 +118,15 @@ enum FileBackend {
         data: Arc<tokio::sync::Mutex<Vec<u8>>>,
         max_read: u32,
         max_write: u32,
+        write_fault: Option<TestWriteFault>,
     },
+}
+
+#[cfg(feature = "python-test-support")]
+#[derive(Clone, Copy, Debug)]
+enum TestWriteFault {
+    DefiniteAt(u64),
+    ZeroAt(u64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -134,10 +142,7 @@ impl FileMode {
     fn parse(mode: &str) -> Result<Self> {
         let base = mode.as_bytes().first().copied();
         let update = mode.contains('+');
-        let valid = matches!(
-            mode,
-            "rb" | "wb" | "ab" | "r+b" | "w+b" | "a+b" | "rb+" | "wb+" | "ab+"
-        );
+        let valid = matches!(mode, "rb" | "wb" | "ab" | "r+b" | "w+b" | "a+b");
         if !valid {
             return Err(NfsError::InvalidInput(
                 "unsupported binary file mode".to_string(),
@@ -170,7 +175,7 @@ struct FileResource {
     relative_gate: tokio::sync::Mutex<()>,
     position: AtomicU64,
     position_uncertain: AtomicBool,
-    dirty_ranges: tokio::sync::Mutex<Vec<(u64, u64)>>,
+    dirty_state: tokio::sync::Mutex<DirtyState>,
     close_state: Mutex<FileCloseState>,
     close_started: Notify,
     close_notify: Notify,
@@ -178,6 +183,14 @@ struct FileResource {
     test_fail_commit: bool,
     #[cfg(feature = "python-test-support")]
     test_commit_calls: AtomicU64,
+    #[cfg(feature = "python-test-support")]
+    test_verifier_change: bool,
+}
+
+#[derive(Debug, Default)]
+struct DirtyState {
+    ranges: Vec<(u64, u64)>,
+    verifier: Option<[u8; 8]>,
 }
 
 #[derive(Debug, Default)]
@@ -206,11 +219,80 @@ fn shared_nfs_error(error: Arc<NfsError>) -> NfsError {
     NfsError::Io(std::io::Error::new(error.kind(), SharedNfsFailure(error)))
 }
 
-fn with_confirmed_bytes(mut error: NfsError, confirmed: u64) -> NfsError {
+fn with_confirmed_bytes(mut error: NfsError, confirmed: u64, protocol: NFSVersion) -> NfsError {
     if let NfsError::OperationOutcome(outcome) = &mut error {
         outcome.completed_bytes = Some(confirmed);
+        return error;
     }
-    error
+    if confirmed == 0 {
+        return error;
+    }
+    let definite = matches!(
+        error,
+        NfsError::Nfs3(_)
+            | NfsError::Nfs4(_)
+            | NfsError::LockDenied { .. }
+            | NfsError::Mount(_)
+            | NfsError::Unsupported(_)
+            | NfsError::InvalidInput(_)
+            | NfsError::RdattrError(_)
+    );
+    let outcome = if definite {
+        crate::OperationOutcome::DefiniteFailure
+    } else {
+        crate::OperationOutcome::Uncertain
+    };
+    let recovery = if definite {
+        crate::RecoveryAction::DoNotRetry
+    } else {
+        crate::RecoveryAction::VerifyThenResume
+    };
+    NfsError::OperationOutcome(Box::new(
+        crate::OperationOutcomeError::new(
+            outcome,
+            crate::OperationClass::ReplaySensitive,
+            recovery,
+            crate::RequestContext {
+                operation: "write".to_string(),
+                protocol,
+                request_id: None,
+            },
+            error,
+        )
+        .with_completed_bytes(confirmed),
+    ))
+}
+
+fn write_uncertain_error(message: &str, protocol: NFSVersion, confirmed: u64) -> NfsError {
+    with_confirmed_bytes(
+        NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
+            crate::OperationOutcome::Uncertain,
+            crate::OperationClass::ReplaySensitive,
+            crate::RecoveryAction::VerifyThenResume,
+            crate::RequestContext {
+                operation: "write".to_string(),
+                protocol,
+                request_id: None,
+            },
+            NfsError::Rpc(message.to_string()),
+        ))),
+        confirmed,
+        protocol,
+    )
+}
+
+fn commit_uncertain_error(message: &str, protocol: NFSVersion) -> NfsError {
+    NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
+        crate::OperationOutcome::Uncertain,
+        crate::OperationClass::ReplaySensitive,
+        crate::RecoveryAction::VerifyThenResume,
+        crate::RequestContext {
+            operation: "commit".to_string(),
+            protocol,
+            request_id: None,
+        },
+        NfsError::Rpc(message.to_string()),
+    )))
 }
 
 impl FileResource {
@@ -231,7 +313,7 @@ impl FileResource {
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(position),
             position_uncertain: AtomicBool::new(false),
-            dirty_ranges: tokio::sync::Mutex::new(Vec::new()),
+            dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
             close_state: Mutex::new(FileCloseState {
                 started: false,
                 file: Some(file),
@@ -243,6 +325,8 @@ impl FileResource {
             test_fail_commit: false,
             #[cfg(feature = "python-test-support")]
             test_commit_calls: AtomicU64::new(0),
+            #[cfg(feature = "python-test-support")]
+            test_verifier_change: false,
         })
     }
 
@@ -251,6 +335,8 @@ impl FileResource {
         mode: FileMode,
         data: Arc<tokio::sync::Mutex<Vec<u8>>>,
         fail_commit: bool,
+        write_fault: Option<TestWriteFault>,
+        verifier_change: bool,
     ) -> Arc<Self> {
         if mode.truncate {
             data.lock().await.clear();
@@ -267,17 +353,19 @@ impl FileResource {
                 data,
                 max_read: 4,
                 max_write: 4,
+                write_fault,
             },
             mode,
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(position),
             position_uncertain: AtomicBool::new(false),
-            dirty_ranges: tokio::sync::Mutex::new(Vec::new()),
+            dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
             close_state: Mutex::new(FileCloseState::default()),
             close_started: Notify::new(),
             close_notify: Notify::new(),
             test_fail_commit: fail_commit,
             test_commit_calls: AtomicU64::new(0),
+            test_verifier_change: verifier_change,
         })
     }
 
@@ -428,32 +516,72 @@ impl FileResource {
         }
     }
 
-    async fn write_chunk(&self, offset: u64, data: Bytes) -> Result<u32> {
+    fn protocol_version(&self) -> NFSVersion {
+        match &self.backend {
+            FileBackend::Mount { mount, .. } => mount.version(),
+            #[cfg(feature = "python-test-support")]
+            FileBackend::Test { .. } => NFSVersion::NFSv4p1,
+        }
+    }
+
+    async fn write_chunk(&self, offset: u64, data: Bytes) -> Result<crate::WriteOutcome> {
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
-            } => mount.write(file_handle.clone(), offset, data).await,
+            } => {
+                mount
+                    .write_with_outcome(file_handle.clone(), offset, data)
+                    .await
+            }
             #[cfg(feature = "python-test-support")]
-            FileBackend::Test { data: target, .. } => {
+            FileBackend::Test {
+                data: target,
+                write_fault,
+                ..
+            } => {
+                if matches!(write_fault, Some(TestWriteFault::DefiniteAt(at)) if offset >= *at) {
+                    return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOSPC));
+                }
+                if matches!(write_fault, Some(TestWriteFault::ZeroAt(at)) if offset >= *at) {
+                    return Ok(crate::WriteOutcome {
+                        count: 0,
+                        stable: false,
+                        verifier: None,
+                    });
+                }
                 let written = data.len().min(2);
                 let start = usize::try_from(offset).map_err(|_| {
                     NfsError::InvalidInput("write offset exceeds platform size".to_string())
                 })?;
+                let end = start.checked_add(written).ok_or_else(|| {
+                    NfsError::InvalidInput("write range exceeds platform size".to_string())
+                })?;
                 let mut target = target.lock().await;
-                if target.len() < start {
+                let current_len = target.len();
+                if current_len < start {
+                    target.try_reserve(start - current_len).map_err(|_| {
+                        NfsError::InvalidInput("write range is too large".to_string())
+                    })?;
                     target.resize(start, 0);
                 }
-                if target.len() < start.saturating_add(written) {
-                    target.resize(start.saturating_add(written), 0);
+                let current_len = target.len();
+                if current_len < end {
+                    target.try_reserve(end - current_len).map_err(|_| {
+                        NfsError::InvalidInput("write range is too large".to_string())
+                    })?;
+                    target.resize(end, 0);
                 }
-                target[start..start + written].copy_from_slice(&data[..written]);
-                Ok(written as u32)
+                target[start..end].copy_from_slice(&data[..written]);
+                Ok(crate::WriteOutcome {
+                    count: written as u32,
+                    stable: false,
+                    verifier: self.test_verifier_change.then_some([1; 8]),
+                })
             }
         }
     }
 
-    async fn mark_dirty(&self, start: u64, end: u64) {
-        let mut ranges = self.dirty_ranges.lock().await;
+    fn merge_dirty_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
         ranges.push((start, end));
         ranges.sort_unstable_by_key(|range| range.0);
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -469,7 +597,24 @@ impl FileResource {
         *ranges = merged;
     }
 
-    async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
+    async fn record_write(&self, start: u64, end: u64, outcome: crate::WriteOutcome) -> bool {
+        let mut dirty = self.dirty_state.lock().await;
+        let verifier_changed = outcome
+            .verifier
+            .is_some_and(|verifier| dirty.verifier.is_some_and(|expected| expected != verifier));
+        if !outcome.stable || verifier_changed {
+            Self::merge_dirty_range(&mut dirty.ranges, start, end);
+        }
+        if !outcome.stable
+            && !verifier_changed
+            && let Some(verifier) = outcome.verifier
+        {
+            dirty.verifier = Some(verifier);
+        }
+        verifier_changed
+    }
+
+    async fn write_complete_at(&self, offset: u64, data: Bytes) -> Result<u64> {
         if !self.mode.writable {
             return Err(NfsError::InvalidInput("file is not writable".to_string()));
         }
@@ -479,21 +624,47 @@ impl FileResource {
             let remaining = &data[confirmed as usize..];
             let count = remaining.len().min(self.max_write() as usize);
             let chunk = Bytes::copy_from_slice(&remaining[..count]);
-            let written = match self.write_chunk(current, chunk).await {
-                Ok(written) => u64::from(written),
-                Err(error) => return Err(with_confirmed_bytes(error, confirmed)),
+            let outcome = match self.write_chunk(current, chunk).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(with_confirmed_bytes(
+                        error,
+                        confirmed,
+                        self.protocol_version(),
+                    ));
+                }
             };
+            let written = u64::from(outcome.count);
             if written == 0 || written > count as u64 {
-                return Err(NfsError::Rpc(
-                    "server returned an invalid write count".to_string(),
+                return Err(write_uncertain_error(
+                    "server returned an invalid write count",
+                    self.protocol_version(),
+                    confirmed,
                 ));
             }
-            self.mark_dirty(current, current.saturating_add(written))
-                .await;
+            if self
+                .record_write(current, current.saturating_add(written), outcome)
+                .await
+            {
+                return Err(write_uncertain_error(
+                    "write verifier changed before commit",
+                    self.protocol_version(),
+                    confirmed.saturating_add(written),
+                ));
+            }
             current = current.saturating_add(written);
             confirmed = confirmed.saturating_add(written);
         }
         Ok(confirmed)
+    }
+
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
+        if self.mode.append {
+            return Err(NfsError::InvalidInput(
+                "positional writes are unavailable in append mode".to_string(),
+            ));
+        }
+        self.write_complete_at(offset, data).await
     }
 
     async fn write(&self, data: Bytes) -> Result<u64> {
@@ -508,18 +679,20 @@ impl FileResource {
         } else {
             self.position.load(Ordering::Acquire)
         };
-        match self.write_at(position, data).await {
+        match self.write_complete_at(position, data).await {
             Ok(written) => {
                 self.position
                     .store(position.saturating_add(written), Ordering::Release);
                 Ok(written)
             }
             Err(error) => {
-                if error
-                    .operation_outcome()
-                    .is_some_and(|outcome| outcome.outcome == crate::OperationOutcome::Uncertain)
-                {
-                    self.position_uncertain.store(true, Ordering::Release);
+                if let Some(outcome) = error.operation_outcome() {
+                    if outcome.outcome == crate::OperationOutcome::Uncertain {
+                        self.position_uncertain.store(true, Ordering::Release);
+                    } else if let Some(confirmed) = outcome.completed_bytes {
+                        self.position
+                            .store(position.saturating_add(confirmed), Ordering::Release);
+                    }
                 }
                 Err(error)
             }
@@ -556,11 +729,14 @@ impl FileResource {
                 data.lock().await.resize(size, 0);
             }
         }
-        let mut dirty = self.dirty_ranges.lock().await;
-        for range in dirty.iter_mut() {
+        let mut dirty = self.dirty_state.lock().await;
+        for range in dirty.ranges.iter_mut() {
             range.1 = range.1.min(size);
         }
-        dirty.retain(|range| range.0 < range.1);
+        dirty.ranges.retain(|range| range.0 < range.1);
+        if dirty.ranges.is_empty() {
+            dirty.verifier = None;
+        }
         Ok(size)
     }
 
@@ -568,32 +744,59 @@ impl FileResource {
         if !self.mode.writable {
             return Ok(());
         }
-        let mut ranges = self.dirty_ranges.lock().await;
-        for &(start, end) in ranges.iter() {
+        let mut dirty = self.dirty_state.lock().await;
+        let expected_verifier = dirty.verifier;
+        for &(start, end) in dirty.ranges.iter() {
             let mut offset = start;
             while offset < end {
                 let count = (end - offset).min(u64::from(u32::MAX)) as u32;
                 match &self.backend {
                     FileBackend::Mount {
                         mount, file_handle, ..
-                    } => mount.commit(file_handle.clone(), offset, count).await?,
+                    } => {
+                        let verifier = mount
+                            .commit_with_verifier(file_handle.clone(), offset, count)
+                            .await?;
+                        if let (Some(expected), Some(actual)) = (expected_verifier, verifier)
+                            && expected != actual
+                        {
+                            return Err(commit_uncertain_error(
+                                "commit verifier changed; dirty data may have been lost",
+                                mount.version(),
+                            ));
+                        }
+                    }
                     #[cfg(feature = "python-test-support")]
                     FileBackend::Test { .. } => {
                         self.test_commit_calls.fetch_add(1, Ordering::Relaxed);
                         if self.test_fail_commit {
                             return Err(NfsError::Rpc("scripted commit failure".to_string()));
                         }
+                        if self.test_verifier_change
+                            && expected_verifier.is_some_and(|expected| expected != [2; 8])
+                        {
+                            return Err(commit_uncertain_error(
+                                "commit verifier changed; dirty data may have been lost",
+                                NFSVersion::NFSv3,
+                            ));
+                        }
                     }
                 }
                 offset = offset.saturating_add(u64::from(count));
             }
         }
-        ranges.clear();
+        dirty.ranges.clear();
+        dirty.verifier = None;
         Ok(())
     }
 
     async fn seek(&self, offset: i64, whence: i32) -> Result<u64> {
         let _guard = self.relative_gate.lock().await;
+        if whence != 0 && self.position_uncertain.load(Ordering::Acquire) {
+            return Err(NfsError::InvalidInput(
+                "file position is uncertain; only absolute seek is allowed".to_string(),
+            ));
+        }
         let position = self.position.load(Ordering::Acquire);
         let base = match whence {
             0 => 0_i128,
@@ -1190,6 +1393,12 @@ async fn open_file(
                 mode,
                 resources.test_file(&path)?,
                 path == "__commit_error__",
+                match path.as_str() {
+                    "__partial_write_error__" => Some(TestWriteFault::DefiniteAt(2)),
+                    "__zero_write__" => Some(TestWriteFault::ZeroAt(0)),
+                    _ => None,
+                },
+                path == "__verifier_change__",
             )
             .await
         }
@@ -1934,7 +2143,7 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, feature = "python-test-support"))]
 mod read_only_file_tests {
-    use super::{FileMode, FileResource, with_confirmed_bytes};
+    use super::{FileMode, FileResource, TestWriteFault, with_confirmed_bytes};
     use crate::error::{
         OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction, RequestContext,
     };
@@ -1951,6 +2160,8 @@ mod read_only_file_tests {
             Arc::new(tokio::sync::Mutex::new(
                 b"abcdefghijklmnopqrstuvwxyz".to_vec(),
             )),
+            false,
+            None,
             false,
         )
         .await
@@ -2013,9 +2224,9 @@ mod read_only_file_tests {
             file.read_at(0, -1).await.ok().as_deref(),
             Some(&b"abcdefghij"[..])
         );
-        assert!(!file.dirty_ranges.lock().await.is_empty());
+        assert!(!file.dirty_state.lock().await.ranges.is_empty());
         assert!(file.flush_inner().await.is_ok());
-        assert!(file.dirty_ranges.lock().await.is_empty());
+        assert!(file.dirty_state.lock().await.ranges.is_empty());
     }
 
     #[tokio::test]
@@ -2023,11 +2234,10 @@ mod read_only_file_tests {
         let mode = FileMode::parse("a+b").unwrap_or_else(|_| panic!("a+b mode must be valid"));
         let file = test_file(mode).await;
         assert_eq!(file.tell().ok(), Some(26));
-        assert_eq!(
+        assert!(
             file.write_at(0, bytes::Bytes::from_static(b"XY"))
                 .await
-                .ok(),
-            Some(2)
+                .is_err()
         );
         assert_eq!(file.tell().ok(), Some(26));
         assert_eq!(
@@ -2044,8 +2254,14 @@ mod read_only_file_tests {
     #[tokio::test]
     async fn failed_flush_preserves_dirty_state_and_close_reuses_terminal_result() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
-        let file =
-            FileResource::test(mode, Arc::new(tokio::sync::Mutex::new(Vec::new())), true).await;
+        let file = FileResource::test(
+            mode,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            true,
+            None,
+            false,
+        )
+        .await;
         assert_eq!(
             file.write(bytes::Bytes::from_static(b"dirty")).await.ok(),
             Some(5)
@@ -2059,7 +2275,7 @@ mod read_only_file_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert!(!file.dirty_ranges.lock().await.is_empty());
+        assert!(!file.dirty_state.lock().await.ranges.is_empty());
     }
 
     #[test]
@@ -2075,12 +2291,111 @@ mod read_only_file_tests {
             },
             NfsError::Rpc("current chunk reply lost".to_string()),
         )));
-        let error = with_confirmed_bytes(error, 8);
+        let error = with_confirmed_bytes(error, 8, NFSVersion::NFSv4p1);
         assert_eq!(
             error
                 .operation_outcome()
                 .and_then(|outcome| outcome.completed_bytes),
             Some(8)
         );
+    }
+
+    #[tokio::test]
+    async fn definite_partial_write_advances_position_to_confirmed_boundary() {
+        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+        let file = FileResource::test(
+            mode,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            false,
+            Some(TestWriteFault::DefiniteAt(2)),
+            false,
+        )
+        .await;
+        let error = file.write(bytes::Bytes::from_static(b"abcde")).await;
+        let Err(error) = error else {
+            panic!("scripted partial write must fail");
+        };
+        assert_eq!(
+            error
+                .operation_outcome()
+                .and_then(|outcome| outcome.completed_bytes),
+            Some(2)
+        );
+        assert_eq!(file.tell().ok(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn zero_write_reply_poisons_relative_position() {
+        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+        let file = FileResource::test(
+            mode,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            false,
+            Some(TestWriteFault::ZeroAt(0)),
+            false,
+        )
+        .await;
+        assert!(file.write(bytes::Bytes::from_static(b"x")).await.is_err());
+        assert!(file.write(bytes::Bytes::from_static(b"y")).await.is_err());
+        assert!(file.seek(0, 1).await.is_err());
+        assert_eq!(file.seek(3, 0).await.ok(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn verifier_change_preserves_dirty_ranges() {
+        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+        let file = test_file(mode).await;
+        assert!(
+            !file
+                .record_write(
+                    0,
+                    2,
+                    crate::WriteOutcome {
+                        count: 2,
+                        stable: false,
+                        verifier: Some([1; 8]),
+                    },
+                )
+                .await
+        );
+        assert!(
+            file.record_write(
+                2,
+                4,
+                crate::WriteOutcome {
+                    count: 2,
+                    stable: false,
+                    verifier: Some([2; 8]),
+                },
+            )
+            .await
+        );
+        assert_eq!(file.dirty_state.lock().await.ranges, vec![(0, 4)]);
+    }
+
+    #[tokio::test]
+    async fn commit_verifier_change_fails_flush_without_clearing_dirty_state() {
+        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+        let file = FileResource::test(
+            mode,
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            false,
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(
+            file.write(bytes::Bytes::from_static(b"data")).await.ok(),
+            Some(4)
+        );
+        let error = file.flush_inner().await;
+        assert!(
+            error
+                .as_ref()
+                .err()
+                .and_then(NfsError::operation_outcome)
+                .is_some_and(|outcome| outcome.outcome == OperationOutcome::Uncertain)
+        );
+        assert!(!file.dirty_state.lock().await.ranges.is_empty());
     }
 }

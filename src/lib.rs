@@ -275,7 +275,7 @@ pub use mount::{
     LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState, NFSVersion,
     Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes,
     OpenFile, Pathconf, PathconfSupport, ReaddirEntry, ReaddirStream, ReaddirplusEntry,
-    ReaddirplusStream, SupportedPathconf,
+    ReaddirplusStream, SupportedPathconf, WriteOutcome,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配

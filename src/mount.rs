@@ -40,6 +40,15 @@ pub const OPEN_READ: u32 = 1;
 pub const OPEN_WRITE: u32 = 2;
 pub const OPEN_BOTH: u32 = 3;
 
+/// Protocol write acknowledgement used by higher-level durability adapters.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteOutcome {
+    pub count: u32,
+    pub stable: bool,
+    pub verifier: Option<[u8; 8]>,
+}
+
 /// Negotiated and currently effective NFSv4.1 fore-channel bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nfs41ChannelLimits {
@@ -345,6 +354,17 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// }
     /// ```
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()>;
+
+    #[doc(hidden)]
+    async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
+        self.commit(fh, offset, count).await?;
+        Ok(None)
+    }
 
     /// Same as [`Mount::commit`] but instead of taking in a file handle, takes in a path for which file handle is
     /// obtained by performing one or more LOOKUP procedures.
@@ -960,6 +980,20 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// }
     /// ```
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32>;
+
+    #[doc(hidden)]
+    async fn write_with_outcome(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<WriteOutcome> {
+        Ok(WriteOutcome {
+            count: self.write(fh, offset, data).await?,
+            stable: false,
+            verifier: None,
+        })
+    }
 
     /// Same as [`Mount::write`] but instead of taking in a file handle, takes in a path for which file handle is
     /// obtained by performing one or more LOOKUP procedures.

@@ -460,14 +460,13 @@ def _copy_to_buffer(target: Any, expected_length: int, data: bytes) -> int:
         view.release()
 
 
-_BINARY_MODES = frozenset({"rb", "wb", "ab", "r+b", "w+b", "a+b", "rb+", "wb+", "ab+"})
+_BINARY_MODES = frozenset({"rb", "wb", "ab", "r+b", "w+b", "a+b"})
 
 
 def _validate_binary_mode(mode: str) -> str:
     if mode not in _BINARY_MODES:
         raise ValueError(
-            "mode must be one of 'rb', 'wb', 'ab', 'r+b', 'w+b', 'a+b', "
-            "'rb+', 'wb+', or 'ab+'"
+            "mode must be one of 'rb', 'wb', 'ab', 'r+b', 'w+b', or 'a+b'"
         )
     return mode
 
@@ -481,7 +480,7 @@ def _snapshot_bytes(source: Any) -> bytes:
 
 
 class File(io.RawIOBase):
-    __slots__ = ("_inner", "_name", "_mode")
+    __slots__ = ("_inner", "_name", "_mode", "_closing_base")
 
     def __init__(self, inner: Any, name: str, mode: str, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
@@ -490,6 +489,7 @@ class File(io.RawIOBase):
         self._inner = inner
         self._name = name
         self._mode = mode
+        self._closing_base = False
 
     @property
     def name(self) -> str:
@@ -562,6 +562,8 @@ class File(io.RawIOBase):
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
+        if self._mode.startswith("a"):
+            raise io.UnsupportedOperation("positional writes are unavailable in append mode")
         return self._inner.write_at(_snapshot_bytes(data), offset)
 
     def truncate(self, size: int | None = None) -> int:
@@ -571,6 +573,8 @@ class File(io.RawIOBase):
         return self._inner.truncate(size)
 
     def flush(self) -> None:
+        if self._closing_base:
+            return
         self._check_closed()
         if self.writable():
             self._inner.flush()
@@ -579,7 +583,19 @@ class File(io.RawIOBase):
         raise io.UnsupportedOperation("nfs-rs files do not expose OS file descriptors")
 
     def close(self) -> None:
-        self._inner.close()
+        error: BaseException | None = None
+        try:
+            self._inner.close()
+        except BaseException as caught:
+            error = caught
+        finally:
+            self._closing_base = True
+            try:
+                super().close()
+            finally:
+                self._closing_base = False
+        if error is not None:
+            raise error
 
     def __enter__(self) -> File:
         return self
@@ -702,6 +718,8 @@ class AsyncFile:
         self._check_closed()
         if not self.writable():
             raise io.UnsupportedOperation("not writable")
+        if self._mode.startswith("a"):
+            raise io.UnsupportedOperation("positional writes are unavailable in append mode")
         return await self._inner.write_at(_snapshot_bytes(data), offset)
 
     async def truncate(self, size: int | None = None) -> int:

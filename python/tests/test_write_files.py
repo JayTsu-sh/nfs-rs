@@ -102,13 +102,15 @@ def fake_adapter(monkeypatch):
     monkeypatch.setitem(sys.modules, "nfs_rs._internal", fake)
 
 
-@pytest.mark.parametrize("mode", ["rb", "wb", "ab", "r+b", "w+b", "a+b", "rb+", "wb+", "ab+"])
+@pytest.mark.parametrize("mode", ["rb", "wb", "ab", "r+b", "w+b", "a+b"])
 def test_selected_binary_modes_are_accepted(mode: str) -> None:
     file = Client.connect("nfs://server/export").open("file", mode)
     assert file.mode == mode
 
 
-@pytest.mark.parametrize("mode", ["r", "w", "a", "rt", "x", "xb", "br", "", "r++b"])
+@pytest.mark.parametrize(
+    "mode", ["r", "w", "a", "rt", "x", "xb", "br", "", "r++b", "rb+", "wb+", "ab+"]
+)
 def test_other_modes_are_rejected_before_native(mode: str) -> None:
     with pytest.raises(ValueError, match="mode must be"):
         Client.connect("nfs://server/export").open("file", mode)
@@ -139,6 +141,12 @@ def test_sync_write_snapshots_input_and_positional_write_preserves_position() ->
     assert file.truncate() == 5
     file.flush()
     assert file._inner.flushes == 1
+    file.close()
+    assert io.IOBase.closed.__get__(file, type(file))
+
+    append = Client.connect("nfs://server/export").open("file", "a+b")
+    with pytest.raises(io.UnsupportedOperation, match="append mode"):
+        append.write_at(b"x", 0)
 
 
 def test_async_write_snapshots_before_network_suspension() -> None:

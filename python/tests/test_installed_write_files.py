@@ -26,6 +26,7 @@ def test_sync_complete_write_append_positional_and_buffered_io() -> None:
     assert file.read() == b"abXYefghij"
     assert file.truncate(5) == 5
     file.close()
+    assert io.IOBase.closed.__get__(file, type(file))
 
     appended = client.open("fixture.bin", "a+b")
     start = appended.tell()
@@ -68,6 +69,43 @@ def test_failed_close_reuses_terminal_flush_error() -> None:
         file.close()
     with pytest.raises(RuntimeError, match="scripted commit failure"):
         file.close()
+    client.close()
+
+
+def test_partial_and_zero_write_failures_preserve_position_rules() -> None:
+    from nfs_rs import Client
+
+    client = Client.connect("nfs-test://fixture/export")
+    partial = client.open("__partial_write_error__", "w+b")
+    with pytest.raises(RuntimeError):
+        partial.write(b"abcde")
+    assert partial.tell() == 2
+    partial.close()
+
+    zero = client.open("__zero_write__", "w+b")
+    with pytest.raises(RuntimeError):
+        zero.write(b"x")
+    with pytest.raises(RuntimeError, match="uncertain"):
+        zero.seek(0, io.SEEK_CUR)
+    assert zero.seek(0, io.SEEK_SET) == 0
+    zero.close()
+    client.close()
+
+
+def test_commit_verifier_change_keeps_flush_failed_and_close_terminal() -> None:
+    from nfs_rs import Client
+
+    client = Client.connect("nfs-test://fixture/export")
+    file = client.open("__verifier_change__", "w+b")
+    assert file.write(b"dirty") == 5
+    with pytest.raises(RuntimeError, match="Uncertain") as flush_error:
+        file.flush()
+    with pytest.raises(RuntimeError, match="Uncertain") as first_close_error:
+        file.close()
+    with pytest.raises(RuntimeError, match="Uncertain") as second_close_error:
+        file.close()
+    assert str(first_close_error.value) == str(second_close_error.value)
+    assert str(flush_error.value) == str(first_close_error.value)
     client.close()
 
 

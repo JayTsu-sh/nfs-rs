@@ -20,6 +20,40 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
+    pub async fn write_with_outcome(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        if data.len() > u32::MAX as usize {
+            return Err(NfsError::InvalidInput(
+                "data length exceeds maximum".to_string(),
+            ));
+        }
+        let count = data.len() as u32;
+        let ok = self
+            ._write(WRITE3args {
+                file: nfs_fh3 { data: fh },
+                stable: WriteStable::FileSync,
+                count,
+                data,
+                offset,
+            })
+            .await?;
+        let verifier = ok
+            .verf
+            .0
+            .as_ref()
+            .try_into()
+            .map_err(|_| NfsError::Xdr("WRITE verifier must be 8 bytes".to_string()))?;
+        Ok(crate::mount::WriteOutcome {
+            count: ok.count.0,
+            stable: ok.committed == stable_how::FILE_SYNC,
+            verifier: Some(verifier),
+        })
+    }
+
     pub async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
         self.write(self.lookup_path(path).await?.fh, offset, data)
             .await

@@ -14,10 +14,27 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{COMMIT3args, Mount, Result, nfs_fh3};
+use super::{COMMIT3args, Mount, NfsError, Result, nfs_fh3};
 use bytes::Bytes;
 
 impl Mount {
+    pub async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
+        let args = COMMIT3args {
+            file: nfs_fh3 { data: fh },
+            offset,
+            count,
+        };
+        let verifier = self._commit(args).await?.verf.0;
+        Ok(Some(verifier.as_ref().try_into().map_err(|_| {
+            NfsError::Xdr("COMMIT verifier must be 8 bytes".to_string())
+        })?))
+    }
+
     pub async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         let args = COMMIT3args {
             file: nfs_fh3 { data: fh },
