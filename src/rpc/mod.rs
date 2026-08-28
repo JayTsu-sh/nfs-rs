@@ -366,12 +366,19 @@ impl StreamMux {
         bypass_readiness: bool,
     ) -> Result<Bytes> {
         if !bypass_readiness {
-            self.wait_until_ready().await?;
+            self.wait_until_ready()
+                .await
+                .map_err(|error| NfsError::transport(crate::RequestTransmission::NotSent, error))?;
         }
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
-            .map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?
+            .map_err(|_| {
+                NfsError::transport(
+                    crate::RequestTransmission::NotSent,
+                    NfsError::Rpc("pending map lock poisoned".to_string()),
+                )
+            })?
             .insert(xid, tx);
         let _pending_guard = PendingRequestGuard {
             pending: Arc::clone(&self.pending),
@@ -395,19 +402,28 @@ impl StreamMux {
             .await
         };
 
-        write_result?;
+        write_result
+            .map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))?;
 
         // Wait for response from the reader task with timeout.
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NfsError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "reader task terminated",
-            ))),
-            Err(_) => Err(NfsError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "RPC response timeout",
-            ))),
+            Ok(Ok(result)) => {
+                result.map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))
+            }
+            Ok(Err(_)) => Err(NfsError::transport(
+                crate::RequestTransmission::Sent,
+                NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader task terminated",
+                )),
+            )),
+            Err(_) => Err(NfsError::transport(
+                crate::RequestTransmission::Sent,
+                NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "RPC response timeout",
+                )),
+            )),
         }
     }
 
@@ -866,18 +882,14 @@ impl Client {
                     if bypass_readiness {
                         return Err(e);
                     }
-                    let (is_conn_error, is_timeout) = match &e {
-                        NfsError::Io(io_err) => (
-                            matches!(
-                                io_err.kind(),
-                                std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::ConnectionReset
-                            ),
-                            io_err.kind() == std::io::ErrorKind::TimedOut,
-                        ),
-                        _ => (false, false),
-                    };
+                    let kind = e.kind();
+                    let is_conn_error = matches!(
+                        kind,
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    );
+                    let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
                         attempt += 1;
                         if attempt >= max_attempts {
@@ -1188,7 +1200,11 @@ mod tests {
             .await
             .expect_err("short record must fail the pending RPC call");
         assert!(
-            matches!(error, NfsError::Rpc(ref message) if message.contains("shorter than XID")),
+            matches!(
+                error,
+                NfsError::Transport { ref source, .. }
+                    if matches!(&**source, NfsError::Rpc(message) if message.contains("shorter than XID"))
+            ),
             "RPC framing type was not preserved: {error}"
         );
         server.await.unwrap();
@@ -1255,6 +1271,21 @@ mod tests {
         assert!(mux.reconnect(0).await.is_err());
         assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
         assert!(mux.wait_until_ready().await.is_err());
+        let error = mux
+            .send_and_receive_inner(
+                7,
+                &[0; 12],
+                &[],
+                0,
+                std::time::Duration::from_millis(10),
+                false,
+            )
+            .await
+            .expect_err("failed readiness must reject before sending");
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
         server.abort();
     }
 
@@ -1430,7 +1461,8 @@ mod tests {
             .await
             .expect_err("an unanswered one-attempt call must time out");
         assert!(
-            matches!(err, NfsError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut),
+            err.kind() == std::io::ErrorKind::TimedOut
+                && err.request_transmission() == Some(crate::RequestTransmission::Sent),
             "one-attempt call must preserve its authoritative timeout: {err}"
         );
 
@@ -1470,7 +1502,14 @@ mod tests {
             )
             .await
             .expect_err("closed connection must fail the call");
-        assert!(matches!(err, NfsError::Io(_)));
+        assert_eq!(
+            err.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        ));
 
         let (first, reconnected) = server.await.unwrap().unwrap();
         assert!(!first.is_empty());

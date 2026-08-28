@@ -154,6 +154,14 @@ pub enum NfsError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
+    /// Transport failure annotated at the RPC send boundary.
+    #[error("{source}")]
+    Transport {
+        transmission: RequestTransmission,
+        #[source]
+        source: Box<NfsError>,
+    },
+
     /// NFS3 protocol error (nfsstat3).
     #[error("NFS3 error: {0}")]
     Nfs3(crate::nfs3::ErrorCode),
@@ -201,6 +209,22 @@ pub enum NfsError {
 }
 
 impl NfsError {
+    pub(crate) fn transport(transmission: RequestTransmission, source: NfsError) -> Self {
+        Self::Transport {
+            transmission,
+            source: Box::new(source),
+        }
+    }
+
+    /// Returns transport send-boundary evidence when it is available.
+    pub fn request_transmission(&self) -> Option<RequestTransmission> {
+        match self {
+            Self::Transport { transmission, .. } => Some(*transmission),
+            Self::OperationOutcome(error) => Some(error.transmission),
+            _ => None,
+        }
+    }
+
     /// Wraps a failure for which the caller proved that the current request did
     /// not cross the transport send boundary.
     pub fn before_send_failure(
@@ -252,6 +276,7 @@ impl NfsError {
     pub fn kind(&self) -> std::io::ErrorKind {
         match self {
             NfsError::Io(io) => io.kind(),
+            NfsError::Transport { source, .. } => source.kind(),
             NfsError::Nfs3(_) => std::io::ErrorKind::Other,
             NfsError::Nfs4(_) => std::io::ErrorKind::Other,
             NfsError::LockDenied { .. } => std::io::ErrorKind::WouldBlock,
@@ -271,33 +296,12 @@ pub(crate) fn classify_sent_nfs41_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
-    let lacks_authoritative_result = matches!(
-        &source,
-        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
-    ) || matches!(
+    let replay_protocol_error = matches!(
         &source,
         NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP)
             | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY)
     );
-    if !lacks_authoritative_result {
-        return source;
-    }
-
-    let (outcome, recovery) = match operation_class {
-        OperationClass::ReadOnly => (OperationOutcome::SafeToRetry, RecoveryAction::Retry),
-        OperationClass::SessionControl => (OperationOutcome::Uncertain, RecoveryAction::Remount),
-        OperationClass::ReplaySensitive => (
-            OperationOutcome::Uncertain,
-            RecoveryAction::VerifyThenResume,
-        ),
-    };
-    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
-        outcome,
-        operation_class,
-        recovery,
-        context,
-        source,
-    )))
+    classify_non_authoritative_error(operation_class, context, source, replay_protocol_error)
 }
 
 pub(crate) fn classify_sent_nfs3_error(
@@ -305,29 +309,7 @@ pub(crate) fn classify_sent_nfs3_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
-    let lacks_authoritative_result = matches!(
-        &source,
-        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
-    );
-    if !lacks_authoritative_result {
-        return source;
-    }
-
-    let (outcome, recovery) = match operation_class {
-        OperationClass::ReadOnly => (OperationOutcome::SafeToRetry, RecoveryAction::Retry),
-        OperationClass::SessionControl => (OperationOutcome::Uncertain, RecoveryAction::Remount),
-        OperationClass::ReplaySensitive => (
-            OperationOutcome::Uncertain,
-            RecoveryAction::VerifyThenResume,
-        ),
-    };
-    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
-        outcome,
-        operation_class,
-        recovery,
-        context,
-        source,
-    )))
+    classify_non_authoritative_error(operation_class, context, source, false)
 }
 
 pub(crate) fn classify_sent_nfs40_error(
@@ -335,10 +317,25 @@ pub(crate) fn classify_sent_nfs40_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
-    let lacks_authoritative_result = matches!(
-        &source,
-        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
-    );
+    classify_non_authoritative_error(operation_class, context, source, false)
+}
+
+fn classify_non_authoritative_error(
+    operation_class: OperationClass,
+    context: RequestContext,
+    source: NfsError,
+    replay_protocol_error: bool,
+) -> NfsError {
+    if source.request_transmission() == Some(RequestTransmission::NotSent) {
+        return NfsError::before_send_failure(operation_class, context, None, source);
+    }
+
+    let lacks_authoritative_result = replay_protocol_error
+        || source.request_transmission() == Some(RequestTransmission::Sent)
+        || matches!(
+            &source,
+            NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
+        );
     if !lacks_authoritative_result {
         return source;
     }
@@ -367,6 +364,7 @@ impl From<NfsError> for std::io::Error {
     fn from(e: NfsError) -> Self {
         match e {
             NfsError::Io(io) => io,
+            NfsError::Transport { source, .. } => (*source).into(),
             NfsError::Nfs3(code) => std::io::Error::other(code),
             NfsError::Nfs4(code) => std::io::Error::other(code),
             error @ NfsError::LockDenied { .. } => {
@@ -711,5 +709,27 @@ mod tests {
         assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
         assert_eq!(outcome.transmission, RequestTransmission::Sent);
         assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+    }
+
+    #[test]
+    fn nfs3_transport_evidence_preserves_before_send_failure() {
+        let mut nfs3_context = context();
+        nfs3_context.protocol = NFSVersion::NFSv3;
+        nfs3_context.request_id = None;
+        let error = classify_sent_nfs3_error(
+            OperationClass::ReplaySensitive,
+            nfs3_context,
+            NfsError::transport(
+                RequestTransmission::NotSent,
+                NfsError::Rpc("connection was not ready".to_string()),
+            ),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("transport evidence must be preserved");
+
+        assert_eq!(outcome.outcome, OperationOutcome::DefiniteFailure);
+        assert_eq!(outcome.transmission, RequestTransmission::NotSent);
+        assert_eq!(outcome.recovery, RecoveryAction::Retry);
     }
 }

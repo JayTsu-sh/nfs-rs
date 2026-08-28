@@ -179,56 +179,38 @@ enum NFSProc3 {
 }
 
 impl NFSProc3 {
-    const fn operation_class(&self) -> crate::OperationClass {
+    const fn metadata(&self) -> (&'static str, crate::OperationClass) {
         match self {
-            Self::Null
-            | Self::GetAttr
-            | Self::Lookup
-            | Self::Access
-            | Self::Readlink
-            | Self::Read
-            | Self::Readdir
-            | Self::Readdirplus
-            | Self::FSStat
-            | Self::FSInfo
-            | Self::Pathconf => crate::OperationClass::ReadOnly,
-            Self::SetAttr
-            | Self::Write
-            | Self::Create
-            | Self::Mkdir
-            | Self::Symlink
-            | Self::Remove
-            | Self::Rmdir
-            | Self::Rename
-            | Self::Link
-            | Self::Commit => crate::OperationClass::ReplaySensitive,
+            Self::Null => ("null", crate::OperationClass::ReadOnly),
+            Self::GetAttr => ("getattr", crate::OperationClass::ReadOnly),
+            Self::SetAttr => ("setattr", crate::OperationClass::ReplaySensitive),
+            Self::Lookup => ("lookup", crate::OperationClass::ReadOnly),
+            Self::Access => ("access", crate::OperationClass::ReadOnly),
+            Self::Readlink => ("readlink", crate::OperationClass::ReadOnly),
+            Self::Read => ("read", crate::OperationClass::ReadOnly),
+            Self::Write => ("write", crate::OperationClass::ReplaySensitive),
+            Self::Create => ("create", crate::OperationClass::ReplaySensitive),
+            Self::Mkdir => ("mkdir", crate::OperationClass::ReplaySensitive),
+            Self::Symlink => ("symlink", crate::OperationClass::ReplaySensitive),
+            Self::Remove => ("remove", crate::OperationClass::ReplaySensitive),
+            Self::Rmdir => ("rmdir", crate::OperationClass::ReplaySensitive),
+            Self::Rename => ("rename", crate::OperationClass::ReplaySensitive),
+            Self::Link => ("link", crate::OperationClass::ReplaySensitive),
+            Self::Readdir => ("readdir", crate::OperationClass::ReadOnly),
+            Self::Readdirplus => ("readdirplus", crate::OperationClass::ReadOnly),
+            Self::FSStat => ("fsstat", crate::OperationClass::ReadOnly),
+            Self::FSInfo => ("fsinfo", crate::OperationClass::ReadOnly),
+            Self::Pathconf => ("pathconf", crate::OperationClass::ReadOnly),
+            Self::Commit => ("commit", crate::OperationClass::ReplaySensitive),
         }
     }
 
+    const fn operation_class(&self) -> crate::OperationClass {
+        self.metadata().1
+    }
+
     const fn operation_name(&self) -> &'static str {
-        match self {
-            Self::Null => "null",
-            Self::GetAttr => "getattr",
-            Self::SetAttr => "setattr",
-            Self::Lookup => "lookup",
-            Self::Access => "access",
-            Self::Readlink => "readlink",
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Create => "create",
-            Self::Mkdir => "mkdir",
-            Self::Symlink => "symlink",
-            Self::Remove => "remove",
-            Self::Rmdir => "rmdir",
-            Self::Rename => "rename",
-            Self::Link => "link",
-            Self::Readdir => "readdir",
-            Self::Readdirplus => "readdirplus",
-            Self::FSStat => "fsstat",
-            Self::FSInfo => "fsinfo",
-            Self::Pathconf => "pathconf",
-            Self::Commit => "commit",
-        }
+        self.metadata().0
     }
 
     const fn replay_policy(&self) -> crate::rpc::ReplayPolicy {
