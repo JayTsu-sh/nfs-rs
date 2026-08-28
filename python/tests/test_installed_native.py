@@ -1,8 +1,12 @@
 import asyncio
+import os
 
 import pytest
 
-native = pytest.importorskip("nfs_rs._internal")
+if os.environ.get("NFS_RS_TEST_INSTALLED") != "1":
+    pytest.skip("requires an installed wheel", allow_module_level=True)
+
+import nfs_rs._internal as native
 
 
 def test_installed_native_sync_factory_rejects_invalid_url_without_network_work():

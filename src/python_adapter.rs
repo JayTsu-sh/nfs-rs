@@ -79,6 +79,15 @@ fn health_dict<'py>(py: Python<'py>, health: MountHealth) -> PyResult<Bound<'py,
     Ok(result)
 }
 
+fn current_health(mut health: MountHealth, core: &ClientCore) -> MountHealth {
+    health.lifecycle = match core.lifecycle() {
+        crate::client_core::ClientLifecycle::Ready => crate::MountLifecycleState::Ready,
+        crate::client_core::ClientLifecycle::Closing => crate::MountLifecycleState::Closing,
+        crate::client_core::ClientLifecycle::Closed => crate::MountLifecycleState::Closed,
+    };
+    health
+}
+
 fn connected_parts(
     mount: Box<dyn Mount>,
     capacity: usize,
@@ -154,6 +163,7 @@ struct SyncClient {
     runtime: Mutex<Runtime>,
     version: NFSVersion,
     health: MountHealth,
+    _operation_timeout: Option<Duration>,
 }
 
 #[pymethods]
@@ -168,6 +178,7 @@ impl SyncClient {
     ) -> PyResult<Self> {
         let capacity = recovery_capacity(options)?;
         let connect_timeout = timeout_option(options, "connect_timeout")?;
+        let operation_timeout = timeout_option(options, "operation_timeout")?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -188,6 +199,7 @@ impl SyncClient {
                 runtime: Mutex::new(runtime),
                 version,
                 health,
+                _operation_timeout: operation_timeout,
             });
         }
         let mount = py
@@ -199,6 +211,7 @@ impl SyncClient {
             runtime: Mutex::new(runtime),
             version,
             health,
+            _operation_timeout: operation_timeout,
         })
     }
 
@@ -209,7 +222,7 @@ impl SyncClient {
 
     #[getter]
     fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        health_dict(py, self.health)
+        health_dict(py, current_health(self.health, &self.core))
     }
 
     #[getter]
@@ -238,6 +251,7 @@ struct AsyncClient {
     core: Arc<ClientCore>,
     version: NFSVersion,
     health: MountHealth,
+    _operation_timeout: Option<Duration>,
 }
 
 #[pymethods]
@@ -252,6 +266,7 @@ impl AsyncClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let capacity = recovery_capacity(options)?;
         let connect_timeout = timeout_option(options, "connect_timeout")?;
+        let operation_timeout = timeout_option(options, "operation_timeout")?;
         if let Some(parts) = test_connected_parts(&url, capacity) {
             let (core, version, health) = parts?;
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -262,6 +277,7 @@ impl AsyncClient {
                     core,
                     version,
                     health,
+                    _operation_timeout: operation_timeout,
                 })
             });
         }
@@ -274,6 +290,7 @@ impl AsyncClient {
                 core,
                 version,
                 health,
+                _operation_timeout: operation_timeout,
             })
         })
     }
@@ -285,7 +302,7 @@ impl AsyncClient {
 
     #[getter]
     fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        health_dict(py, self.health)
+        health_dict(py, current_health(self.health, &self.core))
     }
 
     #[getter]
@@ -311,8 +328,5 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SyncClient>()?;
     module.add_class::<AsyncClient>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    if env!("CARGO_PKG_VERSION") != "0.5.1" {
-        return Err(PyValueError::new_err("Rust and Python versions differ"));
-    }
     Ok(())
 }

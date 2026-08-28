@@ -1,32 +1,38 @@
 import asyncio
+import os
 import threading
 
 import pytest
 
-pytest.importorskip("nfs_rs._internal")
+if os.environ.get("NFS_RS_TEST_INSTALLED") != "1":
+    pytest.skip("requires an installed test-support wheel", allow_module_level=True)
 
-from nfs_rs import AsyncClient, Client, Health, Version
+import nfs_rs._internal
+
+from nfs_rs import AsyncClient, Client, Health, Lifecycle, Version
 
 
 def test_installed_sync_artifact_connects_inspects_and_closes():
     client = Client.connect("nfs-test://fixture/export")
-    assert client.version == Version(4, 1)
-    assert client.health == Health("ready", 0, None)
+    assert client.version == Version.NFS_V4_1
+    assert client.health == Health(Lifecycle.READY, 0, None)
     assert not client.closed
     with client:
         pass
     assert client.closed
+    assert client.health.lifecycle is Lifecycle.CLOSED
     client.close()
 
 
 def test_installed_async_artifact_connects_inspects_and_closes():
     async def scenario():
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        assert client.version == Version(4, 1)
-        assert client.health.lifecycle == "ready"
+        assert client.version == Version.NFS_V4_1
+        assert client.health.lifecycle is Lifecycle.READY
         async with client:
             pass
         assert client.closed
+        assert client.health.lifecycle is Lifecycle.CLOSED
         await client.close()
 
     asyncio.run(scenario())

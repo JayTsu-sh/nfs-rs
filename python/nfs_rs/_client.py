@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
 from types import ModuleType
@@ -10,18 +11,24 @@ from typing import Any, ClassVar
 _CONSTRUCTION_TOKEN = object()
 
 
-@dataclass(frozen=True, slots=True)
-class Version:
-    major: int
-    minor: int | None = None
+class Version(str, Enum):
+    NFS_V3 = "3"
+    NFS_V4_0 = "4.0"
+    NFS_V4_1 = "4.1"
 
     def __str__(self) -> str:
-        return str(self.major) if self.minor is None else f"{self.major}.{self.minor}"
+        return self.value
+
+
+class Lifecycle(str, Enum):
+    READY = "ready"
+    CLOSING = "closing"
+    CLOSED = "closed"
 
 
 @dataclass(frozen=True, slots=True)
 class Health:
-    lifecycle: str
+    lifecycle: Lifecycle
     generation: int
     lease_healthy: bool | None
 
@@ -96,6 +103,14 @@ def _options(
         raise TypeError("noresvport must be bool or None")
     if not isinstance(retain_delegations, (bool, type(None))):
         raise TypeError("retain_delegations must be bool or None")
+    if readdir_buffer is not None:
+        values = (readdir_buffer,) if isinstance(readdir_buffer, int) else readdir_buffer
+        if (
+            not isinstance(values, tuple)
+            or len(values) not in {1, 2}
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values)
+        ):
+            raise ValueError("readdir_buffer must be a positive integer or a pair of positive integers")
     return {
         name: value
         for name, value in {
@@ -162,11 +177,12 @@ class Client(_ClientOptions):
     @property
     def version(self) -> Version:
         major, minor = self._inner.version
-        return Version(major, minor)
+        return Version(str(major) if minor is None else f"{major}.{minor}")
 
     @property
     def health(self) -> Health:
-        return Health(**self._inner.health)
+        values = self._inner.health
+        return Health(Lifecycle(values["lifecycle"]), values["generation"], values["lease_healthy"])
 
     @property
     def closed(self) -> bool:
@@ -178,8 +194,13 @@ class Client(_ClientOptions):
     def __enter__(self) -> Client:
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, exc: BaseException | None, traceback: object) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note(f"Client cleanup also failed: {cleanup_error}")
 
     def __repr__(self) -> str:
         return f"Client(version={self.version!s}, closed={self.closed})"
@@ -216,11 +237,12 @@ class AsyncClient(_ClientOptions):
     @property
     def version(self) -> Version:
         major, minor = self._inner.version
-        return Version(major, minor)
+        return Version(str(major) if minor is None else f"{major}.{minor}")
 
     @property
     def health(self) -> Health:
-        return Health(**self._inner.health)
+        values = self._inner.health
+        return Health(Lifecycle(values["lifecycle"]), values["generation"], values["lease_healthy"])
 
     @property
     def closed(self) -> bool:
@@ -234,8 +256,13 @@ class AsyncClient(_ClientOptions):
         self._check_loop()
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        await self.close()
+    async def __aexit__(self, exc_type: object, exc: BaseException | None, traceback: object) -> None:
+        try:
+            await self.close()
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note(f"AsyncClient cleanup also failed: {cleanup_error}")
 
     def __repr__(self) -> str:
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"

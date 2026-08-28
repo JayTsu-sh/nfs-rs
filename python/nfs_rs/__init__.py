@@ -1,6 +1,11 @@
 """Stable Python facade for the nfs-rs userspace NFS client."""
 
-from ._client import AsyncClient, Client, Health, Version
+from importlib.metadata import PackageNotFoundError, version
 
-__all__ = ["AsyncClient", "Client", "Health", "Version"]
-__version__ = "0.5.1"
+from ._client import AsyncClient, Client, Health, Lifecycle, Version
+
+__all__ = ["AsyncClient", "Client", "Health", "Lifecycle", "Version"]
+try:
+    __version__ = version("nfs-rs")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
