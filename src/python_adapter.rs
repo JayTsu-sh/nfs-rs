@@ -1,4 +1,4 @@
-use crate::client_core::{ClientCore, ClientDriver, CoreOperation, ResourceKey};
+use crate::client_core::{ClientCore, ClientDriver, CoreOperation, OperationGuard, ResourceKey};
 use crate::{
     Attr, Mount, MountHealth, NFSVersion, NfsError, OpenFile, Result, parse_url_and_mount,
 };
@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 type DirectoryItem = std::result::Result<Py<PyDict>, NfsError>;
 
@@ -83,9 +84,12 @@ enum ReadBackend {
 struct FileResource {
     backend: ReadBackend,
     size: u64,
+    operation_gate: Arc<RwLock<()>>,
+    lifecycle: AtomicU64,
     relative_gate: tokio::sync::Mutex<()>,
     position: AtomicU64,
     close_state: Mutex<FileCloseState>,
+    close_started: Notify,
     close_notify: Notify,
 }
 
@@ -93,7 +97,49 @@ struct FileResource {
 struct FileCloseState {
     started: bool,
     file: Option<OpenFile>,
-    result: Option<std::result::Result<(), String>>,
+    result: Option<std::result::Result<(), SharedCloseError>>,
+}
+
+#[derive(Clone, Debug)]
+enum SharedCloseError {
+    NotFound(String),
+    PermissionDenied(String),
+    Other(String),
+}
+
+impl SharedCloseError {
+    fn from_nfs(error: NfsError) -> Self {
+        let message = error.to_string();
+        if error.is_not_found() {
+            Self::NotFound(message)
+        } else if matches!(
+            error,
+            NfsError::Nfs3(
+                crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
+            ) | NfsError::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS
+                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
+            )
+        ) || error.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            Self::PermissionDenied(message)
+        } else {
+            Self::Other(message)
+        }
+    }
+
+    fn into_nfs(self) -> NfsError {
+        match self {
+            Self::NotFound(message) => {
+                NfsError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, message))
+            }
+            Self::PermissionDenied(message) => NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                message,
+            )),
+            Self::Other(message) => NfsError::Rpc(message),
+        }
+    }
 }
 
 impl FileResource {
@@ -107,6 +153,8 @@ impl FileResource {
                 max_read,
             },
             size,
+            operation_gate: Arc::new(RwLock::new(())),
+            lifecycle: AtomicU64::new(0),
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(0),
             close_state: Mutex::new(FileCloseState {
@@ -114,6 +162,7 @@ impl FileResource {
                 file: Some(file),
                 result: None,
             }),
+            close_started: Notify::new(),
             close_notify: Notify::new(),
         })
     }
@@ -123,22 +172,40 @@ impl FileResource {
         let data: Arc<[u8]> = Arc::from(&b"abcdefghijklmnopqrstuvwxyz"[..]);
         Arc::new(Self {
             size: data.len() as u64,
+            operation_gate: Arc::new(RwLock::new(())),
+            lifecycle: AtomicU64::new(0),
             backend: ReadBackend::Test { data, max_read: 4 },
             relative_gate: tokio::sync::Mutex::new(()),
             position: AtomicU64::new(0),
             close_state: Mutex::new(FileCloseState::default()),
+            close_started: Notify::new(),
             close_notify: Notify::new(),
         })
     }
 
     fn closed(&self) -> bool {
-        self.close_state
-            .lock()
-            .map(|state| state.result.is_some())
-            .unwrap_or(true)
+        self.lifecycle.load(Ordering::Acquire) != 0
     }
 
-    async fn close(self: &Arc<Self>) -> std::result::Result<(), String> {
+    async fn begin_operation(&self) -> Result<OwnedRwLockReadGuard<()>> {
+        if self.lifecycle.load(Ordering::Acquire) != 0 {
+            return Err(NfsError::InvalidInput(
+                "I/O operation on closed file".to_string(),
+            ));
+        }
+        let guard = self.operation_gate.clone().read_owned().await;
+        if self.lifecycle.load(Ordering::Acquire) == 0 {
+            Ok(guard)
+        } else {
+            Err(NfsError::InvalidInput(
+                "I/O operation on closed file".to_string(),
+            ))
+        }
+    }
+
+    async fn close(self: &Arc<Self>) -> std::result::Result<(), SharedCloseError> {
+        self.lifecycle.store(1, Ordering::Release);
+        self.close_started.notify_one();
         let file = self
             .close_state
             .lock()
@@ -150,15 +217,16 @@ impl FileResource {
                     Some(state.file.take())
                 }
             })
-            .map_err(|_| "file close state lock poisoned".to_string())?;
+            .map_err(|_| SharedCloseError::Other("file close state lock poisoned".to_string()))?;
         if let Some(file) = file {
             let resource = self.clone();
             tokio::spawn(async move {
+                let _operation_guard = resource.operation_gate.clone().write_owned().await;
                 let result = match (&resource.backend, file) {
                     (ReadBackend::Mount { mount, .. }, Some(file)) => mount
                         .close_stateful(file)
                         .await
-                        .map_err(|error| error.to_string()),
+                        .map_err(SharedCloseError::from_nfs),
                     _ => Ok(()),
                 };
                 if let Ok(mut state) = resource.close_state.lock() {
@@ -252,7 +320,7 @@ impl FileResource {
         let base = match whence {
             0 => 0_i128,
             1 => i128::from(position),
-            2 => i128::from(self.size),
+            2 => i128::from(self.current_size().await?),
             _ => {
                 return Err(NfsError::InvalidInput(
                     "whence must be SEEK_SET, SEEK_CUR, or SEEK_END".to_string(),
@@ -268,8 +336,24 @@ impl FileResource {
         Ok(next)
     }
 
-    fn tell(&self) -> u64 {
-        self.position.load(Ordering::Acquire)
+    async fn current_size(&self) -> Result<u64> {
+        match &self.backend {
+            ReadBackend::Mount {
+                mount, file_handle, ..
+            } => Ok(mount.getattr(file_handle.clone()).await?.filesize),
+            #[cfg(feature = "python-test-support")]
+            ReadBackend::Test { data, .. } => Ok(data.len() as u64),
+        }
+    }
+
+    fn tell(&self) -> Result<u64> {
+        if self.lifecycle.load(Ordering::Acquire) == 0 {
+            Ok(self.position.load(Ordering::Acquire))
+        } else {
+            Err(NfsError::InvalidInput(
+                "I/O operation on closed file".to_string(),
+            ))
+        }
     }
 }
 
@@ -288,7 +372,7 @@ impl ClientDriver for TestDriver {
 
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         if let Some(resource) = self.resources.remove(key)? {
-            resource.close().await.map_err(NfsError::Rpc)?;
+            resource.close().await.map_err(SharedCloseError::into_nfs)?;
         }
         Ok(())
     }
@@ -308,7 +392,7 @@ impl ClientDriver for MountDriver {
 
     async fn close_resource(&self, key: ResourceKey) -> Result<()> {
         if let Some(resource) = self.resources.remove(key)? {
-            resource.close().await.map_err(NfsError::Rpc)?;
+            resource.close().await.map_err(SharedCloseError::into_nfs)?;
         }
         Ok(())
     }
@@ -764,11 +848,11 @@ async fn connect_mount(url: &str, timeout: Option<Duration>) -> Result<Box<dyn M
 
 async fn open_file(
     core: Arc<ClientCore>,
+    _operation: OperationGuard,
     mount: Option<Arc<dyn Mount>>,
     resources: Arc<AdapterResources>,
     path: String,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
-    let _operation = core.begin_operation()?;
     let resource = if let Some(mount) = mount {
         // Resolve size before acquiring protocol-owned open state. Once open
         // succeeds, registration is synchronous so cancellation cannot orphan it.
@@ -795,15 +879,34 @@ async fn open_file(
     Ok((key, resource))
 }
 
+async fn cancellation_safe_open_file(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+) -> Result<(ResourceKey, Arc<FileResource>)> {
+    let operation = core.begin_operation()?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let task_core = core.clone();
+    core.spawn_owned(async move {
+        let result = open_file(task_core, operation, mount, resources, path).await;
+        let _ = sender.send(result);
+    })?;
+    receiver
+        .await
+        .map_err(|_| NfsError::Rpc("open task ended without a result".to_string()))?
+}
+
 async fn close_file(
     core: Arc<ClientCore>,
     resources: Arc<AdapterResources>,
     key: ResourceKey,
     resource: Arc<FileResource>,
 ) -> Result<()> {
+    let result = resource.close().await.map_err(SharedCloseError::into_nfs);
     core.unregister_resource(key)?;
     let _ = resources.remove(key)?;
-    resource.close().await.map_err(NfsError::Rpc)
+    result
 }
 
 fn validate_read_mode(mode: &str) -> PyResult<()> {
@@ -832,30 +935,53 @@ impl SyncFile {
         self.resource.closed()
     }
 
+    #[getter]
+    fn max_read_size(&self) -> u32 {
+        self.resource.max_read()
+    }
+
     #[pyo3(signature = (size = -1))]
     fn read(&self, py: Python<'_>, size: i64) -> PyResult<Py<PyBytes>> {
+        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let data = py
-            .detach(|| self.runtime.block_on(self.resource.read(size)))
+            .detach(|| {
+                self.runtime.block_on(async {
+                    let _file_operation = self.resource.begin_operation().await?;
+                    self.resource.read(size).await
+                })
+            })
             .map_err(nfs_error)?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, size = -1))]
     fn read_at(&self, py: Python<'_>, offset: u64, size: i64) -> PyResult<Py<PyBytes>> {
+        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let data = py
-            .detach(|| self.runtime.block_on(self.resource.read_at(offset, size)))
+            .detach(|| {
+                self.runtime.block_on(async {
+                    let _file_operation = self.resource.begin_operation().await?;
+                    self.resource.read_at(offset, size).await
+                })
+            })
             .map_err(nfs_error)?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, whence = 0))]
     fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
-        py.detach(|| self.runtime.block_on(self.resource.seek(offset, whence)))
-            .map_err(nfs_error)
+        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
+        py.detach(|| {
+            self.runtime.block_on(async {
+                let _file_operation = self.resource.begin_operation().await?;
+                self.resource.seek(offset, whence).await
+            })
+        })
+        .map_err(nfs_error)
     }
 
-    fn tell(&self) -> u64 {
-        self.resource.tell()
+    fn tell(&self) -> PyResult<u64> {
+        self.resource.tell().map_err(nfs_error)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -886,10 +1012,18 @@ impl AsyncFile {
         self.resource.closed()
     }
 
+    #[getter]
+    fn max_read_size(&self) -> u32 {
+        self.resource.max_read()
+    }
+
     #[pyo3(signature = (size = -1))]
     fn read<'py>(&self, py: Python<'py>, size: i64) -> PyResult<Bound<'py, PyAny>> {
+        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _core_operation = core_operation;
+            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
             let data = resource.read(size).await.map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
@@ -897,8 +1031,11 @@ impl AsyncFile {
 
     #[pyo3(signature = (offset, size = -1))]
     fn read_at<'py>(&self, py: Python<'py>, offset: u64, size: i64) -> PyResult<Bound<'py, PyAny>> {
+        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _core_operation = core_operation;
+            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
             let data = resource.read_at(offset, size).await.map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
@@ -906,14 +1043,17 @@ impl AsyncFile {
 
     #[pyo3(signature = (offset, whence = 0))]
     fn seek<'py>(&self, py: Python<'py>, offset: i64, whence: i32) -> PyResult<Bound<'py, PyAny>> {
+        let core_operation = self.core.begin_operation().map_err(nfs_error)?;
         let resource = self.resource.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _core_operation = core_operation;
+            let _file_operation = resource.begin_operation().await.map_err(nfs_error)?;
             resource.seek(offset, whence).await.map_err(nfs_error)
         })
     }
 
-    fn tell(&self) -> u64 {
-        self.resource.tell()
+    fn tell(&self) -> PyResult<u64> {
+        self.resource.tell().map_err(nfs_error)
     }
 
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1129,7 +1269,7 @@ impl SyncClient {
         validate_read_mode(mode)?;
         let (key, resource) = py
             .detach(|| {
-                self.runtime.block_on(open_file(
+                self.runtime.block_on(cancellation_safe_open_file(
                     self.core.clone(),
                     self.health_source.clone(),
                     self.resources.clone(),
@@ -1273,9 +1413,10 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (key, resource) = open_file(core.clone(), mount, resources.clone(), path)
-                .await
-                .map_err(nfs_error)?;
+            let (key, resource) =
+                cancellation_safe_open_file(core.clone(), mount, resources.clone(), path)
+                    .await
+                    .map_err(nfs_error)?;
             Ok(AsyncFile {
                 key,
                 resource,
@@ -1327,6 +1468,26 @@ mod read_only_file_tests {
         };
         assert_eq!(left, b"efgh");
         assert_eq!(right, b"ijkl");
-        assert_eq!(file.tell(), 3);
+        assert_eq!(file.tell().ok(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn close_rejects_new_work_and_drains_an_active_operation() {
+        let file = FileResource::test();
+        let active = file.begin_operation().await;
+        let Ok(active) = active else {
+            panic!("fixture operation should start");
+        };
+        let close_started = file.close_started.notified();
+        let closing_file = file.clone();
+        let close = tokio::spawn(async move { closing_file.close().await });
+        close_started.await;
+
+        assert!(file.begin_operation().await.is_err());
+        assert!(!close.is_finished());
+        drop(active);
+        let result = close.await;
+        assert!(matches!(result, Ok(Ok(()))));
+        assert!(file.tell().is_err());
     }
 }

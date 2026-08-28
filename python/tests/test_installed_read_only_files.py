@@ -43,6 +43,16 @@ def test_client_close_closes_registered_sync_file() -> None:
     file = client.open("fixture.bin")
     client.close()
     assert file.closed
+    for operation in (
+        lambda: file.read(1),
+        lambda: file.read_at(0, 1),
+        lambda: file.readinto(bytearray(1)),
+        lambda: file.readinto_at(bytearray(1), 0),
+        lambda: file.seek(0),
+        file.tell,
+    ):
+        with pytest.raises(ValueError, match="closed file"):
+            operation()
 
 
 def test_open_rejects_non_read_binary_modes() -> None:
@@ -68,9 +78,20 @@ def test_async_file_has_relative_and_positional_parity() -> None:
         assert file.tell() == 3
 
         target = bytearray(5)
-        assert await file.readinto_at(target, 10) == 5
-        assert target == b"klmno"
+        assert await file.readinto_at(target, 10) == 4
+        assert target == b"klmn\0"
         await client.close()
         assert file.closed
+        for operation in (
+            lambda: file.read(1),
+            lambda: file.read_at(0, 1),
+            lambda: file.readinto(bytearray(1)),
+            lambda: file.readinto_at(bytearray(1), 0),
+            lambda: file.seek(0),
+        ):
+            with pytest.raises(ValueError, match="closed file"):
+                await operation()
+        with pytest.raises(ValueError, match="closed file"):
+            file.tell()
 
     asyncio.run(scenario())

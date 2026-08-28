@@ -5,6 +5,7 @@ import importlib
 import inspect
 import io
 import os
+import warnings
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
@@ -479,6 +480,10 @@ class File(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
+    def _check_closed(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+
     def writable(self) -> bool:
         return False
 
@@ -486,23 +491,31 @@ class File(io.RawIOBase):
         return True
 
     def read(self, size: int = -1) -> bytes:
+        self._check_closed()
         return self._inner.read(size)
 
     def readinto(self, target: Any) -> int:
+        self._check_closed()
         length = _buffer_length(target)
-        return _copy_to_buffer(target, length, self._inner.read(length))
+        request = min(length, self._inner.max_read_size)
+        return _copy_to_buffer(target, length, self._inner.read(request))
 
     def read_at(self, offset: int, size: int = -1) -> bytes:
+        self._check_closed()
         return self._inner.read_at(offset, size)
 
     def readinto_at(self, target: Any, offset: int) -> int:
+        self._check_closed()
         length = _buffer_length(target)
-        return _copy_to_buffer(target, length, self._inner.read_at(offset, length))
+        request = min(length, self._inner.max_read_size)
+        return _copy_to_buffer(target, length, self._inner.read_at(offset, request))
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self._check_closed()
         return self._inner.seek(offset, whence)
 
     def tell(self) -> int:
+        self._check_closed()
         return self._inner.tell()
 
     def fileno(self) -> int:
@@ -524,6 +537,15 @@ class File(io.RawIOBase):
             if exc is None:
                 raise
             _record_cleanup_failure(exc, cleanup_error, "File")
+
+    def __del__(self) -> None:
+        inner = getattr(self, "_inner", None)
+        if inner is not None and not inner.closed:
+            warnings.warn(
+                f"unclosed NFS file {self._name!r}",
+                ResourceWarning,
+                stacklevel=2,
+            )
 
 
 class AsyncFile:
@@ -559,30 +581,43 @@ class AsyncFile:
         return self._inner.closed
 
     def tell(self) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
         return self._inner.tell()
+
+    def _check_closed(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
 
     async def read(self, size: int = -1) -> bytes:
         self._check_loop()
+        self._check_closed()
         return await self._inner.read(size)
 
     async def readinto(self, target: Any) -> int:
         self._check_loop()
+        self._check_closed()
         length = _buffer_length(target)
-        data = await self._inner.read(length)
+        request = min(length, self._inner.max_read_size)
+        data = await self._inner.read(request)
         return _copy_to_buffer(target, length, data)
 
     async def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_loop()
+        self._check_closed()
         return await self._inner.read_at(offset, size)
 
     async def readinto_at(self, target: Any, offset: int) -> int:
         self._check_loop()
+        self._check_closed()
         length = _buffer_length(target)
-        data = await self._inner.read_at(offset, length)
+        request = min(length, self._inner.max_read_size)
+        data = await self._inner.read_at(offset, request)
         return _copy_to_buffer(target, length, data)
 
     async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         self._check_loop()
+        self._check_closed()
         return await self._inner.seek(offset, whence)
 
     async def close(self) -> None:

@@ -11,6 +11,8 @@ DATA = b"abcdefghijklmnopqrstuvwxyz"
 
 
 class SyncFileInner:
+    max_read_size = 4
+
     def __init__(self):
         self.position = 0
         self.closed = False
@@ -90,6 +92,7 @@ fake.SyncClient = SyncClientInner
 fake.AsyncClient = AsyncClientInner
 
 from nfs_rs import AsyncClient, AsyncFile, Client, File
+from nfs_rs._client import _CONSTRUCTION_TOKEN
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +147,14 @@ def test_sync_readinto_revalidates_target_after_network_work():
     file._inner.read = resizing_read
     with pytest.raises(BufferError, match="changed size"):
         file.readinto(target)
+
+
+def test_file_finalizer_warns_without_blocking_close():
+    inner = SyncFileInner()
+    file = File(inner, "fixture.bin", _CONSTRUCTION_TOKEN)
+    with pytest.warns(ResourceWarning, match="unclosed NFS file"):
+        file.__del__()
+    assert not inner.closed
 
 
 def test_async_file_matches_read_seek_and_positional_contract():
