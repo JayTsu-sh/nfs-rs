@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use pyo3::exceptions::{
-    PyFileExistsError, PyFileNotFoundError, PyIsADirectoryError, PyNotADirectoryError, PyOSError,
-    PyPermissionError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
+    PyFileExistsError, PyFileNotFoundError, PyIsADirectoryError, PyNotADirectoryError,
+    PyNotImplementedError, PyOSError, PyPermissionError, PyRuntimeError, PyStopAsyncIteration,
+    PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
@@ -70,6 +71,8 @@ struct AdapterResources {
     files: Mutex<HashMap<ResourceKey, Arc<FileResource>>>,
     #[cfg(feature = "python-test-support")]
     test_files: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Vec<u8>>>>>,
+    #[cfg(feature = "python-test-support")]
+    test_xattrs: Mutex<HashMap<(String, String), Vec<u8>>>,
 }
 
 impl AdapterResources {
@@ -934,6 +937,8 @@ fn nfs_error_ref(error: &NfsError) -> PyErr {
         PyIsADirectoryError::new_err(error.to_string())
     } else if not_empty {
         PyOSError::new_err((nix::errno::Errno::ENOTEMPTY as i32, error.to_string()))
+    } else if matches!(error, NfsError::Unsupported(_)) {
+        PyNotImplementedError::new_err(error.to_string())
     } else if permission_denied || error.kind() == std::io::ErrorKind::PermissionDenied {
         PyPermissionError::new_err(error.to_string())
     } else {
@@ -991,6 +996,122 @@ fn attr_dict<'py>(py: Python<'py>, attr: &Attr) -> PyResult<Bound<'py, PyDict>> 
         "group",
         (!attr.owner_group.is_empty()).then_some(attr.owner_group.as_str()),
     )?;
+    Ok(values)
+}
+
+fn capabilities_dict<'py>(
+    py: Python<'py>,
+    capabilities: crate::MountCapabilities,
+) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    values.set_item("acl", capabilities.acl)?;
+    values.set_item("named_attributes", capabilities.named_attributes)?;
+    values.set_item("locks", capabilities.locks)?;
+    values.set_item("callbacks", capabilities.callbacks)?;
+    values.set_item("delegation_retention", capabilities.delegation_retention)?;
+    values.set_item("pnfs", capabilities.pnfs)?;
+    values.set_item("session_diagnostics", capabilities.session_diagnostics)?;
+    Ok(values)
+}
+
+fn io_limits_dict<'py>(
+    py: Python<'py>,
+    mount: Option<&Arc<dyn Mount>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    let max_read = mount.map_or(4, |mount| mount.get_max_read_size());
+    let max_write = mount.map_or(4, |mount| mount.get_max_write_size());
+    values.set_item("max_read", max_read)?;
+    values.set_item("max_write", max_write)?;
+    values.set_item("preferred_read", max_read)?;
+    values.set_item("preferred_write", max_write)?;
+    values.set_item("read_multiple", 1)?;
+    values.set_item("write_multiple", 1)?;
+    values.set_item("preferred_directory", max_read)?;
+    Ok(values)
+}
+
+async fn fs_info_values(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+) -> Result<crate::FSInfo> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        return Ok(crate::FSInfo {
+            rtmax: 4,
+            rtpref: 4,
+            rtmult: 1,
+            wtmax: 4,
+            wtpref: 4,
+            wtmult: 1,
+            dtpref: 4,
+            maxfilesize: 1 << 40,
+            time_delta: crate::Time {
+                seconds: 0,
+                nseconds: 1,
+            },
+            properties: 0,
+            ..Default::default()
+        });
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("fs_info requires a connected protocol engine".to_string())
+        })?
+        .fsinfo()
+        .await
+}
+
+async fn fs_stat_values(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+) -> Result<crate::FSStat> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        return Ok(crate::FSStat {
+            tbytes: 1000,
+            fbytes: 600,
+            abytes: 500,
+            tfiles: 100,
+            ffiles: 60,
+            afiles: 50,
+            invarsec: 1,
+            ..Default::default()
+        });
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("fs_stat requires a connected protocol engine".to_string())
+        })?
+        .fsstat()
+        .await
+}
+
+fn fs_info_dict<'py>(py: Python<'py>, info: crate::FSInfo) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    values.set_item("max_file_size", info.maxfilesize)?;
+    values.set_item(
+        "time_delta_ns",
+        nanoseconds(info.time_delta.seconds, info.time_delta.nseconds),
+    )?;
+    values.set_item("supports_links", info.properties & 0x01 != 0)?;
+    values.set_item("supports_symlinks", info.properties & 0x02 != 0)?;
+    values.set_item("homogeneous", info.properties & 0x08 != 0)?;
+    values.set_item("can_set_time", info.properties & 0x10 != 0)?;
+    Ok(values)
+}
+
+fn fs_stat_dict<'py>(py: Python<'py>, info: crate::FSStat) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    values.set_item("total_bytes", info.tbytes)?;
+    values.set_item("free_bytes", info.fbytes)?;
+    values.set_item("available_bytes", info.abytes)?;
+    values.set_item("total_files", info.tfiles)?;
+    values.set_item("free_files", info.ffiles)?;
+    values.set_item("available_files", info.afiles)?;
+    values.set_item("invariant_seconds", info.invarsec)?;
     Ok(values)
 }
 
@@ -1164,6 +1285,230 @@ async fn readlink_path(
             NfsError::Unsupported("readlink requires a connected protocol engine".to_string())
         })?
         .readlink_path(&path)
+        .await
+}
+
+fn time_from_ns(value: u64) -> Result<crate::Time> {
+    let seconds = value / 1_000_000_000;
+    Ok(crate::Time {
+        seconds: u32::try_from(seconds)
+            .map_err(|_| NfsError::InvalidInput("timestamp is out of range".to_string()))?,
+        nseconds: (value % 1_000_000_000) as u32,
+    })
+}
+
+fn optional_identity(value: i64) -> PyResult<Option<u32>> {
+    if value == -1 {
+        Ok(None)
+    } else {
+        u32::try_from(value).map(Some).map_err(|_| {
+            PyValueError::new_err("uid and gid must be -1 or unsigned 32-bit integers")
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MetadataOperation {
+    Chmod(u32),
+    Chown(Option<u32>, Option<u32>),
+    Utime(u64, u64),
+    Truncate(u64),
+}
+
+async fn metadata_operation(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    operation: MetadataOperation,
+    path: String,
+) -> Result<()> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if path == "denied" {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES));
+        }
+        return Ok(());
+    }
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("metadata mutation requires a connected protocol engine".to_string())
+    })?;
+    match operation {
+        MetadataOperation::Chmod(mode) => {
+            mount
+                .setattr_path(&path, false, Some(mode), None, None, None, None, None)
+                .await
+        }
+        MetadataOperation::Chown(uid, gid) => {
+            mount
+                .setattr_path(&path, false, None, uid, gid, None, None, None)
+                .await
+        }
+        MetadataOperation::Utime(atime, mtime) => {
+            mount
+                .setattr_path(
+                    &path,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(time_from_ns(atime)?),
+                    Some(time_from_ns(mtime)?),
+                )
+                .await
+        }
+        MetadataOperation::Truncate(size) => {
+            mount
+                .setattr_path(&path, false, None, None, None, Some(size), None, None)
+                .await
+        }
+    }
+}
+
+async fn access_path(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+    mode: u32,
+) -> Result<bool> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        return Ok(path != "denied" && mode & !0o7 == 0);
+    }
+    let granted = mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("access requires a connected protocol engine".to_string())
+        })?
+        .access_path(&path, mode)
+        .await?;
+    Ok(granted & mode == mode)
+}
+
+async fn xattr_get(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+    name: String,
+) -> Result<Vec<u8>> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if path == "unsupported" {
+            return Err(NfsError::Unsupported(
+                "named attributes are not supported".to_string(),
+            ));
+        }
+        return resources
+            .test_xattrs
+            .lock()
+            .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
+            .get(&(path, name))
+            .cloned()
+            .ok_or_else(|| NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT));
+    }
+    Ok(mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("xattr requires a connected protocol engine".to_string())
+        })?
+        .getxattr_path(&path, &name)
+        .await?
+        .to_vec())
+}
+
+async fn xattr_set(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+    name: String,
+    value: Vec<u8>,
+) -> Result<()> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if path == "unsupported" {
+            return Err(NfsError::Unsupported(
+                "named attributes are not supported".to_string(),
+            ));
+        }
+        resources
+            .test_xattrs
+            .lock()
+            .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
+            .insert((path, name), value);
+        return Ok(());
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("xattr requires a connected protocol engine".to_string())
+        })?
+        .setxattr_path(&path, &name, Bytes::from(value))
+        .await
+}
+
+async fn xattr_list(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+) -> Result<Vec<String>> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if path == "unsupported" {
+            return Err(NfsError::Unsupported(
+                "named attributes are not supported".to_string(),
+            ));
+        }
+        let mut names: Vec<_> = resources
+            .test_xattrs
+            .lock()
+            .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
+            .keys()
+            .filter(|(candidate, _)| candidate == &path)
+            .map(|(_, name)| name.clone())
+            .collect();
+        names.sort();
+        return Ok(names);
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("xattr requires a connected protocol engine".to_string())
+        })?
+        .listxattr_path(&path)
+        .await
+}
+
+async fn xattr_remove(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    resources: Arc<AdapterResources>,
+    path: String,
+    name: String,
+) -> Result<()> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if path == "unsupported" {
+            return Err(NfsError::Unsupported(
+                "named attributes are not supported".to_string(),
+            ));
+        }
+        resources
+            .test_xattrs
+            .lock()
+            .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
+            .remove(&(path, name))
+            .ok_or_else(|| NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT))?;
+        return Ok(());
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("xattr requires a connected protocol engine".to_string())
+        })?
+        .removexattr_path(&path, &name)
         .await
 }
 
@@ -2047,6 +2392,23 @@ impl SyncClient {
     }
 
     #[getter]
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities_dict(
+            py,
+            self.health_source
+                .as_ref()
+                .map_or_else(crate::MountCapabilities::default, |mount| {
+                    mount.capabilities()
+                }),
+        )
+    }
+
+    #[getter]
+    fn io_limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        io_limits_dict(py, self.health_source.as_ref())
+    }
+
+    #[getter]
     fn closed(&self) -> bool {
         self.core.lifecycle() == crate::client_core::ClientLifecycle::Closed
     }
@@ -2163,6 +2525,144 @@ impl SyncClient {
         .map_err(nfs_error)
     }
 
+    fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(metadata_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                MetadataOperation::Chmod(mode),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn chown(&self, py: Python<'_>, path: String, uid: i64, gid: i64) -> PyResult<()> {
+        let uid = optional_identity(uid)?;
+        let gid = optional_identity(gid)?;
+        py.detach(|| {
+            self.runtime.block_on(metadata_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                MetadataOperation::Chown(uid, gid),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn utime(&self, py: Python<'_>, path: String, atime_ns: u64, mtime_ns: u64) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(metadata_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                MetadataOperation::Utime(atime_ns, mtime_ns),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn truncate_path(&self, py: Python<'_>, path: String, size: u64) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(metadata_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                MetadataOperation::Truncate(size),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn access(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<bool> {
+        py.detach(|| {
+            self.runtime.block_on(access_path(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                mode,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn getxattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<Vec<u8>> {
+        py.detach(|| {
+            self.runtime.block_on(xattr_get(
+                self.core.clone(),
+                self.health_source.clone(),
+                self.resources.clone(),
+                path,
+                name,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn setxattr(&self, py: Python<'_>, path: String, name: String, value: Vec<u8>) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(xattr_set(
+                self.core.clone(),
+                self.health_source.clone(),
+                self.resources.clone(),
+                path,
+                name,
+                value,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn listxattr(&self, py: Python<'_>, path: String) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            self.runtime.block_on(xattr_list(
+                self.core.clone(),
+                self.health_source.clone(),
+                self.resources.clone(),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn removexattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(xattr_remove(
+                self.core.clone(),
+                self.health_source.clone(),
+                self.resources.clone(),
+                path,
+                name,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn fs_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let info = py
+            .detach(|| {
+                self.runtime.block_on(fs_info_values(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                ))
+            })
+            .map_err(nfs_error)?;
+        fs_info_dict(py, info)
+    }
+
+    fn fs_stat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let info = py
+            .detach(|| {
+                self.runtime.block_on(fs_stat_values(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                ))
+            })
+            .map_err(nfs_error)?;
+        fs_stat_dict(py, info)
+    }
+
     fn scandir(&self, py: Python<'_>, path: String) -> PyResult<SyncDirectoryCursor> {
         let receiver = py
             .detach(|| {
@@ -2225,6 +2725,21 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             namespace_operation(core, mount, operation, first, second)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn metadata_future<'py>(
+        &self,
+        py: Python<'py>,
+        operation: MetadataOperation,
+        path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            metadata_operation(core, mount, operation, path)
                 .await
                 .map_err(nfs_error)
         })
@@ -2306,6 +2821,23 @@ impl AsyncClient {
         self.core.lifecycle() == crate::client_core::ClientLifecycle::Closed
     }
 
+    #[getter]
+    fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        capabilities_dict(
+            py,
+            self.health_source
+                .as_ref()
+                .map_or_else(crate::MountCapabilities::default, |mount| {
+                    mount.capabilities()
+                }),
+        )
+    }
+
+    #[getter]
+    fn io_limits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        io_limits_dict(py, self.health_source.as_ref())
+    }
+
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2372,6 +2904,131 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             readlink_path(core, mount, path).await.map_err(nfs_error)
+        })
+    }
+
+    fn chmod<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+        self.metadata_future(py, MetadataOperation::Chmod(mode), path)
+    }
+
+    fn chown<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        uid: i64,
+        gid: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.metadata_future(
+            py,
+            MetadataOperation::Chown(optional_identity(uid)?, optional_identity(gid)?),
+            path,
+        )
+    }
+
+    fn utime<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        atime_ns: u64,
+        mtime_ns: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.metadata_future(py, MetadataOperation::Utime(atime_ns, mtime_ns), path)
+    }
+
+    fn truncate_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        size: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.metadata_future(py, MetadataOperation::Truncate(size), path)
+    }
+
+    fn access<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            access_path(core, mount, path, mode)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn getxattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let resources = self.resources.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            xattr_get(core, mount, resources, path, name)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn setxattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let resources = self.resources.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            xattr_set(core, mount, resources, path, name, value)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn listxattr<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let resources = self.resources.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            xattr_list(core, mount, resources, path)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn removexattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let resources = self.resources.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            xattr_remove(core, mount, resources, path, name)
+                .await
+                .map_err(nfs_error)
+        })
+    }
+
+    fn fs_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let info = fs_info_values(core, mount).await.map_err(nfs_error)?;
+            Python::attach(|py| fs_info_dict(py, info).map(Bound::unbind))
+        })
+    }
+
+    fn fs_stat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let info = fs_stat_values(core, mount).await.map_err(nfs_error)?;
+            Python::attach(|py| fs_stat_dict(py, info).map(Bound::unbind))
         })
     }
 

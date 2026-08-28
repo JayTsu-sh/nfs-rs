@@ -81,6 +81,49 @@ class ExportEntry:
     groups: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class FsInfo:
+    max_file_size: int
+    time_delta_ns: int
+    supports_links: bool
+    supports_symlinks: bool
+    homogeneous: bool
+    can_set_time: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FsStat:
+    total_bytes: int
+    free_bytes: int
+    available_bytes: int
+    total_files: int
+    free_files: int
+    available_files: int
+    invariant_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class Capabilities:
+    acl: bool
+    named_attributes: bool
+    locks: bool
+    callbacks: bool
+    delegation_retention: bool
+    pnfs: bool
+    session_diagnostics: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IoLimits:
+    max_read: int
+    max_write: int
+    preferred_read: int
+    preferred_write: int
+    read_multiple: int
+    write_multiple: int
+    preferred_directory: int
+
+
 def _normalize_path(path: os.PathLike[str] | str) -> str:
     raw = os.fspath(path)
     if isinstance(raw, bytes):
@@ -123,6 +166,22 @@ def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
 def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
     path = values["name"] if parent == "." else f"{parent}/{values['name']}"
     return DirEntry(values["name"], path, _file_info(path, values["info"]))
+
+
+def _capabilities(values: dict[str, Any]) -> Capabilities:
+    return Capabilities(**values)
+
+
+def _io_limits(values: dict[str, Any]) -> IoLimits:
+    return IoLimits(**values)
+
+
+def _fs_info(values: dict[str, Any]) -> FsInfo:
+    return FsInfo(**values)
+
+
+def _fs_stat(values: dict[str, Any]) -> FsStat:
+    return FsStat(**values)
 
 
 def _adapter() -> ModuleType:
@@ -290,6 +349,14 @@ class Client(_ClientOptions):
         return Health(Lifecycle(values["lifecycle"]), values["generation"], values["lease_healthy"])
 
     @property
+    def capabilities(self) -> Capabilities:
+        return _capabilities(self._inner.capabilities)
+
+    @property
+    def io_limits(self) -> IoLimits:
+        return _io_limits(self._inner.io_limits)
+
+    @property
     def closed(self) -> bool:
         return self._inner.closed
 
@@ -313,6 +380,41 @@ class Client(_ClientOptions):
 
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name for entry in self.scandir(path)]
+
+    def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
+        self._inner.chmod(_normalize_path(path), mode)
+
+    def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
+        self._inner.chown(_normalize_path(path), uid, gid)
+
+    def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+        if not isinstance(ns, tuple) or len(ns) != 2:
+            raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
+        self._inner.utime(_normalize_path(path), ns[0], ns[1])
+
+    def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
+        self._inner.truncate_path(_normalize_path(path), size)
+
+    def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+        return bool(self._inner.access(_normalize_path(path), mode))
+
+    def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
+        return bytes(self._inner.getxattr(_normalize_path(path), name))
+
+    def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None:
+        self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+
+    def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
+        return list(self._inner.listxattr(_normalize_path(path)))
+
+    def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
+        self._inner.removexattr(_normalize_path(path), name)
+
+    def fs_info(self) -> FsInfo:
+        return _fs_info(self._inner.fs_info())
+
+    def fs_stat(self) -> FsStat:
+        return _fs_stat(self._inner.fs_stat())
 
     def mkdir(
         self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
@@ -444,6 +546,14 @@ class AsyncClient(_ClientOptions):
         return Health(Lifecycle(values["lifecycle"]), values["generation"], values["lease_healthy"])
 
     @property
+    def capabilities(self) -> Capabilities:
+        return _capabilities(self._inner.capabilities)
+
+    @property
+    def io_limits(self) -> IoLimits:
+        return _io_limits(self._inner.io_limits)
+
+    @property
     def closed(self) -> bool:
         return self._inner.closed
 
@@ -474,6 +584,52 @@ class AsyncClient(_ClientOptions):
 
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name async for entry in self.scandir(path)]
+
+    async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
+        self._check_loop()
+        await self._inner.chmod(_normalize_path(path), mode)
+
+    async def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
+        self._check_loop()
+        await self._inner.chown(_normalize_path(path), uid, gid)
+
+    async def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+        self._check_loop()
+        if not isinstance(ns, tuple) or len(ns) != 2:
+            raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
+        await self._inner.utime(_normalize_path(path), ns[0], ns[1])
+
+    async def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
+        self._check_loop()
+        await self._inner.truncate_path(_normalize_path(path), size)
+
+    async def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+        self._check_loop()
+        return bool(await self._inner.access(_normalize_path(path), mode))
+
+    async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
+        self._check_loop()
+        return bytes(await self._inner.getxattr(_normalize_path(path), name))
+
+    async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None:
+        self._check_loop()
+        await self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+
+    async def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
+        self._check_loop()
+        return list(await self._inner.listxattr(_normalize_path(path)))
+
+    async def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
+        self._check_loop()
+        await self._inner.removexattr(_normalize_path(path), name)
+
+    async def fs_info(self) -> FsInfo:
+        self._check_loop()
+        return _fs_info(await self._inner.fs_info())
+
+    async def fs_stat(self) -> FsStat:
+        self._check_loop()
+        return _fs_stat(await self._inner.fs_stat())
 
     async def mkdir(
         self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
