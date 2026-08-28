@@ -569,7 +569,6 @@ async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
 fn nfs_error_msg(err: &NfsError) -> String {
     match err {
         NfsError::Io(e) => e.to_string(),
-        NfsError::Transport { source, .. } => nfs_error_msg(source),
         NfsError::Nfs3(c) => c.to_string(),
         NfsError::Nfs4(c) => c.to_string(),
         NfsError::LockDenied { .. } => err.to_string(),

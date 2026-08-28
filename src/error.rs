@@ -55,6 +55,24 @@ pub enum RequestTransmission {
     Sent,
 }
 
+#[derive(Debug)]
+struct TransportFailure {
+    transmission: RequestTransmission,
+    source: Box<NfsError>,
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
 /// Opaque, bounded request identity. It deliberately excludes file handles and payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestId {
@@ -154,14 +172,6 @@ pub enum NfsError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
 
-    /// Transport failure annotated at the RPC send boundary.
-    #[error("{source}")]
-    Transport {
-        transmission: RequestTransmission,
-        #[source]
-        source: Box<NfsError>,
-    },
-
     /// NFS3 protocol error (nfsstat3).
     #[error("NFS3 error: {0}")]
     Nfs3(crate::nfs3::ErrorCode),
@@ -210,16 +220,23 @@ pub enum NfsError {
 
 impl NfsError {
     pub(crate) fn transport(transmission: RequestTransmission, source: NfsError) -> Self {
-        Self::Transport {
-            transmission,
-            source: Box::new(source),
-        }
+        let kind = source.kind();
+        Self::Io(std::io::Error::new(
+            kind,
+            TransportFailure {
+                transmission,
+                source: Box::new(source),
+            },
+        ))
     }
 
     /// Returns transport send-boundary evidence when it is available.
     pub fn request_transmission(&self) -> Option<RequestTransmission> {
         match self {
-            Self::Transport { transmission, .. } => Some(*transmission),
+            Self::Io(error) => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<TransportFailure>())
+                .map(|failure| failure.transmission),
             Self::OperationOutcome(error) => Some(error.transmission),
             _ => None,
         }
@@ -276,7 +293,6 @@ impl NfsError {
     pub fn kind(&self) -> std::io::ErrorKind {
         match self {
             NfsError::Io(io) => io.kind(),
-            NfsError::Transport { source, .. } => source.kind(),
             NfsError::Nfs3(_) => std::io::ErrorKind::Other,
             NfsError::Nfs4(_) => std::io::ErrorKind::Other,
             NfsError::LockDenied { .. } => std::io::ErrorKind::WouldBlock,
@@ -364,7 +380,6 @@ impl From<NfsError> for std::io::Error {
     fn from(e: NfsError) -> Self {
         match e {
             NfsError::Io(io) => io,
-            NfsError::Transport { source, .. } => (*source).into(),
             NfsError::Nfs3(code) => std::io::Error::other(code),
             NfsError::Nfs4(code) => std::io::Error::other(code),
             error @ NfsError::LockDenied { .. } => {

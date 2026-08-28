@@ -407,9 +407,10 @@ impl StreamMux {
 
         // Wait for response from the reader task with timeout.
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => {
-                result.map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))
+            Ok(Ok(Err(error @ NfsError::Io(_)))) => {
+                Err(NfsError::transport(crate::RequestTransmission::Sent, error))
             }
+            Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(NfsError::transport(
                 crate::RequestTransmission::Sent,
                 NfsError::Io(std::io::Error::new(
@@ -826,6 +827,7 @@ impl Client {
         let max_attempts = replay_policy.max_attempts();
         let mut attempt = 0usize;
         let mut last_error = None;
+        let mut logical_transmission = crate::RequestTransmission::NotSent;
         let start = tokio::time::Instant::now();
         // Total replay budget: 3x the per-attempt timeout, so we fail fast instead
         // of accumulating max_attempts * timeout worth of delay.
@@ -878,7 +880,12 @@ impl Client {
                     trace!(xid, "RPC response received");
                     return parse_rpc_response(response_data, xid);
                 }
-                Err(e) => {
+                Err(mut e) => {
+                    if e.request_transmission() == Some(crate::RequestTransmission::Sent) {
+                        logical_transmission = crate::RequestTransmission::Sent;
+                    } else if logical_transmission == crate::RequestTransmission::Sent {
+                        e = NfsError::transport(crate::RequestTransmission::Sent, e);
+                    }
                     if bypass_readiness {
                         return Err(e);
                     }
@@ -1200,11 +1207,7 @@ mod tests {
             .await
             .expect_err("short record must fail the pending RPC call");
         assert!(
-            matches!(
-                error,
-                NfsError::Transport { ref source, .. }
-                    if matches!(&**source, NfsError::Rpc(message) if message.contains("shorter than XID"))
-            ),
+            matches!(error, NfsError::Rpc(ref message) if message.contains("shorter than XID")),
             "RPC framing type was not preserved: {error}"
         );
         server.await.unwrap();
@@ -1514,6 +1517,48 @@ mod tests {
         let (first, reconnected) = server.await.unwrap().unwrap();
         assert!(!first.is_empty());
         assert!(!reconnected, "one-attempt policy must not reconnect");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn logical_request_keeps_sent_evidence_after_a_later_before_send_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await?;
+            let first = read_test_record(&mut first_stream).await?;
+            drop(first_stream);
+            let (_replacement, _) = listener.accept().await?;
+            Ok::<Vec<u8>, std::io::Error>(first)
+        });
+
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        mux.set_reconnect_handler(Arc::new(|_client, _generation| {
+            Box::pin(async { Err(NfsError::Rpc("injected bind failure".to_string())) })
+        }))
+        .unwrap();
+        let client = Client::new(mux, None);
+        let mut body = Vec::new();
+        body.extend_from_slice(&RPC_VERSION.to_be_bytes());
+        body.extend_from_slice(&NFS_PROG.to_be_bytes());
+        body.extend_from_slice(&crate::nfs41::NFS4_VERSION.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+
+        let error = client
+            .call(
+                body,
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("failed rebind must fail the logical request");
+
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent),
+            "an earlier sent attempt must remain authoritative"
+        );
+        assert!(!server.await.unwrap().unwrap().is_empty());
         client.shutdown().await;
     }
 

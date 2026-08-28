@@ -3989,10 +3989,7 @@ mod tests {
         let error = mount_on_addr(addr, &args, Auth::new_null())
             .await
             .unwrap_err();
-        assert!(matches!(
-            error,
-            NfsError::Rpc(_) | NfsError::Io(_) | NfsError::Transport { .. }
-        ));
+        assert!(matches!(error, NfsError::Rpc(_) | NfsError::Io(_)));
         server.await.unwrap().unwrap();
     }
 
