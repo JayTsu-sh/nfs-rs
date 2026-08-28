@@ -636,6 +636,15 @@ class AsyncFile:
                 raise
             _record_cleanup_failure(exc, cleanup_error, "AsyncFile")
 
+    def __del__(self) -> None:
+        inner = getattr(self, "_inner", None)
+        if inner is not None and not inner.closed:
+            warnings.warn(
+                f"unclosed async NFS file {self._name!r}",
+                ResourceWarning,
+                stacklevel=2,
+            )
+
 
 def list_exports(host: str, **options: Any) -> tuple[ExportEntry, ...]:
     validated = Client._connection_options(**options)
