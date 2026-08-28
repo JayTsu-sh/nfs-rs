@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use pyo3::exceptions::{
-    PyFileNotFoundError, PyPermissionError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
+    PyFileExistsError, PyFileNotFoundError, PyPermissionError, PyRuntimeError,
+    PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
@@ -910,6 +911,8 @@ fn nfs_error_ref(error: &NfsError) -> PyErr {
     );
     if error.is_not_found() {
         PyFileNotFoundError::new_err(error.to_string())
+    } else if error.is_exist() {
+        PyFileExistsError::new_err(error.to_string())
     } else if permission_denied || error.kind() == std::io::ErrorKind::PermissionDenied {
         PyPermissionError::new_err(error.to_string())
     } else {
@@ -1031,6 +1034,92 @@ async fn stat_attr(
         NfsError::Unsupported("stat requires a connected protocol engine".to_string())
     })?;
     mount.getattr_path(&path).await
+}
+
+#[derive(Clone, Copy)]
+enum NamespaceOperation {
+    Mkdir(u32),
+    Remove,
+    Rmdir,
+    Rename,
+    Link,
+    Symlink,
+}
+
+async fn namespace_operation(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    operation: NamespaceOperation,
+    first: String,
+    second: Option<String>,
+) -> Result<()> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        if first.contains("__before_send__") {
+            return Err(NfsError::before_send_failure(
+                crate::OperationClass::ReplaySensitive,
+                crate::RequestContext {
+                    operation: "namespace mutation".to_string(),
+                    protocol: NFSVersion::NFSv3,
+                    request_id: None,
+                },
+                None,
+                NfsError::Rpc("injected before-send failure".to_string()),
+            ));
+        }
+        if first.contains("__after_send__") {
+            return Err(NfsError::OperationOutcome(Box::new(
+                crate::OperationOutcomeError::new(
+                    crate::OperationOutcome::Uncertain,
+                    crate::OperationClass::ReplaySensitive,
+                    crate::RecoveryAction::VerifyThenResume,
+                    crate::RequestContext {
+                        operation: "namespace mutation".to_string(),
+                        protocol: NFSVersion::NFSv3,
+                        request_id: None,
+                    },
+                    NfsError::Rpc("injected after-send failure".to_string()),
+                ),
+            )));
+        }
+        return Ok(());
+    }
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("namespace mutation requires a connected protocol engine".to_string())
+    })?;
+    match operation {
+        NamespaceOperation::Mkdir(mode) => mount.mkdir_path(&first, mode).await.map(|_| ()),
+        NamespaceOperation::Remove => mount.remove_path(&first).await,
+        NamespaceOperation::Rmdir => mount.rmdir_path(&first).await,
+        NamespaceOperation::Rename => mount.rename_path(&first, second.as_deref().unwrap()).await,
+        NamespaceOperation::Link => mount
+            .link_path(&first, second.as_deref().unwrap())
+            .await
+            .map(|_| ()),
+        NamespaceOperation::Symlink => mount
+            .symlink_path(&first, second.as_deref().unwrap())
+            .await
+            .map(|_| ()),
+    }
+}
+
+async fn readlink_path(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+) -> Result<String> {
+    let _operation_guard = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        return Ok("../target".to_string());
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("readlink requires a connected protocol engine".to_string())
+        })?
+        .readlink_path(&path)
+        .await
 }
 
 #[cfg(feature = "python-test-support")]
@@ -1939,6 +2028,96 @@ impl SyncClient {
         attr_dict(py, &attr)
     }
 
+    #[pyo3(signature = (path, mode = 0o777))]
+    fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Mkdir(mode),
+                path,
+                None,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn remove(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Remove,
+                path,
+                None,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn rmdir(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Rmdir,
+                path,
+                None,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn rename(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Rename,
+                source,
+                Some(destination),
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn link(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Link,
+                source,
+                Some(destination),
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn symlink(&self, py: Python<'_>, target: String, link_path: String) -> PyResult<()> {
+        py.detach(|| {
+            self.runtime.block_on(namespace_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                NamespaceOperation::Symlink,
+                target,
+                Some(link_path),
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn readlink(&self, py: Python<'_>, path: String) -> PyResult<String> {
+        py.detach(|| {
+            self.runtime.block_on(readlink_path(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
     fn scandir(&self, py: Python<'_>, path: String) -> PyResult<SyncDirectoryCursor> {
         let receiver = py
             .detach(|| {
@@ -1987,6 +2166,24 @@ struct AsyncClient {
     health: MountHealth,
     health_source: Option<Arc<dyn Mount>>,
     _operation_timeout: Option<Duration>,
+}
+
+impl AsyncClient {
+    fn namespace_future<'py>(
+        &self,
+        py: Python<'py>,
+        operation: NamespaceOperation,
+        first: String,
+        second: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            namespace_operation(core, mount, operation, first, second)
+                .await
+                .map_err(nfs_error)
+        })
+    }
 }
 
 #[pymethods]
@@ -2082,6 +2279,54 @@ impl AsyncClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let attr = stat_attr(core, mount, path).await.map_err(nfs_error)?;
             Python::attach(|py| attr_dict(py, &attr).map(Bound::unbind))
+        })
+    }
+
+    #[pyo3(signature = (path, mode = 0o777))]
+    fn mkdir<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Mkdir(mode), path, None)
+    }
+
+    fn remove<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Remove, path, None)
+    }
+
+    fn rmdir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Rmdir, path, None)
+    }
+
+    fn rename<'py>(
+        &self,
+        py: Python<'py>,
+        source: String,
+        destination: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Rename, source, Some(destination))
+    }
+
+    fn link<'py>(
+        &self,
+        py: Python<'py>,
+        source: String,
+        destination: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Link, source, Some(destination))
+    }
+
+    fn symlink<'py>(
+        &self,
+        py: Python<'py>,
+        target: String,
+        link_path: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.namespace_future(py, NamespaceOperation::Symlink, target, Some(link_path))
+    }
+
+    fn readlink<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            readlink_path(core, mount, path).await.map_err(nfs_error)
         })
     }
 

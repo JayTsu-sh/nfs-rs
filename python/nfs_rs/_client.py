@@ -314,6 +314,71 @@ class Client(_ClientOptions):
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name for entry in self.scandir(path)]
 
+    def mkdir(
+        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        """Create directories non-transactionally when ``parents`` is true."""
+        normalized = _normalize_path(path)
+        paths = [normalized]
+        if parents:
+            parts = normalized.split("/")
+            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+        for candidate in paths:
+            try:
+                self._inner.mkdir(candidate, mode)
+            except FileExistsError:
+                if not (parents or exist_ok):
+                    raise
+                try:
+                    existing = self.stat(candidate)
+                except BaseException:
+                    raise
+                if existing.type is not FileType.DIRECTORY:
+                    raise
+
+    def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+        try:
+            self._inner.remove(_normalize_path(path))
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+    unlink = remove
+
+    def rmdir(self, path: os.PathLike[str] | str) -> None:
+        self._inner.rmdir(_normalize_path(path))
+
+    def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+        self._inner.rename(_normalize_path(source), _normalize_path(destination))
+
+    def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+        self._inner.link(_normalize_path(source), _normalize_path(destination))
+
+    def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
+        target_text = os.fspath(target)
+        if isinstance(target_text, bytes):
+            raise TypeError("symlink targets must be strings, not bytes")
+        if "\0" in target_text:
+            raise ValueError("symlink targets may not contain NUL")
+        self._inner.symlink(target_text, _normalize_path(link_path))
+
+    def readlink(self, path: os.PathLike[str] | str) -> str:
+        return self._inner.readlink(_normalize_path(path))
+
+    def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+        normalized = _normalize_path(path)
+        if not exist_ok and self.exists(normalized):
+            raise FileExistsError(normalized)
+        self.open(normalized, "ab").close()
+
+    def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
+        with self.open(path, "rb") as file:
+            return file.read()
+
+    def write_bytes(self, path: os.PathLike[str] | str, data: Any) -> int:
+        with self.open(path, "wb") as file:
+            return file.write(data)
+
     def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
         """Open a binary file.
 
@@ -409,6 +474,78 @@ class AsyncClient(_ClientOptions):
 
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name async for entry in self.scandir(path)]
+
+    async def mkdir(
+        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        self._check_loop()
+        normalized = _normalize_path(path)
+        paths = [normalized]
+        if parents:
+            parts = normalized.split("/")
+            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+        for candidate in paths:
+            try:
+                await self._inner.mkdir(candidate, mode)
+            except FileExistsError:
+                if not (parents or exist_ok):
+                    raise
+                try:
+                    existing = await self.stat(candidate)
+                except BaseException:
+                    raise
+                if existing.type is not FileType.DIRECTORY:
+                    raise
+
+    async def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+        self._check_loop()
+        try:
+            await self._inner.remove(_normalize_path(path))
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+    unlink = remove
+
+    async def rmdir(self, path: os.PathLike[str] | str) -> None:
+        self._check_loop()
+        await self._inner.rmdir(_normalize_path(path))
+
+    async def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+        self._check_loop()
+        await self._inner.rename(_normalize_path(source), _normalize_path(destination))
+
+    async def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+        self._check_loop()
+        await self._inner.link(_normalize_path(source), _normalize_path(destination))
+
+    async def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
+        self._check_loop()
+        target_text = os.fspath(target)
+        if isinstance(target_text, bytes):
+            raise TypeError("symlink targets must be strings, not bytes")
+        if "\0" in target_text:
+            raise ValueError("symlink targets may not contain NUL")
+        await self._inner.symlink(target_text, _normalize_path(link_path))
+
+    async def readlink(self, path: os.PathLike[str] | str) -> str:
+        self._check_loop()
+        return await self._inner.readlink(_normalize_path(path))
+
+    async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+        normalized = _normalize_path(path)
+        if not exist_ok and await self.exists(normalized):
+            raise FileExistsError(normalized)
+        file = await self.open(normalized, "ab")
+        await file.close()
+
+    async def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
+        async with await self.open(path, "rb") as file:
+            return await file.read()
+
+    async def write_bytes(self, path: os.PathLike[str] | str, data: Any) -> int:
+        async with await self.open(path, "wb") as file:
+            return await file.write(data)
 
     async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
         """Open a binary file with the same non-transactional effects as Client.open()."""
