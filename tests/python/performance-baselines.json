@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "status": "accepted",
+  "captured_at": "2026-08-28",
+  "provenance": {
+    "run_id": "nightly-codex-ticket14-20260828",
+    "artifacts": [
+      "production manylinux2014 x86_64 wheel",
+      "wheel rebuilt from the production sdist"
+    ],
+    "selection": "minimum observed median throughput and maximum observed p95 latency"
+  },
+  "policy": {
+    "comparable_runs": 5,
+    "minimum_valid_runs": 4,
+    "maximum_regression_percent": 10
+  },
+  "cases": {
+    "linux-source-v3": {
+      "write_mib_s_median": 19.422230574020823,
+      "read_mib_s_median": 240.71729570021833,
+      "write_latency_ms_p95": 528.0333841219544,
+      "read_latency_ms_p95": 18.370450474321842
+    },
+    "dxn-v40": {
+      "write_mib_s_median": 28.212894401202735,
+      "read_mib_s_median": 67.0481027045506,
+      "write_latency_ms_p95": 261.30117755383253,
+      "read_latency_ms_p95": 64.0200674533844
+    },
+    "linux-source-v41": {
+      "write_mib_s_median": 12.421044813437856,
+      "read_mib_s_median": 350.05968143266864,
+      "write_latency_ms_p95": 400.4327254369855,
+      "read_latency_ms_p95": 16.01852010935545
+    },
+    "netapp-pnfs-mds": {
+      "write_mib_s_median": 46.72933351201229,
+      "read_mib_s_median": 69.725315167318,
+      "write_latency_ms_p95": 107.53947123885155,
+      "read_latency_ms_p95": 67.36926827579737
+    }
+  }
+}

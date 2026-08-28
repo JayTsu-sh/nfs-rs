@@ -1471,9 +1471,7 @@ impl crate::Mount for Mount41Wrapper {
             locks: true,
             callbacks: true,
             delegation_retention: self.m.retain_delegations,
-            // pNFS is negotiated per session; the synchronous capability
-            // snapshot stays conservative until that state is cached here.
-            pnfs: false,
+            pnfs: self.m.session_holder.pnfs_mds(),
             session_diagnostics: true,
         }
     }

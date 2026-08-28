@@ -6,7 +6,7 @@
 //! and provides exactly-once semantics.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use bytes::{Buf, Bytes};
@@ -819,15 +819,23 @@ fn validate_channel_attrs(
 /// Recovery operations take a write lock to replace the session.
 pub(crate) struct SessionHolder {
     inner: tokio::sync::RwLock<Arc<Session>>,
+    pnfs_mds: AtomicBool,
 }
 
 impl SessionHolder {
     pub fn new(session: Session) -> Self {
         let mut session = session;
         session.generation = 1;
+        let pnfs_mds = session.pnfs_mds();
         Self {
             inner: tokio::sync::RwLock::new(Arc::new(session)),
+            pnfs_mds: AtomicBool::new(pnfs_mds),
         }
+    }
+
+    /// Return the pNFS MDS capability from the currently published session.
+    pub fn pnfs_mds(&self) -> bool {
+        self.pnfs_mds.load(Ordering::Acquire)
     }
 
     /// Get a clone of the current session (shared read lock, immediately released).
@@ -843,6 +851,8 @@ impl SessionHolder {
             return false;
         }
         new_session.generation = expected.saturating_add(1);
+        self.pnfs_mds
+            .store(new_session.pnfs_mds(), Ordering::Release);
         *guard = Arc::new(new_session);
         true
     }
@@ -868,6 +878,8 @@ impl SessionHolder {
             new_session.backchannel_max_request_size,
             new_session.backchannel_max_operations,
         )?;
+        self.pnfs_mds
+            .store(new_session.pnfs_mds(), Ordering::Release);
         *guard = Arc::new(new_session);
         Ok(true)
     }
@@ -1224,10 +1236,15 @@ mod tests {
     #[tokio::test]
     async fn session_holder_generations_are_monotonic_and_stale_safe() {
         let holder = SessionHolder::new(test_session(1));
+        assert!(!holder.pnfs_mds());
         assert_eq!(holder.get().await.generation(), 1);
-        assert!(holder.replace_if_current(1, test_session(2)).await);
+        let mut pnfs_session = test_session(2);
+        pnfs_session.pnfs_mds = true;
+        assert!(holder.replace_if_current(1, pnfs_session).await);
+        assert!(holder.pnfs_mds());
         assert_eq!(holder.get().await.generation(), 2);
         assert!(!holder.replace_if_current(1, test_session(3)).await);
+        assert!(holder.pnfs_mds());
         let active = holder.get().await;
         assert_eq!(active.generation(), 2);
         assert_eq!(active.id(), &[2; 16]);
