@@ -4,10 +4,10 @@
 
 **Blocked by:** 04 — Deliver paths, metadata, and directory browsing
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Sync and async chmod, chown, nanosecond utime, path truncate, and access have semantic parity.
-- [ ] Supported xattr operations round-trip values and unsupported protocol paths raise the structured unsupported category.
-- [ ] Filesystem and I/O information is immutable, protocol neutral, and omits raw handles and channel state.
-- [ ] Capabilities report unsupported features honestly rather than silently emulating them.
-- [ ] Deterministic and real-server tests cover success, permission, unsupported, and protocol failure cases.
+- [x] Sync and async chmod, chown, nanosecond utime, path truncate, and access have semantic parity.
+- [x] Supported xattr operations round-trip values and unsupported protocol paths raise the structured unsupported category.
+- [x] Filesystem and I/O information is immutable, protocol neutral, and omits raw handles and channel state.
+- [x] Capabilities report unsupported features honestly rather than silently emulating them.
+- [x] Deterministic and real-server tests cover success, permission, unsupported, and protocol failure cases.
