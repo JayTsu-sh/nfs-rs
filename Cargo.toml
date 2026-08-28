@@ -24,6 +24,10 @@ include = [
     "/tests/lab_e2e.rs",
 ]
 
+[features]
+default = []
+python-bindings-internal = []
+
 [dependencies]
 byteorder = "1.5.0"
 bytes = "1.10.1"
@@ -49,3 +53,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bench]]
 name = "xdr_decode"
 harness = false
+
+[[test]]
+name = "client_core_contract"
+path = "tests/client_core_contract.rs"
+required-features = ["python-bindings-internal"]

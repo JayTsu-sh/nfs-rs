@@ -1,6 +1,9 @@
 use async_trait::async_trait;
-use nfs_rs::Result;
 use nfs_rs::client_core::{ClientCore, ClientDriver, ClientLifecycle, ResourceKey};
+use nfs_rs::{
+    NFSVersion, NfsError, OperationClass, OperationOutcome, RecoveryAction, RequestContext,
+    RequestTransmission, Result,
+};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -92,7 +95,7 @@ async fn close_rejects_new_work_and_waits_for_in_flight_work() {
         let core = core.clone();
         tokio::spawn(async move { core.close().await })
     };
-    tokio::task::yield_now().await;
+    core.wait_for_lifecycle(ClientLifecycle::Closing).await;
 
     assert_eq!(core.lifecycle(), ClientLifecycle::Closing);
     assert!(core.begin_operation().is_err());
@@ -126,7 +129,7 @@ async fn core_owned_work_survives_the_callers_waiter_and_gates_close() {
         let core = core.clone();
         tokio::spawn(async move { core.close().await })
     };
-    tokio::task::yield_now().await;
+    core.wait_for_lifecycle(ClientLifecycle::Closing).await;
     assert!(driver.events.lock().unwrap().is_empty());
 
     release.notify_one();
@@ -200,7 +203,7 @@ async fn cancelling_a_close_waiter_does_not_cancel_core_owned_cleanup() {
         let core = core.clone();
         tokio::spawn(async move { core.close().await })
     };
-    tokio::task::yield_now().await;
+    core.wait_for_lifecycle(ClientLifecycle::Closing).await;
     waiter.abort();
     let _ = waiter.await;
     release.notify_one();
@@ -209,4 +212,81 @@ async fn cancelling_a_close_waiter_does_not_cancel_core_owned_cleanup() {
     assert!(report.errors().is_empty());
     assert_eq!(core.lifecycle(), ClientLifecycle::Closed);
     assert_eq!(*driver.events.lock().unwrap(), vec!["umount".to_string()]);
+}
+
+#[tokio::test]
+async fn injected_operation_has_explicit_barriers_and_gates_close() {
+    let core = ClientCore::new(Arc::new(RecordingDriver::default()));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let operation = {
+        let core = core.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        tokio::spawn(async move {
+            core.execute(async move {
+                entered.notify_one();
+                release.notified().await;
+                Err::<(), _>(NfsError::before_send_failure(
+                    OperationClass::ReadOnly,
+                    RequestContext {
+                        operation: "injected".to_string(),
+                        protocol: NFSVersion::NFSv3,
+                        request_id: None,
+                    },
+                    None,
+                    NfsError::Rpc("injected failure".to_string()),
+                ))
+            })
+            .await
+        })
+    };
+    entered.notified().await;
+    let close = {
+        let core = core.clone();
+        tokio::spawn(async move { core.close().await })
+    };
+    core.wait_for_lifecycle(ClientLifecycle::Closing).await;
+    assert!(!close.is_finished());
+
+    release.notify_one();
+    let error = operation.await.unwrap().unwrap_err();
+    assert_eq!(
+        error.request_transmission(),
+        Some(RequestTransmission::NotSent)
+    );
+    assert!(close.await.unwrap().errors().is_empty());
+}
+
+fn recovery_event(operation: &str) -> nfs_rs::client_core::CoreRecoveryEvent {
+    nfs_rs::client_core::CoreRecoveryEvent {
+        operation: operation.to_string(),
+        safe_path: Some("/safe/path".to_string()),
+        protocol: NFSVersion::NFSv3,
+        outcome: OperationOutcome::DefiniteFailure,
+        recovery: RecoveryAction::Retry,
+        completed_bytes: None,
+        message: "retry operation".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn recovery_event_queue_is_bounded_observable_and_atomically_drained() {
+    let core =
+        ClientCore::with_recovery_event_capacity(Arc::new(RecordingDriver::default()), 2).unwrap();
+    core.record_recovery_event(recovery_event("one")).unwrap();
+    core.record_recovery_event(recovery_event("two")).unwrap();
+    core.record_recovery_event(recovery_event("three")).unwrap();
+
+    assert_eq!(core.dropped_recovery_event_count().unwrap(), 1);
+    assert_eq!(
+        core.recovery_events()
+            .unwrap()
+            .iter()
+            .map(|event| event.operation.as_str())
+            .collect::<Vec<_>>(),
+        vec!["two", "three"]
+    );
+    assert_eq!(core.drain_recovery_events().unwrap().len(), 2);
+    assert!(core.recovery_events().unwrap().is_empty());
 }

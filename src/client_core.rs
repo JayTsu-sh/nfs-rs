@@ -16,8 +16,9 @@
 
 //! Lifecycle seam used by private language adapters.
 
-use crate::{NfsError, Result};
+use crate::{NFSVersion, NfsError, OperationOutcome, RecoveryAction, Result};
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -66,13 +67,13 @@ pub struct ClientCore {
     driver: Arc<dyn ClientDriver>,
     lifecycle: AtomicU8,
     next_resource_key: AtomicU64,
-    in_flight: AtomicU64,
-    in_flight_notify: Notify,
+    in_flight: DrainCounter,
     resources: Mutex<Vec<ResourceKey>>,
-    owned_tasks: AtomicU64,
-    owned_tasks_notify: Notify,
+    owned_tasks: DrainCounter,
+    recovery_events: Mutex<RecoveryEventQueue>,
     close_state: Mutex<CloseState>,
     close_notify: Notify,
+    lifecycle_notify: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -81,20 +82,99 @@ struct CloseState {
     report: Option<Arc<ClientCloseReport>>,
 }
 
+#[derive(Debug, Default)]
+struct DrainCounter {
+    count: AtomicU64,
+    notify: Notify,
+}
+
+impl DrainCounter {
+    fn increment(&self) {
+        self.count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn decrement(&self) {
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_zero(&self) {
+        while self.count() != 0 {
+            let notified = self.notify.notified();
+            if self.count() != 0 {
+                notified.await;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreRecoveryEvent {
+    pub operation: String,
+    pub safe_path: Option<String>,
+    pub protocol: NFSVersion,
+    pub outcome: OperationOutcome,
+    pub recovery: RecoveryAction,
+    pub completed_bytes: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug)]
+struct RecoveryEventQueue {
+    capacity: usize,
+    dropped: u64,
+    events: VecDeque<CoreRecoveryEvent>,
+}
+
 impl ClientCore {
     pub fn new(driver: Arc<dyn ClientDriver>) -> Arc<Self> {
+        Self::build(driver, 256)
+    }
+
+    pub fn with_recovery_event_capacity(
+        driver: Arc<dyn ClientDriver>,
+        recovery_event_capacity: usize,
+    ) -> Result<Arc<Self>> {
+        if recovery_event_capacity == 0 {
+            return Err(NfsError::InvalidInput(
+                "recovery-event capacity must be positive".to_string(),
+            ));
+        }
+        Ok(Self::build(driver, recovery_event_capacity))
+    }
+
+    fn build(driver: Arc<dyn ClientDriver>, recovery_event_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             driver,
             lifecycle: AtomicU8::new(READY),
             next_resource_key: AtomicU64::new(1),
-            in_flight: AtomicU64::new(0),
-            in_flight_notify: Notify::new(),
+            in_flight: DrainCounter::default(),
             resources: Mutex::new(Vec::new()),
-            owned_tasks: AtomicU64::new(0),
-            owned_tasks_notify: Notify::new(),
+            owned_tasks: DrainCounter::default(),
+            recovery_events: Mutex::new(RecoveryEventQueue {
+                capacity: recovery_event_capacity,
+                dropped: 0,
+                events: VecDeque::new(),
+            }),
             close_state: Mutex::new(CloseState::default()),
             close_notify: Notify::new(),
+            lifecycle_notify: Notify::new(),
         })
+    }
+
+    fn ensure_ready(&self) -> Result<()> {
+        if self.lifecycle.load(Ordering::Acquire) == READY {
+            Ok(())
+        } else {
+            Err(NfsError::InvalidInput(
+                "connected client is closing or closed".to_string(),
+            ))
+        }
     }
 
     pub fn lifecycle(&self) -> ClientLifecycle {
@@ -105,22 +185,65 @@ impl ClientCore {
         }
     }
 
-    pub fn register_resource(&self) -> Result<ResourceKey> {
-        if self.lifecycle.load(Ordering::Acquire) != READY {
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
+    pub async fn wait_for_lifecycle(&self, expected: ClientLifecycle) {
+        while self.lifecycle() != expected {
+            let notified = self.lifecycle_notify.notified();
+            if self.lifecycle() != expected {
+                notified.await;
+            }
         }
+    }
+
+    pub async fn execute<T, F>(self: &Arc<Self>, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let _operation = self.begin_operation()?;
+        future.await
+    }
+
+    pub fn record_recovery_event(&self, event: CoreRecoveryEvent) -> Result<()> {
+        let mut queue = self
+            .recovery_events
+            .lock()
+            .map_err(|_| NfsError::Rpc("recovery-event queue lock poisoned".to_string()))?;
+        if queue.events.len() == queue.capacity {
+            queue.events.pop_front();
+            queue.dropped = queue.dropped.saturating_add(1);
+        }
+        queue.events.push_back(event);
+        Ok(())
+    }
+
+    pub fn recovery_events(&self) -> Result<Vec<CoreRecoveryEvent>> {
+        self.recovery_events
+            .lock()
+            .map(|queue| queue.events.iter().cloned().collect())
+            .map_err(|_| NfsError::Rpc("recovery-event queue lock poisoned".to_string()))
+    }
+
+    pub fn drain_recovery_events(&self) -> Result<Vec<CoreRecoveryEvent>> {
+        self.recovery_events
+            .lock()
+            .map(|mut queue| queue.events.drain(..).collect())
+            .map_err(|_| NfsError::Rpc("recovery-event queue lock poisoned".to_string()))
+    }
+
+    pub fn dropped_recovery_event_count(&self) -> Result<u64> {
+        self.recovery_events
+            .lock()
+            .map(|queue| queue.dropped)
+            .map_err(|_| NfsError::Rpc("recovery-event queue lock poisoned".to_string()))
+    }
+
+    pub fn register_resource(&self) -> Result<ResourceKey> {
+        self.ensure_ready()?;
         let key = ResourceKey(self.next_resource_key.fetch_add(1, Ordering::Relaxed));
         let mut resources = self
             .resources
             .lock()
             .map_err(|_| NfsError::Rpc("client resource registry lock poisoned".to_string()))?;
-        if self.lifecycle.load(Ordering::Acquire) != READY {
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
-        }
+        self.ensure_ready()?;
         resources.push(key);
         Ok(key)
     }
@@ -145,17 +268,11 @@ impl ClientCore {
     }
 
     pub fn begin_operation(self: &Arc<Self>) -> Result<OperationGuard> {
-        if self.lifecycle.load(Ordering::Acquire) != READY {
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
-        }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        if self.lifecycle.load(Ordering::Acquire) != READY {
+        self.ensure_ready()?;
+        self.in_flight.increment();
+        if let Err(error) = self.ensure_ready() {
             self.finish_operation();
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
+            return Err(error);
         }
         Ok(OperationGuard {
             core: Some(Arc::clone(self)),
@@ -163,26 +280,18 @@ impl ClientCore {
     }
 
     fn finish_operation(&self) {
-        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.in_flight_notify.notify_waiters();
-        }
+        self.in_flight.decrement();
     }
 
     pub fn spawn_owned<F>(self: &Arc<Self>, future: F) -> Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if self.lifecycle.load(Ordering::Acquire) != READY {
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
-        }
-        self.owned_tasks.fetch_add(1, Ordering::AcqRel);
-        if self.lifecycle.load(Ordering::Acquire) != READY {
+        self.ensure_ready()?;
+        self.owned_tasks.increment();
+        if let Err(error) = self.ensure_ready() {
             self.finish_owned_task();
-            return Err(NfsError::InvalidInput(
-                "connected client is closing or closed".to_string(),
-            ));
+            return Err(error);
         }
         let core = Arc::clone(self);
         tokio::spawn(async move {
@@ -193,13 +302,11 @@ impl ClientCore {
     }
 
     fn finish_owned_task(&self) {
-        if self.owned_tasks.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.owned_tasks_notify.notify_waiters();
-        }
+        self.owned_tasks.decrement();
     }
 
     pub fn owned_task_count(&self) -> u64 {
-        self.owned_tasks.load(Ordering::Acquire)
+        self.owned_tasks.count()
     }
 
     pub async fn close(self: &Arc<Self>) -> Arc<ClientCloseReport> {
@@ -217,6 +324,7 @@ impl ClientCore {
             .unwrap_or(false);
         if start_cleanup {
             self.lifecycle.store(CLOSING, Ordering::Release);
+            self.lifecycle_notify.notify_waiters();
             let core = Arc::clone(self);
             tokio::spawn(async move {
                 core.run_close().await;
@@ -238,18 +346,8 @@ impl ClientCore {
     }
 
     async fn run_close(&self) {
-        while self.in_flight.load(Ordering::Acquire) != 0 {
-            let notified = self.in_flight_notify.notified();
-            if self.in_flight.load(Ordering::Acquire) != 0 {
-                notified.await;
-            }
-        }
-        while self.owned_tasks.load(Ordering::Acquire) != 0 {
-            let notified = self.owned_tasks_notify.notified();
-            if self.owned_tasks.load(Ordering::Acquire) != 0 {
-                notified.await;
-            }
-        }
+        self.in_flight.wait_for_zero().await;
+        self.owned_tasks.wait_for_zero().await;
         let mut errors = Vec::new();
         let resources = self
             .resources
@@ -265,6 +363,7 @@ impl ClientCore {
             errors.push(Arc::new(error));
         }
         self.lifecycle.store(CLOSED, Ordering::Release);
+        self.lifecycle_notify.notify_waiters();
         let report = Arc::new(ClientCloseReport { errors });
         if let Ok(mut state) = self.close_state.lock() {
             state.report = Some(report);
