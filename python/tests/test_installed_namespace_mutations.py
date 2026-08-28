@@ -36,6 +36,13 @@ def test_namespace_faults_preserve_before_and_after_send_outcomes() -> None:
         client.remove("__before_send__")
     with pytest.raises(RuntimeError, match="Uncertain"):
         client.rename("__after_send__", "destination")
+    with pytest.raises(NotADirectoryError):
+        client.remove("__notdir__")
+    with pytest.raises(IsADirectoryError):
+        client.remove("__isdir__")
+    with pytest.raises(OSError) as not_empty:
+        client.rmdir("__notempty__")
+    assert not_empty.value.errno == 39
     client.close()
 
 

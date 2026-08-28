@@ -110,7 +110,11 @@ def test_mkdir_suppresses_exists_only_for_a_confirmed_directory():
     client = Client.connect("nfs://server/export")
     client.mkdir("existing-dir", exist_ok=True)
     with pytest.raises(FileExistsError):
+        client.mkdir("existing-dir", parents=True)
+    with pytest.raises(FileExistsError):
         client.mkdir("existing-file", exist_ok=True)
+    with pytest.raises(NotImplementedError, match="exclusive create"):
+        client.touch("new", exist_ok=False)
 
 
 def test_async_surface_matches_sync():

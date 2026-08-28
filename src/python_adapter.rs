@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use pyo3::exceptions::{
-    PyFileExistsError, PyFileNotFoundError, PyPermissionError, PyRuntimeError,
-    PyStopAsyncIteration, PyValueError,
+    PyFileExistsError, PyFileNotFoundError, PyIsADirectoryError, PyNotADirectoryError, PyOSError,
+    PyPermissionError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
@@ -909,10 +909,31 @@ fn nfs_error_ref(error: &NfsError) -> PyErr {
             crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
         )
     );
+    let not_directory = matches!(
+        error,
+        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTDIR)
+            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOTDIR)
+    );
+    let is_directory = matches!(
+        error,
+        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ISDIR)
+            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ISDIR)
+    );
+    let not_empty = matches!(
+        error,
+        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTEMPTY)
+            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOTEMPTY)
+    );
     if error.is_not_found() {
         PyFileNotFoundError::new_err(error.to_string())
     } else if error.is_exist() {
         PyFileExistsError::new_err(error.to_string())
+    } else if not_directory {
+        PyNotADirectoryError::new_err(error.to_string())
+    } else if is_directory {
+        PyIsADirectoryError::new_err(error.to_string())
+    } else if not_empty {
+        PyOSError::new_err((39, error.to_string()))
     } else if permission_denied || error.kind() == std::io::ErrorKind::PermissionDenied {
         PyPermissionError::new_err(error.to_string())
     } else {
@@ -1056,6 +1077,15 @@ async fn namespace_operation(
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
+        if first.contains("__notdir__") {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTDIR));
+        }
+        if first.contains("__isdir__") {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ISDIR));
+        }
+        if first.contains("__notempty__") {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTEMPTY));
+        }
         if first.contains("__before_send__") {
             return Err(NfsError::before_send_failure(
                 crate::OperationClass::ReplaySensitive,

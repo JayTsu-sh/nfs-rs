@@ -327,7 +327,7 @@ class Client(_ClientOptions):
             try:
                 self._inner.mkdir(candidate, mode)
             except FileExistsError:
-                if not (parents or exist_ok):
+                if not ((parents and candidate != normalized) or exist_ok):
                     raise
                 try:
                     existing = self.stat(candidate)
@@ -367,8 +367,8 @@ class Client(_ClientOptions):
 
     def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
         normalized = _normalize_path(path)
-        if not exist_ok and self.exists(normalized):
-            raise FileExistsError(normalized)
+        if not exist_ok:
+            raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         self.open(normalized, "ab").close()
 
     def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
@@ -488,7 +488,7 @@ class AsyncClient(_ClientOptions):
             try:
                 await self._inner.mkdir(candidate, mode)
             except FileExistsError:
-                if not (parents or exist_ok):
+                if not ((parents and candidate != normalized) or exist_ok):
                     raise
                 try:
                     existing = await self.stat(candidate)
@@ -534,8 +534,8 @@ class AsyncClient(_ClientOptions):
 
     async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
         normalized = _normalize_path(path)
-        if not exist_ok and await self.exists(normalized):
-            raise FileExistsError(normalized)
+        if not exist_ok:
+            raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         file = await self.open(normalized, "ab")
         await file.close()
 
