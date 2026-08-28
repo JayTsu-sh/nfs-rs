@@ -1329,6 +1329,9 @@ async fn metadata_operation(
         if path == "denied" {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES));
         }
+        if path == "protocol-error" {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_IO));
+        }
         return Ok(());
     }
     let mount = mount.ok_or_else(|| {
@@ -3147,7 +3150,10 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, feature = "python-test-support"))]
 mod read_only_file_tests {
-    use super::{FileMode, FileResource, TestWriteFault, nfs_access_mask, with_confirmed_bytes};
+    use super::{
+        FileMode, FileResource, TestWriteFault, nfs_access_mask, optional_identity,
+        with_confirmed_bytes,
+    };
     use crate::error::{
         OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction, RequestContext,
     };
@@ -3161,6 +3167,14 @@ mod read_only_file_tests {
         assert_eq!(nfs_access_mask(0o1, false), 0x20);
         assert_eq!(nfs_access_mask(0o1, true), 0x02);
         assert_eq!(nfs_access_mask(0o2, true), 0x04 | 0x08 | 0x10);
+    }
+
+    #[test]
+    fn chown_minus_one_preserves_existing_identity() {
+        assert_eq!(optional_identity(-1).ok(), Some(None));
+        assert_eq!(optional_identity(0).ok(), Some(Some(0)));
+        assert!(optional_identity(-2).is_err());
+        assert!(optional_identity(i64::from(u32::MAX) + 1).is_err());
     }
 
     fn read_mode() -> FileMode {

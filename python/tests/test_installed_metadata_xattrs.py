@@ -14,12 +14,16 @@ def test_sync_metadata_xattrs_and_filesystem_snapshots() -> None:
     client = Client.connect("nfs-test://fixture/export")
     client.chmod("file", 0o640)
     client.chown("file", 1000, 1001)
+    client.chown("file", -1, -1)
     client.utime("file", ns=(1_000_000_002, 3_000_000_004))
     client.truncate("file", 9)
     assert client.access("file", os.R_OK | os.W_OK)
     assert not client.access("denied", os.R_OK)
     assert not client.access("missing", os.F_OK)
     with pytest.raises(ValueError): client.access("file", 8)
+    with pytest.raises(PermissionError): client.chmod("denied", 0o600)
+    with pytest.raises(RuntimeError, match="I/O error"):
+        client.truncate("protocol-error", 1)
     client.setxattr("file", "user.key", b"value")
     assert client.getxattr("file", "user.key") == b"value"
     assert client.listxattr("file") == ["user.key"]
