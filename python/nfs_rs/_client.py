@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import inspect
 import io
 import os
@@ -10,6 +9,7 @@ import sys
 import sysconfig
 import time
 import warnings
+from importlib import import_module as _import_module
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
@@ -262,7 +262,7 @@ def _fs_stat(values: dict[str, Any]) -> FsStat:
 
 def _adapter() -> ModuleType:
     try:
-        return importlib.import_module("nfs_rs._internal")
+        return _import_module("nfs_rs._internal")
     except (ImportError, OSError) as error:
         libc_name, libc_version = platform.libc_ver()
         libc = f"{libc_name or 'unknown'} {libc_version or 'unknown'}"

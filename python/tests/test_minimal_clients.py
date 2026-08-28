@@ -91,7 +91,11 @@ def test_sync_context_preserves_body_exception_when_close_also_fails():
     with pytest.raises(ValueError, match="body failed") as raised:
         with Client.connect("nfs://server/export"):
             raise ValueError("body failed")
-    assert any("cleanup also failed" in note for note in raised.value.__notes__)
+    if sys.version_info >= (3, 11):
+        assert any("cleanup also failed" in note for note in raised.value.__notes__)
+    else:
+        assert isinstance(raised.value.__context__, RuntimeError)
+        assert str(raised.value.__context__) == "cleanup failed"
 
 
 def test_async_context_preserves_body_exception_when_close_also_fails():
@@ -100,7 +104,11 @@ def test_async_context_preserves_body_exception_when_close_also_fails():
         with pytest.raises(ValueError, match="body failed") as raised:
             async with await AsyncClient.connect("nfs://server/export"):
                 raise ValueError("body failed")
-        assert any("cleanup also failed" in note for note in raised.value.__notes__)
+        if sys.version_info >= (3, 11):
+            assert any("cleanup also failed" in note for note in raised.value.__notes__)
+        else:
+            assert isinstance(raised.value.__context__, RuntimeError)
+            assert str(raised.value.__context__) == "cleanup failed"
 
     asyncio.run(scenario())
 

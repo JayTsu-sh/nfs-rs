@@ -67,7 +67,7 @@ def test_extension_load_error_preserves_cause_and_platform_guidance(monkeypatch:
         assert name == "nfs_rs._internal"
         raise cause
 
-    monkeypatch.setattr(_client.importlib, "import_module", fail_import)
+    monkeypatch.setattr(_client, "_import_module", fail_import)
     with pytest.raises(ImportError) as caught:
         _client._adapter()
     assert caught.value.__cause__ is cause
