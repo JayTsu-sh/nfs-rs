@@ -37,6 +37,14 @@ def _adapter() -> ModuleType:
     return importlib.import_module("nfs_rs._internal")
 
 
+def _record_cleanup_failure(exc: BaseException, cleanup_error: BaseException, owner: str) -> None:
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        add_note(f"{owner} cleanup also failed: {cleanup_error}")
+    else:
+        exc.__context__ = cleanup_error
+
+
 def _configured_url(url: str, options: dict[str, Any]) -> str:
     parsed = urlsplit(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -200,7 +208,7 @@ class Client(_ClientOptions):
         except BaseException as cleanup_error:
             if exc is None:
                 raise
-            exc.add_note(f"Client cleanup also failed: {cleanup_error}")
+            _record_cleanup_failure(exc, cleanup_error, "Client")
 
     def __repr__(self) -> str:
         return f"Client(version={self.version!s}, closed={self.closed})"
@@ -262,7 +270,7 @@ class AsyncClient(_ClientOptions):
         except BaseException as cleanup_error:
             if exc is None:
                 raise
-            exc.add_note(f"AsyncClient cleanup also failed: {cleanup_error}")
+            _record_cleanup_failure(exc, cleanup_error, "AsyncClient")
 
     def __repr__(self) -> str:
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"

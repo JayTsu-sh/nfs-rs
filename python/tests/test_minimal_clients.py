@@ -40,6 +40,7 @@ fake.SyncClient = FakeSyncClient
 fake.AsyncClient = FakeAsyncClient
 
 from nfs_rs import AsyncClient, Client, Health, Lifecycle, Version
+from nfs_rs._client import _record_cleanup_failure
 
 
 @pytest.fixture(autouse=True)
@@ -115,3 +116,13 @@ def test_async_context_preserves_body_exception_when_close_also_fails():
 def test_connection_option_validation_is_shared(options, message):
     with pytest.raises(ValueError, match=message):
         Client.connect("nfs://server/export", **options)
+
+
+def test_python_310_cleanup_fallback_keeps_body_exception_primary():
+    class Python310StyleError(Exception):
+        add_note = None
+
+    body_error = Python310StyleError("body failed")
+    cleanup_error = RuntimeError("cleanup failed")
+    _record_cleanup_failure(body_error, cleanup_error, "Client")
+    assert body_error.__context__ is cleanup_error

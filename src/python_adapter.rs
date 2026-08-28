@@ -10,7 +10,14 @@ use tokio::runtime::Runtime;
 
 #[derive(Debug)]
 struct MountDriver {
-    mount: tokio::sync::Mutex<Option<Box<dyn Mount>>>,
+    mount: tokio::sync::Mutex<Option<Arc<dyn Mount>>>,
+}
+
+struct ConnectedParts {
+    core: Arc<ClientCore>,
+    version: NFSVersion,
+    health: MountHealth,
+    health_source: Option<Arc<dyn Mount>>,
 }
 
 #[cfg(feature = "python-test-support")]
@@ -79,7 +86,12 @@ fn health_dict<'py>(py: Python<'py>, health: MountHealth) -> PyResult<Bound<'py,
     Ok(result)
 }
 
-fn current_health(mut health: MountHealth, core: &ClientCore) -> MountHealth {
+fn current_health(
+    initial: MountHealth,
+    source: Option<&Arc<dyn Mount>>,
+    core: &ClientCore,
+) -> MountHealth {
+    let mut health = source.map_or(initial, |mount| mount.health());
     health.lifecycle = match core.lifecycle() {
         crate::client_core::ClientLifecycle::Ready => crate::MountLifecycleState::Ready,
         crate::client_core::ClientLifecycle::Closing => crate::MountLifecycleState::Closing,
@@ -88,24 +100,24 @@ fn current_health(mut health: MountHealth, core: &ClientCore) -> MountHealth {
     health
 }
 
-fn connected_parts(
-    mount: Box<dyn Mount>,
-    capacity: usize,
-) -> PyResult<(Arc<ClientCore>, NFSVersion, MountHealth)> {
+fn connected_parts(mount: Box<dyn Mount>, capacity: usize) -> PyResult<ConnectedParts> {
+    let mount: Arc<dyn Mount> = Arc::from(mount);
     let version = mount.version();
     let health = mount.health();
     let driver = Arc::new(MountDriver {
-        mount: tokio::sync::Mutex::new(Some(mount)),
+        mount: tokio::sync::Mutex::new(Some(mount.clone())),
     });
     let core = ClientCore::with_recovery_event_capacity(driver, capacity).map_err(python_error)?;
-    Ok((core, version, health))
+    Ok(ConnectedParts {
+        core,
+        version,
+        health,
+        health_source: Some(mount),
+    })
 }
 
 #[cfg(feature = "python-test-support")]
-fn test_connected_parts(
-    url: &str,
-    capacity: usize,
-) -> Option<PyResult<(Arc<ClientCore>, NFSVersion, MountHealth)>> {
+fn test_connected_parts(url: &str, capacity: usize) -> Option<PyResult<ConnectedParts>> {
     matches!(
         url,
         "nfs-test://fixture/export" | "nfs-test://fixture/delay"
@@ -113,15 +125,17 @@ fn test_connected_parts(
     .then(|| {
         let core = ClientCore::with_recovery_event_capacity(Arc::new(TestDriver), capacity)
             .map_err(python_error)?;
-        Ok((core, NFSVersion::NFSv4p1, MountHealth::default()))
+        Ok(ConnectedParts {
+            core,
+            version: NFSVersion::NFSv4p1,
+            health: MountHealth::default(),
+            health_source: None,
+        })
     })
 }
 
 #[cfg(not(feature = "python-test-support"))]
-fn test_connected_parts(
-    _url: &str,
-    _capacity: usize,
-) -> Option<PyResult<(Arc<ClientCore>, NFSVersion, MountHealth)>> {
+fn test_connected_parts(_url: &str, _capacity: usize) -> Option<PyResult<ConnectedParts>> {
     None
 }
 
@@ -163,6 +177,7 @@ struct SyncClient {
     runtime: Mutex<Runtime>,
     version: NFSVersion,
     health: MountHealth,
+    health_source: Option<Arc<dyn Mount>>,
     _operation_timeout: Option<Duration>,
 }
 
@@ -193,24 +208,36 @@ impl SyncClient {
                     })
                 });
             }
-            let (core, version, health) = parts?;
+            let ConnectedParts {
+                core,
+                version,
+                health,
+                health_source,
+            } = parts?;
             return Ok(Self {
                 core,
                 runtime: Mutex::new(runtime),
                 version,
                 health,
+                health_source,
                 _operation_timeout: operation_timeout,
             });
         }
         let mount = py
             .detach(|| runtime.block_on(connect_mount(&url, connect_timeout)))
             .map_err(python_error)?;
-        let (core, version, health) = connected_parts(mount, capacity)?;
+        let ConnectedParts {
+            core,
+            version,
+            health,
+            health_source,
+        } = connected_parts(mount, capacity)?;
         Ok(Self {
             core,
             runtime: Mutex::new(runtime),
             version,
             health,
+            health_source,
             _operation_timeout: operation_timeout,
         })
     }
@@ -222,7 +249,10 @@ impl SyncClient {
 
     #[getter]
     fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        health_dict(py, current_health(self.health, &self.core))
+        health_dict(
+            py,
+            current_health(self.health, self.health_source.as_ref(), &self.core),
+        )
     }
 
     #[getter]
@@ -251,6 +281,7 @@ struct AsyncClient {
     core: Arc<ClientCore>,
     version: NFSVersion,
     health: MountHealth,
+    health_source: Option<Arc<dyn Mount>>,
     _operation_timeout: Option<Duration>,
 }
 
@@ -268,7 +299,12 @@ impl AsyncClient {
         let connect_timeout = timeout_option(options, "connect_timeout")?;
         let operation_timeout = timeout_option(options, "operation_timeout")?;
         if let Some(parts) = test_connected_parts(&url, capacity) {
-            let (core, version, health) = parts?;
+            let ConnectedParts {
+                core,
+                version,
+                health,
+                health_source,
+            } = parts?;
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                 if url.ends_with("/delay") {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -277,6 +313,7 @@ impl AsyncClient {
                     core,
                     version,
                     health,
+                    health_source,
                     _operation_timeout: operation_timeout,
                 })
             });
@@ -285,11 +322,17 @@ impl AsyncClient {
             let mount = connect_mount(&url, connect_timeout)
                 .await
                 .map_err(python_error)?;
-            let (core, version, health) = connected_parts(mount, capacity)?;
+            let ConnectedParts {
+                core,
+                version,
+                health,
+                health_source,
+            } = connected_parts(mount, capacity)?;
             Ok(AsyncClient {
                 core,
                 version,
                 health,
+                health_source,
                 _operation_timeout: operation_timeout,
             })
         })
@@ -302,7 +345,10 @@ impl AsyncClient {
 
     #[getter]
     fn health<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        health_dict(py, current_health(self.health, &self.core))
+        health_dict(
+            py,
+            current_health(self.health, self.health_source.as_ref(), &self.core),
+        )
     }
 
     #[getter]
