@@ -55,11 +55,11 @@ def test_client_close_closes_registered_sync_file() -> None:
             operation()
 
 
-def test_open_rejects_non_read_binary_modes() -> None:
+def test_open_rejects_non_binary_modes() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    with pytest.raises(ValueError, match="binary read mode"):
+    with pytest.raises(ValueError, match="mode must be"):
         client.open("fixture.bin", "r")
     client.close()
 

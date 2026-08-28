@@ -315,10 +315,15 @@ class Client(_ClientOptions):
         return [entry.name for entry in self.scandir(path)]
 
     def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
+        """Open a binary file.
+
+        Creating and truncating modes may require multiple NFS operations. Their
+        effects are non-transactional: a created or truncated file can remain if
+        a later open step fails.
+        """
         normalized = _normalize_path(path)
-        if mode != "rb":
-            raise ValueError("Ticket 05 supports only binary read mode 'rb'")
-        return File(self._inner.open(normalized, mode), normalized, _CONSTRUCTION_TOKEN)
+        mode = _validate_binary_mode(mode)
+        return File(self._inner.open(normalized, mode), normalized, mode, _CONSTRUCTION_TOKEN)
 
     def __enter__(self) -> Client:
         return self
@@ -406,12 +411,12 @@ class AsyncClient(_ClientOptions):
         return [entry.name async for entry in self.scandir(path)]
 
     async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
+        """Open a binary file with the same non-transactional effects as Client.open()."""
         self._check_loop()
         normalized = _normalize_path(path)
-        if mode != "rb":
-            raise ValueError("Ticket 05 supports only binary read mode 'rb'")
+        mode = _validate_binary_mode(mode)
         inner = await self._inner.open(normalized, mode)
-        return AsyncFile(inner, normalized, self._loop, _CONSTRUCTION_TOKEN)
+        return AsyncFile(inner, normalized, mode, self._loop, _CONSTRUCTION_TOKEN)
 
     async def __aenter__(self) -> AsyncClient:
         self._check_loop()
@@ -455,15 +460,28 @@ def _copy_to_buffer(target: Any, expected_length: int, data: bytes) -> int:
         view.release()
 
 
-class File(io.RawIOBase):
-    __slots__ = ("_inner", "_name")
+_BINARY_MODES = frozenset({"rb", "wb", "ab", "r+b", "w+b", "a+b", "rb+", "wb+", "ab+"})
 
-    def __init__(self, inner: Any, name: str, token: object = None) -> None:
+
+def _validate_binary_mode(mode: str) -> str:
+    if mode not in _BINARY_MODES:
+        raise ValueError(
+            "mode must be one of 'rb', 'wb', 'ab', 'r+b', 'w+b', 'a+b', "
+            "'rb+', 'wb+', or 'ab+'"
+        )
+    return mode
+
+
+class File(io.RawIOBase):
+    __slots__ = ("_inner", "_name", "_mode")
+
+    def __init__(self, inner: Any, name: str, mode: str, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("File objects are created only by Client.open()")
         super().__init__()
         self._inner = inner
         self._name = name
+        self._mode = mode
 
     @property
     def name(self) -> str:
@@ -471,41 +489,49 @@ class File(io.RawIOBase):
 
     @property
     def mode(self) -> str:
-        return "rb"
+        return self._mode
 
     @property
     def closed(self) -> bool:
         return self._inner.closed
 
     def readable(self) -> bool:
-        return True
+        return self._mode.startswith("r") or "+" in self._mode
 
     def _check_closed(self) -> None:
         if self.closed:
             raise ValueError("I/O operation on closed file")
 
     def writable(self) -> bool:
-        return False
+        return self._mode.startswith(("w", "a")) or "+" in self._mode
 
     def seekable(self) -> bool:
         return True
 
     def read(self, size: int = -1) -> bytes:
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         return self._inner.read(size)
 
     def readinto(self, target: Any) -> int:
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         return _copy_to_buffer(target, length, self._inner.read(request))
 
     def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         return self._inner.read_at(offset, size)
 
     def readinto_at(self, target: Any, offset: int) -> int:
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         return _copy_to_buffer(target, length, self._inner.read_at(offset, request))
@@ -518,12 +544,34 @@ class File(io.RawIOBase):
         self._check_closed()
         return self._inner.tell()
 
+    def write(self, data: Any) -> int:
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return self._inner.write(bytes(data))
+
+    def write_at(self, data: Any, offset: int) -> int:
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return self._inner.write_at(bytes(data), offset)
+
+    def truncate(self, size: int | None = None) -> int:
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return self._inner.truncate(size)
+
+    def flush(self) -> None:
+        self._check_closed()
+        if self.writable():
+            self._inner.flush()
+
     def fileno(self) -> int:
         raise io.UnsupportedOperation("nfs-rs files do not expose OS file descriptors")
 
     def close(self) -> None:
         self._inner.close()
-        super().close()
 
     def __enter__(self) -> File:
         return self
@@ -547,12 +595,13 @@ class File(io.RawIOBase):
 
 
 class AsyncFile:
-    __slots__ = ("_inner", "_name", "_loop")
+    __slots__ = ("_inner", "_name", "_mode", "_loop")
 
     def __init__(
         self,
         inner: Any,
         name: str,
+        mode: str,
         loop: asyncio.AbstractEventLoop,
         token: object = None,
     ) -> None:
@@ -560,6 +609,7 @@ class AsyncFile:
             raise TypeError("AsyncFile objects are created only by AsyncClient.open()")
         self._inner = inner
         self._name = name
+        self._mode = mode
         self._loop = loop
 
     def _check_loop(self) -> None:
@@ -572,7 +622,7 @@ class AsyncFile:
 
     @property
     def mode(self) -> str:
-        return "rb"
+        return self._mode
 
     @property
     def closed(self) -> bool:
@@ -590,11 +640,15 @@ class AsyncFile:
     async def read(self, size: int = -1) -> bytes:
         self._check_loop()
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         return await self._inner.read(size)
 
     async def readinto(self, target: Any) -> int:
         self._check_loop()
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         data = await self._inner.read(request)
@@ -603,11 +657,15 @@ class AsyncFile:
     async def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_loop()
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         return await self._inner.read_at(offset, size)
 
     async def readinto_at(self, target: Any, offset: int) -> int:
         self._check_loop()
         self._check_closed()
+        if not self.readable():
+            raise io.UnsupportedOperation("not readable")
         length = _buffer_length(target)
         request = min(length, self._inner.max_read_size)
         data = await self._inner.read_at(offset, request)
@@ -617,6 +675,39 @@ class AsyncFile:
         self._check_loop()
         self._check_closed()
         return await self._inner.seek(offset, whence)
+
+    def readable(self) -> bool:
+        return self._mode.startswith("r") or "+" in self._mode
+
+    def writable(self) -> bool:
+        return self._mode.startswith(("w", "a")) or "+" in self._mode
+
+    async def write(self, data: Any) -> int:
+        self._check_loop()
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return await self._inner.write(bytes(data))
+
+    async def write_at(self, data: Any, offset: int) -> int:
+        self._check_loop()
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return await self._inner.write_at(bytes(data), offset)
+
+    async def truncate(self, size: int | None = None) -> int:
+        self._check_loop()
+        self._check_closed()
+        if not self.writable():
+            raise io.UnsupportedOperation("not writable")
+        return await self._inner.truncate(size)
+
+    async def flush(self) -> None:
+        self._check_loop()
+        self._check_closed()
+        if self.writable():
+            await self._inner.flush()
 
     async def close(self) -> None:
         self._check_loop()

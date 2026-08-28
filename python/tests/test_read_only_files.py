@@ -100,10 +100,10 @@ def fake_adapter(monkeypatch):
     monkeypatch.setitem(sys.modules, "nfs_rs._internal", fake)
 
 
-@pytest.mark.parametrize("mode", ["r", "rt", "wb", "r+b", ""])
-def test_open_rejects_every_mode_except_rb_before_native(mode):
+@pytest.mark.parametrize("mode", ["r", "rt", "x", "xb", ""])
+def test_open_rejects_unsupported_modes_before_native(mode):
     client = Client.connect("nfs://server/export")
-    with pytest.raises(ValueError, match="rb"):
+    with pytest.raises(ValueError, match="mode must be"):
         client.open("file", mode)
 
 
@@ -151,7 +151,7 @@ def test_sync_readinto_revalidates_target_after_network_work():
 
 def test_file_finalizer_warns_without_blocking_close():
     inner = SyncFileInner()
-    file = File(inner, "fixture.bin", _CONSTRUCTION_TOKEN)
+    file = File(inner, "fixture.bin", "rb", _CONSTRUCTION_TOKEN)
     with pytest.warns(ResourceWarning, match="unclosed NFS file"):
         file.__del__()
     assert not inner.closed

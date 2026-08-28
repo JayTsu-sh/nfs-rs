@@ -115,6 +115,13 @@ pub struct OpenFile {
 }
 
 impl OpenFile {
+    pub(crate) fn from_object(object: ObjRes) -> Self {
+        Self {
+            object,
+            state: None,
+        }
+    }
+
     pub(crate) fn with_protocol_state(object: ObjRes, state: Bytes) -> Self {
         Self {
             object,
@@ -402,6 +409,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// }
     /// ```
     async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes>;
+
+    /// Stateful form of [`Mount::create_path`] used when the caller must later
+    /// release protocol-owned open state deterministically.
+    async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<OpenFile> {
+        Ok(OpenFile::from_object(self.create_path(path, mode).await?))
+    }
 
     /// Procedure DELEGPURGE purges delegations (NFSv4 only; returns Unsupported on NFSv3).
     #[deprecated(note = "delegation lifecycle is managed internally by the mount")]

@@ -1511,6 +1511,32 @@ impl Mount for Mount40 {
         let parent = self.lookup_path(&dir).await?;
         self.create(parent.fh, &name, mode).await
     }
+    async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<mount::OpenFile> {
+        let (dir, name) = crate::split_path(path)?;
+        let parent = self.lookup_path(&dir).await?;
+        let opened = self
+            .open_file(parent.fh.clone(), &name, crate::OPEN_BOTH, true)
+            .await?;
+        if let Some(mode) = mode
+            && let Err(error) = self
+                .setattr(
+                    opened.file_handle(),
+                    None,
+                    Some(mode),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        {
+            let _ = self.close_stateful(opened).await;
+            let _ = self.remove(parent.fh, &name).await;
+            return Err(error);
+        }
+        Ok(opened)
+    }
     async fn fsinfo(&self) -> Result<mount::FSInfo> {
         let bitmap = [
             (1 << 5) | (1 << 6) | (1 << 15) | (1 << 26) | (1 << 27) | (1 << 30) | (1 << 31),
