@@ -4,7 +4,7 @@
 
 **Blocked by:** 14 — Validate final artifacts across real protocols and performance gates
 
-**Status:** implemented
+**Status:** completed
 
 - [x] One version tag validates versions, builds all artifacts once, and publishes only the exact tested bytes through protected trusted publishing.
 - [x] Test registry preflight, dependency audits, checksums, available provenance, and partial-publication recovery use the same immutable artifacts.
