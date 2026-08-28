@@ -9,13 +9,16 @@ if os.environ.get("NFS_RS_TEST_INSTALLED") != "1":
 
 import nfs_rs._internal
 
-from nfs_rs import AsyncClient, Client, FileType, async_list_exports, list_exports
+from nfs_rs import AsyncClient, Client, FileType, list_exports, list_exports_async
 
 
 def test_installed_sync_paths_metadata_and_streaming_directory():
     client = Client.connect("nfs-test://fixture/export")
     info = client.stat(Path("folder/../file"))
     assert info.type is FileType.FILE
+    assert info.path == "file"
+    assert info.owner is None
+    assert info.group is None
     assert info.fileid == 9
     assert info.mtime_ns == 3_000_000_004
     assert not client.exists("missing")
@@ -36,6 +39,13 @@ def test_client_close_cancels_unconsumed_directory_producer_without_hanging():
     assert client.closed
 
 
+def test_client_close_interrupts_directory_producer_blocked_before_first_protocol_result():
+    client = Client.connect("nfs-test://fixture/export")
+    client.scandir("blocked")
+    client.close()
+    assert client.closed
+
+
 def test_installed_async_paths_match_sync_values():
     async def scenario():
         client = await AsyncClient.connect("nfs-test://fixture/export")
@@ -48,9 +58,33 @@ def test_installed_async_paths_match_sync_values():
     asyncio.run(scenario())
 
 
+def test_installed_sync_and_async_permission_families_and_stream_errors_match():
+    sync_client = Client.connect("nfs-test://fixture/export")
+    for path in ("denied", "forbidden"):
+        with pytest.raises(PermissionError):
+            sync_client.stat(path)
+    entries = sync_client.scandir("denied-directory")
+    assert next(entries).name == "first"
+    with pytest.raises(PermissionError):
+        next(entries)
+
+    async def scenario():
+        client = await AsyncClient.connect("nfs-test://fixture/export")
+        for path in ("denied", "forbidden"):
+            with pytest.raises(PermissionError):
+                await client.stat(path)
+        entries = client.scandir("denied-directory")
+        assert (await anext(entries)).name == "first"
+        with pytest.raises(PermissionError):
+            await anext(entries)
+        await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_installed_export_discovery_matches_sync_and_async():
     sync_values = list_exports("nfs-test://fixture/")
-    async_values = asyncio.run(async_list_exports("nfs-test://fixture/"))
+    async_values = asyncio.run(list_exports_async("nfs-test://fixture/"))
     assert sync_values == async_values
     assert sync_values[0].path == "/data"
     assert sync_values[0].groups == ("team",)

@@ -86,8 +86,11 @@ fn python_error(error: impl std::fmt::Display) -> PyErr {
 fn nfs_error(error: NfsError) -> PyErr {
     let permission_denied = matches!(
         &error,
-        NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES)
-            | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS)
+        NfsError::Nfs3(
+            crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
+        ) | NfsError::Nfs4(
+            crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
+        )
     );
     if error.is_not_found() {
         PyFileNotFoundError::new_err(error.to_string())
@@ -140,6 +143,14 @@ fn attr_dict<'py>(py: Python<'py>, attr: &Attr) -> PyResult<Bound<'py, PyDict>> 
         "ctime_ns",
         nanoseconds(attr.ctime.seconds, attr.ctime.nseconds),
     )?;
+    values.set_item(
+        "owner",
+        (!attr.owner.is_empty()).then_some(attr.owner.as_str()),
+    )?;
+    values.set_item(
+        "group",
+        (!attr.owner_group.is_empty()).then_some(attr.owner_group.as_str()),
+    )?;
     Ok(values)
 }
 
@@ -157,6 +168,7 @@ fn test_attr(path: &str) -> Option<Result<Attr>> {
     let fileid = match path {
         "missing" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT))),
         "denied" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES))),
+        "forbidden" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM))),
         _ => 9,
     };
     Some(Ok(Attr {
@@ -231,6 +243,26 @@ fn test_directory_entries(_path: &str) -> Option<Vec<(String, Attr)>> {
     None
 }
 
+#[cfg(feature = "python-test-support")]
+fn test_directory_blocks(path: &str) -> bool {
+    path == "blocked"
+}
+
+#[cfg(not(feature = "python-test-support"))]
+fn test_directory_blocks(_path: &str) -> bool {
+    false
+}
+
+#[cfg(feature = "python-test-support")]
+fn test_directory_fails(path: &str) -> bool {
+    path == "denied-directory"
+}
+
+#[cfg(not(feature = "python-test-support"))]
+fn test_directory_fails(_path: &str) -> bool {
+    false
+}
+
 async fn directory_receiver(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
@@ -238,6 +270,30 @@ async fn directory_receiver(
 ) -> Result<mpsc::Receiver<DirectoryItem>> {
     let operation = core.begin_operation()?;
     let (sender, receiver) = mpsc::channel(1);
+    if test_directory_blocks(&path) {
+        tokio::spawn(async move {
+            let _operation = operation;
+            core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
+                .await;
+        });
+        return Ok(receiver);
+    }
+    if test_directory_fails(&path) {
+        let closing = core.clone();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let first = test_attr("first")
+                .and_then(std::result::Result::ok)
+                .unwrap_or_default();
+            let first = entry_dict("first".to_string(), first)
+                .map_err(|error| NfsError::Rpc(error.to_string()));
+            if send_directory_item(&sender, first, &closing).await {
+                let error = NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM);
+                let _ = send_directory_item(&sender, Err(error), &closing).await;
+            }
+        });
+        return Ok(receiver);
+    }
     if let Some(entries) = test_directory_entries(&path) {
         let closing = core.clone();
         tokio::spawn(async move {
@@ -257,9 +313,23 @@ async fn directory_receiver(
     let closing = core.clone();
     tokio::spawn(async move {
         let _operation = operation;
-        match mount.readdirplus_path(&path).await {
+        let stream = tokio::select! {
+            result = mount.readdirplus_path(&path) => Some(result),
+            () = closing.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => None,
+        };
+        let Some(stream) = stream else {
+            return;
+        };
+        match stream {
             Ok(mut entries) => loop {
-                let item = match entries.try_next().await {
+                let next = tokio::select! {
+                    result = entries.try_next() => Some(result),
+                    () = closing.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => None,
+                };
+                let Some(next) = next else {
+                    break;
+                };
+                let item = match next {
                     Ok(Some(entry)) => match entry.attr {
                         Some(attr) => entry_dict(entry.file_name, attr)
                             .map_err(|error| NfsError::Rpc(error.to_string())),

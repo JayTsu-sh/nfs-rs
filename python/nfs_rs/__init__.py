@@ -5,29 +5,29 @@ from importlib.metadata import PackageNotFoundError, version
 from ._client import (
     AsyncClient,
     Client,
-    DirectoryEntry,
-    Export,
+    DirEntry,
+    ExportEntry,
     FileInfo,
     FileType,
     Health,
     Lifecycle,
     Version,
-    async_list_exports,
     list_exports,
+    list_exports_async,
 )
 
 __all__ = [
     "AsyncClient",
     "Client",
-    "DirectoryEntry",
-    "Export",
+    "DirEntry",
+    "ExportEntry",
     "FileInfo",
     "FileType",
     "Health",
     "Lifecycle",
     "Version",
-    "async_list_exports",
     "list_exports",
+    "list_exports_async",
 ]
 try:
     __version__ = version("nfs-rs")

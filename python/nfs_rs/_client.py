@@ -49,6 +49,7 @@ class Health:
 
 @dataclass(frozen=True, slots=True)
 class FileInfo:
+    path: str
     type: FileType
     mode: int
     nlink: int
@@ -61,17 +62,19 @@ class FileInfo:
     atime_ns: int
     mtime_ns: int
     ctime_ns: int
+    owner: str | None
+    group: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class DirectoryEntry:
+class DirEntry:
     name: str
     path: str
     info: FileInfo
 
 
 @dataclass(frozen=True, slots=True)
-class Export:
+class ExportEntry:
     path: str
     groups: tuple[str, ...]
 
@@ -95,8 +98,9 @@ def _normalize_path(path: os.PathLike[str] | str) -> str:
     return "/".join(parts) or "."
 
 
-def _file_info(values: dict[str, Any]) -> FileInfo:
+def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
     return FileInfo(
+        path=path,
         type=FileType(values["type"]),
         mode=values["mode"],
         nlink=values["nlink"],
@@ -109,12 +113,14 @@ def _file_info(values: dict[str, Any]) -> FileInfo:
         atime_ns=values["atime_ns"],
         mtime_ns=values["mtime_ns"],
         ctime_ns=values["ctime_ns"],
+        owner=values.get("owner") or None,
+        group=values.get("group") or None,
     )
 
 
-def _directory_entry(parent: str, values: dict[str, Any]) -> DirectoryEntry:
+def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
     path = values["name"] if parent == "." else f"{parent}/{values['name']}"
-    return DirectoryEntry(values["name"], path, _file_info(values["info"]))
+    return DirEntry(values["name"], path, _file_info(path, values["info"]))
 
 
 def _adapter() -> ModuleType:
@@ -289,7 +295,8 @@ class Client(_ClientOptions):
         self._inner.close()
 
     def stat(self, path: os.PathLike[str] | str) -> FileInfo:
-        return _file_info(self._inner.stat(_normalize_path(path)))
+        normalized = _normalize_path(path)
+        return _file_info(normalized, self._inner.stat(normalized))
 
     def exists(self, path: os.PathLike[str] | str) -> bool:
         try:
@@ -298,7 +305,7 @@ class Client(_ClientOptions):
             return False
         return True
 
-    def scandir(self, path: os.PathLike[str] | str = ".") -> Iterator[DirectoryEntry]:
+    def scandir(self, path: os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
         normalized = _normalize_path(path)
         return (_directory_entry(normalized, values) for values in self._inner.scandir(normalized))
 
@@ -368,7 +375,8 @@ class AsyncClient(_ClientOptions):
 
     async def stat(self, path: os.PathLike[str] | str) -> FileInfo:
         self._check_loop()
-        return _file_info(await self._inner.stat(_normalize_path(path)))
+        normalized = _normalize_path(path)
+        return _file_info(normalized, await self._inner.stat(normalized))
 
     async def exists(self, path: os.PathLike[str] | str) -> bool:
         try:
@@ -377,7 +385,7 @@ class AsyncClient(_ClientOptions):
             return False
         return True
 
-    async def scandir(self, path: os.PathLike[str] | str = ".") -> AsyncIterator[DirectoryEntry]:
+    async def scandir(self, path: os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
         self._check_loop()
         normalized = _normalize_path(path)
         cursor = self._inner.scandir(normalized)
@@ -405,23 +413,23 @@ class AsyncClient(_ClientOptions):
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"
 
 
-def list_exports(host: str, **options: Any) -> tuple[Export, ...]:
+def list_exports(host: str, **options: Any) -> tuple[ExportEntry, ...]:
     validated = Client._connection_options(**options)
     values = _adapter().list_exports(_export_url(host, validated), **validated)
     return tuple(
-        Export(value["path"], tuple(value["groups"]))
+        ExportEntry(value["path"], tuple(value["groups"]))
         if isinstance(value, dict)
-        else Export(value[0], tuple(value[1]))
+        else ExportEntry(value[0], tuple(value[1]))
         for value in values
     )
 
 
-async def async_list_exports(host: str, **options: Any) -> tuple[Export, ...]:
+async def list_exports_async(host: str, **options: Any) -> tuple[ExportEntry, ...]:
     validated = AsyncClient._connection_options(**options)
     values = await _adapter().async_list_exports(_export_url(host, validated), **validated)
     return tuple(
-        Export(value["path"], tuple(value["groups"]))
+        ExportEntry(value["path"], tuple(value["groups"]))
         if isinstance(value, dict)
-        else Export(value[0], tuple(value[1]))
+        else ExportEntry(value[0], tuple(value[1]))
         for value in values
     )
