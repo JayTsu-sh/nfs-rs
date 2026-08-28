@@ -32,6 +32,19 @@ def _restore_error(error_type: type[NfsError], state: dict[str, Any]) -> NfsErro
 class NfsError(RuntimeError):
     """Structured, immutable public base for every nfs-rs failure."""
 
+    message: str
+    operation: str | None
+    protocol: str | None
+    code: int | None
+    code_name: str | None
+    recovery_action: RecoveryAction | None
+    outcome: OperationOutcome | None
+    operation_class: OperationClass | None
+    completed_bytes: int | None
+    errno: int | None
+    filename: str | None
+    errors: tuple[NfsError, ...]
+
     def __init__(
         self,
         *,

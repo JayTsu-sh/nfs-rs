@@ -45,6 +45,7 @@ __all__ = [
     "AsyncFile",
     "list_exports",
     "list_exports_async",
+    "__version__",
 ]
 __all__ += _public_errors.__all__
 try:

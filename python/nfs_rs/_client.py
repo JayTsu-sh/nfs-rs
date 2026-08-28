@@ -5,6 +5,9 @@ import importlib
 import inspect
 import io
 import os
+import platform
+import sys
+import sysconfig
 import time
 import warnings
 from enum import Enum
@@ -258,7 +261,20 @@ def _fs_stat(values: dict[str, Any]) -> FsStat:
 
 
 def _adapter() -> ModuleType:
-    return importlib.import_module("nfs_rs._internal")
+    try:
+        return importlib.import_module("nfs_rs._internal")
+    except (ImportError, OSError) as error:
+        libc_name, libc_version = platform.libc_ver()
+        libc = f"{libc_name or 'unknown'} {libc_version or 'unknown'}"
+        runtime = f"{platform.python_implementation()} {platform.python_version()}"
+        soabi = sysconfig.get_config_var("SOABI") or "unknown"
+        raise ImportError(
+            "nfs_rs native extension could not be loaded; install a CPython 3.10+ "
+            "Linux/glibc wheel matching this machine's architecture, or rebuild the "
+            "source distribution with a supported Rust toolchain; detected "
+            f"runtime={runtime}, sys.platform={sys.platform}, "
+            f"architecture={platform.machine() or 'unknown'}, libc={libc}, SOABI={soabi}"
+        ) from error
 
 
 def _record_cleanup_failure(exc: BaseException, cleanup_error: BaseException, owner: str) -> None:
@@ -322,17 +338,26 @@ def _options(
         versions = tuple(versions)
         if not versions or any(version not in {"3", "4.0", "4.1"} for version in versions):
             raise ValueError("versions must be a non-empty sequence containing 3, 4.0, or 4.1")
-    for name, value in (("uid", uid), ("gid", gid)):
-        if value is not None and (isinstance(value, bool) or not 0 <= value <= 2**32 - 1):
+    for name, integer_value in (("uid", uid), ("gid", gid)):
+        if integer_value is not None and (
+            isinstance(integer_value, bool) or not 0 <= integer_value <= 2**32 - 1
+        ):
             raise ValueError(f"{name} must be an unsigned 32-bit integer")
-    for name, value in (("nfs_port", nfs_port), ("mount_port", mount_port)):
-        if value is not None and (isinstance(value, bool) or not 1 <= value <= 65535):
+    for name, port_value in (("nfs_port", nfs_port), ("mount_port", mount_port)):
+        if port_value is not None and (
+            isinstance(port_value, bool) or not 1 <= port_value <= 65535
+        ):
             raise ValueError(f"{name} must be between 1 and 65535")
-    for name, value in (("rsize", rsize), ("wsize", wsize)):
-        if value is not None and (isinstance(value, bool) or value <= 0):
+    for name, size_value in (("rsize", rsize), ("wsize", wsize)):
+        if size_value is not None and (isinstance(size_value, bool) or size_value <= 0):
             raise ValueError(f"{name} must be positive")
-    for name, value in (("connect_timeout", connect_timeout), ("operation_timeout", operation_timeout)):
-        if value is not None and (isinstance(value, bool) or value <= 0):
+    for name, timeout_value in (
+        ("connect_timeout", connect_timeout),
+        ("operation_timeout", operation_timeout),
+    ):
+        if timeout_value is not None and (
+            isinstance(timeout_value, bool) or timeout_value <= 0
+        ):
             raise ValueError(f"{name} must be positive")
     if isinstance(recovery_event_capacity, bool) or recovery_event_capacity <= 0:
         raise ValueError("recovery_event_capacity must be positive")

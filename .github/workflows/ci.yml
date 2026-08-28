@@ -23,16 +23,79 @@ jobs:
       - run: cargo test --all-targets --no-fail-fast
 
   python:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
       - uses: Swatinem/rust-cache@v2
-      - run: python -m pip install "maturin>=1,<2" pytest
+      - run: python -m pip install "maturin>=1,<2" mypy pytest
       - run: cargo check --locked --features python-extension
       - run: maturin build --locked --features python-test-support --out target/wheels
       - run: python -m pip install --force-reinstall target/wheels/nfs_rs-*.whl
+      - run: >-
+          python -m mypy.stubtest nfs_rs --ignore-missing-stub
+          --allowlist python/stubtest-allowlist.txt
       - run: NFS_RS_TEST_INSTALLED=1 python -m pytest -q python/tests
+
+  python-artifacts:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            architecture: x86_64
+            build_sdist: true
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            build_sdist: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.13.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: python -m pip install "maturin>=1,<2"
+      - run: >-
+          maturin build --release --locked --compatibility manylinux2014 --zig
+          --out target/python-artifacts
+      - run: >-
+          python scripts/verify-python-artifacts.py
+          --wheel target/python-artifacts/*_${{ matrix.architecture }}.whl
+      - run: python -m pip install --force-reinstall --no-deps target/python-artifacts/*.whl
+      - run: python -c "import importlib.metadata, nfs_rs; assert nfs_rs.__version__ == importlib.metadata.version('nfs-rs')"
+      - if: matrix.build_sdist
+        run: maturin sdist --out target/python-artifacts
+      - if: matrix.build_sdist
+        run: >-
+          python scripts/verify-python-artifacts.py
+          --sdist target/python-artifacts/nfs_rs-*.tar.gz
+      - if: matrix.build_sdist
+        run: mkdir -p target/sdist-source target/sdist-wheel
+      - if: matrix.build_sdist
+        run: tar -xzf target/python-artifacts/nfs_rs-*.tar.gz -C target/sdist-source
+      - if: matrix.build_sdist
+        run: >-
+          maturin build --release --locked --features python-test-support
+          --compatibility manylinux2014 --zig
+          --manifest-path target/sdist-source/nfs_rs-*/Cargo.toml
+          --out target/sdist-wheel
+      - if: matrix.build_sdist
+        run: python -m pip install --force-reinstall --no-deps target/sdist-wheel/*.whl
+      - if: matrix.build_sdist
+        run: python scripts/smoke-python-artifact.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.architecture }}
+          path: target/python-artifacts/
