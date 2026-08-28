@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import errno
 
 import pytest
 
@@ -42,7 +43,7 @@ def test_namespace_faults_preserve_before_and_after_send_outcomes() -> None:
         client.remove("__isdir__")
     with pytest.raises(OSError) as not_empty:
         client.rmdir("__notempty__")
-    assert not_empty.value.errno == 39
+    assert not_empty.value.errno == errno.ENOTEMPTY
     client.close()
 
 

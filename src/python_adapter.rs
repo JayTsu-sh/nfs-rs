@@ -933,7 +933,7 @@ fn nfs_error_ref(error: &NfsError) -> PyErr {
     } else if is_directory {
         PyIsADirectoryError::new_err(error.to_string())
     } else if not_empty {
-        PyOSError::new_err((39, error.to_string()))
+        PyOSError::new_err((nix::errno::Errno::ENOTEMPTY as i32, error.to_string()))
     } else if permission_denied || error.kind() == std::io::ErrorKind::PermissionDenied {
         PyPermissionError::new_err(error.to_string())
     } else {

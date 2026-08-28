@@ -533,6 +533,7 @@ class AsyncClient(_ClientOptions):
         return await self._inner.readlink(_normalize_path(path))
 
     async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+        self._check_loop()
         normalized = _normalize_path(path)
         if not exist_ok:
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
