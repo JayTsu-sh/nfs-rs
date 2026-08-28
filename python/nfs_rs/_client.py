@@ -5,6 +5,7 @@ import importlib
 import inspect
 import io
 import os
+import time
 import warnings
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -83,6 +84,13 @@ class ExportEntry:
 
 @dataclass(frozen=True, slots=True)
 class FsInfo:
+    max_read: int
+    preferred_read: int
+    read_multiple: int
+    max_write: int
+    preferred_write: int
+    write_multiple: int
+    preferred_directory: int
     max_file_size: int
     time_delta_ns: int
     supports_links: bool
@@ -117,11 +125,6 @@ class Capabilities:
 class IoLimits:
     max_read: int
     max_write: int
-    preferred_read: int
-    preferred_write: int
-    read_multiple: int
-    write_multiple: int
-    preferred_directory: int
 
 
 def _normalize_path(path: os.PathLike[str] | str) -> str:
@@ -396,6 +399,8 @@ class Client(_ClientOptions):
         self._inner.truncate_path(_normalize_path(path), size)
 
     def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
+            raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(self._inner.access(_normalize_path(path), mode))
 
     def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
@@ -472,6 +477,8 @@ class Client(_ClientOptions):
         if not exist_ok:
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         self.open(normalized, "ab").close()
+        now = time.time_ns()
+        self.utime(normalized, ns=(now, now))
 
     def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
         with self.open(path, "rb") as file:
@@ -605,6 +612,8 @@ class AsyncClient(_ClientOptions):
 
     async def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
         self._check_loop()
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
+            raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(await self._inner.access(_normalize_path(path), mode))
 
     async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
@@ -695,6 +704,8 @@ class AsyncClient(_ClientOptions):
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         file = await self.open(normalized, "ab")
         await file.close()
+        now = time.time_ns()
+        await self.utime(normalized, ns=(now, now))
 
     async def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
         async with await self.open(path, "rb") as file:

@@ -44,6 +44,7 @@ class SyncInner:
     def link(self, source, destination): self.calls.append(("link", source, destination))
     def symlink(self, target, link_path): self.calls.append(("symlink", target, link_path))
     def readlink(self, path): self.calls.append(("readlink", path)); return "../raw-target"
+    def utime(self, path, atime_ns, mtime_ns): self.calls.append(("utime", path, atime_ns, mtime_ns))
     def stat(self, path):
         if path == "existing-dir":
             return {"type": "directory", "mode": 0o755, "nlink": 1, "uid": 0, "gid": 0, "size": 0, "used": 0, "fsid": 1, "fileid": 1, "atime_ns": 0, "mtime_ns": 0, "ctime_ns": 0}
@@ -70,6 +71,7 @@ class AsyncInner(SyncInner):
     async def link(self, *args): return super().link(*args)
     async def symlink(self, *args): return super().symlink(*args)
     async def readlink(self, *args): return super().readlink(*args)
+    async def utime(self, *args): return super().utime(*args)
     async def stat(self, path): return super().stat(path)
     async def open(self, path, mode): self.calls.append(("open", path, mode)); return AsyncFile(self, path, mode)
 

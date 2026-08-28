@@ -18,6 +18,8 @@ def test_sync_metadata_xattrs_and_filesystem_snapshots() -> None:
     client.truncate("file", 9)
     assert client.access("file", os.R_OK | os.W_OK)
     assert not client.access("denied", os.R_OK)
+    assert not client.access("missing", os.F_OK)
+    with pytest.raises(ValueError): client.access("file", 8)
     client.setxattr("file", "user.key", b"value")
     assert client.getxattr("file", "user.key") == b"value"
     assert client.listxattr("file") == ["user.key"]

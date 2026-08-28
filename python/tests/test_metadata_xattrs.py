@@ -10,7 +10,7 @@ class SyncInner:
     version = (4, 1)
     health = {"lifecycle": "ready", "generation": 0, "lease_healthy": True}
     capabilities = {"acl": True, "named_attributes": True, "locks": True, "callbacks": True, "delegation_retention": False, "pnfs": False, "session_diagnostics": True}
-    io_limits = {"max_read": 8, "max_write": 4, "preferred_read": 8, "preferred_write": 4, "read_multiple": 1, "write_multiple": 1, "preferred_directory": 8}
+    io_limits = {"max_read": 8, "max_write": 4}
     closed = False
 
     def __init__(self): self.calls, self.xattrs = [], {}
@@ -25,7 +25,7 @@ class SyncInner:
     def setxattr(self, path, name, value): self.xattrs[(path, name)] = value; self.calls.append(("setxattr", path, name, value))
     def listxattr(self, path): return sorted(name for candidate, name in self.xattrs if candidate == path)
     def removexattr(self, path, name): del self.xattrs[(path, name)]
-    def fs_info(self): return {"max_file_size": 2**40, "time_delta_ns": 1, "supports_links": True, "supports_symlinks": True, "homogeneous": False, "can_set_time": False}
+    def fs_info(self): return {"max_read": 8, "preferred_read": 8, "read_multiple": 1, "max_write": 4, "preferred_write": 4, "write_multiple": 1, "preferred_directory": 8, "max_file_size": 2**40, "time_delta_ns": 1, "supports_links": True, "supports_symlinks": True, "homogeneous": False, "can_set_time": False}
     def fs_stat(self): return {"total_bytes": 1000, "free_bytes": 600, "available_bytes": 500, "total_files": 100, "free_files": 60, "available_files": 50, "invariant_seconds": 1}
 
 
@@ -63,6 +63,8 @@ def test_sync_metadata_xattrs_and_immutable_information():
     client.truncate("file", 12)
     assert client.access("file", 4)
     assert not client.access("denied", 4)
+    for invalid in (-1, 8, True, "read"):
+        with pytest.raises(ValueError): client.access("file", invalid)
     source = bytearray(b"value")
     client.setxattr("file", "user.key", source)
     source[:] = b"other"

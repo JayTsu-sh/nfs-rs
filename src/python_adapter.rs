@@ -1023,11 +1023,6 @@ fn io_limits_dict<'py>(
     let max_write = mount.map_or(4, |mount| mount.get_max_write_size());
     values.set_item("max_read", max_read)?;
     values.set_item("max_write", max_write)?;
-    values.set_item("preferred_read", max_read)?;
-    values.set_item("preferred_write", max_write)?;
-    values.set_item("read_multiple", 1)?;
-    values.set_item("write_multiple", 1)?;
-    values.set_item("preferred_directory", max_read)?;
     Ok(values)
 }
 
@@ -1091,6 +1086,13 @@ async fn fs_stat_values(
 
 fn fs_info_dict<'py>(py: Python<'py>, info: crate::FSInfo) -> PyResult<Bound<'py, PyDict>> {
     let values = PyDict::new(py);
+    values.set_item("max_read", info.rtmax)?;
+    values.set_item("preferred_read", info.rtpref)?;
+    values.set_item("read_multiple", info.rtmult)?;
+    values.set_item("max_write", info.wtmax)?;
+    values.set_item("preferred_write", info.wtpref)?;
+    values.set_item("write_multiple", info.wtmult)?;
+    values.set_item("preferred_directory", info.dtpref)?;
     values.set_item("max_file_size", info.maxfilesize)?;
     values.set_item(
         "time_delta_ns",
@@ -1374,21 +1376,76 @@ async fn access_path(
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        return Ok(path != "denied" && mode & !0o7 == 0);
+        return Ok(path != "denied" && path != "missing" && mode & !0o7 == 0);
     }
-    let granted = mount
-        .ok_or_else(|| {
-            NfsError::Unsupported("access requires a connected protocol engine".to_string())
-        })?
-        .access_path(&path, mode)
-        .await?;
-    Ok(granted & mode == mode)
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("access requires a connected protocol engine".to_string())
+    })?;
+    let object = match mount.lookup_path(&path).await {
+        Ok(object) => object,
+        Err(error) if access_false_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if mode == 0 {
+        return Ok(true);
+    }
+    let attr = match object.attr {
+        Some(attr) => attr,
+        None => match mount.getattr(object.fh.clone()).await {
+            Ok(attr) => attr,
+            Err(error) if access_false_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        },
+    };
+    let requested = nfs_access_mask(mode, attr.type_ == 2);
+    match mount.access(object.fh, requested).await {
+        Ok(granted) => Ok(granted & requested == requested),
+        Err(error) if access_false_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn access_false_error(error: &NfsError) -> bool {
+    error.is_not_found()
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(
+            error,
+            NfsError::Nfs3(
+                crate::nfs3::ErrorCode::NFS3ERR_ACCES | crate::nfs3::ErrorCode::NFS3ERR_PERM
+            ) | NfsError::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS
+                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_PERM
+            )
+        )
+}
+
+fn nfs_access_mask(mode: u32, directory: bool) -> u32 {
+    const READ: u32 = 0x01;
+    const LOOKUP: u32 = 0x02;
+    const MODIFY: u32 = 0x04;
+    const EXTEND: u32 = 0x08;
+    const DELETE: u32 = 0x10;
+    const EXECUTE: u32 = 0x20;
+    let mut requested = 0;
+    if mode & 0o4 != 0 {
+        requested |= READ;
+    }
+    if mode & 0o2 != 0 {
+        requested |= MODIFY | EXTEND;
+        if directory {
+            requested |= DELETE;
+        }
+    }
+    if mode & 0o1 != 0 {
+        requested |= if directory { LOOKUP } else { EXECUTE };
+    }
+    requested
 }
 
 async fn xattr_get(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    resources: Arc<AdapterResources>,
+    _resources: Arc<AdapterResources>,
     path: String,
     name: String,
 ) -> Result<Vec<u8>> {
@@ -1400,7 +1457,7 @@ async fn xattr_get(
                 "named attributes are not supported".to_string(),
             ));
         }
-        return resources
+        return _resources
             .test_xattrs
             .lock()
             .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
@@ -1420,7 +1477,7 @@ async fn xattr_get(
 async fn xattr_set(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    resources: Arc<AdapterResources>,
+    _resources: Arc<AdapterResources>,
     path: String,
     name: String,
     value: Vec<u8>,
@@ -1433,7 +1490,7 @@ async fn xattr_set(
                 "named attributes are not supported".to_string(),
             ));
         }
-        resources
+        _resources
             .test_xattrs
             .lock()
             .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
@@ -1451,7 +1508,7 @@ async fn xattr_set(
 async fn xattr_list(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    resources: Arc<AdapterResources>,
+    _resources: Arc<AdapterResources>,
     path: String,
 ) -> Result<Vec<String>> {
     let _operation_guard = core.begin_operation()?;
@@ -1462,7 +1519,7 @@ async fn xattr_list(
                 "named attributes are not supported".to_string(),
             ));
         }
-        let mut names: Vec<_> = resources
+        let mut names: Vec<_> = _resources
             .test_xattrs
             .lock()
             .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
@@ -1484,7 +1541,7 @@ async fn xattr_list(
 async fn xattr_remove(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    resources: Arc<AdapterResources>,
+    _resources: Arc<AdapterResources>,
     path: String,
     name: String,
 ) -> Result<()> {
@@ -1496,7 +1553,7 @@ async fn xattr_remove(
                 "named attributes are not supported".to_string(),
             ));
         }
-        resources
+        _resources
             .test_xattrs
             .lock()
             .map_err(|_| NfsError::Rpc("xattr registry lock poisoned".to_string()))?
@@ -3090,12 +3147,21 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(all(test, feature = "python-test-support"))]
 mod read_only_file_tests {
-    use super::{FileMode, FileResource, TestWriteFault, with_confirmed_bytes};
+    use super::{FileMode, FileResource, TestWriteFault, nfs_access_mask, with_confirmed_bytes};
     use crate::error::{
         OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction, RequestContext,
     };
     use crate::{NFSVersion, NfsError};
     use std::sync::Arc;
+
+    #[test]
+    fn python_access_bits_map_to_nfs_access_semantics() {
+        assert_eq!(nfs_access_mask(0o4, false), 0x01);
+        assert_eq!(nfs_access_mask(0o2, false), 0x04 | 0x08);
+        assert_eq!(nfs_access_mask(0o1, false), 0x20);
+        assert_eq!(nfs_access_mask(0o1, true), 0x02);
+        assert_eq!(nfs_access_mask(0o2, true), 0x04 | 0x08 | 0x10);
+    }
 
     fn read_mode() -> FileMode {
         FileMode::parse("rb").unwrap_or_else(|_| panic!("rb mode must be valid"))
