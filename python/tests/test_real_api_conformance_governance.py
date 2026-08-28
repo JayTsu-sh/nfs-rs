@@ -16,7 +16,7 @@ def public_methods(class_name: str) -> set[str]:
         node.name
         for node in class_node.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name not in {"__init__", "__enter__", "__exit__", "__aenter__", "__aexit__"}
+        and node.name != "__init__"
     }
 
 

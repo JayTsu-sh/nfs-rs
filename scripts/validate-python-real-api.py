@@ -22,7 +22,8 @@ PUBLIC_API_COVERAGE = {
         "fs_stat", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "write_bytes",
+        "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__enter__",
+        "__exit__",
     ),
     "AsyncClient": (
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
@@ -30,17 +31,18 @@ PUBLIC_API_COVERAGE = {
         "fs_stat", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "write_bytes",
+        "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__aenter__",
+        "__aexit__",
     ),
     "File": (
         "close", "closed", "fileno", "flush", "mode", "name", "read", "read_at",
         "readable", "readinto", "readinto_at", "seek", "seekable", "tell", "truncate",
-        "writable", "write", "write_at",
+        "writable", "write", "write_at", "__enter__", "__exit__",
     ),
     "AsyncFile": (
         "close", "closed", "flush", "mode", "name", "read", "read_at", "readable",
         "readinto", "readinto_at", "seek", "tell", "truncate", "writable", "write",
-        "write_at",
+        "write_at", "__aenter__", "__aexit__",
     ),
     "module": ("list_exports", "list_exports_async"),
 }
@@ -114,32 +116,24 @@ def unavailable_methods(checks: list[str]) -> set[str]:
     return {
         evidence.split(":", 1)[0]
         for evidence in checks
-        if evidence.endswith(":structured-unavailable")
+        if evidence.endswith(":unsupported")
     }
 
 
-def capability_call(operation, name: str, checks: list[str], *, absent_ok: bool = False) -> None:
+def capability_call(operation, name: str, checks: list[str]) -> None:
     try:
         operation()
-    except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError):
-        checks.append(name + ":structured-unavailable")
-    except nfs_rs.NfsNotFoundError:
-        if not absent_ok:
-            raise
-        checks.append(name + ":structured-unavailable")
+    except nfs_rs.NfsUnsupportedError:
+        checks.append(name + ":unsupported")
     else:
         checks.append(name + ":success")
 
 
-async def capability_call_async(operation, name: str, checks: list[str], *, absent_ok: bool = False) -> None:
+async def capability_call_async(operation, name: str, checks: list[str]) -> None:
     try:
         await operation()
-    except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError):
-        checks.append(name + ":structured-unavailable")
-    except nfs_rs.NfsNotFoundError:
-        if not absent_ok:
-            raise
-        checks.append(name + ":structured-unavailable")
+    except nfs_rs.NfsUnsupportedError:
+        checks.append(name + ":unsupported")
     else:
         checks.append(name + ":success")
 
@@ -175,6 +169,7 @@ def sync_file_scenario(client: nfs_rs.Client, root: str, checks: list[str]) -> N
     check(opened.truncate(5) == 5, "File.truncate", checks)
     opened.flush()
     checks.append("File.flush")
+    check(opened.read_at(0) == b"abXYe", "File.flush observable effect", checks)
     try:
         opened.fileno()
     except io.UnsupportedOperation:
@@ -184,6 +179,10 @@ def sync_file_scenario(client: nfs_rs.Client, root: str, checks: list[str]) -> N
     opened.close()
     check(opened.closed, "File.close/closed", checks)
     opened.close()
+    context_path = f"{root}/sync-context-file.bin"
+    with client.open(context_path, "wb") as context_file:
+        check(context_file.write(b"context") == 7, "File.__enter__", checks)
+    check(context_file.closed, "File.__exit__", checks)
     require_complete_coverage(checks, "File")
 
 
@@ -224,26 +223,31 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         check(client.access(data, os.R_OK), "Client.access", checks)
         fs_info = client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "Client.fs_info", checks)
+        check(fs_info.supports_links and fs_info.supports_symlinks, "Client full namespace capabilities", checks)
         fs_stat = client.fs_stat()
         check(fs_stat.total_bytes >= fs_stat.free_bytes, "Client.fs_stat", checks)
 
         client.chmod(data, 0o640)
-        checks.append("Client.chmod")
+        check(client.stat(data).mode & 0o777 == 0o640, "Client.chmod", checks)
         current = client.stat(data)
-        capability_call(lambda: client.chown(data, current.uid, current.gid), "Client.chown", checks)
-        client.utime(data, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000))
-        checks.append("Client.utime")
+        client.chown(data, current.uid, current.gid)
+        owned = client.stat(data)
+        check((owned.uid, owned.gid) == (current.uid, current.gid), "Client.chown", checks)
+        expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
+        client.utime(data, ns=expected_times)
+        timed = client.stat(data)
+        check((timed.atime_ns, timed.mtime_ns) == expected_times, "Client.utime", checks)
         client.truncate(data, 4)
         check(client.stat(data).size == 4, "Client.truncate", checks)
 
         xattr = "user.nfs_rs_conformance"
         try:
             client.setxattr(data, xattr, b"value")
-        except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError):
-            checks.append("Client.setxattr:structured-unavailable")
-            capability_call(lambda: client.getxattr(data, xattr), "Client.getxattr", checks, absent_ok=True)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("Client.setxattr:unsupported")
+            capability_call(lambda: client.getxattr(data, xattr), "Client.getxattr", checks)
             capability_call(lambda: client.listxattr(data), "Client.listxattr", checks)
-            capability_call(lambda: client.removexattr(data, xattr), "Client.removexattr", checks, absent_ok=True)
+            capability_call(lambda: client.removexattr(data, xattr), "Client.removexattr", checks)
         else:
             check(client.getxattr(data, xattr) == b"value", "Client.getxattr", checks)
             check(xattr in client.listxattr(data), "Client.listxattr", checks)
@@ -251,35 +255,31 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
             checks.extend(("Client.setxattr", "Client.removexattr"))
 
         client.rename(data, renamed)
-        check(client.exists(renamed), "Client.rename", checks)
-        if fs_info.supports_links:
-            client.link(renamed, hard_link)
-            check(client.read_bytes(hard_link) == b"payl", "Client.link", checks)
-        else:
-            capability_call(lambda: client.link(renamed, hard_link), "Client.link", checks)
-        if fs_info.supports_symlinks:
-            client.symlink("renamed.bin", symbolic_link)
-            check(client.readlink(symbolic_link) == "renamed.bin", "Client.symlink/readlink", checks)
-        else:
-            capability_call(lambda: client.symlink("renamed.bin", symbolic_link), "Client.symlink", checks)
-            capability_call(lambda: client.readlink(symbolic_link), "Client.readlink", checks, absent_ok=True)
+        check(not client.exists(data) and client.exists(renamed), "Client.rename", checks)
+        client.link(renamed, hard_link)
+        check(client.read_bytes(hard_link) == b"payl", "Client.link", checks)
+        client.symlink("renamed.bin", symbolic_link)
+        check(client.readlink(symbolic_link) == "renamed.bin", "Client.symlink/readlink", checks)
         client.touch(touched)
         check(client.exists(touched), "Client.touch", checks)
         sync_file_scenario(client, root, checks)
 
         client.unlink(touched)
-        checks.append("Client.unlink")
-        client.remove(f"{root}/missing.bin", missing_ok=True)
-        checks.append("Client.remove")
+        check(not client.exists(touched), "Client.unlink", checks)
+        remove_path = f"{root}/remove-me.bin"
+        client.write_bytes(remove_path, b"remove")
+        client.remove(remove_path)
+        check(not client.exists(remove_path), "Client.remove", checks)
         client.rmdir(f"{nested}/child")
         client.rmdir(nested)
-        checks.append("Client.rmdir")
+        check(not client.exists(nested), "Client.rmdir", checks)
     finally:
         client.close()
     check(client.closed, "Client.close/closed", checks)
     client.close()
     with nfs_rs.Client.connect(url) as context_client:
-        check(not context_client.closed, "Client context manager", checks)
+        check(not context_client.closed, "Client.__enter__", checks)
+    check(context_client.closed, "Client.__exit__", checks)
     require_complete_coverage(checks, "Client")
     return checks
 
@@ -301,9 +301,14 @@ async def async_file_scenario(client: nfs_rs.AsyncClient, root: str, checks: lis
     check(await opened.truncate(5) == 5, "AsyncFile.truncate", checks)
     await opened.flush()
     checks.append("AsyncFile.flush")
+    check(await opened.read_at(0) == b"abXYe", "AsyncFile.flush observable effect", checks)
     await opened.close()
     check(opened.closed, "AsyncFile.close/closed", checks)
     await opened.close()
+    context_path = f"{root}/async-context-file.bin"
+    async with await client.open(context_path, "wb") as context_file:
+        check(await context_file.write(b"context") == 7, "AsyncFile.__aenter__", checks)
+    check(context_file.closed, "AsyncFile.__aexit__", checks)
     require_complete_coverage(checks, "AsyncFile")
 
 
@@ -343,26 +348,31 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         check(await client.access(data, os.R_OK), "AsyncClient.access", checks)
         fs_info = await client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "AsyncClient.fs_info", checks)
+        check(fs_info.supports_links and fs_info.supports_symlinks, "AsyncClient full namespace capabilities", checks)
         fs_stat = await client.fs_stat()
         check(fs_stat.total_bytes >= fs_stat.free_bytes, "AsyncClient.fs_stat", checks)
 
         await client.chmod(data, 0o640)
-        checks.append("AsyncClient.chmod")
+        check((await client.stat(data)).mode & 0o777 == 0o640, "AsyncClient.chmod", checks)
         current = await client.stat(data)
-        await capability_call_async(lambda: client.chown(data, current.uid, current.gid), "AsyncClient.chown", checks)
-        await client.utime(data, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000))
-        checks.append("AsyncClient.utime")
+        await client.chown(data, current.uid, current.gid)
+        owned = await client.stat(data)
+        check((owned.uid, owned.gid) == (current.uid, current.gid), "AsyncClient.chown", checks)
+        expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
+        await client.utime(data, ns=expected_times)
+        timed = await client.stat(data)
+        check((timed.atime_ns, timed.mtime_ns) == expected_times, "AsyncClient.utime", checks)
         await client.truncate(data, 4)
         check((await client.stat(data)).size == 4, "AsyncClient.truncate", checks)
 
         xattr = "user.nfs_rs_conformance"
         try:
             await client.setxattr(data, xattr, b"value")
-        except (nfs_rs.NfsUnsupportedError, nfs_rs.NfsPermissionError):
-            checks.append("AsyncClient.setxattr:structured-unavailable")
-            await capability_call_async(lambda: client.getxattr(data, xattr), "AsyncClient.getxattr", checks, absent_ok=True)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("AsyncClient.setxattr:unsupported")
+            await capability_call_async(lambda: client.getxattr(data, xattr), "AsyncClient.getxattr", checks)
             await capability_call_async(lambda: client.listxattr(data), "AsyncClient.listxattr", checks)
-            await capability_call_async(lambda: client.removexattr(data, xattr), "AsyncClient.removexattr", checks, absent_ok=True)
+            await capability_call_async(lambda: client.removexattr(data, xattr), "AsyncClient.removexattr", checks)
         else:
             check(await client.getxattr(data, xattr) == b"value", "AsyncClient.getxattr", checks)
             check(xattr in await client.listxattr(data), "AsyncClient.listxattr", checks)
@@ -370,35 +380,31 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             checks.extend(("AsyncClient.setxattr", "AsyncClient.removexattr"))
 
         await client.rename(data, renamed)
-        check(await client.exists(renamed), "AsyncClient.rename", checks)
-        if fs_info.supports_links:
-            await client.link(renamed, hard_link)
-            check(await client.read_bytes(hard_link) == b"payl", "AsyncClient.link", checks)
-        else:
-            await capability_call_async(lambda: client.link(renamed, hard_link), "AsyncClient.link", checks)
-        if fs_info.supports_symlinks:
-            await client.symlink("async-renamed.bin", symbolic_link)
-            check(await client.readlink(symbolic_link) == "async-renamed.bin", "AsyncClient.symlink/readlink", checks)
-        else:
-            await capability_call_async(lambda: client.symlink("async-renamed.bin", symbolic_link), "AsyncClient.symlink", checks)
-            await capability_call_async(lambda: client.readlink(symbolic_link), "AsyncClient.readlink", checks, absent_ok=True)
+        check(not await client.exists(data) and await client.exists(renamed), "AsyncClient.rename", checks)
+        await client.link(renamed, hard_link)
+        check(await client.read_bytes(hard_link) == b"payl", "AsyncClient.link", checks)
+        await client.symlink("async-renamed.bin", symbolic_link)
+        check(await client.readlink(symbolic_link) == "async-renamed.bin", "AsyncClient.symlink/readlink", checks)
         await client.touch(touched)
         check(await client.exists(touched), "AsyncClient.touch", checks)
         await async_file_scenario(client, root, checks)
 
         await client.unlink(touched)
-        checks.append("AsyncClient.unlink")
-        await client.remove(f"{root}/missing.bin", missing_ok=True)
-        checks.append("AsyncClient.remove")
+        check(not await client.exists(touched), "AsyncClient.unlink", checks)
+        remove_path = f"{root}/async-remove-me.bin"
+        await client.write_bytes(remove_path, b"remove")
+        await client.remove(remove_path)
+        check(not await client.exists(remove_path), "AsyncClient.remove", checks)
         await client.rmdir(f"{nested}/child")
         await client.rmdir(nested)
-        checks.append("AsyncClient.rmdir")
+        check(not await client.exists(nested), "AsyncClient.rmdir", checks)
     finally:
         await client.close()
     check(client.closed, "AsyncClient.close/closed", checks)
     await client.close()
     async with await nfs_rs.AsyncClient.connect(url) as context_client:
-        check(not context_client.closed, "AsyncClient context manager", checks)
+        check(not context_client.closed, "AsyncClient.__aenter__", checks)
+    check(context_client.closed, "AsyncClient.__aexit__", checks)
     require_complete_coverage(checks, "AsyncClient")
     return checks
 
