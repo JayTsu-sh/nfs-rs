@@ -246,6 +246,7 @@ pub(crate) struct Mount41 {
     pub(crate) retain_delegations: bool,
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
+    pub(crate) acl_supported: bool,
 }
 
 impl Mount41 {
@@ -822,11 +823,12 @@ async fn mount_on_addr(
     );
 
     // 4. Get filesystem limits via GETATTR
-    let (rsize, wsize, renewal_interval) =
+    let (rsize, wsize, renewal_interval, acl_supported) =
         get_fs_limits(&client, &session, auth, &root_fh, args.rsize, args.wsize).await?;
     info!(
         rsize,
         wsize,
+        acl_supported,
         renewal_secs = renewal_interval.as_secs(),
         "negotiated transfer sizes"
     );
@@ -907,6 +909,7 @@ async fn mount_on_addr(
         retain_delegations: args.retain_delegations,
         rsize,
         wsize,
+        acl_supported,
     };
 
     Ok(Box::new(Mount41Wrapper {
@@ -1280,9 +1283,9 @@ async fn get_fs_limits(
     root_fh: &Bytes,
     requested_rsize: u32,
     requested_wsize: u32,
-) -> Result<(u32, u32, std::time::Duration)> {
+) -> Result<(u32, u32, std::time::Duration, bool)> {
     // NFSv4.1: lease_time=10, maxread=30, maxwrite=31
-    let bitmap = [(1u32 << 10) | (1u32 << 30) | (1u32 << 31)]; // word0 only
+    let bitmap = [(1u32 << 0) | (1u32 << 10) | (1u32 << 30) | (1u32 << 31)];
 
     let mut slot = session.acquire_slot().await?;
     let sequence_id = slot.sequence_id;
@@ -1367,6 +1370,19 @@ async fn get_fs_limits(
     let mut server_maxread = u64::MAX;
     let mut server_maxwrite = u64::MAX;
 
+    let supported_attrs = if bitmap_len > 0 && (resp_bitmap[0] & 1) != 0 {
+        if vals.remaining() < 4 {
+            return Err(NfsError::Xdr("supported_attrs truncated".to_string()));
+        }
+        let words = vals.get_u32() as usize;
+        if vals.remaining() < words.saturating_mul(4) {
+            return Err(NfsError::Xdr("supported_attrs truncated".to_string()));
+        }
+        (0..words).map(|_| vals.get_u32()).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     if has_lease_time && vals.remaining() >= 4 {
         server_lease_secs = vals.get_u32();
     }
@@ -1406,7 +1422,10 @@ async fn get_fs_limits(
         session.max_request_size(),
     )?;
 
-    Ok((rsize, wsize, renewal_interval))
+    let acl_supported = supported_attrs
+        .first()
+        .is_some_and(|word| word & (1 << 12) != 0);
+    Ok((rsize, wsize, renewal_interval, acl_supported))
 }
 
 const NFS41_WRITE_REQUEST_HEADROOM: u32 = 4 * 1024;
@@ -1465,7 +1484,7 @@ fn effective_wsize(
 impl crate::Mount for Mount41Wrapper {
     fn capabilities(&self) -> crate::MountCapabilities {
         crate::MountCapabilities {
-            acl: true,
+            acl: self.m.acl_supported,
             // Server-effective named attributes are not negotiated yet.
             named_attributes: false,
             locks: true,
