@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+
 concurrency:
   group: terrasync-release
   cancel-in-progress: false
