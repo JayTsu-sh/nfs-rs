@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 #[cfg(feature = "python-test-support")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -41,7 +41,10 @@ static OPEN_TEST_BARRIER: OnceLock<Mutex<Option<Arc<OpenTestBarrier>>>> = OnceLo
 #[derive(Debug)]
 struct OperationTestBarrier {
     operation: String,
+    expected_entries: usize,
+    entry_count: AtomicUsize,
     entered: Notify,
+    released: AtomicBool,
     release: Notify,
     settled: Notify,
 }
@@ -67,8 +70,16 @@ async fn wait_at_operation_test_barrier(operation: &str) {
         .and_then(|value| value.clone())
         .filter(|barrier| barrier.operation == operation);
     if let Some(barrier) = barrier {
-        barrier.entered.notify_one();
-        barrier.release.notified().await;
+        if barrier.entry_count.fetch_add(1, Ordering::AcqRel) + 1 == barrier.expected_entries {
+            barrier.entered.notify_one();
+        }
+        loop {
+            let released = barrier.release.notified();
+            if barrier.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
     }
 }
 
@@ -124,6 +135,14 @@ impl AdapterResources {
             .lock()
             .map_err(|_| NfsError::Rpc("file registry lock poisoned".to_string()))?
             .remove(&key))
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn open_file_count(&self) -> usize {
+        self.files
+            .lock()
+            .map(|files| files.len())
+            .unwrap_or_default()
     }
 
     #[cfg(feature = "python-test-support")]
@@ -2733,14 +2752,20 @@ fn _wait_open_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 }
 
 #[cfg(feature = "python-test-support")]
-#[pyfunction]
-fn _arm_operation_test_barrier(operation: String) -> PyResult<()> {
+#[pyfunction(signature = (operation, parties = 1))]
+fn _arm_operation_test_barrier(operation: String, parties: usize) -> PyResult<()> {
+    if parties == 0 || parties > 1024 {
+        return Err(PyValueError::new_err("parties must be between 1 and 1024"));
+    }
     *operation_test_barrier()
         .lock()
         .map_err(|_| PyRuntimeError::new_err("operation test barrier lock poisoned"))? =
         Some(Arc::new(OperationTestBarrier {
             operation,
+            expected_entries: parties,
+            entry_count: AtomicUsize::new(0),
             entered: Notify::new(),
+            released: AtomicBool::new(false),
             release: Notify::new(),
             settled: Notify::new(),
         }));
@@ -2761,7 +2786,13 @@ fn current_operation_test_barrier() -> PyResult<Arc<OperationTestBarrier>> {
 fn _wait_operation_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_operation_test_barrier()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        barrier.entered.notified().await;
+        loop {
+            let entered = barrier.entered.notified();
+            if barrier.entry_count.load(Ordering::Acquire) >= barrier.expected_entries {
+                break;
+            }
+            entered.await;
+        }
         Ok(())
     })
 }
@@ -2769,7 +2800,9 @@ fn _wait_operation_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 #[cfg(feature = "python-test-support")]
 #[pyfunction]
 fn _release_operation_test_barrier() -> PyResult<()> {
-    current_operation_test_barrier()?.release.notify_one();
+    let barrier = current_operation_test_barrier()?;
+    barrier.released.store(true, Ordering::Release);
+    barrier.release.notify_waiters();
     Ok(())
 }
 
@@ -3038,6 +3071,26 @@ impl SyncFile {
         self.resource.open_state_lost.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "python-test-support")]
+    #[pyo3(signature = (timeout_seconds = 2.0))]
+    fn _wait_closing(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+        if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
+            return Err(PyValueError::new_err("timeout_seconds must be positive"));
+        }
+        if !self.resource.closed() {
+            let result = py.detach(|| {
+                self.runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs_f64(timeout_seconds),
+                    self.resource.close_started.notified(),
+                ))
+            });
+            result.map_err(|_| {
+                PyRuntimeError::new_err("file did not start closing before timeout")
+            })?;
+        }
+        Ok(())
+    }
+
     #[pyo3(signature = (size = -1))]
     fn read(&self, py: Python<'_>, size: i64) -> PyResult<Py<PyBytes>> {
         let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
@@ -3161,6 +3214,17 @@ impl AsyncFile {
     #[cfg(feature = "python-test-support")]
     fn _lose_open_state(&self) {
         self.resource.open_state_lost.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _wait_closing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let resource = self.resource.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if !resource.closed() {
+                resource.close_started.notified().await;
+            }
+            Ok(())
+        })
     }
 
     #[pyo3(signature = (size = -1))]
@@ -3492,6 +3556,15 @@ impl SyncClient {
     #[cfg(feature = "python-test-support")]
     fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
         record_test_recovery_event(&self.core, self.version, operation, path)
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _resource_counts(&self) -> (usize, usize, u64) {
+        (
+            self.core.resource_count(),
+            self.resources.open_file_count(),
+            self.core.owned_task_count(),
+        )
     }
 
     fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
@@ -3958,6 +4031,15 @@ impl AsyncClient {
     #[cfg(feature = "python-test-support")]
     fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
         record_test_recovery_event(&self.core, self.version, operation, path)
+    }
+
+    #[cfg(feature = "python-test-support")]
+    fn _resource_counts(&self) -> (usize, usize, u64) {
+        (
+            self.core.resource_count(),
+            self.resources.open_file_count(),
+            self.core.owned_task_count(),
+        )
     }
 
     #[cfg(feature = "python-test-support")]

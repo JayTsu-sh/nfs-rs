@@ -1039,7 +1039,7 @@ class File(io.RawIOBase):
 
 
 class AsyncFile:
-    __slots__ = ("_inner", "_name", "_mode", "_loop")
+    __slots__ = ("_inner", "_name", "_mode", "_loop", "__weakref__")
 
     def __init__(
         self,
