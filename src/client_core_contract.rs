@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::client_core::{ClientCore, ClientDriver, ClientLifecycle, CoreOperation, ResourceKey};
 use crate::{
     NFSVersion, NfsError, OperationClass, OperationOutcome, RecoveryAction, RequestContext,

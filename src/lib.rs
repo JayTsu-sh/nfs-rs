@@ -251,6 +251,7 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
 }
 
 #[cfg(any(test, feature = "python-bindings"))]
+#[cfg_attr(all(feature = "python-bindings", not(test)), allow(dead_code))]
 mod client_core;
 #[cfg(test)]
 mod client_core_contract;
@@ -260,6 +261,8 @@ mod nfs3;
 mod nfs4;
 mod nfs40;
 mod nfs41;
+#[cfg(feature = "python-bindings")]
+mod python_adapter;
 mod rpc;
 mod shared;
 

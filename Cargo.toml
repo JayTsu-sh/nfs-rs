@@ -24,9 +24,14 @@ include = [
     "/tests/lab_e2e.rs",
 ]
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 default = []
-python-bindings = []
+python-bindings = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+python-extension = ["python-bindings", "pyo3/extension-module"]
+python-test-support = ["python-extension"]
 
 [dependencies]
 byteorder = "1.5.0"
@@ -42,6 +47,8 @@ tokio = { version = "1.35.1", features = ["net", "io-util", "sync", "rt-multi-th
 tracing = "0.1"
 async-trait = "0.1.77"
 socket2 = { version = "0.5", features = ["all"] }
+pyo3 = { version = "0.27", features = ["abi3-py310"], optional = true }
+pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"], optional = true }
 
 [build-dependencies]
 fastxdr = "=1.0.2"

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nfs-rs"
+version = "0.5.1"
+requires-python = ">=3.10"
+description = "Synchronous and asyncio userspace NFS clients backed by nfs-rs"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+]
+
+[tool.maturin]
+features = ["python-extension"]
+module-name = "nfs_rs._internal"
+python-source = "python"
