@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-08-29
+
+### Fixed
+
+- Apply the release policy of three independent supplemental attempts to each
+  Python artifact RSS plateau failure, accepting any successful retest while
+  preserving failed-attempt evidence.
+
 ## [0.5.6] - 2026-08-29
 
 ### Security
@@ -146,7 +154,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.3...v0.5.4
