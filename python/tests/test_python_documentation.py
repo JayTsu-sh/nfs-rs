@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import re
-import tomllib
 from pathlib import Path
 
 
@@ -15,8 +14,8 @@ def _python_blocks(path: Path) -> list[str]:
 
 
 def test_pypi_uses_python_specific_readme() -> None:
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert project["project"]["readme"] == "README-PYPI.md"
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r'^readme = "README-PYPI\.md"$', project, flags=re.MULTILINE)
 
     readme = (ROOT / "README-PYPI.md").read_text(encoding="utf-8")
     assert "```rust" not in readme
