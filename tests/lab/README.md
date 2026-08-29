@@ -86,9 +86,6 @@ accepted with a `warning` only when throughput remains at least 90% of that
 limit or latency remains at most 110% of it. Reports preserve the actual value,
 hard limit, soft limit, and deviation. Results beyond the soft limit still fail;
 sample completeness, data integrity, and capability checks are never softened.
-DXN NFSv4.0 read throughput has an environment-specific exact 20% regression
-budget; its soft-limit factor is 1.0, so the global jitter allowance cannot
-expand that acceptance range beyond 20%.
 When an environment still fails only numeric limits, the release gate performs
 three consecutive supplemental five-run tests for that environment alone. A
 passing or warning result in any round becomes the final decision while all
