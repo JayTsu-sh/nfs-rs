@@ -269,7 +269,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let nightly = include_str!("../.github/workflows/nightly.yml");
     let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
-    assert!(cargo.contains("version = \"0.5.4\""));
+    assert!(cargo.contains("version = \"0.5.5\""));
     for required in [
         "NFSv4.0 (experimental)",
         "AUTH_SYS",
@@ -294,6 +294,8 @@ fn nfsv40_experimental_release_contract_is_complete() {
     assert!(publisher.contains("publish-crate-artifact.py"));
     assert!(publisher.contains("actions/download-artifact@v5"));
     assert!(!publisher.contains("cargo publish"));
+    assert!(release.contains("cp target/package/nfs-rs-*.crate target/python-release-artifacts/* release-sha256.txt immutable-release/"));
+    assert!(release.contains("path: immutable-release/*"));
 }
 
 #[test]

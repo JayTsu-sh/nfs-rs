@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-08-29
+
+### Fixed
+
+- Flatten immutable release artifacts before upload so audit and registry
+  publication consume the exact validated wheel, sdist, and crate files.
+
 ## [0.5.4] - 2026-08-29
 
 ### Fixed
@@ -132,7 +139,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.1...v0.5.2

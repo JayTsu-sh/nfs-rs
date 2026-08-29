@@ -177,16 +177,15 @@ jobs:
         run: |
           find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum > release-sha256.txt
           sha256sum target/package/nfs-rs-*.crate target/python-release-artifacts/* >> release-sha256.txt
+          mkdir -p immutable-release
+          cp target/package/nfs-rs-*.crate target/python-release-artifacts/* release-sha256.txt immutable-release/
       - name: Upload immutable x86_64 release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: immutable-release-x86_64
           retention-days: 14
           if-no-files-found: error
-          path: |
-            target/package/nfs-rs-*.crate
-            target/python-release-artifacts/*
-            release-sha256.txt
+          path: immutable-release/*
       - uses: actions/upload-artifact@v4
         with:
           name: nfs-rs-release-validation-${{ github.run_id }}
