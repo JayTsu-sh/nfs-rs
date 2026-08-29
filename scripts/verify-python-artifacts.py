@@ -19,7 +19,6 @@ ALLOWED_MANYLINUX_LIBRARIES = {
     "librt.so.1",
     "libutil.so.1",
     "ld-linux-x86-64.so.2",
-    "ld-linux-aarch64.so.1",
 }
 
 
@@ -37,7 +36,7 @@ def verify_wheel(root: Path, wheel: Path) -> None:
     name = wheel.name
     assert f"-{version}-cp310-abi3-" in name, f"wheel version/ABI mismatch: {name}"
     assert "manylinux_2_17" in name or "manylinux2014" in name, f"not manylinux2014: {name}"
-    assert name.endswith(("_x86_64.whl", "_aarch64.whl")), f"unsupported architecture: {name}"
+    assert name.endswith("_x86_64.whl"), f"unsupported architecture: {name}"
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         for required in ("nfs_rs/__init__.pyi", "nfs_rs/py.typed", "nfs_rs/_client.py"):

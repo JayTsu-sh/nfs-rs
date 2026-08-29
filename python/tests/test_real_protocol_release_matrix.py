@@ -31,6 +31,20 @@ def test_release_validation_requires_both_x86_artifacts_without_an_arm_lab() -> 
     assert "continue-on-error" not in workflow
 
 
+def test_build_and_release_workflows_are_x86_64_only() -> None:
+    files = [
+        ROOT / ".github/workflows/ci.yml",
+        ROOT / ".github/workflows/release-validation.yml",
+        ROOT / ".github/workflows/release.yml",
+        ROOT / "scripts/verify-python-artifacts.py",
+        ROOT / "README.md",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in files).lower()
+    assert "aarch64" not in combined
+    assert "arm64" not in combined
+    assert "ubuntu-24.04-arm" not in combined
+
+
 def test_nightly_runs_public_python_api_conformance_on_every_real_protocol() -> None:
     workflow = (ROOT / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
     runner = (ROOT / "tests/lab/run-python-api-conformance.sh").read_text(

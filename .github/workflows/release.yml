@@ -36,7 +36,6 @@ jobs:
           python scripts/verify-release-version.py --tag "$GITHUB_REF_NAME"
           python scripts/verify-python-artifacts.py \
             --wheel immutable-release/*_x86_64.whl \
-            --wheel immutable-release/*_aarch64.whl \
             --sdist immutable-release/nfs_rs-*.tar.gz
       - name: Audit the locked Rust dependency graph
         run: |

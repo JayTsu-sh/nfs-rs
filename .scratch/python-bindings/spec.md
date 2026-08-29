@@ -30,8 +30,8 @@ augmented with structured protocol, outcome, and recovery information. Explicit
 close and context managers provide deterministic cleanup. Cancellation never
 pretends that a sent modifying operation was cancelled remotely.
 
-The first release targets GIL-enabled CPython 3.10+ with `abi3` Linux x86_64
-and aarch64 wheels plus a tested source distribution. It validates public
+The first release targets GIL-enabled CPython 3.10+ with an `abi3` Linux x86_64
+wheel plus a tested source distribution. It validates public
 behavior primarily at the installed facade seam, uses one private deterministic
 injection seam for otherwise-unreproducible protocol faults, and runs packaged
 artifacts against the existing real-server and performance labs.
@@ -150,7 +150,7 @@ artifacts against the existing real-server and performance labs.
     version, so that compatibility is unambiguous.
 51. As a minimum-version user, I want the installed artifact tested on CPython
     3.10, so that the declared floor is evidence-based.
-52. As an aarch64 user, I want a tested manylinux wheel, so that installation
+52. As an x86_64 user, I want a tested manylinux wheel, so that installation
     does not depend on a local Rust toolchain.
 53. As a source-build user, I want a complete and tested source distribution,
     so that supported Linux/glibc builds are reproducible from the tarball.
@@ -237,7 +237,7 @@ artifacts against the existing real-server and performance labs.
   information, directory entries, capabilities, health, I/O limits, callbacks,
   exports, and recovery events. They never expose raw handles or session state.
 - The first release is a Maturin mixed package for GIL-enabled CPython 3.10+
-  using `abi3-py310`. It publishes audited manylinux2014 x86_64/aarch64 wheels
+  using `abi3-py310`. It publishes an audited manylinux2014 x86_64 wheel
   and a tested Linux/glibc source distribution with no mandatory Python runtime
   dependencies.
 - The preferred distribution name is `nfs-rs` and the stable import is
@@ -295,12 +295,11 @@ artifacts against the existing real-server and performance labs.
   NFSv4.1 exports, and NetApp pNFS through the protocol-neutral Interface.
   Required unavailable servers fail closed rather than skip.
 - Packaged integration tests install and exercise the final wheel and source
-  distribution, not a development-tree extension. x86_64 runs the full matrix;
-  aarch64 runs installation and real-protocol smoke coverage at minimum.
-- Existing performance-baseline conventions are reused: five comparable runs,
-  at least four valid samples, and more than 10% throughput or latency
-  regression against the accepted Python baseline blocks release. The first
-  release records its Rust comparison and establishes the Python baseline.
+  distribution, not a development-tree extension. x86_64 runs the full matrix.
+- Existing performance-baseline conventions are reused by the authoritative
+  storage performance gate. Packaged Python tests still run five comparable
+  runs with at least four valid samples; Python throughput and latency drift is
+  retained as diagnostic evidence without creating a second release gate.
 - Memory tests enforce one input snapshot plus a bounded transfer chunk for
   writes and at most one negotiated read chunk for readinto. Repeated lifecycle
   tests require RSS to plateau rather than grow linearly.
