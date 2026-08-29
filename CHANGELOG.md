@@ -7,8 +7,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-29
+
+### Added
+
+- Add typed synchronous and asyncio Python clients for NFSv3, experimental
+  NFSv4.0, and NFSv4.1, including files, directories, namespace mutations,
+  metadata, ACLs, xattrs, recovery events, and structured operation outcomes.
+- Add an `abi3-py310` Linux x86_64 wheel and tested source distribution with
+  complete stubs and a `py.typed` marker.
+- Negotiate NFSv4 ACL capability from server-supported attributes.
+
+### Changed
+
+- Refresh the DXN NFSv4.0 performance baseline from nine independent capture
+  windows and keep the repository storage gate as the sole release-blocking
+  performance decision.
+- Restrict the first Python artifact release to Linux x86_64.
+
 ### Testing
 
+- Validate the final wheel and the wheel rebuilt from the source distribution
+  across real NFSv3, NFSv4.0, NFSv4.1, and NetApp pNFS environments.
+- Add deterministic Python contract, typing, concurrency, cancellation,
+  lifecycle, memory-bound, fault, and packaging coverage.
 - Run performance baseline capture every 20 minutes during bootstrap, reducing
   the expected nine-window collection period from about 18 hours to 160 minutes.
 
@@ -96,7 +118,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.3.1...v0.4.0
