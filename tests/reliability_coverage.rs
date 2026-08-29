@@ -269,7 +269,7 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let nightly = include_str!("../.github/workflows/nightly.yml");
     let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
-    assert!(cargo.contains("version = \"0.5.2\""));
+    assert!(cargo.contains("version = \"0.5.3\""));
     for required in [
         "NFSv4.0 (experimental)",
         "AUTH_SYS",
