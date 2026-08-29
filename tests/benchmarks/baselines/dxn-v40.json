@@ -22,6 +22,12 @@
     "p99_latency_regression_percent": 50,
     "metadata_p95_absolute_floor_ms": 10
   },
+  "metric_thresholds": {
+    "read_mib_s": {
+      "regression_percent": 20,
+      "soft_limit_factor": 1.0
+    }
+  },
   "benchmarks": {
     "storage_path": {
       "mount_ms": {

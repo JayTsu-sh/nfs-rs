@@ -10,6 +10,99 @@ fn workspace_path(relative: &str) -> PathBuf {
 }
 
 #[test]
+fn dxn_read_throughput_fails_below_the_exact_twenty_percent_floor() {
+    let fixture_dir =
+        std::env::temp_dir().join(format!("nfsrs-dxn-read-floor-{}", std::process::id()));
+    fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
+    let manifest_path = fixture_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "minimum_capture_runs": 45,
+            "minimum_capture_windows": 9,
+            "soft_threshold_policy": {
+                "throughput_hard_limit_factor": 0.9,
+                "latency_hard_limit_factor": 1.1
+            },
+            "environments": [{
+                "id": "dxn-v40",
+                "endpoint": "10.131.7.201:/jay_nfs",
+                "protocol": "4.0",
+                "baseline": workspace_path("tests/benchmarks/baselines/dxn-v40.json")
+            }]
+        }))
+        .expect("manifest must serialize"),
+    )
+    .expect("manifest must be written");
+    for run in 1..=4 {
+        fs::write(
+            fixture_dir.join(format!("dxn-v40-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"mount_ms": 0.0, "umount_ms": 0.0, "samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 100.0,
+                    "read_mib_s": 79.0
+                }]}]
+            }))
+            .expect("DXN gate run must serialize"),
+        )
+        .expect("DXN gate run must be written");
+    }
+    let gate_path = fixture_dir.join("gate.json");
+    let status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--output")
+        .arg(&gate_path)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("DXN performance gate should start");
+    assert_eq!(status.code(), Some(2));
+    let gate: Value = serde_json::from_slice(&fs::read(gate_path).expect("gate JSON"))
+        .expect("gate report must be JSON");
+    let finding = &gate["environments"][0]["violations"][0];
+    assert_eq!(finding["metric"], "read_mib_s");
+    assert_eq!(finding["hard_limit"], 79.9262689739112);
+    assert_eq!(finding["soft_limit"], 79.9262689739112);
+
+    for run in 1..=4 {
+        fs::write(
+            fixture_dir.join(format!("dxn-v40-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"mount_ms": 0.0, "umount_ms": 0.0, "samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 100.0,
+                    "read_mib_s": 80.0
+                }]}]
+            }))
+            .expect("passing DXN gate run must serialize"),
+        )
+        .expect("passing DXN gate run must be written");
+    }
+    let passing_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--output")
+        .arg(fixture_dir.join("passing-gate.json"))
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("passing DXN performance gate should start");
+    assert_eq!(passing_status.code(), Some(0));
+}
+
+#[test]
 fn every_real_storage_protocol_has_an_independent_baseline() {
     let manifest: Value = serde_json::from_slice(
         &fs::read(workspace_path("tests/benchmarks/baselines/manifest.json"))

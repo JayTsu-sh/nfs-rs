@@ -76,6 +76,7 @@ def evaluate_runs(baseline, run_paths):
                 values = [run["lifs"][0][metric] for run in valid_runs]
                 checks.append((metric, percentile(values, 0.95), "maximum"))
         for metric, actual, direction in checks:
+            metric_policy = baseline.get("metric_thresholds", {}).get(metric, {})
             if direction == "minimum":
                 reference_value = reference[metric]["median"]
             else:
@@ -83,17 +84,24 @@ def evaluate_runs(baseline, run_paths):
                     reference[metric].get("window_p95", {}).get("p95")
                     or reference[metric]["p95"]
                 )
-            budget = thresholds[
-                "throughput_regression_percent" if direction == "minimum"
+            default_budget_name = (
+                "throughput_regression_percent"
+                if direction == "minimum"
                 else "p95_latency_regression_percent"
-            ] / 100
+            )
+            budget = metric_policy.get(
+                "regression_percent", thresholds[default_budget_name]
+            ) / 100
             limit = reference_value * (1 - budget if direction == "minimum" else 1 + budget)
             if metric in metadata_latency_metric_set:
                 limit = max(limit, thresholds["metadata_p95_absolute_floor_ms"])
             violated = actual < limit if direction == "minimum" else actual > limit
             if violated:
-                soft_limit = limit * (
+                default_soft_factor = (
                     throughput_soft_factor if direction == "minimum" else latency_soft_factor
+                )
+                soft_limit = limit * metric_policy.get(
+                    "soft_limit_factor", default_soft_factor
                 )
                 soft_violated = actual < soft_limit if direction == "minimum" else actual > soft_limit
                 finding = {
