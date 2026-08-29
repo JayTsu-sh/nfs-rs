@@ -269,7 +269,7 @@ def _adapter() -> ModuleType:
         runtime = f"{platform.python_implementation()} {platform.python_version()}"
         soabi = sysconfig.get_config_var("SOABI") or "unknown"
         raise ImportError(
-            "nfs_rs native extension could not be loaded; install a CPython 3.10+ "
+            "nfs_rs native extension could not be loaded; install a CPython 3.11+ "
             "Linux/glibc wheel matching this machine's architecture, or rebuild the "
             "source distribution with a supported Rust toolchain; detected "
             f"runtime={runtime}, sys.platform={sys.platform}, "

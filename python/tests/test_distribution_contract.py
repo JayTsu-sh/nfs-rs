@@ -73,7 +73,7 @@ def test_extension_load_error_preserves_cause_and_platform_guidance(monkeypatch:
     assert caught.value.__cause__ is cause
     message = str(caught.value)
     for context in (
-        "CPython 3.10+", "Linux/glibc", "source distribution",
+        "CPython 3.11+", "Linux/glibc", "source distribution",
         platform.python_implementation(), platform.python_version(), sys.platform,
         platform.machine(), str(sysconfig.get_config_var("SOABI")),
     ):

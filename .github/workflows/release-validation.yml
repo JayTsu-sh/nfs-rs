@@ -76,7 +76,7 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Discover pre-provisioned Zig 0.13.0
         run: |
           zig_bin=""
@@ -104,7 +104,7 @@ jobs:
           python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/python-contract-wheel/*.whl
           python -m mypy.stubtest nfs_rs --ignore-missing-stub --allowlist python/stubtest-allowlist.txt
           NFS_RS_TEST_INSTALLED=1 \
-            NFS_RS_CONTRACT_ENVIRONMENT="release-${{ runner.os }}-${{ runner.arch }}-py310" \
+            NFS_RS_CONTRACT_ENVIRONMENT="release-${{ runner.os }}-${{ runner.arch }}-py311" \
             NFS_RS_TEST_SEED=0 \
             python -m pytest -q python/tests
       - name: Upload non-publishable Python protocol-smoke fixture

@@ -1,6 +1,6 @@
 [package]
 name = "nfs-rs"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -47,7 +47,7 @@ tokio = { version = "1.35.1", features = ["net", "io-util", "sync", "rt-multi-th
 tracing = "0.1"
 async-trait = "0.1.77"
 socket2 = { version = "0.5", features = ["all"] }
-pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
+pyo3 = { version = "0.29", features = ["abi3-py311"], optional = true }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"], optional = true }
 
 [build-dependencies]
