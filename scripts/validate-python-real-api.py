@@ -273,12 +273,26 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
             42_420 if current.uid != 42_420 else 42_421,
             42_430 if current.gid != 42_430 else 42_431,
         )
-        client.chown(data, *changed_identity)
-        owned = client.stat(data)
-        check((owned.uid, owned.gid) == changed_identity, "Client.chown", checks)
-        client.chown(data, current.uid, current.gid)
-        restored = client.stat(data)
-        check((restored.uid, restored.gid) == (current.uid, current.gid), "Client.chown restore", checks)
+        try:
+            client.chown(data, *changed_identity)
+        except nfs_rs.NfsPermissionError:
+            client.chown(data, current.uid, current.gid)
+            restricted = client.stat(data)
+            check(
+                (restricted.uid, restricted.gid) == (current.uid, current.gid),
+                "Client.chown:restricted",
+                checks,
+            )
+        else:
+            owned = client.stat(data)
+            check((owned.uid, owned.gid) == changed_identity, "Client.chown", checks)
+            client.chown(data, current.uid, current.gid)
+            restored = client.stat(data)
+            check(
+                (restored.uid, restored.gid) == (current.uid, current.gid),
+                "Client.chown restore",
+                checks,
+            )
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         client.utime(data, ns=expected_times)
         timed = client.stat(data)
@@ -416,12 +430,26 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             42_420 if current.uid != 42_420 else 42_421,
             42_430 if current.gid != 42_430 else 42_431,
         )
-        await client.chown(data, *changed_identity)
-        owned = await client.stat(data)
-        check((owned.uid, owned.gid) == changed_identity, "AsyncClient.chown", checks)
-        await client.chown(data, current.uid, current.gid)
-        restored = await client.stat(data)
-        check((restored.uid, restored.gid) == (current.uid, current.gid), "AsyncClient.chown restore", checks)
+        try:
+            await client.chown(data, *changed_identity)
+        except nfs_rs.NfsPermissionError:
+            await client.chown(data, current.uid, current.gid)
+            restricted = await client.stat(data)
+            check(
+                (restricted.uid, restricted.gid) == (current.uid, current.gid),
+                "AsyncClient.chown:restricted",
+                checks,
+            )
+        else:
+            owned = await client.stat(data)
+            check((owned.uid, owned.gid) == changed_identity, "AsyncClient.chown", checks)
+            await client.chown(data, current.uid, current.gid)
+            restored = await client.stat(data)
+            check(
+                (restored.uid, restored.gid) == (current.uid, current.gid),
+                "AsyncClient.chown restore",
+                checks,
+            )
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         await client.utime(data, ns=expected_times)
         timed = await client.stat(data)

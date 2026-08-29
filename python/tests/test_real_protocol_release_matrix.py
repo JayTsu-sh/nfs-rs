@@ -21,14 +21,13 @@ def test_real_protocol_runner_is_fail_closed_and_complete() -> None:
     assert "continue-on-error" not in runner
 
 
-def test_release_validation_requires_both_x86_artifacts_and_aarch64() -> None:
+def test_release_validation_requires_both_x86_artifacts_without_an_arm_lab() -> None:
     workflow = (ROOT / ".github/workflows/release-validation.yml").read_text(encoding="utf-8")
-    assert workflow.count("run-python-artifact-matrix.sh") == 3
+    assert workflow.count("run-python-artifact-matrix.sh") == 2
     assert "x86_64-wheel.json" in workflow
     assert "x86_64-sdist-wheel.json" in workflow
-    assert "runs-on: [self-hosted, linux, ARM64, terrasync-lab, nfs-rs]" in workflow
-    assert "aarch64-wheel.json" in workflow
-    assert 'aarch64-wheel.json" smoke' in workflow
+    assert "runs-on: [self-hosted, linux, ARM64, terrasync-lab, nfs-rs]" not in workflow
+    assert "aarch64-wheel.json" not in workflow
     assert "continue-on-error" not in workflow
 
 

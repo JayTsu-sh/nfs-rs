@@ -288,6 +288,10 @@ impl FileMode {
             _ => crate::OPEN_READ,
         }
     }
+
+    fn create_permissions(self) -> Option<u32> {
+        self.create.then_some(0o666)
+    }
 }
 
 #[derive(Debug)]
@@ -2710,7 +2714,10 @@ async fn open_file(
         let file = match mount.open_path_stateful(&path, mode.access()).await {
             Ok(file) => file,
             Err(error) if mode.create && error.is_not_found() => {
-                match mount.create_path_stateful(&path, None).await {
+                match mount
+                    .create_path_stateful(&path, mode.create_permissions())
+                    .await
+                {
                     Ok(file) => file,
                     Err(error) if error.is_exist() => {
                         mount.open_path_stateful(&path, mode.access()).await?
@@ -4509,6 +4516,16 @@ mod read_only_file_tests {
 
     fn read_mode() -> FileMode {
         FileMode::parse("rb").unwrap_or_else(|_| panic!("rb mode must be valid"))
+    }
+
+    #[test]
+    fn creating_file_modes_request_standard_read_write_permissions() {
+        for mode in ["wb", "ab", "w+b", "a+b"] {
+            let parsed =
+                FileMode::parse(mode).unwrap_or_else(|_| panic!("{mode} mode must be valid"));
+            assert_eq!(parsed.create_permissions(), Some(0o666));
+        }
+        assert_eq!(read_mode().create_permissions(), None);
     }
 
     async fn test_file(mode: FileMode) -> Arc<FileResource> {
