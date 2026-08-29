@@ -7,7 +7,7 @@ name = "nfs-rs"
 dynamic = ["version"]
 requires-python = ">=3.10"
 description = "Typed userspace NFSv3/NFSv4.1 clients with experimental NFSv4.0; AUTH_SYS only, without Kerberos or RPCSEC_GSS"
-readme = "README.md"
+readme = "README-PYPI.md"
 license = { text = "Apache-2.0" }
 keywords = ["nfs", "nfs3", "nfs4", "filesystem", "asyncio"]
 classifiers = [

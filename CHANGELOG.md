@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-08-29
+
+### Fixed
+
+- Give the PyPI distribution a Python-specific README with verified sync,
+  asyncio, metadata, xattr, protocol-selection, and recovery examples.
+- Expand the Python user guide and state the tested NFSv3, experimental
+  NFSv4.0, NFSv4.1, and x86_64 support boundaries precisely.
+
 ## [0.5.7] - 2026-08-29
 
 ### Fixed
@@ -154,7 +163,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...HEAD
+[0.5.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.4...v0.5.5
