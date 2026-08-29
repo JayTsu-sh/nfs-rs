@@ -46,6 +46,33 @@ pub enum RecoveryAction {
     DoNotRetry,
 }
 
+/// Whether the request crossed the transport send boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestTransmission {
+    /// The core proved that no request bytes were sent.
+    NotSent,
+    /// The request crossed the send boundary and may have reached the server.
+    Sent,
+}
+
+#[derive(Debug)]
+struct TransportFailure {
+    transmission: RequestTransmission,
+    source: Box<NfsError>,
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
 /// Opaque, bounded request identity. It deliberately excludes file handles and payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestId {
@@ -96,7 +123,9 @@ pub struct RequestContext {
 pub struct OperationOutcomeError {
     pub outcome: OperationOutcome,
     pub operation_class: OperationClass,
+    pub transmission: RequestTransmission,
     pub recovery: RecoveryAction,
+    pub completed_bytes: Option<u64>,
     #[source]
     pub source: Box<NfsError>,
     context: RequestContext,
@@ -113,7 +142,9 @@ impl OperationOutcomeError {
         Self {
             outcome,
             operation_class,
+            transmission: RequestTransmission::Sent,
             recovery,
+            completed_bytes: None,
             source: Box::new(source),
             context,
         }
@@ -121,6 +152,13 @@ impl OperationOutcomeError {
 
     pub fn context(&self) -> &RequestContext {
         &self.context
+    }
+
+    /// Records bytes completed by authoritative preceding chunks. The current
+    /// uncertain chunk must never be included in this count.
+    pub fn with_completed_bytes(mut self, completed_bytes: u64) -> Self {
+        self.completed_bytes = Some(completed_bytes);
+        self
     }
 }
 
@@ -171,6 +209,30 @@ pub enum NfsError {
     #[error("{0}")]
     InvalidInput(String),
 
+    /// A local operation targeted a resource that is already closed.
+    #[error("{0}")]
+    ClosedResource(String),
+
+    /// The open mode does not permit the requested operation.
+    #[error("{0}")]
+    ModeViolation(String),
+
+    /// The connected client is already closing or closed.
+    #[error("{0}")]
+    ClientClosed(String),
+
+    /// A prior uncertain mutation made the next relative position unknowable.
+    #[error("{0}")]
+    PositionUncertain(String),
+
+    /// Recovery could not prove that an open resource retained identity and state.
+    #[error("{0}")]
+    LostOpenState(String),
+
+    /// Ordered failures observed while flushing and closing one open file.
+    #[error("file close completed with errors")]
+    FileClose(Vec<FileCloseFailure>),
+
     /// Server returned rdattr_error for an entry (READDIRPLUS per-entry error).
     #[error("rdattr_error: server returned nfsstat4 {0} for entry attributes")]
     RdattrError(u32),
@@ -180,7 +242,59 @@ pub enum NfsError {
     OperationOutcome(#[from] Box<OperationOutcomeError>),
 }
 
+/// One ordered phase failure from a terminal file close.
+#[derive(Debug)]
+pub struct FileCloseFailure {
+    /// Stable operation name (`commit` or `close`).
+    pub operation: &'static str,
+    /// The original structured failure.
+    pub error: std::sync::Arc<NfsError>,
+}
+
 impl NfsError {
+    pub(crate) fn transport(transmission: RequestTransmission, source: NfsError) -> Self {
+        let kind = source.kind();
+        Self::Io(std::io::Error::new(
+            kind,
+            TransportFailure {
+                transmission,
+                source: Box::new(source),
+            },
+        ))
+    }
+
+    /// Returns transport send-boundary evidence when it is available.
+    pub fn request_transmission(&self) -> Option<RequestTransmission> {
+        match self {
+            Self::Io(error) => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<TransportFailure>())
+                .map(|failure| failure.transmission),
+            Self::OperationOutcome(error) => Some(error.transmission),
+            _ => None,
+        }
+    }
+
+    /// Wraps a failure for which the caller proved that the current request did
+    /// not cross the transport send boundary.
+    pub fn before_send_failure(
+        operation_class: OperationClass,
+        context: RequestContext,
+        completed_bytes: Option<u64>,
+        source: NfsError,
+    ) -> Self {
+        let mut error = OperationOutcomeError::new(
+            OperationOutcome::DefiniteFailure,
+            operation_class,
+            RecoveryAction::Retry,
+            context,
+            source,
+        );
+        error.transmission = RequestTransmission::NotSent;
+        error.completed_bytes = completed_bytes;
+        Self::OperationOutcome(Box::new(error))
+    }
+
     /// Returns structured retry/verification guidance when the result is non-authoritative.
     pub fn operation_outcome(&self) -> Option<&OperationOutcomeError> {
         match self {
@@ -220,6 +334,12 @@ impl NfsError {
             NfsError::Xdr(_) => std::io::ErrorKind::Other,
             NfsError::Unsupported(_) => std::io::ErrorKind::Unsupported,
             NfsError::InvalidInput(_) => std::io::ErrorKind::InvalidInput,
+            NfsError::ClosedResource(_) => std::io::ErrorKind::NotConnected,
+            NfsError::ModeViolation(_) => std::io::ErrorKind::PermissionDenied,
+            NfsError::ClientClosed(_) => std::io::ErrorKind::NotConnected,
+            NfsError::PositionUncertain(_)
+            | NfsError::LostOpenState(_)
+            | NfsError::FileClose(_) => std::io::ErrorKind::Other,
             NfsError::RdattrError(_) => std::io::ErrorKind::Other,
             NfsError::OperationOutcome(_) => std::io::ErrorKind::Other,
         }
@@ -231,33 +351,20 @@ pub(crate) fn classify_sent_nfs41_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
-    let lacks_authoritative_result = matches!(
-        &source,
-        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
-    ) || matches!(
+    let replay_protocol_error = matches!(
         &source,
         NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_RETRY_UNCACHED_REP)
             | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_SEQ_FALSE_RETRY)
     );
-    if !lacks_authoritative_result {
-        return source;
-    }
+    classify_non_authoritative_error(operation_class, context, source, replay_protocol_error)
+}
 
-    let (outcome, recovery) = match operation_class {
-        OperationClass::ReadOnly => (OperationOutcome::SafeToRetry, RecoveryAction::Retry),
-        OperationClass::SessionControl => (OperationOutcome::Uncertain, RecoveryAction::Remount),
-        OperationClass::ReplaySensitive => (
-            OperationOutcome::Uncertain,
-            RecoveryAction::VerifyThenResume,
-        ),
-    };
-    NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
-        outcome,
-        operation_class,
-        recovery,
-        context,
-        source,
-    )))
+pub(crate) fn classify_sent_nfs3_error(
+    operation_class: OperationClass,
+    context: RequestContext,
+    source: NfsError,
+) -> NfsError {
+    classify_non_authoritative_error(operation_class, context, source, false)
 }
 
 pub(crate) fn classify_sent_nfs40_error(
@@ -265,10 +372,25 @@ pub(crate) fn classify_sent_nfs40_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
-    let lacks_authoritative_result = matches!(
-        &source,
-        NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
-    );
+    classify_non_authoritative_error(operation_class, context, source, false)
+}
+
+fn classify_non_authoritative_error(
+    operation_class: OperationClass,
+    context: RequestContext,
+    source: NfsError,
+    replay_protocol_error: bool,
+) -> NfsError {
+    if source.request_transmission() == Some(RequestTransmission::NotSent) {
+        return NfsError::before_send_failure(operation_class, context, None, source);
+    }
+
+    let lacks_authoritative_result = replay_protocol_error
+        || source.request_transmission() == Some(RequestTransmission::Sent)
+        || matches!(
+            &source,
+            NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_)
+        );
     if !lacks_authoritative_result {
         return source;
     }
@@ -309,6 +431,25 @@ impl From<NfsError> for std::io::Error {
             NfsError::InvalidInput(msg) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
             }
+            NfsError::ClosedResource(msg) => {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, msg)
+            }
+            NfsError::ModeViolation(msg) => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)
+            }
+            NfsError::ClientClosed(msg) => {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, msg)
+            }
+            NfsError::PositionUncertain(msg) | NfsError::LostOpenState(msg) => {
+                std::io::Error::other(msg)
+            }
+            NfsError::FileClose(errors) => std::io::Error::other(
+                errors
+                    .first()
+                    .map_or("file close completed with errors".to_string(), |failure| {
+                        failure.error.to_string()
+                    }),
+            ),
             NfsError::RdattrError(code) => {
                 std::io::Error::other(format!("rdattr_error: nfsstat4 {}", code))
             }
@@ -565,5 +706,103 @@ mod tests {
         let debug = format!("{outcome:?}");
         assert!(!debug.contains("file handle"));
         assert!(!debug.contains("payload"));
+    }
+
+    #[test]
+    fn modifying_failure_before_send_is_definite_and_preserves_completed_bytes() {
+        let error = NfsError::before_send_failure(
+            OperationClass::ReplaySensitive,
+            context(),
+            Some(4096),
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "request was not sent",
+            )),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("outcome must be structured");
+
+        assert_eq!(outcome.outcome, OperationOutcome::DefiniteFailure);
+        assert_eq!(outcome.transmission, RequestTransmission::NotSent);
+        assert_eq!(outcome.completed_bytes, Some(4096));
+        assert_eq!(outcome.recovery, RecoveryAction::Retry);
+    }
+
+    #[test]
+    fn sent_modifying_failure_records_sent_transmission() {
+        let error = classify_sent_nfs41_error(
+            OperationClass::ReplaySensitive,
+            context(),
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "lost after send",
+            )),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("outcome must be structured");
+
+        assert_eq!(outcome.transmission, RequestTransmission::Sent);
+        assert_eq!(outcome.completed_bytes, None);
+    }
+
+    #[test]
+    fn uncertain_chunked_operation_preserves_only_confirmed_bytes() {
+        let error = OperationOutcomeError::new(
+            OperationOutcome::Uncertain,
+            OperationClass::ReplaySensitive,
+            RecoveryAction::VerifyThenResume,
+            context(),
+            NfsError::Rpc("reply lost for current chunk".to_string()),
+        )
+        .with_completed_bytes(8192);
+
+        assert_eq!(error.completed_bytes, Some(8192));
+        assert_eq!(error.transmission, RequestTransmission::Sent);
+    }
+
+    #[test]
+    fn sent_nfs3_mutation_without_reply_is_uncertain() {
+        let mut nfs3_context = context();
+        nfs3_context.protocol = NFSVersion::NFSv3;
+        nfs3_context.request_id = None;
+        let error = classify_sent_nfs3_error(
+            OperationClass::ReplaySensitive,
+            nfs3_context,
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "NFSv3 reply timeout",
+            )),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("sent NFSv3 mutation must have a structured outcome");
+
+        assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+        assert_eq!(outcome.transmission, RequestTransmission::Sent);
+        assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+    }
+
+    #[test]
+    fn nfs3_transport_evidence_preserves_before_send_failure() {
+        let mut nfs3_context = context();
+        nfs3_context.protocol = NFSVersion::NFSv3;
+        nfs3_context.request_id = None;
+        let error = classify_sent_nfs3_error(
+            OperationClass::ReplaySensitive,
+            nfs3_context,
+            NfsError::transport(
+                RequestTransmission::NotSent,
+                NfsError::Rpc("connection was not ready".to_string()),
+            ),
+        );
+        let outcome = error
+            .operation_outcome()
+            .expect("transport evidence must be preserved");
+
+        assert_eq!(outcome.outcome, OperationOutcome::DefiniteFailure);
+        assert_eq!(outcome.transmission, RequestTransmission::NotSent);
+        assert_eq!(outcome.recovery, RecoveryAction::Retry);
     }
 }

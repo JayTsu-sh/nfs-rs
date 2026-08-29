@@ -36,6 +36,16 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 The minimum supported Rust version is 1.95.
 
+For Python on Linux x86_64:
+
+```console
+python -m pip install nfs-rs
+```
+
+See the [Python API guide](docs/python-api.md) for synchronous and asyncio
+examples, typing, large-transfer guidance, cancellation and uncertain outcomes,
+and the precise first-release support boundaries.
+
 ## Example
 
 ```rust,no_run

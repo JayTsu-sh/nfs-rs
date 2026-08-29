@@ -68,16 +68,20 @@ if [[ "$mode" == gate ]]; then
     jq -r '.environments[] | select(.supplemental_eligible) | .environment' "$output/gate-initial.json"
   )
   if ((${#supplemental_environments[@]})); then
-    supplemental="$output/supplemental"
-    mkdir -p "$supplemental"
-    for environment in "${supplemental_environments[@]}"; do
-      template="$(jq -r --arg environment "$environment" \
-        '.environments[] | select(.id == $environment) | .url_template' "$manifest")"
-      run_environment "$environment" "$template" "${NFS_RS_BENCHMARK_GATE_RUNS:-5}" "$supplemental"
+    supplemental_args=()
+    for round in 1 2 3; do
+      supplemental="$output/supplemental-$round"
+      mkdir -p "$supplemental"
+      supplemental_args+=(--supplemental-results-dir "$supplemental")
+      for environment in "${supplemental_environments[@]}"; do
+        template="$(jq -r --arg environment "$environment" \
+          '.environments[] | select(.id == $environment) | .url_template' "$manifest")"
+        run_environment "$environment" "$template" "${NFS_RS_BENCHMARK_GATE_RUNS:-5}" "$supplemental"
+      done
     done
     python3 tests/benchmarks/check-performance-baselines.py \
       --manifest "$manifest" --results-dir "$output" \
-      --supplemental-results-dir "$supplemental" --output "$output/gate.json" || gate_status=$?
+      "${supplemental_args[@]}" --output "$output/gate.json" || gate_status=$?
   else
     cp "$output/gate-initial.json" "$output/gate.json"
     gate_status="${initial_gate_status:-0}"
@@ -87,7 +91,9 @@ fi
 report_args=(--manifest "$manifest" --results-dir "$output" --output-dir "$output/report")
 if [[ "$mode" == gate ]]; then
   report_args+=(--gate-result "$output/gate.json")
-  [[ -d "$output/supplemental" ]] && report_args+=(--supplemental-results-dir "$output/supplemental")
+  for supplemental in "$output"/supplemental-*; do
+    [[ -d "$supplemental" ]] && report_args+=(--supplemental-results-dir "$supplemental")
+  done
 fi
 python3 tests/benchmarks/generate-baseline-report.py "${report_args[@]}" || report_status=$?
 if [[ "$mode" == gate ]]; then

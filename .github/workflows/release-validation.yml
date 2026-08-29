@@ -1,6 +1,12 @@
 name: Release validation
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit or tag to validate
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       ref:
@@ -10,6 +16,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
 
 concurrency:
   group: terrasync-release
@@ -26,6 +35,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+      - name: Verify release tag and version coupling
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/verify-release-version.py --tag "${GITHUB_REF_NAME}"
       - name: Allocate unique NFSv4.0 evidence directory
         run: echo "NFS_RS_LAB_V40_EVIDENCE_DIR=$RUNNER_TEMP/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - name: Discover persisted Rust toolchain
@@ -54,6 +66,51 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+      - name: Gate formatting and Rust quality
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Discover pre-provisioned Zig 0.13.0
+        run: |
+          zig_bin=""
+          for candidate in \
+            "/opt/zig/0.13.0" \
+            "/home/github-runner/.local/zig/0.13.0"; do
+            if [[ -x "$candidate/zig" ]]; then
+              zig_bin="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$zig_bin" ]]; then
+            echo "pre-provisioned Zig 0.13.0 not found" >&2
+            exit 1
+          fi
+          echo "$zig_bin" >> "$GITHUB_PATH"
+      - name: Use pre-provisioned Zig 0.13.0
+        run: test "$(zig version)" = "0.13.0"
+      - run: python -m pip install "maturin>=1,<2"
+      - name: Gate the installed Python contract and typing registry
+        run: |
+          python -m pip install mypy pytest
+          mkdir -p "$RUNNER_TEMP/python-contract-wheel"
+          maturin build --locked --features python-test-support --out "$RUNNER_TEMP/python-contract-wheel"
+          python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/python-contract-wheel/*.whl
+          python -m mypy.stubtest nfs_rs --ignore-missing-stub --allowlist python/stubtest-allowlist.txt
+          NFS_RS_TEST_INSTALLED=1 \
+            NFS_RS_CONTRACT_ENVIRONMENT="release-${{ runner.os }}-${{ runner.arch }}-py310" \
+            NFS_RS_TEST_SEED=0 \
+            python -m pytest -q python/tests
+      - name: Upload non-publishable Python protocol-smoke fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-support-x86_64
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/python-contract-wheel/*.whl
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --locked --no-fail-fast
@@ -74,12 +131,59 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 pNFS compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
+      - name: Build final x86_64 Python wheel and source artifact once
+        run: |
+          mkdir -p target/python-release-artifacts
+          maturin build --release --locked --compatibility manylinux2014 --zig --out target/python-release-artifacts
+          maturin sdist --out target/python-release-artifacts
+          python scripts/verify-python-artifacts.py \
+            --wheel target/python-release-artifacts/*_x86_64.whl \
+            --sdist target/python-release-artifacts/nfs_rs-*.tar.gz
+      - name: Validate final x86_64 wheel on every required real protocol
+        run: |
+          python -m venv "$RUNNER_TEMP/python-wheel-venv"
+          "$RUNNER_TEMP/python-wheel-venv/bin/python" -m pip install --no-deps target/python-release-artifacts/*_x86_64.whl
+          mkdir -p "$RUNNER_TEMP/python-real-protocol"
+          flock --wait 10800 /tmp/terrasync-lab-tests.lock env \
+            PYTHON="$RUNNER_TEMP/python-wheel-venv/bin/python" \
+            tests/lab/run-python-artifact-matrix.sh "$RUN_ID" wheel \
+            "$RUNNER_TEMP/python-real-protocol/x86_64-wheel.json"
+      - name: Validate wheel rebuilt from final source artifact on every required real protocol
+        run: |
+          mkdir -p "$RUNNER_TEMP/python-sdist-source" "$RUNNER_TEMP/python-sdist-wheel"
+          tar -xzf target/python-release-artifacts/nfs_rs-*.tar.gz -C "$RUNNER_TEMP/python-sdist-source"
+          maturin build --release --locked --compatibility manylinux2014 --zig \
+            --manifest-path "$RUNNER_TEMP"/python-sdist-source/nfs_rs-*/Cargo.toml \
+            --out "$RUNNER_TEMP/python-sdist-wheel"
+          python -m venv "$RUNNER_TEMP/python-sdist-venv"
+          "$RUNNER_TEMP/python-sdist-venv/bin/python" -m pip install --no-deps "$RUNNER_TEMP"/python-sdist-wheel/*.whl
+          flock --wait 10800 /tmp/terrasync-lab-tests.lock env \
+            PYTHON="$RUNNER_TEMP/python-sdist-venv/bin/python" \
+            tests/lab/run-python-artifact-matrix.sh "$RUN_ID" sdist-wheel \
+            "$RUNNER_TEMP/python-real-protocol/x86_64-sdist-wheel.json"
+      - name: Upload Python real-protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-real-protocol-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/python-real-protocol
       - run: cargo build --release --locked
       - run: cargo package --locked
-      - run: cargo publish --locked --dry-run
       - run: tests/lab/collect-nfsv40-release-evidence.sh "$RUN_ID" release-evidence
       - name: Checksums
-        run: find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum | tee release-sha256.txt
+        run: |
+          find target/release -maxdepth 1 -type f -executable -print0 | sort -z | xargs -0r sha256sum > release-sha256.txt
+          sha256sum target/package/nfs-rs-*.crate target/python-release-artifacts/* >> release-sha256.txt
+      - name: Upload immutable x86_64 release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-release-x86_64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            target/package/nfs-rs-*.crate
+            target/python-release-artifacts/*
+            release-sha256.txt
       - uses: actions/upload-artifact@v4
         with:
           name: nfs-rs-release-validation-${{ github.run_id }}
@@ -91,3 +195,27 @@ jobs:
         run: |
           tests/lab/verify-netapp-v40-cleanup.sh "$RUN_ID"
           tests/lab/cleanup-run.sh "$RUN_ID"
+
+  intermediate-python-smoke:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: python-test-support-x86_64
+          path: test-wheel
+      - name: Install, import, and run sync/async protocol smoke
+        run: |
+          python -m pip install --no-deps test-wheel/*.whl
+          python -c "import importlib.metadata, nfs_rs; assert nfs_rs.__version__ == importlib.metadata.version('nfs-rs')"
+          python scripts/smoke-python-artifact.py

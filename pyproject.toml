@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nfs-rs"
+dynamic = ["version"]
+requires-python = ">=3.10"
+description = "Typed userspace NFSv3/NFSv4.1 clients with experimental NFSv4.0; AUTH_SYS only, without Kerberos or RPCSEC_GSS"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+keywords = ["nfs", "nfs3", "nfs4", "filesystem", "asyncio"]
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Documentation = "https://github.com/JayTsu-sh/nfs-rs/blob/main/docs/python-api.md"
+Repository = "https://github.com/JayTsu-sh/nfs-rs"
+Issues = "https://github.com/JayTsu-sh/nfs-rs/issues"
+
+[tool.maturin]
+features = ["python-extension"]
+module-name = "nfs_rs._internal"
+python-source = "python"

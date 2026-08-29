@@ -87,8 +87,9 @@ limit or latency remains at most 110% of it. Reports preserve the actual value,
 hard limit, soft limit, and deviation. Results beyond the soft limit still fail;
 sample completeness, data integrity, and capability checks are never softened.
 When an environment still fails only numeric limits, the release gate performs
-one supplemental five-run test for that environment alone. A passing or warning
-supplemental result becomes the final decision while the initial failure remains
+three consecutive supplemental five-run tests for that environment alone. A
+passing or warning result in any round becomes the final decision while all
+three rounds and the initial failure remain
 in JSON, Markdown, and HTML evidence. Non-numeric failures are never retried,
 and unaffected environments are not sampled again.
 `tests/benchmarks/report/performance-baselines.{json,md,html}` is the generated

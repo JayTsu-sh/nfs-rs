@@ -2,6 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+fn disambiguate_empty_byte_slices(code: String) -> String {
+    code.replace("assert_eq!(buf.as_ref(), &[]);", "assert!(buf.is_empty());")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
@@ -14,7 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which is invalid in Rust 2021. Replace with bool literals.
     let nfs_code = nfs_code.replace("1 => Self::TRUE(", "true => Self::TRUE(");
     let nfs_code = nfs_code.replace("0 => Self::FALSE,", "false => Self::FALSE,");
-    fs::write(out_dir.join("nfs_xdr.rs"), nfs_code)?;
+    fs::write(
+        out_dir.join("nfs_xdr.rs"),
+        disambiguate_empty_byte_slices(nfs_code),
+    )?;
 
     let mount_xdr = fs::read_to_string("src/nfs3/xdr/mount.x")?;
     let mount_code = fastxdr::Generator::default().generate(&mount_xdr)?;
@@ -25,7 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "auth_flavors: v.try_variable_array::<i32>(None)?",
         "auth_flavors: { let n = v.try_u32()? as usize; let mut arr = Vec::with_capacity(n); for _ in 0..n { arr.push(v.try_i32()?); } arr }",
     );
-    fs::write(out_dir.join("mount_xdr.rs"), mount_code)?;
+    fs::write(
+        out_dir.join("mount_xdr.rs"),
+        disambiguate_empty_byte_slices(mount_code),
+    )?;
 
     // NFSv4 common XDR types plus explicit NFSv4.1 extensions.
     let nfs4_xdr = fs::read_to_string("src/nfs4/xdr/nfs4.x")?;
@@ -63,7 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "v.try_variable_array::<u32>(Some(1))?",
         "{ let n = v.try_u32()? as usize; if n > 1 { return Err(Error::InvalidLength); } let mut arr = Vec::with_capacity(n); for _ in 0..n { arr.push(v.try_u32()?); } arr }",
     );
-    fs::write(out_dir.join("nfs4_xdr.rs"), nfs4_code)?;
+    fs::write(
+        out_dir.join("nfs4_xdr.rs"),
+        disambiguate_empty_byte_slices(nfs4_code),
+    )?;
 
     println!("cargo:rerun-if-changed=src/nfs3/xdr/nfs.x");
     println!("cargo:rerun-if-changed=src/nfs3/xdr/mount.x");

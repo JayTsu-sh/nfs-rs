@@ -1602,6 +1602,21 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         let created = mount.create_path(ORIGINAL_FILE, Some(0o640)).await?;
         let expected = payload();
         if expected_version == NFSVersion::NFSv4p1 {
+            ensure(
+                capabilities.acl,
+                format!("{url}: server negotiation omitted the NFSv4 ACL capability"),
+            )?;
+            let acl_support = mount.aclsupport(created.fh.clone()).await?;
+            ensure(
+                acl_support.supports(nfs_rs::AclSupport::ALLOW),
+                format!("{url}: ACLSUPPORT omitted ALLOW"),
+            )?;
+            let original_acl = mount.getacl(created.fh.clone()).await?;
+            mount.setacl(created.fh.clone(), &original_acl).await?;
+            ensure(
+                mount.getacl(created.fh.clone()).await? == original_acl,
+                format!("{url}: NFSv4.1 ACL round trip mismatch"),
+            )?;
             let lock = mount
                 .lock_stateful(created.fh.clone(), 2, 0, expected.len() as u64)
                 .await?;

@@ -1,0 +1,6 @@
+# Only the facade is public; imported helpers in private modules are not API.
+nfs_rs\._client\..*
+nfs_rs\._errors\..*
+# Runtime constructors require an unexported token.  Stubs expose an impossible
+# argument instead, making these factory-created resource classes non-callable.
+nfs_rs\.(AsyncClient|AsyncFile|Client|File)\.__init__.*

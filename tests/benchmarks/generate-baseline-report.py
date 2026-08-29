@@ -42,7 +42,7 @@ def display_number(value):
 parser = argparse.ArgumentParser()
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--results-dir")
-parser.add_argument("--supplemental-results-dir")
+parser.add_argument("--supplemental-results-dir", action="append", default=[])
 parser.add_argument("--gate-result")
 parser.add_argument("--output-dir", required=True)
 args = parser.parse_args()
@@ -51,7 +51,7 @@ manifest = load(args.manifest)
 output = Path(args.output_dir)
 output.mkdir(parents=True, exist_ok=True)
 results_root = Path(args.results_dir) if args.results_dir else None
-supplemental_root = Path(args.supplemental_results_dir) if args.supplemental_results_dir else None
+supplemental_roots = [Path(path) for path in args.supplemental_results_dir]
 gate = load(args.gate_result) if args.gate_result else None
 gate_by_environment = {
     row["environment"]: row for row in (gate or {}).get("environments", [])
@@ -79,12 +79,18 @@ for environment in manifest["environments"]:
     gate_row = gate_by_environment.get(environment["id"])
     current_runs = []
     if results_root:
-        use_supplemental = (
-            supplemental_root is not None
-            and gate_row
-            and gate_row.get("supplemental_test", {}).get("status") in ("pass", "warning")
+        accepted_round = next(
+            (
+                index for index, test in enumerate((gate_row or {}).get("supplemental_tests", []))
+                if test.get("status") in ("pass", "warning")
+            ),
+            None,
         )
-        current_root = supplemental_root if use_supplemental else results_root
+        current_root = (
+            supplemental_roots[accepted_round]
+            if accepted_round is not None and accepted_round < len(supplemental_roots)
+            else results_root
+        )
         result_paths = sorted(current_root.glob(f'{environment["id"]}*.json'))
         current_runs = [load(path) for path in result_paths]
     row_status = "accepted" if accepted else "baseline_missing"
@@ -283,7 +289,7 @@ gate_warnings = [
 supplemental_tests = [
     (row["id"], row["gate"])
     for row in rows
-    if (row.get("gate") or {}).get("supplemental_test")
+    if (row.get("gate") or {}).get("supplemental_tests")
 ]
 if supplemental_tests:
     lines.extend([
@@ -292,18 +298,19 @@ if supplemental_tests:
         "",
         "Only environments with retryable numeric failures are sampled again; the initial findings remain recorded below.",
         "",
-        "| Environment | Initial status | Supplemental status | Final status | Supplemental valid runs |",
-        "|---|---|---|---|---:|",
+        "| Environment | Round | Initial status | Supplemental status | Final status | Supplemental valid runs |",
+        "|---|---:|---|---|---|---:|",
     ])
     for environment, gate_row in supplemental_tests:
-        supplemental = gate_row["supplemental_test"]
-        lines.append(
-            f'| {environment} | {gate_row["initial_status"]} | {supplemental["status"]} | '
-            f'{gate_row["status"]} | {supplemental["valid_runs"]} |'
-        )
+        for round_number, supplemental in enumerate(gate_row["supplemental_tests"], 1):
+            lines.append(
+                f'| {environment} | {round_number} | {gate_row["initial_status"]} | '
+                f'{supplemental["status"]} | {gate_row["status"]} | '
+                f'{supplemental["valid_runs"]} |'
+            )
         for finding in gate_row.get("initial_violations", []):
             lines.append(
-                f'| ↳ {finding["metric"]} | actual={finding.get("actual")} | '
+                f'| ↳ {finding["metric"]} | — | actual={finding.get("actual")} | '
                 f'hard_limit={finding.get("hard_limit", "—")} | '
                 f'soft_limit={finding.get("soft_limit", "—")} | — |'
             )
@@ -494,21 +501,23 @@ if supplemental_tests:
         "  <h2>Supplemental performance tests</h2>",
         "  <p>Only environments with retryable numeric failures are sampled again; initial findings remain recorded.</p>",
         '  <div class="table-wrap"><table>',
-        "    <thead><tr><th>Environment</th><th>Initial status</th><th>Supplemental status</th><th>Final status</th><th>Supplemental valid runs</th></tr></thead>",
+        "    <thead><tr><th>Environment</th><th>Round</th><th>Initial status</th><th>Supplemental status</th><th>Final status</th><th>Supplemental valid runs</th></tr></thead>",
         "    <tbody>",
     ])
     for environment, gate_row in supplemental_tests:
-        supplemental = gate_row["supplemental_test"]
-        html_lines.append(
-            f'<tr><td>{escape(environment)}</td><td>{escape(gate_row["initial_status"])}</td>'
-            f'<td>{escape(supplemental["status"])}</td><td>{escape(gate_row["status"])}</td>'
-            f'<td>{supplemental["valid_runs"]}</td></tr>'
-        )
+        for round_number, supplemental in enumerate(gate_row["supplemental_tests"], 1):
+            html_lines.append(
+                f'<tr><td>{escape(environment)}</td><td>{round_number}</td>'
+                f'<td>{escape(gate_row["initial_status"])}</td>'
+                f'<td>{escape(supplemental["status"])}</td>'
+                f'<td>{escape(gate_row["status"])}</td>'
+                f'<td>{supplemental["valid_runs"]}</td></tr>'
+            )
         for finding in gate_row.get("initial_violations", []):
             html_lines.append(
-                f'<tr><td>↳ {escape(finding["metric"])}</td><td>actual={finding.get("actual")}</td>'
+                f'<tr><td>↳ {escape(finding["metric"])}</td><td>—</td><td>actual={finding.get("actual")}</td>'
                 f'<td>hard_limit={finding.get("hard_limit", "—")}</td>'
-                f'<td>soft_limit={finding.get("soft_limit", "—")}</td><td>—</td></tr>'
+                f'<td>soft_limit={finding.get("soft_limit", "—")}</td><td>—</td><td>—</td></tr>'
             )
     html_lines.extend(["    </tbody>", "  </table></div>"])
 if gate_warnings:

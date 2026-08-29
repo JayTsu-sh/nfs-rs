@@ -161,6 +161,24 @@ impl crate::Mount for Mount3 {
         self.m.write(fh, offset, data).await
     }
 
+    async fn write_with_outcome(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        self.m.write_with_outcome(fh, offset, data).await
+    }
+
+    async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
+        self.m.commit_with_verifier(fh, offset, count).await
+    }
+
     async fn readdir(&self, dir_fh: Bytes) -> crate::mount::ReaddirStream<'_> {
         Box::pin(self.m.readdir(dir_fh).await.map_ok(Into::into))
     }

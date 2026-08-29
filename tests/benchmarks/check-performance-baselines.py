@@ -14,7 +14,7 @@ def percentile(values, fraction):
 parser = argparse.ArgumentParser()
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--results-dir", required=True)
-parser.add_argument("--supplemental-results-dir")
+parser.add_argument("--supplemental-results-dir", action="append", default=[])
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
@@ -22,7 +22,7 @@ soft_policy = manifest.get("soft_threshold_policy", {})
 throughput_soft_factor = soft_policy.get("throughput_hard_limit_factor", 1.0)
 latency_soft_factor = soft_policy.get("latency_hard_limit_factor", 1.0)
 results_root = Path(args.results_dir)
-supplemental_root = Path(args.supplemental_results_dir) if args.supplemental_results_dir else None
+supplemental_roots = [Path(path) for path in args.supplemental_results_dir]
 rows = []
 complete = True
 has_warnings = False
@@ -139,17 +139,24 @@ for environment in manifest["environments"]:
         and all("hard_limit" in finding for finding in row["violations"])
     )
     row["supplemental_eligible"] = retryable
-    if supplemental_root is not None and retryable:
-        supplemental = evaluate_runs(
-            baseline,
-            sorted(supplemental_root.glob(f'{environment["id"]}-run-*.json')),
-        )
+    if supplemental_roots and retryable:
+        supplemental_tests = [
+            evaluate_runs(
+                baseline,
+                sorted(root.glob(f'{environment["id"]}-run-*.json')),
+            )
+            for root in supplemental_roots
+        ]
         row["initial_status"] = row["status"]
         row["initial_violations"] = row["violations"]
         row["initial_warnings"] = row["warnings"]
-        row["supplemental_test"] = supplemental
-        if supplemental["status"] in ("pass", "warning"):
-            row.update(supplemental)
+        row["supplemental_tests"] = supplemental_tests
+        accepted_test = next(
+            (test for test in supplemental_tests if test["status"] in ("pass", "warning")),
+            None,
+        )
+        if accepted_test is not None:
+            row.update(accepted_test)
     row["environment"] = environment["id"]
     status = row["status"]
     if status == "warning":

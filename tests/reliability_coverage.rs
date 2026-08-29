@@ -239,6 +239,21 @@ fn release_validation_uses_only_a_verified_preprovisioned_toolchain() {
     assert!(workflow.contains("complete pre-provisioned Rust 1.95.0 toolchain not found"));
     assert!(workflow.contains("rustc --version | grep -q '^rustc 1\\.95\\.0 '"));
     assert!(workflow.contains("cache-bin: false"));
+    assert_eq!(
+        workflow
+            .matches("Discover pre-provisioned Zig 0.13.0")
+            .count(),
+        1
+    );
+    assert_eq!(
+        workflow
+            .matches("test \"$(zig version)\" = \"0.13.0\"")
+            .count(),
+        1
+    );
+    assert!(!workflow.contains("goto-bus-stop/setup-zig"));
+    assert!(!workflow.contains("aarch64-python-real-protocol"));
+    assert!(!workflow.contains("runs-on: [self-hosted, linux, ARM64"));
     assert!(!workflow.contains("dtolnay/rust-toolchain"));
     assert!(!workflow.contains("rustup default"));
     assert!(!workflow.contains("rustup toolchain install"));
@@ -250,10 +265,11 @@ fn nfsv40_experimental_release_contract_is_complete() {
     let readme = fs::read_to_string(workspace_path("README.md")).expect("README readable");
     let changelog = fs::read_to_string(workspace_path("CHANGELOG.md")).expect("changelog readable");
     let release = include_str!("../.github/workflows/release-validation.yml");
+    let publisher = include_str!("../.github/workflows/release.yml");
     let nightly = include_str!("../.github/workflows/nightly.yml");
     let matrix = include_str!("lab/run-netapp-v40-release-matrix.sh");
 
-    assert!(cargo.contains("version = \"0.5.1\""));
+    assert!(cargo.contains("version = \"0.5.2\""));
     for required in [
         "NFSv4.0 (experimental)",
         "AUTH_SYS",
@@ -267,7 +283,6 @@ fn nfsv40_experimental_release_contract_is_complete() {
     assert!(changelog.contains("## [0.5.0]"));
     for command in [
         "cargo package --locked",
-        "cargo publish --locked --dry-run",
         "tests/lab/run-netapp-v40-performance.sh",
         "tests/lab/collect-nfsv40-release-evidence.sh",
     ] {
@@ -276,6 +291,9 @@ fn nfsv40_experimental_release_contract_is_complete() {
             "release matrix lacks {command}"
         );
     }
+    assert!(publisher.contains("publish-crate-artifact.py"));
+    assert!(publisher.contains("actions/download-artifact@v5"));
+    assert!(!publisher.contains("cargo publish"));
 }
 
 #[test]

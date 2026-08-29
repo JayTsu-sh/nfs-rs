@@ -250,25 +250,32 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
     )))
 }
 
+#[cfg(any(test, feature = "python-bindings"))]
+#[cfg_attr(all(feature = "python-bindings", not(test)), allow(dead_code))]
+mod client_core;
+#[cfg(test)]
+mod client_core_contract;
 pub mod error;
 mod mount;
 mod nfs3;
 mod nfs4;
 mod nfs40;
 mod nfs41;
+#[cfg(feature = "python-bindings")]
+mod python_adapter;
 mod rpc;
 mod shared;
 
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
-    RequestContext, RequestId, Result,
+    RequestContext, RequestId, RequestTransmission, Result,
 };
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, AclSupport, Attr, CallbackStats, ExportEntry, FSInfo, FSStat,
     LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState, NFSVersion,
     Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, OPEN_BOTH, OPEN_READ, OPEN_WRITE, ObjRes,
     OpenFile, Pathconf, PathconfSupport, ReaddirEntry, ReaddirStream, ReaddirplusEntry,
-    ReaddirplusStream, SupportedPathconf,
+    ReaddirplusStream, SupportedPathconf, WriteOutcome,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
@@ -576,7 +583,16 @@ fn nfs_error_msg(err: &NfsError) -> String {
         NfsError::Rpc(s)
         | NfsError::Xdr(s)
         | NfsError::Unsupported(s)
-        | NfsError::InvalidInput(s) => s.clone(),
+        | NfsError::InvalidInput(s)
+        | NfsError::ClosedResource(s)
+        | NfsError::ModeViolation(s)
+        | NfsError::ClientClosed(s)
+        | NfsError::PositionUncertain(s)
+        | NfsError::LostOpenState(s) => s.clone(),
+        NfsError::FileClose(errors) => errors.first().map_or_else(
+            || "file close completed with errors".to_string(),
+            |failure| format!("file close completed with errors: {}", failure.error),
+        ),
         NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
         NfsError::OperationOutcome(error) => error.to_string(),
     }

@@ -1,0 +1,107 @@
+name: Publish immutable release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/release-validation.yml
+    with:
+      ref: ${{ github.ref }}
+
+  audit-and-preflight:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      publish_pypi: ${{ steps.registries.outputs.publish_pypi }}
+      publish_crate: ${{ steps.registries.outputs.publish_crate }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: immutable-release-*
+          path: immutable-release
+          merge-multiple: true
+      - name: Verify tag and artifact versions
+        run: |
+          python scripts/verify-release-version.py --tag "$GITHUB_REF_NAME"
+          python scripts/verify-python-artifacts.py \
+            --wheel immutable-release/*_x86_64.whl \
+            --sdist immutable-release/nfs_rs-*.tar.gz
+      - name: Audit the locked Rust dependency graph
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Recompute immutable checksums
+        run: |
+          find immutable-release -maxdepth 1 -type f \( -name '*.crate' -o -name '*.whl' -o -name '*.tar.gz' \) -print0 \
+            | sort -z | xargs -0 sha256sum | tee immutable-release/SHA256SUMS
+      - name: Test registry preflight and partial-publication recovery
+        id: registries
+        run: >-
+          python scripts/check-release-registries.py
+          --version "${GITHUB_REF_NAME#v}"
+          --artifacts immutable-release
+      - name: Attest exact tested bytes
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            immutable-release/*.crate
+            immutable-release/*.whl
+            immutable-release/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: immutable-release-manifest
+          path: immutable-release/SHA256SUMS
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: audit-and-preflight
+    if: needs.audit-and-preflight.outputs.publish_pypi == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: immutable-release-*
+          path: dist
+          merge-multiple: true
+      - run: find dist -maxdepth 1 -type f ! -name '*.whl' ! -name '*.tar.gz' -delete
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-crates-io:
+    needs: audit-and-preflight
+    if: needs.audit-and-preflight.outputs.publish_crate == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/download-artifact@v5
+        with:
+          name: immutable-release-x86_64
+          path: immutable-release
+      - name: Exchange GitHub OIDC identity for a temporary crates.io token
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Upload the exact verified crate bytes
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: python scripts/publish-crate-artifact.py immutable-release/*.crate

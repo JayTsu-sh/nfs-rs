@@ -128,6 +128,7 @@ struct Mount40 {
     maxcount: u32,
     rsize: u32,
     wsize: u32,
+    acl_supported: bool,
 }
 
 #[derive(Clone)]
@@ -233,7 +234,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         )
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
-    let (lease_time, rsize, wsize) =
+    let (lease_time, rsize, wsize, acl_supported) =
         query_mount_parameters(&rpc, &auth, &root_fh, args.rsize, args.wsize).await?;
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
@@ -297,6 +298,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         maxcount: args.maxcount,
         rsize,
         wsize,
+        acl_supported,
     })
 }
 
@@ -306,12 +308,12 @@ async fn query_mount_parameters(
     root_fh: &Bytes,
     requested_rsize: u32,
     requested_wsize: u32,
-) -> Result<(u32, u32, u32)> {
+) -> Result<(u32, u32, u32, bool)> {
     let response = rpc
         .call(
             CompoundBuilder::new("lease-time")
                 .putfh(root_fh)
-                .getattr(&[(1 << 10) | (1 << 30) | (1 << 31)])
+                .getattr(&[(1 << 0) | (1 << 10) | (1 << 30) | (1 << 31)])
                 .encode_with_header(auth),
             SAFE_REPLAY,
             METADATA_TIMEOUT,
@@ -319,6 +321,11 @@ async fn query_mount_parameters(
         .await?;
     let mut attrs = decode_getattr_compound(response)?;
     let (bitmap, mut values) = decode_fattr4_envelope(&mut attrs, "lease_time")?;
+    let supported_attrs = if fattr4_has(&bitmap, 0) {
+        take_bitmap4_attr(&mut values, "supported_attrs")?
+    } else {
+        Vec::new()
+    };
     if !fattr4_has(&bitmap, 10) || values.remaining() < 4 {
         return Err(NfsError::Xdr(
             "NFSv4.0 lease_time response is missing or malformed".into(),
@@ -346,7 +353,7 @@ async fn query_mount_parameters(
             "NFSv4.0 MAXREAD and MAXWRITE produced a zero effective I/O size".into(),
         ));
     }
-    Ok((seconds, rsize, wsize))
+    Ok((seconds, rsize, wsize, fattr4_has(&supported_attrs, 12)))
 }
 
 async fn establish_identity(
@@ -1310,7 +1317,7 @@ impl Mount40 {
 impl Mount for Mount40 {
     fn capabilities(&self) -> crate::MountCapabilities {
         crate::MountCapabilities {
-            acl: true,
+            acl: self.acl_supported,
             named_attributes: false,
             locks: true,
             callbacks: true,
@@ -1510,6 +1517,32 @@ impl Mount for Mount40 {
         let (dir, name) = crate::split_path(path)?;
         let parent = self.lookup_path(&dir).await?;
         self.create(parent.fh, &name, mode).await
+    }
+    async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<mount::OpenFile> {
+        let (dir, name) = crate::split_path(path)?;
+        let parent = self.lookup_path(&dir).await?;
+        let opened = self
+            .open_file(parent.fh.clone(), &name, crate::OPEN_BOTH, true)
+            .await?;
+        if let Some(mode) = mode
+            && let Err(error) = self
+                .setattr(
+                    opened.file_handle(),
+                    None,
+                    Some(mode),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        {
+            let _ = self.close_stateful(opened).await;
+            let _ = self.remove(parent.fh, &name).await;
+            return Err(error);
+        }
+        Ok(opened)
     }
     async fn fsinfo(&self) -> Result<mount::FSInfo> {
         let bitmap = [
@@ -2317,6 +2350,10 @@ mod tests {
     }
 
     fn direct_mount(rpc: rpc::Client) -> Arc<Mount40> {
+        direct_mount_with_acl(rpc, false)
+    }
+
+    fn direct_mount_with_acl(rpc: rpc::Client, acl_supported: bool) -> Arc<Mount40> {
         Arc::new(Mount40 {
             rpc,
             auth: Auth::new_null(),
@@ -2335,7 +2372,21 @@ mod tests {
             maxcount: 32768,
             rsize: 1_048_576,
             wsize: 1_048_576,
+            acl_supported,
         })
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_server_negotiated_acl_support() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
+        let mount = direct_mount(rpc::Client::new(mux, None));
+
+        assert!(!mount.capabilities().acl);
     }
 
     fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
@@ -2392,6 +2443,7 @@ mod tests {
             maxcount: 32768,
             rsize: 1_048_576,
             wsize: 1_048_576,
+            acl_supported: false,
         })
     }
 
@@ -2458,6 +2510,13 @@ mod tests {
             .await
             .unwrap();
         direct_mount(rpc::Client::new(mux, None))
+    }
+
+    async fn connected_direct_mount_with_acl(listener: &TcpListener) -> Arc<Mount40> {
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        direct_mount_with_acl(rpc::Client::new(mux, None), true)
     }
 
     #[tokio::test]
@@ -2967,6 +3026,7 @@ mod tests {
             maxcount: 32768,
             rsize: 1_048_576,
             wsize: 1_048_576,
+            acl_supported: false,
         });
         let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
         let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
@@ -4027,6 +4087,7 @@ mod tests {
             maxcount: 32768,
             rsize: 1_048_576,
             wsize: 1_048_576,
+            acl_supported: false,
         });
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
@@ -4196,7 +4257,7 @@ mod tests {
     #[tokio::test]
     async fn getacl_attrnotsupp_is_per_call_and_preserves_aclsupport() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
+        let mount = connected_direct_mount_with_acl(&listener).await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let support_request = read_record(&mut stream).await?;
@@ -4256,7 +4317,7 @@ mod tests {
     #[tokio::test]
     async fn setacl_attrnotsupp_does_not_suppress_a_later_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
+        let mount = connected_direct_mount_with_acl(&listener).await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let request = read_record(&mut stream).await?;

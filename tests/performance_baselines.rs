@@ -92,7 +92,7 @@ fn report_accepts_every_fully_captured_environment() {
         .expect("Markdown report must be generated for accepted baselines");
     assert!(markdown.contains("Overall status: `complete`"));
     assert!(markdown.contains(
-        "| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 35.158 | 99.908 |"
+        "| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 30.834 | 88.967 |"
     ));
     assert!(
         markdown
@@ -105,7 +105,7 @@ fn report_accepts_every_fully_captured_environment() {
         .expect("HTML report must be generated for accepted baselines");
     assert!(html.contains("<!doctype html>"));
     assert!(html.contains("Overall status:"));
-    assert!(html.contains("35.158"));
+    assert!(html.contains("30.834"));
     assert!(html.contains("pass_with_defaults: case_insensitive"));
     assert!(html.contains("Baseline analysis summary"));
     assert!(html.contains("Write-throughput ranking"));
@@ -369,37 +369,47 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
         .expect("performance gate should start");
     assert_eq!(gate_status.code(), Some(2));
 
-    let supplemental_dir = fixture_dir.join("supplemental");
-    fs::create_dir_all(&supplemental_dir).expect("supplemental directory must be created");
-    for run in 1..=4 {
-        fs::write(
-            supplemental_dir.join(format!("soft-run-{run}.json")),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "status": "pass",
-                "lifs": [{"summary": {
-                    "write_median_mib_s": 8.0,
-                    "read_median_mib_s": 8.0
-                }, "samples": [{
-                    "pathconf_status": "pass",
-                    "write_mib_s": 8.0,
-                    "read_mib_s": 8.0,
-                    "write_ms": 1.4
-                }]}]
-            }))
-            .expect("supplemental run must serialize"),
-        )
-        .expect("supplemental run must be written");
+    let supplemental_dirs: Vec<_> = (1..=3)
+        .map(|round| fixture_dir.join(format!("supplemental-{round}")))
+        .collect();
+    for (round_index, supplemental_dir) in supplemental_dirs.iter().enumerate() {
+        fs::create_dir_all(supplemental_dir).expect("supplemental directory must be created");
+        let throughput = if round_index == 1 { 8.0 } else { 5.0 };
+        for run in 1..=4 {
+            fs::write(
+                supplemental_dir.join(format!("soft-run-{run}.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "status": "pass",
+                    "lifs": [{"summary": {
+                        "write_median_mib_s": 8.0,
+                        "read_median_mib_s": 8.0
+                    }, "samples": [{
+                        "pathconf_status": "pass",
+                        "write_mib_s": throughput,
+                        "read_mib_s": throughput,
+                        "write_ms": 1.4
+                    }]}]
+                }))
+                .expect("supplemental run must serialize"),
+            )
+            .expect("supplemental run must be written");
+        }
     }
-    let gate_status = Command::new("python3")
+    let mut gate_command = Command::new("python3");
+    gate_command
         .arg(workspace_path(
             "tests/benchmarks/check-performance-baselines.py",
         ))
         .arg("--manifest")
         .arg(&manifest_path)
         .arg("--results-dir")
-        .arg(&fixture_dir)
-        .arg("--supplemental-results-dir")
-        .arg(&supplemental_dir)
+        .arg(&fixture_dir);
+    for supplemental_dir in &supplemental_dirs {
+        gate_command
+            .arg("--supplemental-results-dir")
+            .arg(supplemental_dir);
+    }
+    let gate_status = gate_command
         .arg("--output")
         .arg(&gate_path)
         .current_dir(workspace_path("."))
@@ -412,22 +422,30 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
     assert_eq!(gate["environments"][0]["status"], "warning");
     assert_eq!(gate["environments"][0]["initial_status"], "fail");
     assert_eq!(
-        gate["environments"][0]["supplemental_test"]["status"],
-        "warning"
+        gate["environments"][0]["supplemental_tests"]
+            .as_array()
+            .expect("three supplemental rounds must be recorded")
+            .len(),
+        3
     );
     assert_eq!(gate["environments"][0]["warnings"][0]["hard_limit"], 8.5);
     assert_eq!(gate["environments"][0]["warnings"][0]["soft_limit"], 7.65);
 
-    let report_status = Command::new("python3")
+    let mut report_command = Command::new("python3");
+    report_command
         .arg(workspace_path(
             "tests/benchmarks/generate-baseline-report.py",
         ))
         .arg("--manifest")
         .arg(&manifest_path)
         .arg("--results-dir")
-        .arg(&fixture_dir)
-        .arg("--supplemental-results-dir")
-        .arg(&supplemental_dir)
+        .arg(&fixture_dir);
+    for supplemental_dir in &supplemental_dirs {
+        report_command
+            .arg("--supplemental-results-dir")
+            .arg(supplemental_dir);
+    }
+    let report_status = report_command
         .arg("--gate-result")
         .arg(&gate_path)
         .arg("--output-dir")
@@ -444,6 +462,44 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
         assert!(report.contains("soft_limit"));
         assert!(report.to_lowercase().contains("supplemental"));
     }
+
+    for run in 1..=4 {
+        fs::write(
+            supplemental_dirs[1].join(format!("soft-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 5.0,
+                    "read_mib_s": 5.0,
+                    "write_ms": 2.0
+                }]}]
+            }))
+            .expect("failing supplemental run must serialize"),
+        )
+        .expect("failing supplemental run must be written");
+    }
+    let mut all_fail_command = Command::new("python3");
+    all_fail_command
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir);
+    for supplemental_dir in &supplemental_dirs {
+        all_fail_command
+            .arg("--supplemental-results-dir")
+            .arg(supplemental_dir);
+    }
+    let all_fail_status = all_fail_command
+        .arg("--output")
+        .arg(&gate_path)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("all-failing supplemental performance gate should start");
+    assert_eq!(all_fail_status.code(), Some(2));
 }
 
 #[test]
@@ -468,6 +524,7 @@ fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock(
     assert!(runner.contains("gate-initial.json"));
     assert!(runner.contains("select(.supplemental_eligible)"));
     assert!(runner.contains("--supplemental-results-dir"));
+    assert!(runner.contains("for round in 1 2 3"));
     assert!(runner.contains("run_environment \"$environment\" \"$template\""));
     assert!(runner.contains("/tmp/terrasync-lab-tests.lock"));
     assert!(runner.contains("/tmp/terrasync-lab-performance.lock"));

@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import json
+import pathlib
+
+
+ROOT = pathlib.Path(__file__).parents[2]
+
+
+def test_real_protocol_runner_is_fail_closed_and_complete() -> None:
+    runner = (ROOT / "tests/lab/run-python-artifact-matrix.sh").read_text(encoding="utf-8")
+    expected_cases = {
+        "linux-source-v3|3|",
+        "dxn-v40|4.0|",
+        "linux-source-v41|4.1|",
+        "netapp-pnfs-mds|4.1|",
+    }
+    assert all(case in runner for case in expected_cases)
+    assert "netapp-pnfs-mds|4.1|" in runner and "|true\"" in runner
+    assert "check-python-performance.py" in runner
+    assert "continue-on-error" not in runner
+
+
+def test_release_validation_requires_both_x86_artifacts_without_an_arm_lab() -> None:
+    workflow = (ROOT / ".github/workflows/release-validation.yml").read_text(encoding="utf-8")
+    assert workflow.count("run-python-artifact-matrix.sh") == 2
+    assert "x86_64-wheel.json" in workflow
+    assert "x86_64-sdist-wheel.json" in workflow
+    assert "runs-on: [self-hosted, linux, ARM64, terrasync-lab, nfs-rs]" not in workflow
+    assert "aarch64-wheel.json" not in workflow
+    assert "continue-on-error" not in workflow
+
+
+def test_build_and_release_workflows_are_x86_64_only() -> None:
+    files = [
+        ROOT / ".github/workflows/ci.yml",
+        ROOT / ".github/workflows/release-validation.yml",
+        ROOT / ".github/workflows/release.yml",
+        ROOT / "scripts/verify-python-artifacts.py",
+        ROOT / "README.md",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in files).lower()
+    assert "aarch64" not in combined
+    assert "arm64" not in combined
+    assert "ubuntu-24.04-arm" not in combined
+
+
+def test_nightly_runs_public_python_api_conformance_on_every_real_protocol() -> None:
+    workflow = (ROOT / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
+    runner = (ROOT / "tests/lab/run-python-api-conformance.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "run-python-api-conformance.sh" in workflow
+    assert "python-api-conformance" in workflow
+    assert "--features python-test-support" not in workflow
+    assert "continue-on-error" not in workflow
+    assert all(
+        case in runner
+        for case in (
+            "linux-source-v3|3|",
+            "dxn-v40|4.0|",
+            "linux-source-v41|4.1|",
+            "netapp-pnfs-mds|4.1|",
+        )
+    )
+
+
+def test_accepted_baseline_encodes_five_of_four_and_ten_percent_policy() -> None:
+    baseline = json.loads(
+        (ROOT / "tests/python/performance-baselines.json").read_text(encoding="utf-8")
+    )
+    assert baseline["status"] == "accepted"
+    assert baseline["policy"] == {
+        "comparable_runs": 5,
+        "minimum_valid_runs": 4,
+        "maximum_regression_percent": 10,
+    }
+    assert set(baseline["cases"]) == {
+        "linux-source-v3",
+        "dxn-v40",
+        "linux-source-v41",
+        "netapp-pnfs-mds",
+    }

@@ -1,10 +1,10 @@
 [package]
 name = "nfs-rs"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-description = "An asynchronous, pure Rust client library for NFSv3 and NFSv4.1"
+description = "An asynchronous pure Rust client library for NFSv3, experimental NFSv4.0, and NFSv4.1"
 repository = "https://github.com/JayTsu-sh/nfs-rs"
 documentation = "https://docs.rs/nfs-rs"
 readme = "README.md"
@@ -24,6 +24,15 @@ include = [
     "/tests/lab_e2e.rs",
 ]
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python-bindings = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+python-extension = ["python-bindings", "pyo3/extension-module"]
+python-test-support = ["python-extension"]
+
 [dependencies]
 byteorder = "1.5.0"
 bytes = "1.10.1"
@@ -38,6 +47,8 @@ tokio = { version = "1.35.1", features = ["net", "io-util", "sync", "rt-multi-th
 tracing = "0.1"
 async-trait = "0.1.77"
 socket2 = { version = "0.5", features = ["all"] }
+pyo3 = { version = "0.27", features = ["abi3-py310"], optional = true }
+pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"], optional = true }
 
 [build-dependencies]
 fastxdr = "=1.0.2"
