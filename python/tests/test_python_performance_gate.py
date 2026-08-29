@@ -58,8 +58,13 @@ def test_python_performance_gate_requires_five_runs_and_four_valid(tmp_path) -> 
     assert "at least 4 valid" in failed.stderr
 
 
-def test_python_performance_gate_blocks_more_than_ten_percent_regression(tmp_path) -> None:
+def test_python_performance_gate_reports_regression_without_blocking_protocol_validation(
+    tmp_path,
+) -> None:
     assert _run(tmp_path, _result(9)).returncode == 0
-    failed = _run(tmp_path, _result(8.99))
-    assert failed.returncode != 0
-    assert "10% regression limit" in failed.stderr
+    warned = _run(tmp_path, _result(8.99))
+    assert warned.returncode == 0
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "pass_with_warnings"
+    assert report["violations"] == []
+    assert "10% regression limit" in report["warnings"][0]
