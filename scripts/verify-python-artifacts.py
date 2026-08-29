@@ -34,7 +34,7 @@ def cargo_version(root: Path) -> str:
 def verify_wheel(root: Path, wheel: Path) -> None:
     version = cargo_version(root)
     name = wheel.name
-    assert f"-{version}-cp310-abi3-" in name, f"wheel version/ABI mismatch: {name}"
+    assert f"-{version}-cp311-abi3-" in name, f"wheel version/ABI mismatch: {name}"
     assert "manylinux_2_17" in name or "manylinux2014" in name, f"not manylinux2014: {name}"
     assert name.endswith("_x86_64.whl"), f"unsupported architecture: {name}"
     with zipfile.ZipFile(wheel) as archive:

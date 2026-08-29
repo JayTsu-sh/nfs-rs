@@ -8,7 +8,7 @@ contains matching synchronous and `asyncio` APIs with PEP 561 type information.
 
 | Area | Support |
 |---|---|
-| Python | CPython 3.10+ via the stable ABI |
+| Python | CPython 3.11+ via the stable ABI |
 | Platform | Linux/glibc x86_64 |
 | Protocols | NFSv3, NFSv4.1, experimental NFSv4.0 |
 | Authentication | AUTH_SYS |

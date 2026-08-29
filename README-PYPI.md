@@ -48,7 +48,7 @@ is experimental and requires the exact `"4.0"` selector.
 python -m pip install nfs-rs
 ```
 
-The wheel supports CPython 3.10 or newer on Linux/glibc x86_64.
+The wheel supports CPython 3.11 or newer on Linux/glibc x86_64.
 
 ## Connect and work with files
 

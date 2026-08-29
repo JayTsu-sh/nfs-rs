@@ -15,6 +15,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   asyncio, metadata, xattr, protocol-selection, and recovery examples.
 - Expand the Python user guide and state the tested NFSv3, experimental
   NFSv4.0, NFSv4.1, and x86_64 support boundaries precisely.
+- Set the Python minimum to CPython 3.11 and publish a matching `abi3-py311`
+  wheel instead of advertising Python 3.10 support.
 
 ## [0.5.7] - 2026-08-29
 
