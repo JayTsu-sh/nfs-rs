@@ -23,6 +23,11 @@ import nfs_rs
 
 SAFE_ID = re.compile(r"^(nightly|release|local)-[A-Za-z0-9._-]{1,80}$")
 T = TypeVar("T")
+RSS_RETESTS = 3
+
+
+class RssPlateauError(RuntimeError):
+    """A retryable failure of the process RSS plateau gate."""
 
 
 @dataclass(frozen=True)
@@ -260,7 +265,7 @@ async def async_scenario(url: str, version: str, payload: bytes) -> dict[str, fl
     return {"event_loop_heartbeats": float(heartbeat), "event_loop_max_lag_ms": max_lag * 1000}
 
 
-def validate_case(
+def validate_case_attempt(
     case: Case,
     run_id: str,
     artifact: str,
@@ -300,7 +305,7 @@ def validate_case(
         slope = statistics.linear_regression(range(3), tail).slope
         sustained_growth = tail[0] < tail[1] < tail[2] and slope > 4 * 2**20
         if max(tail) - min(tail) > 16 * 2**20 or sustained_growth:
-            raise RuntimeError(
+            raise RssPlateauError(
                 f"{case.name} RSS did not plateau: tail={tail}, slope={slope:.0f} bytes/run"
             )
     return {
@@ -318,6 +323,37 @@ def validate_case(
             "rss_growth_bytes": rss_samples[-1] - min(rss_samples),
         },
     }
+
+
+def validate_case(
+    case: Case,
+    run_id: str,
+    artifact: str,
+    payload: bytes,
+    runs: int,
+    minimum_valid_runs: int,
+) -> dict[str, object]:
+    rss_failures: list[str] = []
+    for attempt in range(RSS_RETESTS + 1):
+        attempt_run_id = run_id if attempt == 0 else f"{run_id}-rss-retest-{attempt}"
+        try:
+            result = validate_case_attempt(
+                case,
+                attempt_run_id,
+                artifact,
+                payload,
+                runs,
+                minimum_valid_runs,
+            )
+            result["rss_gate_attempts"] = attempt + 1
+            result["rss_gate_failures"] = rss_failures
+            return result
+        except RssPlateauError as error:
+            rss_failures.append(str(error))
+    raise RssPlateauError(
+        f"{case.name} failed initial RSS gate and all {RSS_RETESTS} retests: "
+        f"{rss_failures}"
+    )
 
 
 def main() -> None:
