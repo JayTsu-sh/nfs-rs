@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-08-29
+
+### Security
+
+- Upgrade `bytes`, `crossbeam-epoch`, and PyO3 dependencies to versions that
+  address the current RustSec advisories enforced by the release gate.
+
 ## [0.5.5] - 2026-08-29
 
 ### Fixed
@@ -139,7 +146,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.2...v0.5.3
