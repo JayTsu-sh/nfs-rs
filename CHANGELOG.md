@@ -7,6 +7,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-30
+
+### Added
+
+- Add NFSv4.1 `dacl` and `sacl` GET and full-replacement SET protocol
+  primitives for file handles and paths.
+- Expose immutable DACL/SACL values and matching synchronous and asyncio
+  operations through the typed Python API.
+
+### Testing
+
+- Validate file and directory DACL/SACL capability behavior against Linux
+  knfsd and FAS2750 NFSv4.1 exports.
+- Add an ACL-faithful migration matrix spanning NFSv4.0/NFSv4.1 and
+  Linux/FAS2750, including ordered ACE fidelity and descendant inheritance.
+
+### Known limitations
+
+- The current Linux knfsd and FAS2750 validation exports omit NFSv4.1 DACL and
+  SACL attributes and reject SET with `NFS4ERR_ATTRNOTSUPP`; callers receive a
+  structured unsupported error. Ordinary NFSv4 ACL primitives remain usable.
+
 ## [0.5.8] - 2026-08-29
 
 ### Fixed
@@ -165,7 +187,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.5...v0.5.6
