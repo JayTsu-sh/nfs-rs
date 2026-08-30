@@ -19,18 +19,18 @@ PUBLIC_API_COVERAGE = {
     "Client": (
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
-        "fs_stat", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
+        "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
-        "removexattr", "rename", "rmdir", "scandir", "setxattr", "stat", "symlink",
+        "removexattr", "rename", "rmdir", "scandir", "setdacl", "setsacl", "setxattr", "stat", "symlink",
         "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__enter__",
         "__exit__",
     ),
     "AsyncClient": (
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
-        "fs_stat", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
+        "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
-        "removexattr", "rename", "rmdir", "scandir", "setxattr", "stat", "symlink",
+        "removexattr", "rename", "rmdir", "scandir", "setdacl", "setsacl", "setxattr", "stat", "symlink",
         "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__aenter__",
         "__aexit__",
     ),
@@ -51,6 +51,9 @@ EXPECTED_UNAVAILABLE = (
     "Client.setxattr", "Client.getxattr", "Client.listxattr", "Client.removexattr",
     "AsyncClient.setxattr", "AsyncClient.getxattr", "AsyncClient.listxattr",
     "AsyncClient.removexattr",
+    "Client.getdacl", "Client.setdacl", "Client.getsacl", "Client.setsacl",
+    "AsyncClient.getdacl", "AsyncClient.setdacl", "AsyncClient.getsacl",
+    "AsyncClient.setsacl",
 )
 
 SAFE_ID = re.compile(r"^nightly-[A-Za-z0-9._-]{1,80}$")
@@ -300,6 +303,29 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         client.truncate(data, 4)
         check(client.stat(data).size == 4, "Client.truncate", checks)
 
+        try:
+            dacl = client.getdacl(data)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("Client.getdacl:unsupported")
+            capability_call(
+                lambda: client.setdacl(data, nfs_rs.NfsAcl41(nfs_rs.Acl41Flags(0), ())),
+                "Client.setdacl", checks,
+            )
+        else:
+            client.setdacl(data, dacl)
+            checks.extend(("Client.getdacl", "Client.setdacl"))
+        try:
+            sacl = client.getsacl(data)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("Client.getsacl:unsupported")
+            capability_call(
+                lambda: client.setsacl(data, nfs_rs.NfsAcl41(nfs_rs.Acl41Flags(0), ())),
+                "Client.setsacl", checks,
+            )
+        else:
+            client.setsacl(data, sacl)
+            checks.extend(("Client.getsacl", "Client.setsacl"))
+
         xattr = "user.nfs_rs_conformance"
         try:
             client.setxattr(data, xattr, b"value")
@@ -456,6 +482,29 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         check((timed.atime_ns, timed.mtime_ns) == expected_times, "AsyncClient.utime", checks)
         await client.truncate(data, 4)
         check((await client.stat(data)).size == 4, "AsyncClient.truncate", checks)
+
+        try:
+            dacl = await client.getdacl(data)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("AsyncClient.getdacl:unsupported")
+            await capability_call_async(
+                lambda: client.setdacl(data, nfs_rs.NfsAcl41(nfs_rs.Acl41Flags(0), ())),
+                "AsyncClient.setdacl", checks,
+            )
+        else:
+            await client.setdacl(data, dacl)
+            checks.extend(("AsyncClient.getdacl", "AsyncClient.setdacl"))
+        try:
+            sacl = await client.getsacl(data)
+        except nfs_rs.NfsUnsupportedError:
+            checks.append("AsyncClient.getsacl:unsupported")
+            await capability_call_async(
+                lambda: client.setsacl(data, nfs_rs.NfsAcl41(nfs_rs.Acl41Flags(0), ())),
+                "AsyncClient.setsacl", checks,
+            )
+        else:
+            await client.setsacl(data, sacl)
+            checks.extend(("AsyncClient.getsacl", "AsyncClient.setsacl"))
 
         xattr = "user.nfs_rs_conformance"
         try:

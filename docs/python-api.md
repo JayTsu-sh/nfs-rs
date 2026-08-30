@@ -315,6 +315,29 @@ with Client.connect("nfs://server/export?version=4.1") as client:
         print(error.code_name, error.recovery_action, error.outcome)
 ```
 
+## NFSv4.1 DACL and SACL
+
+NFSv4.1 clients expose `getdacl`, `setdacl`, `getsacl`, and `setsacl` on both
+`Client` and `AsyncClient`. Values are immutable `NfsAcl41` objects containing
+the ACL flags and an ordered tuple of `NfsAce` entries. A set operation replaces
+the complete DACL or SACL attribute; it is not an ACE-level patch.
+
+```python
+from nfs_rs import Acl41Flags, Client, NfsAcl41
+
+with Client.connect("nfs://server/export?version=4.1") as client:
+    current = client.getdacl("directory")
+    client.setdacl(
+        "directory",
+        NfsAcl41(current.flags | Acl41Flags.PROTECTED, current.aces),
+    )
+```
+
+These attributes are optional server capabilities. A server that omits DACL or
+SACL from a GETATTR response, or returns `NFS4ERR_ATTRNOTSUPP` while setting it,
+is reported as `NfsUnsupportedError`. The ordinary NFSv4 `acl` attribute remains
+available through the existing Rust API and is distinct from NFSv4.1 DACL/SACL.
+
 For replay-sensitive mutations, `NfsUncertainOutcomeError` means the server may
 have completed the request. Never retry it blindly. Inspect authoritative state
 (existence, size, checksum, destination name, or application transaction ID),

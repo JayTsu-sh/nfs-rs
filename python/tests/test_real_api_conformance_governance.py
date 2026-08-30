@@ -64,5 +64,8 @@ def test_real_conformance_makes_every_unavailable_api_explicit() -> None:
     assert set(literal_assignment("EXPECTED_UNAVAILABLE")) == {
         f"{class_name}.{method}"
         for class_name in ("Client", "AsyncClient")
-        for method in ("setxattr", "getxattr", "listxattr", "removexattr")
+        for method in (
+            "setxattr", "getxattr", "listxattr", "removexattr",
+            "getdacl", "setdacl", "getsacl", "setsacl",
+        )
     }

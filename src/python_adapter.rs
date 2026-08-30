@@ -3,7 +3,8 @@ use crate::client_core::{
 };
 use crate::nfs4::Nfs4ErrorCode::*;
 use crate::{
-    Attr, Mount, MountHealth, NFSVersion, NfsError, OpenFile, Result, parse_url_and_mount,
+    AceFlags, AceMask, AceType, Acl41Flags, Attr, Mount, MountHealth, NFSVersion, NfsAce, NfsAcl41,
+    NfsError, OpenFile, Result, parse_url_and_mount,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1703,6 +1704,43 @@ fn attr_dict<'py>(py: Python<'py>, attr: &Attr) -> PyResult<Bound<'py, PyDict>> 
     Ok(values)
 }
 
+fn acl41_dict<'py>(py: Python<'py>, acl: &NfsAcl41) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    values.set_item("flags", acl.flags.0)?;
+    let aces = acl
+        .aces
+        .iter()
+        .map(|ace| {
+            (
+                ace.ace_type as u32,
+                ace.flags.0,
+                ace.access_mask.0,
+                ace.who.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    values.set_item("aces", aces)?;
+    Ok(values)
+}
+
+fn acl41_value(flags: u32, aces: Vec<(u32, u32, u32, String)>) -> Result<NfsAcl41> {
+    let aces = aces
+        .into_iter()
+        .map(|(ace_type, flags, access_mask, who)| {
+            Ok(NfsAce {
+                ace_type: AceType::try_from(ace_type)?,
+                flags: AceFlags(flags),
+                access_mask: AceMask(access_mask),
+                who,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(NfsAcl41 {
+        flags: Acl41Flags(flags),
+        aces,
+    })
+}
+
 fn capabilities_dict<'py>(
     py: Python<'py>,
     capabilities: crate::MountCapabilities,
@@ -2238,6 +2276,45 @@ async fn xattr_get(
         .getxattr_path(&path, &name)
         .await?
         .to_vec())
+}
+
+#[derive(Clone, Copy)]
+enum Acl41Kind {
+    Discretionary,
+    System,
+}
+
+async fn acl41_get(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+    kind: Acl41Kind,
+) -> Result<NfsAcl41> {
+    let _operation_guard = core.begin_operation()?;
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("DACL/SACL requires a connected NFSv4.1 engine".to_string())
+    })?;
+    match kind {
+        Acl41Kind::Discretionary => mount.getdacl_path(&path).await,
+        Acl41Kind::System => mount.getsacl_path(&path).await,
+    }
+}
+
+async fn acl41_set(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+    value: NfsAcl41,
+    kind: Acl41Kind,
+) -> Result<()> {
+    let _operation_guard = core.begin_operation()?;
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("DACL/SACL requires a connected NFSv4.1 engine".to_string())
+    })?;
+    match kind {
+        Acl41Kind::Discretionary => mount.setdacl_path(&path, &value).await,
+        Acl41Kind::System => mount.setsacl_path(&path, &value).await,
+    }
 }
 
 async fn xattr_set(
@@ -3916,6 +3993,74 @@ impl SyncClient {
         .map_err(nfs_error)
     }
 
+    fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+        let value = py
+            .detach(|| {
+                self.runtime.block_on(acl41_get(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                    path,
+                    Acl41Kind::Discretionary,
+                ))
+            })
+            .map_err(nfs_error)?;
+        acl41_dict(py, &value)
+    }
+
+    fn setdacl(
+        &self,
+        py: Python<'_>,
+        path: String,
+        flags: u32,
+        aces: Vec<(u32, u32, u32, String)>,
+    ) -> PyResult<()> {
+        let value = acl41_value(flags, aces).map_err(nfs_error)?;
+        py.detach(|| {
+            self.runtime.block_on(acl41_set(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                value,
+                Acl41Kind::Discretionary,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
+    fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+        let value = py
+            .detach(|| {
+                self.runtime.block_on(acl41_get(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                    path,
+                    Acl41Kind::System,
+                ))
+            })
+            .map_err(nfs_error)?;
+        acl41_dict(py, &value)
+    }
+
+    fn setsacl(
+        &self,
+        py: Python<'_>,
+        path: String,
+        flags: u32,
+        aces: Vec<(u32, u32, u32, String)>,
+    ) -> PyResult<()> {
+        let value = acl41_value(flags, aces).map_err(nfs_error)?;
+        py.detach(|| {
+            self.runtime.block_on(acl41_set(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                value,
+                Acl41Kind::System,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
     fn getxattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<Vec<u8>> {
         py.detach(|| {
             self.runtime.block_on(xattr_get(
@@ -4337,6 +4482,76 @@ impl AsyncClient {
             access_path(core, mount, path, mode)
                 .await
                 .map_err(nfs_error)
+        })
+    }
+
+    fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = acl41_get(core, mount, path, Acl41Kind::Discretionary)
+                .await
+                .map_err(nfs_error)?;
+            Python::attach(|py| acl41_dict(py, &value).map(Bound::unbind))
+        })
+    }
+
+    fn setdacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        flags: u32,
+        aces: Vec<(u32, u32, u32, String)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let value = acl41_value(flags, aces).map_err(nfs_error)?;
+        let core = self.core.clone();
+        let work_core = core.clone();
+        let mount = self.health_source.clone();
+        let safe_path = path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            cancellation_safe_owned_operation(
+                core,
+                Some(safe_path),
+                "setdacl",
+                acl41_set(work_core, mount, path, value, Acl41Kind::Discretionary),
+            )
+            .await
+            .map_err(nfs_error)
+        })
+    }
+
+    fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = acl41_get(core, mount, path, Acl41Kind::System)
+                .await
+                .map_err(nfs_error)?;
+            Python::attach(|py| acl41_dict(py, &value).map(Bound::unbind))
+        })
+    }
+
+    fn setsacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        flags: u32,
+        aces: Vec<(u32, u32, u32, String)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let value = acl41_value(flags, aces).map_err(nfs_error)?;
+        let core = self.core.clone();
+        let work_core = core.clone();
+        let mount = self.health_source.clone();
+        let safe_path = path.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            cancellation_safe_owned_operation(
+                core,
+                Some(safe_path),
+                "setsacl",
+                acl41_set(work_core, mount, path, value, Acl41Kind::System),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 

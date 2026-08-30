@@ -10,7 +10,7 @@ import sysconfig
 import time
 import warnings
 from importlib import import_module as _import_module
-from enum import Enum
+from enum import Enum, IntEnum, IntFlag
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
 from types import ModuleType
@@ -91,6 +91,61 @@ class FileType(str, Enum):
     FIFO = "fifo"
     SOCKET = "socket"
     UNKNOWN = "unknown"
+
+
+class AceType(IntEnum):
+    ALLOW = 0
+    DENY = 1
+    AUDIT = 2
+    ALARM = 3
+
+
+class AceFlags(IntFlag):
+    FILE_INHERIT = 0x01
+    DIRECTORY_INHERIT = 0x02
+    NO_PROPAGATE_INHERIT = 0x04
+    INHERIT_ONLY = 0x08
+    SUCCESSFUL_ACCESS = 0x10
+    FAILED_ACCESS = 0x20
+    IDENTIFIER_GROUP = 0x40
+    INHERITED = 0x80
+
+
+class AceMask(IntFlag):
+    READ_DATA = 0x000001
+    WRITE_DATA = 0x000002
+    APPEND_DATA = 0x000004
+    READ_NAMED_ATTRS = 0x000008
+    WRITE_NAMED_ATTRS = 0x000010
+    EXECUTE = 0x000020
+    DELETE_CHILD = 0x000040
+    READ_ATTRIBUTES = 0x000080
+    WRITE_ATTRIBUTES = 0x000100
+    DELETE = 0x010000
+    READ_ACL = 0x020000
+    WRITE_ACL = 0x040000
+    WRITE_OWNER = 0x080000
+    SYNCHRONIZE = 0x100000
+
+
+class Acl41Flags(IntFlag):
+    AUTO_INHERIT = 0x01
+    PROTECTED = 0x02
+    DEFAULTED = 0x04
+
+
+@dataclass(frozen=True, slots=True)
+class NfsAce:
+    type: AceType
+    flags: AceFlags
+    access_mask: AceMask
+    who: str
+
+
+@dataclass(frozen=True, slots=True)
+class NfsAcl41:
+    flags: Acl41Flags
+    aces: tuple[NfsAce, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +305,25 @@ def _capabilities(values: dict[str, Any]) -> Capabilities:
 
 def _io_limits(values: dict[str, Any]) -> IoLimits:
     return IoLimits(**values)
+
+
+def _acl41(values: dict[str, Any]) -> NfsAcl41:
+    return NfsAcl41(
+        flags=Acl41Flags(values["flags"]),
+        aces=tuple(
+            NfsAce(AceType(type_), AceFlags(flags), AceMask(access_mask), who)
+            for type_, flags, access_mask, who in values["aces"]
+        ),
+    )
+
+
+def _acl41_args(value: NfsAcl41) -> tuple[int, list[tuple[int, int, int, str]]]:
+    if not isinstance(value, NfsAcl41):
+        raise TypeError("ACL value must be an NfsAcl41")
+    return int(value.flags), [
+        (int(ace.type), int(ace.flags), int(ace.access_mask), ace.who)
+        for ace in value.aces
+    ]
 
 
 def _fs_info(values: dict[str, Any]) -> FsInfo:
@@ -517,6 +591,20 @@ class Client(_ClientOptions):
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(self._inner.access(_normalize_path(path), mode))
 
+    def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+        return _acl41(self._inner.getdacl(_normalize_path(path)))
+
+    def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+        flags, aces = _acl41_args(acl)
+        self._inner.setdacl(_normalize_path(path), flags, aces)
+
+    def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+        return _acl41(self._inner.getsacl(_normalize_path(path)))
+
+    def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+        flags, aces = _acl41_args(acl)
+        self._inner.setsacl(_normalize_path(path), flags, aces)
+
     def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
         return bytes(self._inner.getxattr(_normalize_path(path), name))
 
@@ -744,6 +832,24 @@ class AsyncClient(_ClientOptions):
         if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(await self._inner.access(_normalize_path(path), mode))
+
+    async def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+        self._check_loop()
+        return _acl41(await self._inner.getdacl(_normalize_path(path)))
+
+    async def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+        self._check_loop()
+        flags, aces = _acl41_args(acl)
+        await self._inner.setdacl(_normalize_path(path), flags, aces)
+
+    async def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+        self._check_loop()
+        return _acl41(await self._inner.getsacl(_normalize_path(path)))
+
+    async def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+        self._check_loop()
+        flags, aces = _acl41_args(acl)
+        await self._inner.setsacl(_normalize_path(path), flags, aces)
 
     async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
         self._check_loop()

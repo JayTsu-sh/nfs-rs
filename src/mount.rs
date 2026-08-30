@@ -543,6 +543,46 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.setacl(res.fh, acl).await
     }
 
+    /// Retrieve the NFSv4.1 discretionary ACL, including ACL-wide flags.
+    async fn getdacl(&self, _fh: Bytes) -> Result<NfsAcl41> {
+        Err(NfsError::Unsupported("DACL requires NFSv4.1".to_string()))
+    }
+
+    async fn getdacl_path(&self, path: &str) -> Result<NfsAcl41> {
+        let res = self.lookup_path(path).await?;
+        self.getdacl(res.fh).await
+    }
+
+    /// Atomically replace the complete NFSv4.1 discretionary ACL.
+    async fn setdacl(&self, _fh: Bytes, _acl: &NfsAcl41) -> Result<()> {
+        Err(NfsError::Unsupported("DACL requires NFSv4.1".to_string()))
+    }
+
+    async fn setdacl_path(&self, path: &str, acl: &NfsAcl41) -> Result<()> {
+        let res = self.lookup_path(path).await?;
+        self.setdacl(res.fh, acl).await
+    }
+
+    /// Retrieve the NFSv4.1 system ACL, including ACL-wide flags.
+    async fn getsacl(&self, _fh: Bytes) -> Result<NfsAcl41> {
+        Err(NfsError::Unsupported("SACL requires NFSv4.1".to_string()))
+    }
+
+    async fn getsacl_path(&self, path: &str) -> Result<NfsAcl41> {
+        let res = self.lookup_path(path).await?;
+        self.getsacl(res.fh).await
+    }
+
+    /// Atomically replace the complete NFSv4.1 system ACL.
+    async fn setsacl(&self, _fh: Bytes, _acl: &NfsAcl41) -> Result<()> {
+        Err(NfsError::Unsupported("SACL requires NFSv4.1".to_string()))
+    }
+
+    async fn setsacl_path(&self, path: &str, acl: &NfsAcl41) -> Result<()> {
+        let res = self.lookup_path(path).await?;
+        self.setsacl(res.fh, acl).await
+    }
+
     /// Query which ACE types the server supports (FATTR4_ACLSUPPORT, NFSv4 only).
     async fn aclsupport(&self, _fh: Bytes) -> Result<AclSupport> {
         Err(NfsError::Unsupported(
@@ -1644,6 +1684,7 @@ impl AceFlags {
     pub const SUCCESSFUL_ACCESS: u32 = 0x0000_0010;
     pub const FAILED_ACCESS: u32 = 0x0000_0020;
     pub const IDENTIFIER_GROUP: u32 = 0x0000_0040;
+    pub const INHERITED: u32 = 0x0000_0080;
 
     pub fn contains(self, flag: u32) -> bool {
         self.0 & flag != 0
@@ -1690,6 +1731,27 @@ pub struct NfsAce {
 /// NFSv4 ACL: ordered list of access control entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Acl {
+    pub aces: Vec<NfsAce>,
+}
+
+/// NFSv4.1 ACL-wide flags carried by FATTR4_DACL and FATTR4_SACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Acl41Flags(pub u32);
+
+impl Acl41Flags {
+    pub const AUTO_INHERIT: u32 = 0x0000_0001;
+    pub const PROTECTED: u32 = 0x0000_0002;
+    pub const DEFAULTED: u32 = 0x0000_0004;
+
+    pub fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+/// NFSv4.1 DACL/SACL value (`nfsacl41`): ACL-wide flags plus ordered ACEs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NfsAcl41 {
+    pub flags: Acl41Flags,
     pub aces: Vec<NfsAce>,
 }
 

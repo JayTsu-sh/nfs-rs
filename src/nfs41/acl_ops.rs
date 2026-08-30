@@ -52,4 +52,61 @@ impl Mount41 {
         let mut data = getattr.data.clone();
         acl::decode_getattr_aclsupport(&mut data)
     }
+
+    async fn get_acl41(
+        &self,
+        fh: Bytes,
+        attribute: u32,
+        operation: &str,
+    ) -> Result<mount::NfsAcl41> {
+        let bitmap = [0, 1 << (attribute - 32)];
+        let resp = self
+            .compound(operation, |b| b.putfh(&fh).getattr(&bitmap))
+            .await;
+        let resp = acl::attrnotsupp_as_unsupported(operation, resp)?;
+        resp.op_ok(1)?;
+        let getattr = resp.op_ok(2)?;
+        let mut data = getattr.data.clone();
+        acl::decode_getattr_acl41(&mut data, attribute)
+    }
+
+    async fn set_acl41(
+        &self,
+        fh: Bytes,
+        value: &mount::NfsAcl41,
+        attribute: u32,
+        operation: &str,
+    ) -> Result<()> {
+        let (attrmask, attr_vals) = acl::encode_setattr_acl41(value, attribute);
+        let stateid = [0u8; 16];
+        let resp = self
+            .compound(operation, |b| {
+                b.putfh(&fh).setattr(&stateid, &attrmask, &attr_vals)
+            })
+            .await;
+        let resp = acl::attrnotsupp_as_unsupported(operation, resp)?;
+        resp.op_ok(1)?;
+        resp.op_ok(2)?;
+        Ok(())
+    }
+
+    pub(crate) async fn getdacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        self.get_acl41(fh, crate::nfs4::attrnum::DACL, "GETDACL")
+            .await
+    }
+
+    pub(crate) async fn setdacl(&self, fh: Bytes, value: &mount::NfsAcl41) -> Result<()> {
+        self.set_acl41(fh, value, crate::nfs4::attrnum::DACL, "SETDACL")
+            .await
+    }
+
+    pub(crate) async fn getsacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        self.get_acl41(fh, crate::nfs4::attrnum::SACL, "GETSACL")
+            .await
+    }
+
+    pub(crate) async fn setsacl(&self, fh: Bytes, value: &mount::NfsAcl41) -> Result<()> {
+        self.set_acl41(fh, value, crate::nfs4::attrnum::SACL, "SETSACL")
+            .await
+    }
 }

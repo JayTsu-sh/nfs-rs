@@ -7,7 +7,7 @@
 
 use bytes::{Buf, Bytes};
 
-use super::acl::{decode_acl, skip_acl};
+use super::acl::{decode_acl, skip_acl41};
 use super::attrnum;
 use crate::Time;
 use crate::error::{NfsError, Result};
@@ -541,10 +541,10 @@ pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<
     }
     // Attrs 58-59: dacl/sacl (nfsacl41, complex ACL)
     if bitmap_has(bitmap, 58) {
-        skip_acl(vals)?;
+        skip_acl41(vals)?;
     }
     if bitmap_has(bitmap, 59) {
-        skip_acl(vals)?;
+        skip_acl41(vals)?;
     }
     // Attr 60: change_policy (uint64 + uint64 = 16 bytes)
     if bitmap_has(bitmap, 60) {
