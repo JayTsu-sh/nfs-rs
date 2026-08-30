@@ -8,7 +8,7 @@ use bytes::{Buf, Bytes};
 use super::attrnum;
 use super::attrs::{decode_getattr_envelope, decode_utf8str};
 use crate::error::{NfsError, Result};
-use crate::mount::{AceFlags, AceMask, AceType, Acl, AclSupport, NfsAce};
+use crate::mount::{AceFlags, AceMask, AceType, Acl, Acl41Flags, AclSupport, NfsAce, NfsAcl41};
 
 /// Translate an operation-local FATTR4_ACL rejection without caching it.
 /// ATTRNOTSUPP can depend on the object or ACL contents, while ACLSUPPORT is
@@ -118,6 +118,15 @@ pub(super) fn skip_acl(buf: &mut Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Skip an NFSv4.1 `nfsacl41` value: ACL flags followed by an ACE array.
+pub(super) fn skip_acl41(buf: &mut Bytes) -> Result<()> {
+    if buf.remaining() < 4 {
+        return Err(NfsError::Xdr("NFSv4.1 ACL flags truncated".to_string()));
+    }
+    buf.advance(4);
+    skip_acl(buf)
+}
+
 // ─── Encode ────────────────────────────────────────────────────────────────────
 
 /// Encode a single nfsace4 to XDR wire format.
@@ -150,6 +159,19 @@ pub(crate) fn encode_setattr_acl(acl: &Acl) -> (Vec<u32>, Vec<u8>) {
     let mut vals = Vec::new();
     encode_acl(acl, &mut vals);
     (vec![word0], vals)
+}
+
+pub(crate) fn encode_setattr_acl41(acl: &NfsAcl41, attribute: u32) -> (Vec<u32>, Vec<u8>) {
+    debug_assert!(matches!(attribute, attrnum::DACL | attrnum::SACL));
+    let mut values = Vec::new();
+    values.extend_from_slice(&acl.flags.0.to_be_bytes());
+    encode_acl(
+        &Acl {
+            aces: acl.aces.clone(),
+        },
+        &mut values,
+    );
+    (vec![0, 1 << (attribute - 32)], values)
 }
 
 // ─── GETATTR response decoders ─────────────────────────────────────────────────
@@ -192,6 +214,24 @@ pub(crate) fn decode_getattr_aclsupport(data: &mut Bytes) -> Result<AclSupport> 
         return Err(NfsError::Xdr("ACLSUPPORT value truncated".to_string()));
     }
     Ok(AclSupport(vals.get_u32()))
+}
+
+pub(crate) fn decode_getattr_acl41(data: &mut Bytes, attribute: u32) -> Result<NfsAcl41> {
+    debug_assert!(matches!(attribute, attrnum::DACL | attrnum::SACL));
+    let (bitmap, mut vals) = decode_getattr_envelope(data)?;
+    let word1 = bitmap.get(1).copied().unwrap_or(0);
+    let bit = 1 << (attribute - 32);
+    if word1 & bit == 0 {
+        return Err(NfsError::Unsupported(format!(
+            "server does not support NFSv4.1 ACL attribute {attribute}"
+        )));
+    }
+    if vals.remaining() < 4 {
+        return Err(NfsError::Xdr("NFSv4.1 ACL flags truncated".to_string()));
+    }
+    let flags = Acl41Flags(vals.get_u32());
+    let aces = decode_acl(&mut vals)?.aces;
+    Ok(NfsAcl41 { flags, aces })
 }
 
 #[cfg(test)]
@@ -382,6 +422,52 @@ mod tests {
         assert_eq!(attrmask, vec![1u32 << 12]);
         // vals should start with count=1
         assert_eq!(&vals[..4], &1u32.to_be_bytes());
+    }
+
+    #[test]
+    fn nfsv41_acl_round_trips_flags_inherited_ace_and_word_one_bitmap() {
+        let acl = NfsAcl41 {
+            flags: Acl41Flags(Acl41Flags::AUTO_INHERIT | Acl41Flags::PROTECTED),
+            aces: vec![make_ace(
+                AceType::AccessAllowed,
+                AceFlags::FILE_INHERIT | AceFlags::INHERITED,
+                AceMask::READ_DATA | AceMask::READ_ACL,
+                "EVERYONE@",
+            )],
+        };
+        let (bitmap, values) = encode_setattr_acl41(&acl, attrnum::DACL);
+        assert_eq!(bitmap, vec![0, 1 << 26]);
+        assert_eq!(&values[..4], &acl.flags.0.to_be_bytes());
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&2u32.to_be_bytes());
+        response.extend_from_slice(&0u32.to_be_bytes());
+        response.extend_from_slice(&(1u32 << 26).to_be_bytes());
+        response.extend_from_slice(&(values.len() as u32).to_be_bytes());
+        response.extend_from_slice(&values);
+        let mut bytes = Bytes::from(response);
+        assert_eq!(
+            decode_getattr_acl41(&mut bytes, attrnum::DACL).unwrap(),
+            acl
+        );
+    }
+
+    #[test]
+    fn skip_nfsv41_acl_consumes_flags_and_aces_only() {
+        let acl = NfsAcl41 {
+            flags: Acl41Flags(Acl41Flags::DEFAULTED),
+            aces: vec![make_ace(
+                AceType::SystemAudit,
+                AceFlags::SUCCESSFUL_ACCESS,
+                AceMask::WRITE_DATA,
+                "EVERYONE@",
+            )],
+        };
+        let (_, mut values) = encode_setattr_acl41(&acl, attrnum::SACL);
+        values.push(0xff);
+        let mut bytes = Bytes::from(values);
+        skip_acl41(&mut bytes).unwrap();
+        assert_eq!(bytes.as_ref(), &[0xff]);
     }
 
     #[test]

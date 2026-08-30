@@ -128,6 +128,8 @@ impl std::fmt::Display for Nfs4ErrorCode {
 pub(crate) mod attrnum {
     pub(crate) const ACL: u32 = 12;
     pub(crate) const ACLSUPPORT: u32 = 13;
+    pub(crate) const DACL: u32 = 58;
+    pub(crate) const SACL: u32 = 59;
     pub(crate) const FILEHANDLE: u32 = 19;
     pub(crate) const FILEID: u32 = 20;
     pub(crate) const MODE: u32 = 33;

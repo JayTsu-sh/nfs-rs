@@ -6,6 +6,10 @@ from . import _errors as _public_errors
 from ._errors import *
 
 from ._client import (
+    AceFlags,
+    AceMask,
+    AceType,
+    Acl41Flags,
     AsyncClient,
     Capabilities,
     Client,
@@ -19,6 +23,8 @@ from ._client import (
     Health,
     Lifecycle,
     IoLimits,
+    NfsAce,
+    NfsAcl41,
     RecoveryEvent,
     Version,
     AsyncFile,
@@ -27,6 +33,10 @@ from ._client import (
 )
 
 __all__ = [
+    "AceFlags",
+    "AceMask",
+    "AceType",
+    "Acl41Flags",
     "AsyncClient",
     "Capabilities",
     "Client",
@@ -40,6 +50,8 @@ __all__ = [
     "Health",
     "Lifecycle",
     "IoLimits",
+    "NfsAce",
+    "NfsAcl41",
     "RecoveryEvent",
     "Version",
     "AsyncFile",

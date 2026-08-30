@@ -4,7 +4,7 @@ import io
 import os
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum, IntFlag
 from typing import Any, NoReturn
 
 __version__: str
@@ -31,6 +31,55 @@ class FileType(str, Enum):
     FIFO = "fifo"
     SOCKET = "socket"
     UNKNOWN = "unknown"
+
+class AceType(IntEnum):
+    ALLOW = 0
+    DENY = 1
+    AUDIT = 2
+    ALARM = 3
+
+class AceFlags(IntFlag):
+    FILE_INHERIT = 0x01
+    DIRECTORY_INHERIT = 0x02
+    NO_PROPAGATE_INHERIT = 0x04
+    INHERIT_ONLY = 0x08
+    SUCCESSFUL_ACCESS = 0x10
+    FAILED_ACCESS = 0x20
+    IDENTIFIER_GROUP = 0x40
+    INHERITED = 0x80
+
+class AceMask(IntFlag):
+    READ_DATA = 0x000001
+    WRITE_DATA = 0x000002
+    APPEND_DATA = 0x000004
+    READ_NAMED_ATTRS = 0x000008
+    WRITE_NAMED_ATTRS = 0x000010
+    EXECUTE = 0x000020
+    DELETE_CHILD = 0x000040
+    READ_ATTRIBUTES = 0x000080
+    WRITE_ATTRIBUTES = 0x000100
+    DELETE = 0x010000
+    READ_ACL = 0x020000
+    WRITE_ACL = 0x040000
+    WRITE_OWNER = 0x080000
+    SYNCHRONIZE = 0x100000
+
+class Acl41Flags(IntFlag):
+    AUTO_INHERIT = 0x01
+    PROTECTED = 0x02
+    DEFAULTED = 0x04
+
+@dataclass(frozen=True)
+class NfsAce:
+    type: AceType
+    flags: AceFlags
+    access_mask: AceMask
+    who: str
+
+@dataclass(frozen=True)
+class NfsAcl41:
+    flags: Acl41Flags
+    aces: tuple[NfsAce, ...]
 
 class OperationOutcome(str, Enum):
     def __new__(cls, value: str) -> OperationOutcome: ...
@@ -227,6 +276,10 @@ class Client:
     def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None: ...
     def truncate(self, path: os.PathLike[str] | str, size: int) -> None: ...
     def access(self, path: os.PathLike[str] | str, mode: int) -> bool: ...
+    def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+    def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+    def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+    def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
     def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes: ...
     def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None: ...
     def listxattr(self, path: os.PathLike[str] | str) -> list[str]: ...
@@ -286,6 +339,10 @@ class AsyncClient:
     async def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None: ...
     async def truncate(self, path: os.PathLike[str] | str, size: int) -> None: ...
     async def access(self, path: os.PathLike[str] | str, mode: int) -> bool: ...
+    async def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+    async def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+    async def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+    async def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
     async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes: ...
     async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None: ...
     async def listxattr(self, path: os.PathLike[str] | str) -> list[str]: ...

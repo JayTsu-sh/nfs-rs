@@ -9,13 +9,20 @@ use bytes::Bytes;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
-    Mount, MountLifecycleState, NFSVersion, NfsError, OPEN_BOTH, OPEN_READ, Time,
-    parse_url_and_mount,
+    AceFlags, AceMask, AceType, Acl, Acl41Flags, Mount, MountLifecycleState, NFSVersion, NfsAce,
+    NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time, parse_url_and_mount,
 };
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
 const LAB_URLS_ENV: &str = "NFS_RS_LAB_URLS";
 const LAB_V40_URLS_ENV: &str = "NFS_RS_LAB_V40_URLS";
+const LAB_ACL_URLS_ENV: &str = "NFS_RS_LAB_ACL_URLS";
+const LAB_ACL_SOURCE_URL_ENV: &str = "NFS_RS_LAB_ACL_SOURCE_URL";
+const LAB_ACL_TARGET_URL_ENV: &str = "NFS_RS_LAB_ACL_TARGET_URL";
+const LAB_ACL_LINUX_V40_URL_ENV: &str = "NFS_RS_LAB_ACL_LINUX_V40_URL";
+const LAB_ACL_LINUX_V41_URL_ENV: &str = "NFS_RS_LAB_ACL_LINUX_V41_URL";
+const LAB_ACL_FAS2750_V40_URL_ENV: &str = "NFS_RS_LAB_ACL_FAS2750_V40_URL";
+const LAB_ACL_FAS2750_V41_URL_ENV: &str = "NFS_RS_LAB_ACL_FAS2750_V41_URL";
 const CASE_DIR: &str = "nfs-rs-e2e";
 const ORIGINAL_FILE: &str = "nfs-rs-e2e/payload.bin";
 const RENAMED_FILE: &str = "nfs-rs-e2e/renamed.bin";
@@ -29,6 +36,14 @@ const CALLBACK_FILE: &str = "callback-recall.bin";
 const PNFS_PAYLOAD_SIZE: usize = 8 * 1024 * 1024 + 37;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Copy)]
+enum AclObjectKind {
+    File,
+    Directory,
+    InheritedFile,
+    InheritedDirectory,
+}
 
 #[tokio::test]
 #[ignore = "requires an NFSv4.0 server for raw MAXREAD/MAXWRITE observation"]
@@ -194,6 +209,800 @@ async fn nfs_v40_mount_null_and_traversal_on_both_lifs() -> TestResult {
         )?;
         mount.null().await?;
         mount.umount().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires writable real NFSv4.0 ACL fixtures"]
+async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResult {
+    let urls = env::var(LAB_ACL_URLS_ENV).or_else(|_| env::var(LAB_V40_URLS_ENV))?;
+    let urls = urls
+        .split(',')
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    ensure(!urls.is_empty(), "NFSv4.0 ACL validation requires URLs")?;
+
+    let owner_directory_mask = AceMask::READ_DATA
+        | AceMask::WRITE_DATA
+        | AceMask::APPEND_DATA
+        | AceMask::EXECUTE
+        | AceMask::DELETE_CHILD
+        | AceMask::READ_ATTRIBUTES
+        | AceMask::WRITE_ATTRIBUTES
+        | AceMask::READ_NAMED_ATTRS
+        | AceMask::WRITE_NAMED_ATTRS
+        | AceMask::READ_ACL
+        | AceMask::WRITE_ACL
+        | AceMask::WRITE_OWNER
+        | AceMask::SYNCHRONIZE;
+    let owner_file_mask = AceMask::READ_DATA
+        | AceMask::WRITE_DATA
+        | AceMask::APPEND_DATA
+        | AceMask::READ_ATTRIBUTES
+        | AceMask::WRITE_ATTRIBUTES
+        | AceMask::READ_NAMED_ATTRS
+        | AceMask::WRITE_NAMED_ATTRS
+        | AceMask::READ_ACL
+        | AceMask::WRITE_ACL
+        | AceMask::WRITE_OWNER
+        | AceMask::SYNCHRONIZE;
+    let read_directory_mask = AceMask::READ_DATA
+        | AceMask::EXECUTE
+        | AceMask::READ_ATTRIBUTES
+        | AceMask::READ_NAMED_ATTRS
+        | AceMask::READ_ACL
+        | AceMask::SYNCHRONIZE;
+    let read_file_mask = AceMask::READ_DATA
+        | AceMask::READ_ATTRIBUTES
+        | AceMask::READ_NAMED_ATTRS
+        | AceMask::READ_ACL
+        | AceMask::SYNCHRONIZE;
+
+    for (index, url) in urls.into_iter().enumerate() {
+        ensure(
+            url.contains("version=4.0"),
+            format!("not an exact v4.0 URL: {url}"),
+        )?;
+        let mount = parse_url_and_mount(url).await?;
+        let root = format!("nfs-rs-v40-acl-primitives-{index}");
+        let root_file = format!("{root}/root-file.txt");
+        let child_directory = format!("{root}/child");
+        let child_file = format!("{child_directory}/child-file.txt");
+
+        let _ = mount.remove_path(&child_file).await;
+        let _ = mount.rmdir_path(&child_directory).await;
+        let _ = mount.remove_path(&root_file).await;
+        let _ = mount.rmdir_path(&root).await;
+
+        let result: TestResult = async {
+            let root_object = mount.mkdir_path(&root, 0o700).await?;
+            let root_acl = Acl {
+                aces: vec![
+                    NfsAce {
+                        ace_type: AceType::AccessAllowed,
+                        flags: AceFlags(0),
+                        access_mask: AceMask(owner_directory_mask),
+                        who: "OWNER@".to_string(),
+                    },
+                    NfsAce {
+                        ace_type: AceType::AccessAllowed,
+                        flags: AceFlags(AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT),
+                        access_mask: AceMask(read_directory_mask),
+                        who: "EVERYONE@".to_string(),
+                    },
+                ],
+            };
+            mount.setacl(root_object.fh.clone(), &root_acl).await?;
+            let accepted_root_acl = mount.getacl(root_object.fh.clone()).await?;
+            ensure(
+                !accepted_root_acl.aces.is_empty(),
+                format!("NFSv4.0 directory returned an empty ACL through {url}"),
+            )?;
+            mount
+                .setacl(root_object.fh.clone(), &accepted_root_acl)
+                .await?;
+            ensure(
+                mount.getacl(root_object.fh.clone()).await? == accepted_root_acl,
+                format!("NFSv4.0 directory ACL did not stabilize through {url}"),
+            )?;
+
+            let root_file_object = mount.create_path(&root_file, Some(0o600)).await?;
+            mount.close(root_file_object.fh.clone()).await?;
+            let root_file_acl = Acl {
+                aces: vec![
+                    NfsAce {
+                        ace_type: AceType::AccessAllowed,
+                        flags: AceFlags(0),
+                        access_mask: AceMask(owner_file_mask),
+                        who: "OWNER@".to_string(),
+                    },
+                    NfsAce {
+                        ace_type: AceType::AccessAllowed,
+                        flags: AceFlags(0),
+                        access_mask: AceMask(read_file_mask),
+                        who: "EVERYONE@".to_string(),
+                    },
+                ],
+            };
+            mount
+                .setacl(root_file_object.fh.clone(), &root_file_acl)
+                .await?;
+            let accepted_root_file_acl = mount.getacl(root_file_object.fh.clone()).await?;
+            ensure(
+                !accepted_root_file_acl.aces.is_empty(),
+                format!("NFSv4.0 file returned an empty ACL through {url}"),
+            )?;
+            mount
+                .setacl(root_file_object.fh.clone(), &accepted_root_file_acl)
+                .await?;
+            ensure(
+                mount.getacl(root_file_object.fh.clone()).await? == accepted_root_file_acl,
+                format!("NFSv4.0 file ACL did not stabilize through {url}"),
+            )?;
+
+            let child_directory_object = mount.mkdir_path(&child_directory, 0o700).await?;
+            let inherited_child_acl = mount.getacl(child_directory_object.fh.clone()).await?;
+            ensure(
+                inherited_child_acl
+                    .aces
+                    .iter()
+                    .any(|ace| ace.who == "EVERYONE@"),
+                format!("NFSv4.0 child directory did not inherit an EVERYONE@ ACE through {url}"),
+            )?;
+            let child_directory_acl = Acl {
+                aces: vec![NfsAce {
+                    ace_type: AceType::AccessAllowed,
+                    flags: AceFlags(AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT),
+                    access_mask: AceMask(owner_directory_mask),
+                    who: "OWNER@".to_string(),
+                }],
+            };
+            mount
+                .setacl(child_directory_object.fh.clone(), &child_directory_acl)
+                .await?;
+            let accepted_child_directory_acl =
+                mount.getacl(child_directory_object.fh.clone()).await?;
+            ensure(
+                accepted_child_directory_acl != inherited_child_acl,
+                format!("NFSv4.0 child-directory ACL did not change after SET through {url}"),
+            )?;
+            mount
+                .setacl(
+                    child_directory_object.fh.clone(),
+                    &accepted_child_directory_acl,
+                )
+                .await?;
+            ensure(
+                mount.getacl(child_directory_object.fh.clone()).await?
+                    == accepted_child_directory_acl,
+                format!("NFSv4.0 child-directory ACL did not stabilize through {url}"),
+            )?;
+
+            let child_file_object = mount.create_path(&child_file, Some(0o600)).await?;
+            mount.close(child_file_object.fh.clone()).await?;
+            let inherited_file_acl = mount.getacl(child_file_object.fh.clone()).await?;
+            ensure(
+                !inherited_file_acl.aces.is_empty(),
+                format!("NFSv4.0 child file returned an empty inherited ACL through {url}"),
+            )?;
+            let child_file_acl = Acl {
+                aces: vec![NfsAce {
+                    ace_type: AceType::AccessAllowed,
+                    flags: AceFlags(0),
+                    access_mask: AceMask(read_file_mask),
+                    who: "EVERYONE@".to_string(),
+                }],
+            };
+            mount
+                .setacl(child_file_object.fh.clone(), &child_file_acl)
+                .await?;
+            let accepted_child_file_acl = mount.getacl(child_file_object.fh.clone()).await?;
+            ensure(
+                accepted_child_file_acl != inherited_file_acl,
+                format!("NFSv4.0 child-file ACL did not change after SET through {url}"),
+            )?;
+            mount
+                .setacl(child_file_object.fh.clone(), &accepted_child_file_acl)
+                .await?;
+            ensure(
+                mount.getacl(child_file_object.fh.clone()).await? == accepted_child_file_acl,
+                format!("NFSv4.0 child-file ACL did not stabilize through {url}"),
+            )?;
+            Ok(())
+        }
+        .await;
+
+        let mut cleanup_error = None;
+        if let Err(error) = mount.remove_path(&child_file).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.rmdir_path(&child_directory).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.remove_path(&root_file).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.rmdir_path(&root).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.umount().await {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        result?;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires writable Linux knfsd source and FAS2750 target fixtures"]
+async fn nfs_v40_linux_acls_migrate_to_fas2750() -> TestResult {
+    let source_url = env::var(LAB_ACL_SOURCE_URL_ENV)?;
+    let target_url = env::var(LAB_ACL_TARGET_URL_ENV)?;
+    for (role, url) in [("source", &source_url), ("target", &target_url)] {
+        ensure(
+            url.contains("version=4.0"),
+            format!("ACL migration {role} is not an exact NFSv4.0 URL: {url}"),
+        )?;
+    }
+
+    let source = parse_url_and_mount(&source_url).await?;
+    let target = parse_url_and_mount(&target_url).await?;
+    ensure(
+        source.version() == NFSVersion::NFSv4p0 && target.version() == NFSVersion::NFSv4p0,
+        "ACL migration fixtures negotiated the wrong protocol",
+    )?;
+
+    let case = format!("nfs-rs-acl-migration-{}", std::process::id());
+    let child_directory = format!("{case}/child");
+    let child_file = format!("{child_directory}/payload.bin");
+    for mount in [&source, &target] {
+        let _ = mount.remove_path(&child_file).await;
+        let _ = mount.rmdir_path(&child_directory).await;
+        let _ = mount.rmdir_path(&case).await;
+    }
+
+    let result: TestResult = async {
+        let source_root = source.mkdir_path(&case, 0o700).await?;
+        let source_root_acl = Acl {
+            aces: vec![
+                NfsAce {
+                    ace_type: AceType::AccessAllowed,
+                    flags: AceFlags(0),
+                    access_mask: AceMask(
+                        AceMask::READ_DATA
+                            | AceMask::WRITE_DATA
+                            | AceMask::APPEND_DATA
+                            | AceMask::EXECUTE
+                            | AceMask::DELETE_CHILD
+                            | AceMask::READ_ATTRIBUTES
+                            | AceMask::WRITE_ATTRIBUTES
+                            | AceMask::READ_NAMED_ATTRS
+                            | AceMask::WRITE_NAMED_ATTRS
+                            | AceMask::READ_ACL
+                            | AceMask::WRITE_ACL
+                            | AceMask::WRITE_OWNER
+                            | AceMask::SYNCHRONIZE,
+                    ),
+                    who: "OWNER@".to_string(),
+                },
+                NfsAce {
+                    ace_type: AceType::AccessAllowed,
+                    flags: AceFlags(AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT),
+                    access_mask: AceMask(
+                        AceMask::READ_DATA
+                            | AceMask::EXECUTE
+                            | AceMask::READ_ATTRIBUTES
+                            | AceMask::READ_NAMED_ATTRS
+                            | AceMask::READ_ACL
+                            | AceMask::SYNCHRONIZE,
+                    ),
+                    who: "EVERYONE@".to_string(),
+                },
+            ],
+        };
+        source
+            .setacl(source_root.fh.clone(), &source_root_acl)
+            .await?;
+        let source_directory = source.mkdir_path(&child_directory, 0o750).await?;
+        let source_file = source.create_path(&child_file, Some(0o640)).await?;
+        source.close(source_file.fh.clone()).await?;
+
+        // The Linux server's readback, including its normalization, is the
+        // authoritative source snapshot used by this migration test.
+        let source_directory_acl = source.getacl(source_directory.fh.clone()).await?;
+        let source_file_acl = source.getacl(source_file.fh.clone()).await?;
+        ensure(
+            !source_directory_acl.aces.is_empty() && !source_file_acl.aces.is_empty(),
+            "Linux source returned an empty ACL",
+        )?;
+
+        target.mkdir_path(&case, 0o700).await?;
+        let target_directory = target.mkdir_path(&child_directory, 0o700).await?;
+        let target_file = target.create_path(&child_file, Some(0o600)).await?;
+        target.close(target_file.fh.clone()).await?;
+
+        // Existing objects migrate file ACLs first and directory ACLs last so
+        // final directory inheritance cannot affect creation of this tree.
+        target
+            .setacl(target_file.fh.clone(), &source_file_acl)
+            .await?;
+        let target_file_acl = target.getacl(target_file.fh.clone()).await?;
+        ensure_acl_structural_fidelity(
+            &source_file_acl,
+            &target_file_acl,
+            "Linux-to-FAS2750 file",
+        )?;
+        target
+            .setacl(target_directory.fh.clone(), &source_directory_acl)
+            .await?;
+        let target_directory_acl = target.getacl(target_directory.fh.clone()).await?;
+        ensure_acl_structural_fidelity(
+            &source_directory_acl,
+            &target_directory_acl,
+            "Linux-to-FAS2750 directory",
+        )?;
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_error = None;
+    for mount in [&target, &source] {
+        if let Err(error) = mount.remove_path(&child_file).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.rmdir_path(&child_directory).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+        if let Err(error) = mount.rmdir_path(&case).await
+            && !error.is_not_found()
+        {
+            cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+        }
+    }
+    if let Err(error) = source.umount().await {
+        cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+    }
+    if let Err(error) = target.umount().await {
+        cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+    }
+    result?;
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires writable Linux knfsd and FAS2750 NFSv4.0/NFSv4.1 fixtures"]
+async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
+    let endpoints = [
+        (
+            "linux-v40",
+            env::var(LAB_ACL_LINUX_V40_URL_ENV)?,
+            NFSVersion::NFSv4p0,
+        ),
+        (
+            "linux-v41",
+            env::var(LAB_ACL_LINUX_V41_URL_ENV)?,
+            NFSVersion::NFSv4p1,
+        ),
+        (
+            "fas2750-v40",
+            env::var(LAB_ACL_FAS2750_V40_URL_ENV)?,
+            NFSVersion::NFSv4p0,
+        ),
+        (
+            "fas2750-v41",
+            env::var(LAB_ACL_FAS2750_V41_URL_ENV)?,
+            NFSVersion::NFSv4p1,
+        ),
+    ];
+
+    for (source_index, (source_label, source_url, source_version)) in endpoints.iter().enumerate() {
+        for (target_index, (target_label, target_url, target_version)) in
+            endpoints.iter().enumerate()
+        {
+            let label = format!("{source_label}-to-{target_label}");
+            let case_index = source_index * endpoints.len() + target_index;
+            ensure(
+                source_url.contains(match source_version {
+                    NFSVersion::NFSv4p0 => "version=4.0",
+                    NFSVersion::NFSv4p1 => "version=4.1",
+                    _ => unreachable!(),
+                }) && target_url.contains(match target_version {
+                    NFSVersion::NFSv4p0 => "version=4.0",
+                    NFSVersion::NFSv4p1 => "version=4.1",
+                    _ => unreachable!(),
+                }),
+                format!("ACL matrix URL/version mismatch for {label}"),
+            )?;
+            let source = parse_url_and_mount(source_url).await?;
+            let target = parse_url_and_mount(target_url).await?;
+            ensure(
+                source.version() == *source_version && target.version() == *target_version,
+                format!("ACL matrix case {label} negotiated the wrong protocol version"),
+            )?;
+
+            let suffix = format!("{}-{case_index}", std::process::id());
+            let source_root = format!("nfs-rs-acl-cross-version-source-{suffix}");
+            let source_directory = format!("{source_root}/child");
+            let source_file = format!("{source_directory}/payload.bin");
+            let source_inherited_directory = format!("{source_directory}/inherited-child");
+            let source_inherited_file = format!("{source_inherited_directory}/inherited.bin");
+            let target_root = format!("nfs-rs-acl-cross-version-target-{suffix}");
+            let target_directory = format!("{target_root}/child");
+            let target_file = format!("{target_directory}/payload.bin");
+            let target_inherited_directory = format!("{target_directory}/inherited-child");
+            let target_inherited_file = format!("{target_inherited_directory}/inherited.bin");
+
+            for (mount, inherited_file, inherited_directory, file, directory, root) in [
+                (
+                    &source,
+                    &source_inherited_file,
+                    &source_inherited_directory,
+                    &source_file,
+                    &source_directory,
+                    &source_root,
+                ),
+                (
+                    &target,
+                    &target_inherited_file,
+                    &target_inherited_directory,
+                    &target_file,
+                    &target_directory,
+                    &target_root,
+                ),
+            ] {
+                let _ = mount.remove_path(inherited_file).await;
+                let _ = mount.rmdir_path(inherited_directory).await;
+                let _ = mount.remove_path(file).await;
+                let _ = mount.rmdir_path(directory).await;
+                let _ = mount.rmdir_path(root).await;
+            }
+
+            let result: TestResult = async {
+                let source_root_object = source.mkdir_path(&source_root, 0o700).await?;
+                let inheritable_acl = Acl {
+                    aces: vec![
+                        NfsAce {
+                            ace_type: AceType::AccessAllowed,
+                            flags: AceFlags(0),
+                            access_mask: AceMask(
+                                AceMask::READ_DATA
+                                    | AceMask::WRITE_DATA
+                                    | AceMask::APPEND_DATA
+                                    | AceMask::EXECUTE
+                                    | AceMask::DELETE_CHILD
+                                    | AceMask::READ_ATTRIBUTES
+                                    | AceMask::WRITE_ATTRIBUTES
+                                    | AceMask::READ_NAMED_ATTRS
+                                    | AceMask::WRITE_NAMED_ATTRS
+                                    | AceMask::READ_ACL
+                                    | AceMask::WRITE_ACL
+                                    | AceMask::WRITE_OWNER
+                                    | AceMask::SYNCHRONIZE,
+                            ),
+                            who: "OWNER@".to_string(),
+                        },
+                        NfsAce {
+                            ace_type: AceType::AccessAllowed,
+                            flags: AceFlags(AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT),
+                            access_mask: AceMask(
+                                AceMask::READ_DATA
+                                    | AceMask::EXECUTE
+                                    | AceMask::READ_ATTRIBUTES
+                                    | AceMask::READ_NAMED_ATTRS
+                                    | AceMask::READ_ACL
+                                    | AceMask::SYNCHRONIZE,
+                            ),
+                            who: "EVERYONE@".to_string(),
+                        },
+                    ],
+                };
+                source
+                    .setacl(source_root_object.fh.clone(), &inheritable_acl)
+                    .await?;
+                let source_directory_object = source.mkdir_path(&source_directory, 0o750).await?;
+                let source_file_object = source.create_path(&source_file, Some(0o640)).await?;
+                source.close(source_file_object.fh.clone()).await?;
+                let directory_snapshot = source.getacl(source_directory_object.fh.clone()).await?;
+                let file_snapshot = source.getacl(source_file_object.fh.clone()).await?;
+                ensure(
+                    !directory_snapshot.aces.is_empty() && !file_snapshot.aces.is_empty(),
+                    format!("ACL matrix source returned an empty ACL for {label}"),
+                )?;
+
+                target.mkdir_path(&target_root, 0o700).await?;
+                let target_directory_object = target.mkdir_path(&target_directory, 0o700).await?;
+                let target_file_object = target.create_path(&target_file, Some(0o600)).await?;
+                target.close(target_file_object.fh.clone()).await?;
+
+                target
+                    .setacl(target_file_object.fh.clone(), &file_snapshot)
+                    .await?;
+                let accepted_file_acl = target.getacl(target_file_object.fh.clone()).await?;
+                let file_fidelity = classify_acl_fidelity(
+                    source_label,
+                    target_label,
+                    AclObjectKind::File,
+                    &file_snapshot,
+                    &accepted_file_acl,
+                )
+                .map_err(io::Error::other)?;
+                if file_fidelity != "EXACT" {
+                        target.setacl(target_file_object.fh.clone(), &accepted_file_acl).await?;
+                        let stable = target.getacl(target_file_object.fh.clone()).await?;
+                        ensure_acl_structural_fidelity(
+                            &accepted_file_acl,
+                            &stable,
+                            &format!("ACL matrix normalized file {label}"),
+                        )?;
+                }
+                target
+                    .setacl(target_directory_object.fh.clone(), &directory_snapshot)
+                    .await?;
+                let accepted_directory_acl = target
+                    .getacl(target_directory_object.fh.clone())
+                    .await?;
+                let directory_fidelity = classify_acl_fidelity(
+                    source_label,
+                    target_label,
+                    AclObjectKind::Directory,
+                    &directory_snapshot,
+                    &accepted_directory_acl,
+                )
+                .map_err(io::Error::other)?;
+                if directory_fidelity != "EXACT" {
+                        target
+                            .setacl(
+                                target_directory_object.fh.clone(),
+                                &accepted_directory_acl,
+                            )
+                            .await?;
+                        let stable = target
+                            .getacl(target_directory_object.fh.clone())
+                            .await?;
+                        ensure_acl_structural_fidelity(
+                            &accepted_directory_acl,
+                            &stable,
+                            &format!("ACL matrix normalized directory {label}"),
+                    )?;
+                }
+
+                let source_inherited_directory_object = source
+                    .mkdir_path(&source_inherited_directory, 0o700)
+                    .await?;
+                let source_inherited_file_object = source
+                    .create_path(&source_inherited_file, Some(0o600))
+                    .await?;
+                source
+                    .close(source_inherited_file_object.fh.clone())
+                    .await?;
+                let target_inherited_directory_object = target
+                    .mkdir_path(&target_inherited_directory, 0o700)
+                    .await?;
+                let target_inherited_file_object = target
+                    .create_path(&target_inherited_file, Some(0o600))
+                    .await?;
+                target
+                    .close(target_inherited_file_object.fh.clone())
+                    .await?;
+                let inherited_directory_fidelity = classify_acl_fidelity(
+                    source_label,
+                    target_label,
+                    AclObjectKind::InheritedDirectory,
+                    &source
+                        .getacl(source_inherited_directory_object.fh.clone())
+                        .await?,
+                    &target
+                        .getacl(target_inherited_directory_object.fh.clone())
+                        .await?,
+                )
+                .map_err(io::Error::other)?;
+                let inherited_file_fidelity = classify_acl_fidelity(
+                    source_label,
+                    target_label,
+                    AclObjectKind::InheritedFile,
+                    &source
+                        .getacl(source_inherited_file_object.fh.clone())
+                        .await?,
+                    &target
+                        .getacl(target_inherited_file_object.fh.clone())
+                        .await?,
+                )
+                .map_err(io::Error::other)?;
+                println!(
+                    "NFSV4_ACL_MIGRATION_MATRIX=PASS case={label} source={:?} target={:?} file_fidelity={file_fidelity} directory_fidelity={directory_fidelity} inherited_file_fidelity={inherited_file_fidelity} inherited_directory_fidelity={inherited_directory_fidelity}",
+                    source.version(),
+                    target.version(),
+                );
+                Ok(())
+            }
+            .await;
+
+            let mut cleanup_error = None;
+            for (mount, inherited_file, inherited_directory, file, directory, root) in [
+                (
+                    &target,
+                    &target_inherited_file,
+                    &target_inherited_directory,
+                    &target_file,
+                    &target_directory,
+                    &target_root,
+                ),
+                (
+                    &source,
+                    &source_inherited_file,
+                    &source_inherited_directory,
+                    &source_file,
+                    &source_directory,
+                    &source_root,
+                ),
+            ] {
+                if let Err(error) = mount.remove_path(inherited_file).await
+                    && !error.is_not_found()
+                {
+                    cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+                }
+                if let Err(error) = mount.rmdir_path(inherited_directory).await
+                    && !error.is_not_found()
+                {
+                    cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+                }
+                if let Err(error) = mount.remove_path(file).await
+                    && !error.is_not_found()
+                {
+                    cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+                }
+                if let Err(error) = mount.rmdir_path(directory).await
+                    && !error.is_not_found()
+                {
+                    cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+                }
+                if let Err(error) = mount.rmdir_path(root).await
+                    && !error.is_not_found()
+                {
+                    cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+                }
+            }
+            if let Err(error) = source.umount().await {
+                cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+            }
+            if let Err(error) = target.umount().await {
+                cleanup_error.get_or_insert_with(|| Box::new(error) as _);
+            }
+            result?;
+            if let Some(error) = cleanup_error {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires writable Linux knfsd and FAS2750 NFSv4.1 fixtures"]
+async fn nfs_v41_dacl_and_sacl_round_trip_on_linux_and_fas2750() -> TestResult {
+    let urls = env::var("NFS_RS_LAB_ACL_V41_URLS")?;
+    for (index, url) in urls.split(',').filter(|url| !url.is_empty()).enumerate() {
+        ensure(
+            url.contains("version=4.1"),
+            format!("DACL/SACL fixture is not exact NFSv4.1: {url}"),
+        )?;
+        let mount = parse_url_and_mount(url).await?;
+        let directory = format!("nfs-rs-v41-acl41-{index}");
+        let filename = format!("{directory}/file");
+        let _ = mount.rmdir_path(&directory).await;
+        let directory_object = mount.mkdir_path(&directory, 0o700).await?;
+        let file_object = mount.create_path(&filename, Some(0o600)).await?;
+        let result = async {
+            for (kind, fh) in [
+                ("directory", directory_object.fh.clone()),
+                ("file", file_object.fh.clone()),
+            ] {
+                match mount.getdacl(fh.clone()).await {
+                    Ok(dacl) => {
+                        let replacement = NfsAcl41 {
+                            flags: Acl41Flags(dacl.flags.0 ^ Acl41Flags::PROTECTED),
+                            aces: dacl.aces.clone(),
+                        };
+                        mount.setdacl(fh.clone(), &replacement).await?;
+                        let replacement_readback = mount.getdacl(fh.clone()).await;
+                        let restore = async {
+                            mount.setdacl(fh.clone(), &dacl).await?;
+                            ensure(
+                                mount.getdacl(fh.clone()).await? == dacl,
+                                format!("{kind} DACL restore did not stabilize through {url}"),
+                            )
+                        }
+                        .await;
+                        ensure(
+                            replacement_readback? == replacement,
+                            format!("{kind} DACL full replacement failed through {url}"),
+                        )?;
+                        restore?;
+                        println!("NFSV41_DACL=SUPPORTED kind={kind} url={url}");
+                    }
+                    Err(NfsError::Unsupported(_)) => {
+                        ensure(
+                            matches!(
+                                mount.setdacl(fh.clone(), &NfsAcl41::default()).await,
+                                Err(NfsError::Unsupported(_))
+                            ),
+                            format!(
+                                "{kind} DACL SET did not preserve unsupported capability through {url}"
+                            ),
+                        )?;
+                        println!("NFSV41_DACL=UNSUPPORTED kind={kind} url={url}");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                match mount.getsacl(fh.clone()).await {
+                    Ok(sacl) => {
+                        let replacement = NfsAcl41 {
+                            flags: Acl41Flags(sacl.flags.0 ^ Acl41Flags::DEFAULTED),
+                            aces: sacl.aces.clone(),
+                        };
+                        mount.setsacl(fh.clone(), &replacement).await?;
+                        let replacement_readback = mount.getsacl(fh.clone()).await;
+                        let restore = async {
+                            mount.setsacl(fh.clone(), &sacl).await?;
+                            ensure(
+                                mount.getsacl(fh.clone()).await? == sacl,
+                                format!("{kind} SACL restore did not stabilize through {url}"),
+                            )
+                        }
+                        .await;
+                        ensure(
+                            replacement_readback? == replacement,
+                            format!("{kind} SACL full replacement failed through {url}"),
+                        )?;
+                        restore?;
+                        println!("NFSV41_SACL=SUPPORTED kind={kind} url={url}");
+                    }
+                    Err(NfsError::Unsupported(_)) => {
+                        ensure(
+                            matches!(
+                                mount.setsacl(fh, &NfsAcl41::default()).await,
+                                Err(NfsError::Unsupported(_))
+                            ),
+                            format!(
+                                "{kind} SACL SET did not preserve unsupported capability through {url}"
+                            ),
+                        )?;
+                        println!("NFSV41_SACL=UNSUPPORTED kind={kind} url={url}");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await;
+        let close = mount.close(file_object.fh).await;
+        let remove = mount.remove_path(&filename).await;
+        let cleanup = mount.rmdir_path(&directory).await;
+        let unmount = mount.umount().await;
+        result?;
+        close?;
+        remove?;
+        cleanup?;
+        unmount?;
     }
     Ok(())
 }
@@ -1360,6 +2169,248 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     } else {
         Err(io::Error::other(message.into()).into())
     }
+}
+
+fn ensure_acl_structural_fidelity(source: &Acl, target: &Acl, context: &str) -> TestResult {
+    if let Some(difference) = acl_structural_difference(source, target) {
+        return ensure(false, format!("{context} {difference}"));
+    }
+    Ok(())
+}
+
+fn acl_structural_difference(source: &Acl, target: &Acl) -> Option<String> {
+    if source.aces.len() != target.aces.len() {
+        return Some(format!(
+            "ACL ACE count differs: source={} target={}",
+            source.aces.len(),
+            target.aces.len()
+        ));
+    }
+    for (index, (source_ace, target_ace)) in source.aces.iter().zip(&target.aces).enumerate() {
+        if source_ace.ace_type != target_ace.ace_type {
+            return Some(format!("ACE {index} type differs"));
+        }
+        if source_ace.flags != target_ace.flags {
+            return Some(format!("ACE {index} flags differ"));
+        }
+        if source_ace.access_mask != target_ace.access_mask {
+            return Some(format!("ACE {index} access mask differs"));
+        }
+        if source_ace.who != target_ace.who {
+            return Some(format!("ACE {index} identity differs"));
+        }
+    }
+    None
+}
+
+fn classify_acl_fidelity(
+    source_label: &str,
+    target_label: &str,
+    kind: AclObjectKind,
+    source: &Acl,
+    target: &Acl,
+) -> Result<String, String> {
+    if acl_structural_difference(source, target).is_none() {
+        return Ok("EXACT".to_string());
+    }
+    if source_label.starts_with("fas2750-")
+        && target_label.starts_with("linux-")
+        && source == &known_fas_to_linux_source(kind)
+        && target == &known_linux_from_fas_target(kind)
+    {
+        let description = match kind {
+            AclObjectKind::File | AclObjectKind::InheritedFile => {
+                "FAS2750 file ACL to Linux mode-derived ACL"
+            }
+            AclObjectKind::Directory | AclObjectKind::InheritedDirectory => {
+                "FAS2750 inheritable ACL to Linux access/default ACLs"
+            }
+        };
+        return Ok(format!("NORMALIZED({description})"));
+    }
+    if source_label.starts_with("linux-")
+        && target_label.starts_with("fas2750-")
+        && source == &known_linux_normalized_acl(kind)
+        && target == &known_fas_acl(kind)
+    {
+        let description = match kind {
+            AclObjectKind::File | AclObjectKind::InheritedFile => {
+                "Linux mode-derived ACL to FAS2750 file ACL"
+            }
+            AclObjectKind::Directory | AclObjectKind::InheritedDirectory => {
+                "Linux access/default ACLs to FAS2750 inheritable ACL"
+            }
+        };
+        return Ok(format!("NORMALIZED({description})"));
+    }
+    Err(format!(
+        "unlisted ACL normalization from {source_label} to {target_label}: {}; source={source:?}; target={target:?}",
+        acl_structural_difference(source, target)
+            .unwrap_or_else(|| "unknown structural difference".to_string())
+    ))
+}
+
+fn known_fas_acl(kind: AclObjectKind) -> Acl {
+    match kind {
+        AclObjectKind::File => acl_from_literals(&[
+            (0, 1_179_784, "EVERYONE@"),
+            (0, 1_966_495, "OWNER@"),
+            (AceFlags::IDENTIFIER_GROUP, 1_179_785, "GROUP@"),
+        ]),
+        AclObjectKind::Directory => acl_from_literals(&[
+            (
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT,
+                1_179_784,
+                "EVERYONE@",
+            ),
+            (0, 1_966_591, "OWNER@"),
+            (AceFlags::IDENTIFIER_GROUP, 1_179_817, "GROUP@"),
+        ]),
+        AclObjectKind::InheritedFile => acl_from_literals(&[
+            (0, 1_966_495, "OWNER@"),
+            (0, 1_179_776, "GROUP@"),
+            (0, 1_179_776, "EVERYONE@"),
+        ]),
+        AclObjectKind::InheritedDirectory => acl_from_literals(&[
+            (
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT,
+                1_966_591,
+                "OWNER@",
+            ),
+            (
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT,
+                1_179_776,
+                "GROUP@",
+            ),
+            (
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT,
+                1_179_776,
+                "EVERYONE@",
+            ),
+        ]),
+    }
+}
+
+fn known_fas_to_linux_source(kind: AclObjectKind) -> Acl {
+    match kind {
+        AclObjectKind::InheritedFile => acl_from_literals(&[
+            (0, 1_179_784, "EVERYONE@"),
+            (0, 1_966_495, "OWNER@"),
+            (AceFlags::IDENTIFIER_GROUP, 1_179_776, "GROUP@"),
+        ]),
+        AclObjectKind::InheritedDirectory => acl_from_literals(&[
+            (
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT,
+                1_179_784,
+                "EVERYONE@",
+            ),
+            (0, 1_966_591, "OWNER@"),
+            (AceFlags::IDENTIFIER_GROUP, 1_179_776, "GROUP@"),
+        ]),
+        _ => known_fas_acl(kind),
+    }
+}
+
+fn known_linux_from_fas_target(kind: AclObjectKind) -> Acl {
+    match kind {
+        AclObjectKind::InheritedDirectory => {
+            let inherited =
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT | AceFlags::INHERIT_ONLY;
+            acl_from_literals(&[
+                (0, 1_442_279, "OWNER@"),
+                (0, 1_179_776, "GROUP@"),
+                (0, 1_179_776, "EVERYONE@"),
+                (inherited, 1_442_279, "OWNER@"),
+                (inherited, 1_179_809, "GROUP@"),
+                (inherited, 1_179_776, "EVERYONE@"),
+            ])
+        }
+        _ => known_linux_normalized_acl(kind),
+    }
+}
+
+fn known_linux_normalized_acl(kind: AclObjectKind) -> Acl {
+    match kind {
+        AclObjectKind::File => acl_from_literals(&[
+            (0, 1_442_183, "OWNER@"),
+            (0, 1_179_777, "GROUP@"),
+            (0, 1_179_776, "EVERYONE@"),
+        ]),
+        AclObjectKind::Directory => {
+            let inherited =
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT | AceFlags::INHERIT_ONLY;
+            acl_from_literals(&[
+                (0, 1_442_279, "OWNER@"),
+                (0, 1_179_809, "GROUP@"),
+                (0, 1_179_776, "EVERYONE@"),
+                (inherited, 1_442_279, "OWNER@"),
+                (inherited, 1_179_809, "GROUP@"),
+                (inherited, 1_179_776, "EVERYONE@"),
+            ])
+        }
+        AclObjectKind::InheritedFile => acl_from_literals(&[
+            (0, 1_442_183, "OWNER@"),
+            (0, 1_179_776, "GROUP@"),
+            (0, 1_179_776, "EVERYONE@"),
+        ]),
+        AclObjectKind::InheritedDirectory => {
+            let inherited =
+                AceFlags::FILE_INHERIT | AceFlags::DIRECTORY_INHERIT | AceFlags::INHERIT_ONLY;
+            acl_from_literals(&[
+                (0, 1_442_279, "OWNER@"),
+                (0, 1_179_776, "GROUP@"),
+                (0, 1_179_776, "EVERYONE@"),
+                (inherited, 1_442_279, "OWNER@"),
+                (inherited, 1_179_809, "GROUP@"),
+                (inherited, 1_179_809, "EVERYONE@"),
+            ])
+        }
+    }
+}
+
+fn acl_from_literals(entries: &[(u32, u32, &str)]) -> Acl {
+    Acl {
+        aces: entries
+            .iter()
+            .map(|(flags, mask, who)| NfsAce {
+                ace_type: AceType::AccessAllowed,
+                flags: AceFlags(*flags),
+                access_mask: AceMask(*mask),
+                who: (*who).to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn acl_migration_rejects_unlisted_server_normalization() {
+    let source = Acl {
+        aces: vec![NfsAce {
+            ace_type: AceType::AccessAllowed,
+            flags: AceFlags(0),
+            access_mask: AceMask(AceMask::READ_DATA),
+            who: "EVERYONE@".to_string(),
+        }],
+    };
+    let target = Acl {
+        aces: vec![NfsAce {
+            ace_type: AceType::AccessAllowed,
+            flags: AceFlags(0),
+            access_mask: AceMask(AceMask::WRITE_DATA),
+            who: "EVERYONE@".to_string(),
+        }],
+    };
+
+    assert!(
+        classify_acl_fidelity(
+            "fas2750-v40",
+            "linux-v40",
+            AclObjectKind::File,
+            &source,
+            &target
+        )
+        .is_err()
+    );
 }
 
 fn payload() -> Bytes {

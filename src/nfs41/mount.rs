@@ -1874,6 +1874,18 @@ impl crate::Mount for Mount41Wrapper {
     async fn setacl(&self, fh: Bytes, acl: &mount::Acl) -> Result<()> {
         self.m.setacl(fh, acl).await
     }
+    async fn getdacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        self.m.getdacl(fh).await
+    }
+    async fn setdacl(&self, fh: Bytes, acl: &mount::NfsAcl41) -> Result<()> {
+        self.m.setdacl(fh, acl).await
+    }
+    async fn getsacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        self.m.getsacl(fh).await
+    }
+    async fn setsacl(&self, fh: Bytes, acl: &mount::NfsAcl41) -> Result<()> {
+        self.m.setsacl(fh, acl).await
+    }
     async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
         self.m.aclsupport(fh).await
     }

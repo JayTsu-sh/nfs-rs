@@ -13,7 +13,10 @@ class SyncInner:
     io_limits = {"max_read": 8, "max_write": 4}
     closed = False
 
-    def __init__(self): self.calls, self.xattrs = [], {}
+    def __init__(self):
+        self.calls, self.xattrs = [], {}
+        self.dacl = {"flags": 0, "aces": []}
+        self.sacl = {"flags": 0, "aces": []}
     @classmethod
     def connect(cls, *_args, **_kwargs): return cls()
     def chmod(self, *args): self.calls.append(("chmod", *args))
@@ -21,6 +24,10 @@ class SyncInner:
     def utime(self, *args): self.calls.append(("utime", *args))
     def truncate_path(self, *args): self.calls.append(("truncate", *args))
     def access(self, path, mode): self.calls.append(("access", path, mode)); return path != "denied"
+    def getdacl(self, path): self.calls.append(("getdacl", path)); return self.dacl
+    def setdacl(self, path, flags, aces): self.calls.append(("setdacl", path, flags, aces)); self.dacl = {"flags": flags, "aces": aces}
+    def getsacl(self, path): self.calls.append(("getsacl", path)); return self.sacl
+    def setsacl(self, path, flags, aces): self.calls.append(("setsacl", path, flags, aces)); self.sacl = {"flags": flags, "aces": aces}
     def getxattr(self, path, name): return self.xattrs[(path, name)]
     def setxattr(self, path, name, value): self.xattrs[(path, name)] = value; self.calls.append(("setxattr", path, name, value))
     def listxattr(self, path): return sorted(name for candidate, name in self.xattrs if candidate == path)
@@ -37,6 +44,10 @@ class AsyncInner(SyncInner):
     async def utime(self, *args): return super().utime(*args)
     async def truncate_path(self, *args): return super().truncate_path(*args)
     async def access(self, *args): return super().access(*args)
+    async def getdacl(self, *args): return super().getdacl(*args)
+    async def setdacl(self, *args): return super().setdacl(*args)
+    async def getsacl(self, *args): return super().getsacl(*args)
+    async def setsacl(self, *args): return super().setsacl(*args)
     async def getxattr(self, *args): return super().getxattr(*args)
     async def setxattr(self, *args): return super().setxattr(*args)
     async def listxattr(self, *args): return super().listxattr(*args)
@@ -48,7 +59,9 @@ class AsyncInner(SyncInner):
 fake = ModuleType("nfs_rs._internal")
 fake.SyncClient, fake.AsyncClient = SyncInner, AsyncInner
 
-from nfs_rs import AsyncClient, Client
+from nfs_rs import (
+    AceFlags, AceMask, AceType, Acl41Flags, AsyncClient, Client, NfsAce, NfsAcl41,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +97,24 @@ def test_utime_requires_exact_ns_tuple():
     with pytest.raises(TypeError): client.utime("file", ns=(1,))
 
 
+def test_sync_nfsv41_dacl_and_sacl_are_typed_and_immutable():
+    client = Client.connect("nfs://server/export")
+    dacl = NfsAcl41(
+        Acl41Flags.AUTO_INHERIT,
+        (NfsAce(AceType.ALLOW, AceFlags.FILE_INHERIT, AceMask.READ_DATA, "EVERYONE@"),),
+    )
+    client.setdacl("a/./directory", dacl)
+    assert client.getdacl("a/directory") == dacl
+    sacl = NfsAcl41(
+        Acl41Flags.PROTECTED,
+        (NfsAce(AceType.AUDIT, AceFlags.SUCCESSFUL_ACCESS, AceMask.WRITE_DATA, "EVERYONE@"),),
+    )
+    client.setsacl("file", sacl)
+    assert client.getsacl("file") == sacl
+    with pytest.raises(FrozenInstanceError):
+        dacl.flags = Acl41Flags.DEFAULTED
+
+
 def test_async_surface_matches_sync():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
@@ -92,6 +123,14 @@ def test_async_surface_matches_sync():
         await client.utime("file", ns=(10, 20))
         await client.truncate("file", 3)
         assert await client.access("file", 6)
+        dacl = NfsAcl41(
+            Acl41Flags.PROTECTED,
+            (NfsAce(AceType.DENY, AceFlags(0), AceMask.WRITE_DATA, "EVERYONE@"),),
+        )
+        await client.setdacl("file", dacl)
+        assert await client.getdacl("file") == dacl
+        await client.setsacl("file", NfsAcl41(Acl41Flags(0), ()))
+        assert await client.getsacl("file") == NfsAcl41(Acl41Flags(0), ())
         await client.setxattr("file", "user.key", memoryview(b"async"))
         assert await client.getxattr("file", "user.key") == b"async"
         assert await client.listxattr("file") == ["user.key"]
