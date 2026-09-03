@@ -95,7 +95,10 @@ impl StateManager {
     pub async fn get_stateid(&self, fh: &Bytes) -> StateId {
         let files = self.open_files.read().await;
         match files.get(fh) {
-            Some(state) if state.generation == self.active_generation.load(Ordering::Acquire) => {
+            Some(state)
+                if state.ref_count > 0
+                    && state.generation == self.active_generation.load(Ordering::Acquire) =>
+            {
                 state.stateid.clone()
             }
             Some(_) | None => StateId::anonymous(),
@@ -147,15 +150,19 @@ impl StateManager {
         Ok(())
     }
 
-    /// Release a reference. Returns true if ref_count reached 0 (caller should CLOSE).
+    /// Release a reference. A final release remains tracked until the caller
+    /// confirms that CLOSE succeeded, allowing umount to retry failed cleanup.
     pub async fn release(&self, fh: &Bytes) -> Option<StateId> {
         let mut files = self.open_files.write().await;
         if let Some(state) = files.get_mut(fh) {
+            if state.ref_count == 0 {
+                debug!(fh_len = fh.len(), "state: retry pending CLOSE");
+                return Some(state.stateid.clone());
+            }
             state.ref_count = state.ref_count.saturating_sub(1);
             if state.ref_count == 0 {
                 let sid = state.stateid.clone();
-                files.remove(fh);
-                debug!(fh_len = fh.len(), "state: last ref released, should CLOSE");
+                debug!(fh_len = fh.len(), "state: last ref released, CLOSE pending");
                 return Some(sid);
             }
             debug!(
@@ -165,6 +172,18 @@ impl StateManager {
             );
         }
         None
+    }
+
+    /// Forget a pending final release only after the matching CLOSE completed.
+    pub async fn close_succeeded(&self, fh: &Bytes, stateid: &StateId) {
+        let mut files = self.open_files.write().await;
+        if files
+            .get(fh)
+            .is_some_and(|state| state.ref_count == 0 && state.stateid == *stateid)
+        {
+            files.remove(fh);
+            debug!(fh_len = fh.len(), "state: CLOSE completed");
+        }
     }
 
     /// Drain all open states, returning (fh, stateid) pairs for CLOSE.
@@ -190,7 +209,8 @@ impl StateManager {
     pub async fn has_open(&self, fh: &Bytes, access: AccessMode) -> Option<StateId> {
         let files = self.open_files.read().await;
         files.get(fh).and_then(|state| {
-            if state.generation == self.active_generation.load(Ordering::Acquire)
+            if state.ref_count > 0
+                && state.generation == self.active_generation.load(Ordering::Acquire)
                 && state.access.covers(access)
             {
                 Some(state.stateid.clone())
@@ -217,6 +237,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mgr.get_stateid(&fh).await, sid);
+    }
+
+    #[tokio::test]
+    async fn final_release_remains_available_for_cleanup_until_close_succeeds() {
+        let mgr = StateManager::new();
+        let fh = Bytes::from_static(b"test_fh");
+        let sid = StateId::from_bytes(&[2u8; 16]);
+        mgr.register_open(&fh, sid.clone(), AccessMode::Write)
+            .await
+            .unwrap();
+
+        assert_eq!(mgr.release(&fh).await, Some(sid.clone()));
+        assert_eq!(mgr.release(&fh).await, Some(sid.clone()));
+        assert_eq!(mgr.drain().await, vec![(fh, sid)]);
+    }
+
+    #[tokio::test]
+    async fn successful_close_forgets_the_matching_pending_release() {
+        let mgr = StateManager::new();
+        let fh = Bytes::from_static(b"test_fh");
+        let sid = StateId::from_bytes(&[3u8; 16]);
+        mgr.register_open(&fh, sid.clone(), AccessMode::Write)
+            .await
+            .unwrap();
+        assert_eq!(mgr.release(&fh).await, Some(sid.clone()));
+
+        mgr.close_succeeded(&fh, &sid).await;
+
+        assert!(mgr.drain().await.is_empty());
     }
 
     #[tokio::test]

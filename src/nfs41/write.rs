@@ -162,13 +162,13 @@ impl Mount41 {
         }
         // Release ref in StateManager; if ref_count hits 0, send CLOSE to server
         if let Some(sid) = self.state.release(&fh).await {
-            let _ = self
-                .compound("close", |b| {
-                    b.require_generation(sid.generation)
-                        .putfh(&fh)
-                        .close(0, &sid.raw)
-                })
-                .await;
+            self.compound("close", |b| {
+                b.require_generation(sid.generation)
+                    .putfh(&fh)
+                    .close(0, &sid.raw)
+            })
+            .await?;
+            self.state.close_succeeded(&fh, &sid).await;
         }
         Ok(())
     }
@@ -179,12 +179,33 @@ impl Mount41 {
         filename: &str,
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
+        self.create_with_access(dir_fh, filename, mode, crate::OPEN_BOTH)
+            .await
+    }
+
+    pub(crate) async fn create_with_access(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<mount::ObjRes> {
+        let access_mode = match access {
+            crate::OPEN_READ => AccessMode::Read,
+            crate::OPEN_WRITE => AccessMode::Write,
+            crate::OPEN_BOTH => AccessMode::Both,
+            _ => {
+                return Err(NfsError::InvalidInput(format!(
+                    "invalid OPEN access {access}"
+                )));
+            }
+        };
         // 不在 OPEN createattrs 传 mode，避免 NFS4ERR_ATTRNOTSUPP；创建后 SETATTR 设置。
         let bitmap = standard_getattr_bitmap();
         let open_args = OpenArgs {
             seqid: 0,
-            share_access: 0x00000003, // OPEN4_SHARE_ACCESS_BOTH
-            share_deny: 0,            // OPEN4_SHARE_DENY_NONE
+            share_access: access_mode.share_access(),
+            share_deny: 0, // OPEN4_SHARE_DENY_NONE
             client_id: self.session_holder.get().await.client_id(),
             owner: Bytes::from_static(b"nfs-rs-create"),
             create: true,
@@ -239,7 +260,7 @@ impl Mount41 {
             .register_open(
                 &fh,
                 StateId::from_bytes_at(&stateid, resp.session_generation),
-                AccessMode::Both,
+                access_mode,
             )
             .await?;
         Ok(mount::ObjRes {
@@ -249,9 +270,20 @@ impl Mount41 {
     }
 
     pub(crate) async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+        self.create_path_with_access(path, mode, crate::OPEN_BOTH)
+            .await
+    }
+
+    pub(crate) async fn create_path_with_access(
+        &self,
+        path: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(path)?;
         let dir_obj = self.lookup_path(&dir).await?;
-        self.create(dir_obj.fh, &name, mode).await
+        self.create_with_access(dir_obj.fh, &name, mode, access)
+            .await
     }
 
     pub(crate) async fn mkdir(

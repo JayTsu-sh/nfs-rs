@@ -436,6 +436,22 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Ok(OpenFile::from_object(self.create_path(path, mode).await?))
     }
 
+    /// Stateful create that preserves the caller's requested OPEN share access.
+    /// Stateless protocol engines may ignore the access after validating it.
+    async fn create_path_stateful_with_access(
+        &self,
+        path: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<OpenFile> {
+        if !matches!(access, OPEN_READ | OPEN_WRITE | OPEN_BOTH) {
+            return Err(NfsError::InvalidInput(format!(
+                "invalid create OPEN access {access}"
+            )));
+        }
+        self.create_path_stateful(path, mode).await
+    }
+
     /// Procedure DELEGPURGE purges delegations (NFSv4 only; returns Unsupported on NFSv3).
     #[deprecated(note = "delegation lifecycle is managed internally by the mount")]
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {

@@ -1504,7 +1504,9 @@ impl Mount for Mount40 {
                 .await
         {
             let _ = self.close(object.fh.clone()).await;
-            let _ = self.remove(dir_fh, filename).await;
+            // OPEN uses UNCHECKED4, so success does not prove that this call
+            // created the directory entry. Removing it here could delete an
+            // object created concurrently by another client.
             return Err(error);
         }
         let attr = self.getattr(object.fh.clone()).await?;
@@ -1519,11 +1521,18 @@ impl Mount for Mount40 {
         self.create(parent.fh, &name, mode).await
     }
     async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<mount::OpenFile> {
+        self.create_path_stateful_with_access(path, mode, crate::OPEN_BOTH)
+            .await
+    }
+    async fn create_path_stateful_with_access(
+        &self,
+        path: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
         let (dir, name) = crate::split_path(path)?;
         let parent = self.lookup_path(&dir).await?;
-        let opened = self
-            .open_file(parent.fh.clone(), &name, crate::OPEN_BOTH, true)
-            .await?;
+        let opened = self.open_file(parent.fh, &name, access, true).await?;
         if let Some(mode) = mode
             && let Err(error) = self
                 .setattr(
@@ -1539,7 +1548,9 @@ impl Mount for Mount40 {
                 .await
         {
             let _ = self.close_stateful(opened).await;
-            let _ = self.remove(parent.fh, &name).await;
+            // UNCHECKED4 cannot distinguish a newly created target from one
+            // that won a concurrent name-creation race. Never remove it as a
+            // compensating action after SETATTR failure.
             return Err(error);
         }
         Ok(opened)
@@ -4987,6 +4998,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(symlink.fh, Bytes::from_static(b"link-fh"));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_create_setattr_never_removes_an_unchecked_open_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let create = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &create,
+                &open_result(0, [0x41; 16], b"possibly-existing-fh"),
+            )
+            .await?;
+
+            let setattr = read_record(&mut stream).await?;
+            reply(&mut stream, &setattr, &failed_lock_result("setattr", 34, 5)).await?;
+
+            let close = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x42; 16])]),
+            )
+            .await?;
+
+            Ok::<bool, std::io::Error>(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_ok(),
+            )
+        });
+
+        assert!(
+            mount
+                .create(Bytes::from_static(b"root"), "raced-name", Some(0o600),)
+                .await
+                .is_err()
+        );
+        assert!(
+            !server.await.unwrap().unwrap(),
+            "UNCHECKED4 rollback must not remove a name that may predate this OPEN"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateful_create_preserves_write_only_share_access() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let create = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &create,
+                &open_result(0, [0x51; 16], b"write-only-fh"),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &close,
+                &compound_result("close", &[(22, &[]), (4, &[0x52; 16])]),
+            )
+            .await
+        });
+
+        let opened = mount
+            .create_path_stateful_with_access("file", None, crate::OPEN_WRITE)
+            .await
+            .unwrap();
+        let fh = opened.file_handle();
+        assert!(mount.state.for_fh(&fh, crate::OPEN_WRITE).await.is_some());
+        assert!(mount.state.for_fh(&fh, crate::OPEN_READ).await.is_none());
+        mount.close_stateful(opened).await.unwrap();
         server.await.unwrap().unwrap();
     }
 

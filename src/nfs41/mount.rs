@@ -1700,6 +1700,16 @@ impl crate::Mount for Mount41Wrapper {
     async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
         self.m.create_path(path, mode).await
     }
+    async fn create_path_stateful_with_access(
+        &self,
+        path: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
+        Ok(mount::OpenFile::from_object(
+            self.m.create_path_with_access(path, mode, access).await?,
+        ))
+    }
     async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
         self.m.mkdir(dir_fh, dirname, mode).await
     }
