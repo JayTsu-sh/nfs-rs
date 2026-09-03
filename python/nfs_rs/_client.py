@@ -361,7 +361,23 @@ def _record_cleanup_failure(exc: BaseException, cleanup_error: BaseException, ow
 
 def _configured_url(url: str, options: dict[str, Any]) -> str:
     parsed = urlsplit(url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    allowed_query_names = {
+        "version",
+        "uid",
+        "gid",
+        "nfsport",
+        "mountport",
+        "rsize",
+        "wsize",
+        "readdir-buffer",
+        "noresvport",
+        "retain-delegations",
+    }
+    unknown = sorted({name for name, _ in query_items} - allowed_query_names)
+    if unknown:
+        raise ValueError(f"unknown NFS URL query option: {', '.join(unknown)}")
+    query = dict(query_items)
     names = {
         "uid": "uid",
         "gid": "gid",

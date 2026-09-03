@@ -86,6 +86,12 @@ def test_async_factory_rejects_invalid_options_before_adapter():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("query", ["versoin=4.1", "uid=1000&typo=value"])
+def test_factory_rejects_unknown_url_query_options_before_adapter(query):
+    with pytest.raises(ValueError, match="unknown NFS URL query option"):
+        Client.connect(f"nfs://server/export?{query}")
+
+
 def test_sync_context_preserves_body_exception_when_close_also_fails():
     FakeSyncClient.fail_close = True
     with pytest.raises(ValueError, match="body failed") as raised:

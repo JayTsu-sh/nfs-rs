@@ -28,6 +28,29 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 type DirectoryItem = std::result::Result<Py<PyDict>, NfsError>;
 
+fn deadline_exceeded(operation: &str) -> NfsError {
+    NfsError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("{operation} deadline exceeded"),
+    ))
+}
+
+async fn with_operation_timeout<T, F>(
+    timeout: Option<Duration>,
+    operation: &str,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| deadline_exceeded(operation))?,
+        None => future.await,
+    }
+}
+
 #[cfg(feature = "python-test-support")]
 #[derive(Debug, Default)]
 struct OpenTestBarrier {
@@ -2487,6 +2510,7 @@ async fn directory_receiver(
             let _operation = operation;
             core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
                 .await;
+            drop(sender);
         });
         return Ok(receiver);
     }
@@ -2569,6 +2593,7 @@ async fn directory_receiver(
 struct SyncDirectoryCursor {
     runtime: Arc<Runtime>,
     receiver: Mutex<mpsc::Receiver<DirectoryItem>>,
+    operation_timeout: Option<Duration>,
 }
 
 #[pymethods]
@@ -2583,7 +2608,12 @@ impl SyncDirectoryCursor {
                 .receiver
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("directory cursor lock poisoned"))?;
-            match self.runtime.block_on(receiver.recv()) {
+            let item = self.runtime.block_on(with_operation_timeout(
+                self.operation_timeout,
+                "scandir",
+                async { Ok(receiver.recv().await) },
+            ));
+            match item.map_err(nfs_error)? {
                 Some(Ok(values)) => Ok(Some(values)),
                 Some(Err(error)) => Err(nfs_error(error)),
                 None => Ok(None),
@@ -2595,6 +2625,7 @@ impl SyncDirectoryCursor {
 #[pyclass(module = "nfs_rs._internal")]
 struct AsyncDirectoryCursor {
     receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectoryItem>>>,
+    operation_timeout: Option<Duration>,
 }
 
 #[pymethods]
@@ -2605,8 +2636,14 @@ impl AsyncDirectoryCursor {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match receiver.lock().await.recv().await {
+            let item = with_operation_timeout(timeout, "scandir", async {
+                Ok(receiver.lock().await.recv().await)
+            })
+            .await
+            .map_err(nfs_error)?;
+            match item {
                 Some(Ok(values)) => Ok(values),
                 Some(Err(error)) => Err(nfs_error(error)),
                 None => Err(PyStopAsyncIteration::new_err(())),
@@ -2768,7 +2805,7 @@ async fn connect_mount(url: &str, timeout: Option<Duration>) -> Result<Box<dyn M
     if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, parse_url_and_mount(url))
             .await
-            .map_err(|_| NfsError::Rpc("connection deadline exceeded".to_string()))?
+            .map_err(|_| deadline_exceeded("connection"))?
     } else {
         parse_url_and_mount(url).await
     }
@@ -2792,7 +2829,11 @@ async fn open_file(
             Ok(file) => file,
             Err(error) if mode.create && error.is_not_found() => {
                 match mount
-                    .create_path_stateful(&path, mode.create_permissions())
+                    .create_path_stateful_with_access(
+                        &path,
+                        mode.create_permissions(),
+                        mode.access(),
+                    )
                     .await
                 {
                     Ok(file) => file,
@@ -3083,6 +3124,7 @@ async fn cancellation_safe_open_file(
     resources: Arc<AdapterResources>,
     path: String,
     mode: String,
+    timeout: Option<Duration>,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
     let operation = core.begin_operation()?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -3106,9 +3148,12 @@ async fn cancellation_safe_open_file(
             barrier.settled.notify_one();
         }
     })?;
-    receiver
-        .await
-        .map_err(|_| NfsError::Rpc("open task ended without a result".to_string()))?
+    with_operation_timeout(timeout, "open", async {
+        receiver
+            .await
+            .map_err(|_| NfsError::Rpc("open task ended without a result".to_string()))?
+    })
+    .await
 }
 
 fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &NfsError) {
@@ -3187,6 +3232,7 @@ async fn cancellation_safe_file_operation<T, F>(
     core: Arc<ClientCore>,
     resource: Arc<FileResource>,
     operation_name: &'static str,
+    timeout: Option<Duration>,
     future: F,
 ) -> Result<T>
 where
@@ -3207,15 +3253,19 @@ where
         }
         notify_operation_test_settled(operation_name);
     })?;
-    receiver
-        .await
-        .map_err(|_| NfsError::Rpc("file operation task ended without a result".to_string()))?
+    with_operation_timeout(timeout, operation_name, async {
+        receiver
+            .await
+            .map_err(|_| NfsError::Rpc("file operation task ended without a result".to_string()))?
+    })
+    .await
 }
 
 async fn cancellation_safe_owned_operation<T, F>(
     core: Arc<ClientCore>,
     safe_path: Option<String>,
     operation_name: &'static str,
+    timeout: Option<Duration>,
     future: F,
 ) -> Result<T>
 where
@@ -3233,9 +3283,12 @@ where
         }
         notify_operation_test_settled(operation_name);
     })?;
-    receiver
-        .await
-        .map_err(|_| NfsError::Rpc("owned operation task ended without a result".to_string()))?
+    with_operation_timeout(timeout, operation_name, async {
+        receiver
+            .await
+            .map_err(|_| NfsError::Rpc("owned operation task ended without a result".to_string()))?
+    })
+    .await
 }
 
 #[cfg(feature = "python-test-support")]
@@ -3270,6 +3323,7 @@ async fn cancellation_safe_close_file(
     resources: Arc<AdapterResources>,
     key: ResourceKey,
     resource: Arc<FileResource>,
+    timeout: Option<Duration>,
 ) -> std::result::Result<(), Arc<NfsError>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task_core = core.clone();
@@ -3285,7 +3339,13 @@ async fn cancellation_safe_close_file(
         notify_operation_test_settled("close");
     })
     .map_err(Arc::new)?;
-    receiver.await.map_err(|_| {
+    let received = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, receiver)
+            .await
+            .map_err(|_| Arc::new(deadline_exceeded("close")))?,
+        None => receiver.await,
+    };
+    received.map_err(|_| {
         Arc::new(NfsError::Rpc(
             "file close task ended without a result".to_string(),
         ))
@@ -3313,6 +3373,26 @@ struct SyncFile {
     resources: Arc<AdapterResources>,
     core: Arc<ClientCore>,
     runtime: Arc<Runtime>,
+    operation_timeout: Option<Duration>,
+}
+
+impl SyncFile {
+    fn run_operation<T, F>(&self, py: Python<'_>, operation: &'static str, future: F) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        py.detach(|| {
+            self.runtime.block_on(cancellation_safe_file_operation(
+                self.core.clone(),
+                self.resource.clone(),
+                operation,
+                self.operation_timeout,
+                future,
+            ))
+        })
+        .map_err(nfs_error)
+    }
 }
 
 #[pymethods]
@@ -3354,40 +3434,31 @@ impl SyncFile {
 
     #[pyo3(signature = (size = -1))]
     fn read(&self, py: Python<'_>, size: i64) -> PyResult<Py<PyBytes>> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.read(size).await
-            })
-        });
-        let data = observe_file_result(&self.resource, result).map_err(nfs_error)?;
+        let resource = self.resource.clone();
+        let data = self.run_operation(py, "read", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.read(size).await
+        })?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, size = -1))]
     fn read_at(&self, py: Python<'_>, offset: u64, size: i64) -> PyResult<Py<PyBytes>> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.read_at(offset, size).await
-            })
-        });
-        let data = observe_file_result(&self.resource, result).map_err(nfs_error)?;
+        let resource = self.resource.clone();
+        let data = self.run_operation(py, "read_at", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.read_at(offset, size).await
+        })?;
         Ok(PyBytes::new(py, &data).unbind())
     }
 
     #[pyo3(signature = (offset, whence = 0))]
     fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.seek(offset, whence).await
-            })
-        });
-        observe_file_result(&self.resource, result).map_err(|error| nfs_error_ref(&error))
+        let resource = self.resource.clone();
+        self.run_operation(py, "seek", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.seek(offset, whence).await
+        })
     }
 
     fn tell(&self) -> PyResult<u64> {
@@ -3395,57 +3466,46 @@ impl SyncFile {
     }
 
     fn write(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<u64> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.write(Bytes::from(data)).await
-            })
-        });
-        observe_file_result(&self.resource, result).map_err(nfs_error)
+        let resource = self.resource.clone();
+        self.run_operation(py, "write", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.write(Bytes::from(data)).await
+        })
     }
 
     fn write_at(&self, py: Python<'_>, data: Vec<u8>, offset: u64) -> PyResult<u64> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.write_at(offset, Bytes::from(data)).await
-            })
-        });
-        observe_file_result(&self.resource, result).map_err(nfs_error)
+        let resource = self.resource.clone();
+        self.run_operation(py, "write_at", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.write_at(offset, Bytes::from(data)).await
+        })
     }
 
     #[pyo3(signature = (size = None))]
     fn truncate(&self, py: Python<'_>, size: Option<u64>) -> PyResult<u64> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.truncate(size).await
-            })
-        });
-        observe_file_result(&self.resource, result).map_err(nfs_error)
+        let resource = self.resource.clone();
+        self.run_operation(py, "truncate", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.truncate(size).await
+        })
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        let _core_operation = self.core.begin_operation().map_err(nfs_error)?;
-        let result = py.detach(|| {
-            self.runtime.block_on(async {
-                let _file_operation = self.resource.begin_operation().await?;
-                self.resource.flush_inner().await
-            })
-        });
-        observe_file_result(&self.resource, result).map_err(nfs_error)
+        let resource = self.resource.clone();
+        self.run_operation(py, "flush", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.flush_inner().await
+        })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
-            self.runtime.block_on(close_file(
+            self.runtime.block_on(cancellation_safe_close_file(
                 self.core.clone(),
                 self.resources.clone(),
                 self.key,
                 self.resource.clone(),
+                self.operation_timeout,
             ))
         })
         .map_err(|error| nfs_error_ref(&error))
@@ -3458,6 +3518,7 @@ struct AsyncFile {
     resource: Arc<FileResource>,
     resources: Arc<AdapterResources>,
     core: Arc<ClientCore>,
+    operation_timeout: Option<Duration>,
 }
 
 #[pymethods]
@@ -3493,13 +3554,15 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let data = cancellation_safe_file_operation(core, resource, "read", async move {
-                let _file_operation = work_resource.begin_operation().await?;
-                work_resource.read(size).await
-            })
-            .await
-            .map_err(nfs_error)?;
+            let data =
+                cancellation_safe_file_operation(core, resource, "read", timeout, async move {
+                    let _file_operation = work_resource.begin_operation().await?;
+                    work_resource.read(size).await
+                })
+                .await
+                .map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
     }
@@ -3509,13 +3572,15 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let data = cancellation_safe_file_operation(core, resource, "read_at", async move {
-                let _file_operation = work_resource.begin_operation().await?;
-                work_resource.read_at(offset, size).await
-            })
-            .await
-            .map_err(nfs_error)?;
+            let data =
+                cancellation_safe_file_operation(core, resource, "read_at", timeout, async move {
+                    let _file_operation = work_resource.begin_operation().await?;
+                    work_resource.read_at(offset, size).await
+                })
+                .await
+                .map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
         })
     }
@@ -3525,8 +3590,9 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_file_operation(core, resource, "seek", async move {
+            cancellation_safe_file_operation(core, resource, "seek", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.seek(offset, whence).await
             })
@@ -3543,8 +3609,9 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_file_operation(core, resource, "write", async move {
+            cancellation_safe_file_operation(core, resource, "write", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.write(Bytes::from(data)).await
             })
@@ -3562,8 +3629,9 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_file_operation(core, resource, "write_at", async move {
+            cancellation_safe_file_operation(core, resource, "write_at", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.write_at(offset, Bytes::from(data)).await
             })
@@ -3577,8 +3645,9 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_file_operation(core, resource, "truncate", async move {
+            cancellation_safe_file_operation(core, resource, "truncate", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.truncate(size).await
             })
@@ -3591,8 +3660,9 @@ impl AsyncFile {
         let resource = self.resource.clone();
         let work_resource = resource.clone();
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_file_operation(core, resource, "flush", async move {
+            cancellation_safe_file_operation(core, resource, "flush", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.flush_inner().await
             })
@@ -3606,8 +3676,9 @@ impl AsyncFile {
         let resources = self.resources.clone();
         let key = self.key;
         let resource = self.resource.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            cancellation_safe_close_file(core, resources, key, resource)
+            cancellation_safe_close_file(core, resources, key, resource, timeout)
                 .await
                 .map_err(|error| nfs_error_ref(&error))
         })
@@ -3621,7 +3692,7 @@ async fn export_values(
     let exports = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, crate::list_exports(host))
             .await
-            .map_err(|_| NfsError::Rpc("export discovery deadline exceeded".to_string()))??
+            .map_err(|_| deadline_exceeded("export discovery"))??
     } else {
         crate::list_exports(host).await?
     };
@@ -3685,7 +3756,32 @@ struct SyncClient {
     version: NFSVersion,
     health: MountHealth,
     health_source: Option<Arc<dyn Mount>>,
-    _operation_timeout: Option<Duration>,
+    operation_timeout: Option<Duration>,
+}
+
+impl SyncClient {
+    fn run_operation<T, F>(
+        &self,
+        py: Python<'_>,
+        operation: &'static str,
+        safe_path: Option<String>,
+        future: F,
+    ) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        py.detach(|| {
+            self.runtime.block_on(cancellation_safe_owned_operation(
+                self.core.clone(),
+                safe_path,
+                operation,
+                self.operation_timeout,
+                future,
+            ))
+        })
+        .map_err(nfs_error)
+    }
 }
 
 #[pymethods]
@@ -3708,20 +3804,29 @@ impl SyncClient {
             .build()
             .map_err(python_error)?;
         if let Some(parts) = test_connected_parts(&url, capacity) {
-            if url.ends_with("/delay") {
-                py.detach(|| {
-                    runtime.block_on(async {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    })
-                });
-            }
+            let parts = parts?;
+            let delay = url.ends_with("/delay");
+            let parts = py
+                .detach(|| {
+                    runtime.block_on(with_operation_timeout(
+                        connect_timeout,
+                        "connection",
+                        async move {
+                            if delay {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            Ok(parts)
+                        },
+                    ))
+                })
+                .map_err(nfs_error)?;
             let ConnectedParts {
                 core,
                 version,
                 health,
                 health_source,
                 resources,
-            } = parts?;
+            } = parts;
             return Ok(Self {
                 core,
                 resources,
@@ -3729,7 +3834,7 @@ impl SyncClient {
                 version,
                 health,
                 health_source,
-                _operation_timeout: operation_timeout,
+                operation_timeout,
             });
         }
         let mount = py
@@ -3749,7 +3854,7 @@ impl SyncClient {
             version,
             health,
             health_source,
-            _operation_timeout: operation_timeout,
+            operation_timeout,
         })
     }
 
@@ -3789,7 +3894,15 @@ impl SyncClient {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let report = py.detach(|| self.runtime.block_on(self.core.close()));
+        let report = py
+            .detach(|| {
+                self.runtime.block_on(with_operation_timeout(
+                    self.operation_timeout,
+                    "close",
+                    async { Ok(self.core.close().await) },
+                ))
+            })
+            .map_err(nfs_error)?;
         if report.errors().is_empty() {
             Ok(())
         } else {
@@ -3829,181 +3942,194 @@ impl SyncClient {
     }
 
     fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
-        let attr = py
-            .detach(|| {
-                self.runtime.block_on(stat_attr(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                    path,
-                ))
-            })
-            .map_err(nfs_error)?;
+        let attr = self.run_operation(
+            py,
+            "stat",
+            Some(path.clone()),
+            stat_attr(self.core.clone(), self.health_source.clone(), path),
+        )?;
         attr_dict(py, &attr)
     }
 
     #[pyo3(signature = (path, mode = 0o777))]
     fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "mkdir",
+            Some(path.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Mkdir(mode),
                 path,
                 None,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn remove(&self, py: Python<'_>, path: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "remove",
+            Some(path.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Remove,
                 path,
                 None,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn rmdir(&self, py: Python<'_>, path: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "rmdir",
+            Some(path.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Rmdir,
                 path,
                 None,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn rename(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "rename",
+            Some(source.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Rename,
                 source,
                 Some(destination),
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn link(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "link",
+            Some(destination.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Link,
                 source,
                 Some(destination),
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn symlink(&self, py: Python<'_>, target: String, link_path: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(namespace_operation(
+        self.run_operation(
+            py,
+            "symlink",
+            Some(link_path.clone()),
+            namespace_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 NamespaceOperation::Symlink,
                 target,
                 Some(link_path),
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn readlink(&self, py: Python<'_>, path: String) -> PyResult<String> {
-        py.detach(|| {
-            self.runtime.block_on(readlink_path(
-                self.core.clone(),
-                self.health_source.clone(),
-                path,
-            ))
-        })
-        .map_err(nfs_error)
+        self.run_operation(
+            py,
+            "readlink",
+            Some(path.clone()),
+            readlink_path(self.core.clone(), self.health_source.clone(), path),
+        )
     }
 
     fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(metadata_operation(
+        self.run_operation(
+            py,
+            "chmod",
+            Some(path.clone()),
+            metadata_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 MetadataOperation::Chmod(mode),
                 path,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn chown(&self, py: Python<'_>, path: String, uid: i64, gid: i64) -> PyResult<()> {
         let uid = optional_identity(uid)?;
         let gid = optional_identity(gid)?;
-        py.detach(|| {
-            self.runtime.block_on(metadata_operation(
+        self.run_operation(
+            py,
+            "chown",
+            Some(path.clone()),
+            metadata_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 MetadataOperation::Chown(uid, gid),
                 path,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn utime(&self, py: Python<'_>, path: String, atime_ns: u64, mtime_ns: u64) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(metadata_operation(
+        self.run_operation(
+            py,
+            "utime",
+            Some(path.clone()),
+            metadata_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 MetadataOperation::Utime(atime_ns, mtime_ns),
                 path,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn truncate_path(&self, py: Python<'_>, path: String, size: u64) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(metadata_operation(
+        self.run_operation(
+            py,
+            "truncate",
+            Some(path.clone()),
+            metadata_operation(
                 self.core.clone(),
                 self.health_source.clone(),
                 MetadataOperation::Truncate(size),
                 path,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn access(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<bool> {
-        py.detach(|| {
-            self.runtime.block_on(access_path(
-                self.core.clone(),
-                self.health_source.clone(),
-                path,
-                mode,
-            ))
-        })
-        .map_err(nfs_error)
+        self.run_operation(
+            py,
+            "access",
+            Some(path.clone()),
+            access_path(self.core.clone(), self.health_source.clone(), path, mode),
+        )
     }
 
     fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
-        let value = py
-            .detach(|| {
-                self.runtime.block_on(acl41_get(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                    path,
-                    Acl41Kind::Discretionary,
-                ))
-            })
-            .map_err(nfs_error)?;
+        let value = self.run_operation(
+            py,
+            "getdacl",
+            Some(path.clone()),
+            acl41_get(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                Acl41Kind::Discretionary,
+            ),
+        )?;
         acl41_dict(py, &value)
     }
 
@@ -4015,29 +4141,32 @@ impl SyncClient {
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<()> {
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
-        py.detach(|| {
-            self.runtime.block_on(acl41_set(
+        self.run_operation(
+            py,
+            "setdacl",
+            Some(path.clone()),
+            acl41_set(
                 self.core.clone(),
                 self.health_source.clone(),
                 path,
                 value,
                 Acl41Kind::Discretionary,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
-        let value = py
-            .detach(|| {
-                self.runtime.block_on(acl41_get(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                    path,
-                    Acl41Kind::System,
-                ))
-            })
-            .map_err(nfs_error)?;
+        let value = self.run_operation(
+            py,
+            "getsacl",
+            Some(path.clone()),
+            acl41_get(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                Acl41Kind::System,
+            ),
+        )?;
         acl41_dict(py, &value)
     }
 
@@ -4049,107 +4178,111 @@ impl SyncClient {
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<()> {
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
-        py.detach(|| {
-            self.runtime.block_on(acl41_set(
+        self.run_operation(
+            py,
+            "setsacl",
+            Some(path.clone()),
+            acl41_set(
                 self.core.clone(),
                 self.health_source.clone(),
                 path,
                 value,
                 Acl41Kind::System,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn getxattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<Vec<u8>> {
-        py.detach(|| {
-            self.runtime.block_on(xattr_get(
+        self.run_operation(
+            py,
+            "getxattr",
+            Some(path.clone()),
+            xattr_get(
                 self.core.clone(),
                 self.health_source.clone(),
                 self.resources.clone(),
                 path,
                 name,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn setxattr(&self, py: Python<'_>, path: String, name: String, value: Vec<u8>) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(xattr_set(
+        self.run_operation(
+            py,
+            "setxattr",
+            Some(path.clone()),
+            xattr_set(
                 self.core.clone(),
                 self.health_source.clone(),
                 self.resources.clone(),
                 path,
                 name,
                 value,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn listxattr(&self, py: Python<'_>, path: String) -> PyResult<Vec<String>> {
-        py.detach(|| {
-            self.runtime.block_on(xattr_list(
+        self.run_operation(
+            py,
+            "listxattr",
+            Some(path.clone()),
+            xattr_list(
                 self.core.clone(),
                 self.health_source.clone(),
                 self.resources.clone(),
                 path,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn removexattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<()> {
-        py.detach(|| {
-            self.runtime.block_on(xattr_remove(
+        self.run_operation(
+            py,
+            "removexattr",
+            Some(path.clone()),
+            xattr_remove(
                 self.core.clone(),
                 self.health_source.clone(),
                 self.resources.clone(),
                 path,
                 name,
-            ))
-        })
-        .map_err(nfs_error)
+            ),
+        )
     }
 
     fn fs_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let info = py
-            .detach(|| {
-                self.runtime.block_on(fs_info_values(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                ))
-            })
-            .map_err(nfs_error)?;
+        let info = self.run_operation(
+            py,
+            "fs_info",
+            None,
+            fs_info_values(self.core.clone(), self.health_source.clone()),
+        )?;
         fs_info_dict(py, info)
     }
 
     fn fs_stat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let info = py
-            .detach(|| {
-                self.runtime.block_on(fs_stat_values(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                ))
-            })
-            .map_err(nfs_error)?;
+        let info = self.run_operation(
+            py,
+            "fs_stat",
+            None,
+            fs_stat_values(self.core.clone(), self.health_source.clone()),
+        )?;
         fs_stat_dict(py, info)
     }
 
     fn scandir(&self, py: Python<'_>, path: String) -> PyResult<SyncDirectoryCursor> {
-        let receiver = py
-            .detach(|| {
-                self.runtime.block_on(directory_receiver(
-                    self.core.clone(),
-                    self.health_source.clone(),
-                    path,
-                ))
-            })
-            .map_err(nfs_error)?;
+        let receiver = self.run_operation(
+            py,
+            "scandir",
+            Some(path.clone()),
+            directory_receiver(self.core.clone(), self.health_source.clone(), path),
+        )?;
         Ok(SyncDirectoryCursor {
             runtime: self.runtime.clone(),
             receiver: Mutex::new(receiver),
+            operation_timeout: self.operation_timeout,
         })
     }
 
@@ -4164,6 +4297,7 @@ impl SyncClient {
                     self.resources.clone(),
                     path,
                     mode.to_string(),
+                    self.operation_timeout,
                 ))
             })
             .map_err(nfs_error)?;
@@ -4173,6 +4307,7 @@ impl SyncClient {
             resources: self.resources.clone(),
             core: self.core.clone(),
             runtime: self.runtime.clone(),
+            operation_timeout: self.operation_timeout,
         })
     }
 }
@@ -4184,7 +4319,7 @@ struct AsyncClient {
     version: NFSVersion,
     health: MountHealth,
     health_source: Option<Arc<dyn Mount>>,
-    _operation_timeout: Option<Duration>,
+    operation_timeout: Option<Duration>,
 }
 
 impl AsyncClient {
@@ -4200,11 +4335,13 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let safe_path = operation.recovery_path(&first, second.as_deref());
         let operation_name = operation.name();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 safe_path,
                 operation_name,
+                timeout,
                 namespace_operation(work_core, mount, operation, first, second),
             )
             .await
@@ -4223,11 +4360,13 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let safe_path = path.clone();
         let operation_name = operation.name();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
                 operation_name,
+                timeout,
                 metadata_operation(work_core, mount, operation, path),
             )
             .await
@@ -4250,25 +4389,30 @@ impl AsyncClient {
         let connect_timeout = timeout_option(options, "connect_timeout")?;
         let operation_timeout = timeout_option(options, "operation_timeout")?;
         if let Some(parts) = test_connected_parts(&url, capacity) {
+            let parts = parts?;
             let ConnectedParts {
                 core,
                 version,
                 health,
                 health_source,
                 resources,
-            } = parts?;
+            } = parts;
             return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                if url.ends_with("/delay") {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Ok(AsyncClient {
-                    core,
-                    resources,
-                    version,
-                    health,
-                    health_source,
-                    _operation_timeout: operation_timeout,
+                with_operation_timeout(connect_timeout, "connection", async {
+                    if url.ends_with("/delay") {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Ok(AsyncClient {
+                        core,
+                        resources,
+                        version,
+                        health,
+                        health_source,
+                        operation_timeout,
+                    })
                 })
+                .await
+                .map_err(nfs_error)
             });
         }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -4288,7 +4432,7 @@ impl AsyncClient {
                 version,
                 health,
                 health_source,
-                _operation_timeout: operation_timeout,
+                operation_timeout,
             })
         })
     }
@@ -4330,8 +4474,11 @@ impl AsyncClient {
 
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = core.close().await;
+            let report = with_operation_timeout(timeout, "close", async { Ok(core.close().await) })
+                .await
+                .map_err(nfs_error)?;
             if report.errors().is_empty() {
                 Ok(())
             } else {
@@ -4384,8 +4531,11 @@ impl AsyncClient {
     fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let attr = stat_attr(core, mount, path).await.map_err(nfs_error)?;
+            let attr = with_operation_timeout(timeout, "stat", stat_attr(core, mount, path))
+                .await
+                .map_err(nfs_error)?;
             Python::attach(|py| attr_dict(py, &attr).map(Bound::unbind))
         })
     }
@@ -4433,8 +4583,11 @@ impl AsyncClient {
     fn readlink<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            readlink_path(core, mount, path).await.map_err(nfs_error)
+            with_operation_timeout(timeout, "readlink", readlink_path(core, mount, path))
+                .await
+                .map_err(nfs_error)
         })
     }
 
@@ -4478,8 +4631,9 @@ impl AsyncClient {
     fn access<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            access_path(core, mount, path, mode)
+            with_operation_timeout(timeout, "access", access_path(core, mount, path, mode))
                 .await
                 .map_err(nfs_error)
         })
@@ -4488,10 +4642,15 @@ impl AsyncClient {
     fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let value = acl41_get(core, mount, path, Acl41Kind::Discretionary)
-                .await
-                .map_err(nfs_error)?;
+            let value = with_operation_timeout(
+                timeout,
+                "getdacl",
+                acl41_get(core, mount, path, Acl41Kind::Discretionary),
+            )
+            .await
+            .map_err(nfs_error)?;
             Python::attach(|py| acl41_dict(py, &value).map(Bound::unbind))
         })
     }
@@ -4508,11 +4667,13 @@ impl AsyncClient {
         let work_core = core.clone();
         let mount = self.health_source.clone();
         let safe_path = path.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
                 "setdacl",
+                timeout,
                 acl41_set(work_core, mount, path, value, Acl41Kind::Discretionary),
             )
             .await
@@ -4523,10 +4684,15 @@ impl AsyncClient {
     fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let value = acl41_get(core, mount, path, Acl41Kind::System)
-                .await
-                .map_err(nfs_error)?;
+            let value = with_operation_timeout(
+                timeout,
+                "getsacl",
+                acl41_get(core, mount, path, Acl41Kind::System),
+            )
+            .await
+            .map_err(nfs_error)?;
             Python::attach(|py| acl41_dict(py, &value).map(Bound::unbind))
         })
     }
@@ -4543,11 +4709,13 @@ impl AsyncClient {
         let work_core = core.clone();
         let mount = self.health_source.clone();
         let safe_path = path.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
                 "setsacl",
+                timeout,
                 acl41_set(work_core, mount, path, value, Acl41Kind::System),
             )
             .await
@@ -4564,10 +4732,15 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            xattr_get(core, mount, resources, path, name)
-                .await
-                .map_err(nfs_error)
+            with_operation_timeout(
+                timeout,
+                "getxattr",
+                xattr_get(core, mount, resources, path, name),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -4583,11 +4756,13 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         let safe_path = path.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
                 "setxattr",
+                timeout,
                 xattr_set(work_core, mount, resources, path, name, value),
             )
             .await
@@ -4599,10 +4774,15 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            xattr_list(core, mount, resources, path)
-                .await
-                .map_err(nfs_error)
+            with_operation_timeout(
+                timeout,
+                "listxattr",
+                xattr_list(core, mount, resources, path),
+            )
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -4617,11 +4797,13 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         let safe_path = path.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
                 "removexattr",
+                timeout,
                 xattr_remove(work_core, mount, resources, path, name),
             )
             .await
@@ -4632,8 +4814,11 @@ impl AsyncClient {
     fn fs_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let info = fs_info_values(core, mount).await.map_err(nfs_error)?;
+            let info = with_operation_timeout(timeout, "fs_info", fs_info_values(core, mount))
+                .await
+                .map_err(nfs_error)?;
             Python::attach(|py| fs_info_dict(py, info).map(Bound::unbind))
         })
     }
@@ -4641,8 +4826,11 @@ impl AsyncClient {
     fn fs_stat<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let info = fs_stat_values(core, mount).await.map_err(nfs_error)?;
+            let info = with_operation_timeout(timeout, "fs_stat", fs_stat_values(core, mount))
+                .await
+                .map_err(nfs_error)?;
             Python::attach(|py| fs_stat_dict(py, info).map(Bound::unbind))
         })
     }
@@ -4650,12 +4838,15 @@ impl AsyncClient {
     fn scandir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let receiver = directory_receiver(core, mount, path)
-                .await
-                .map_err(nfs_error)?;
+            let receiver =
+                with_operation_timeout(timeout, "scandir", directory_receiver(core, mount, path))
+                    .await
+                    .map_err(nfs_error)?;
             Ok(AsyncDirectoryCursor {
                 receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                operation_timeout: timeout,
             })
         })
     }
@@ -4667,16 +4858,24 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         let mode = mode.to_string();
+        let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (key, resource) =
-                cancellation_safe_open_file(core.clone(), mount, resources.clone(), path, mode)
-                    .await
-                    .map_err(nfs_error)?;
+            let (key, resource) = cancellation_safe_open_file(
+                core.clone(),
+                mount,
+                resources.clone(),
+                path,
+                mode,
+                timeout,
+            )
+            .await
+            .map_err(nfs_error)?;
             Ok(AsyncFile {
                 key,
                 resource,
                 resources,
                 core,
+                operation_timeout: timeout,
             })
         })
     }
@@ -4741,6 +4940,32 @@ mod read_only_file_tests {
             assert_eq!(parsed.create_permissions(), Some(0o666));
         }
         assert_eq!(read_mode().create_permissions(), None);
+        for mode in ["wb", "ab"] {
+            let parsed =
+                FileMode::parse(mode).unwrap_or_else(|_| panic!("{mode} mode must be valid"));
+            assert_eq!(parsed.access(), crate::OPEN_WRITE);
+        }
+        assert_eq!(
+            FileMode::parse("w+b")
+                .unwrap_or_else(|_| panic!("w+b mode must be valid"))
+                .access(),
+            crate::OPEN_BOTH
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_deadline_is_a_typed_timeout() {
+        let result = super::with_operation_timeout(
+            Some(std::time::Duration::from_millis(1)),
+            "read",
+            std::future::pending::<crate::Result<()>>(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(NfsError::Io(ref error)) if error.kind() == std::io::ErrorKind::TimedOut
+                && error.to_string() == "read deadline exceeded"
+        ));
     }
 
     async fn test_file(mode: FileMode) -> Arc<FileResource> {

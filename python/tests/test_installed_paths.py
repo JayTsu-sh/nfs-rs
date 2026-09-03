@@ -9,7 +9,14 @@ if os.environ.get("NFS_RS_TEST_INSTALLED") != "1":
 
 import nfs_rs._internal
 
-from nfs_rs import AsyncClient, Client, FileType, list_exports, list_exports_async
+from nfs_rs import (
+    AsyncClient,
+    Client,
+    FileType,
+    NfsTimeoutError,
+    list_exports,
+    list_exports_async,
+)
 
 
 def test_installed_sync_paths_metadata_and_streaming_directory():
@@ -44,6 +51,25 @@ def test_client_close_interrupts_directory_producer_blocked_before_first_protoco
     client.scandir("blocked")
     client.close()
     assert client.closed
+
+
+def test_operation_timeout_bounds_sync_and_async_directory_iteration():
+    client = Client.connect("nfs-test://fixture/export", operation_timeout=0.01)
+    entries = client.scandir("blocked")
+    with pytest.raises(NfsTimeoutError, match="scandir deadline exceeded"):
+        next(entries)
+    client.close()
+
+    async def scenario():
+        async_client = await AsyncClient.connect(
+            "nfs-test://fixture/export", operation_timeout=0.01
+        )
+        async_entries = async_client.scandir("blocked")
+        with pytest.raises(NfsTimeoutError, match="scandir deadline exceeded"):
+            await anext(async_entries)
+        await async_client.close()
+
+    asyncio.run(scenario())
 
 
 def test_installed_async_paths_match_sync_values():
