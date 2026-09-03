@@ -52,7 +52,7 @@ def test_release_gates_rust_quality_and_intermediate_python_smoke() -> None:
     for required in (
         "cargo fmt --all -- --check",
         "cargo clippy --all-targets --locked -- -D warnings",
-        'python-version: ["3.11", "3.12", "3.13"]',
+        'python-version: ["3.11", "3.12", "3.13", "3.14"]',
         "python-test-support-x86_64",
         "scripts/smoke-python-artifact.py",
     ):

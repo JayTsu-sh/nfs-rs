@@ -51,6 +51,96 @@ def test_blocked_sync_file_io_releases_gil() -> None:
     assert _native_counts(client) == (0, 0, 0)
 
 
+@pytest.mark.parametrize("client_kind", ["sync", "async"])
+def test_operation_timeout_bounds_blocked_file_io(client_kind: str) -> None:
+    from nfs_rs import AsyncClient, Client, NfsTimeoutError, _internal
+
+    if client_kind == "sync":
+        client = Client.connect(
+            "nfs-test://fixture/export", operation_timeout=0.01
+        )
+        file = client.open("fixture.bin", "rb")
+        _internal._arm_operation_test_barrier("read")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            reading = executor.submit(file.read, 1)
+
+            async def wait_until_entered() -> None:
+                await _internal._wait_operation_test_entered()
+
+            asyncio.run(wait_until_entered())
+            try:
+                with pytest.raises(NfsTimeoutError, match="read deadline exceeded"):
+                    reading.result(timeout=1)
+            finally:
+                _internal._release_operation_test_barrier()
+        file.close()
+        client.close()
+        return
+
+    async def scenario() -> None:
+        client = await AsyncClient.connect(
+            "nfs-test://fixture/export", operation_timeout=0.01
+        )
+        file = await client.open("fixture.bin", "rb")
+        _internal._arm_operation_test_barrier("read")
+        reading = asyncio.create_task(file.read(1))
+        await _internal._wait_operation_test_entered()
+        try:
+            with pytest.raises(NfsTimeoutError, match="read deadline exceeded"):
+                await reading
+        finally:
+            settled = _internal._wait_operation_test_settled()
+            _internal._release_operation_test_barrier()
+            await settled
+        await file.close()
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("client_kind", ["sync", "async"])
+def test_operation_timeout_bounds_blocked_namespace_mutation(client_kind: str) -> None:
+    from nfs_rs import AsyncClient, Client, NfsTimeoutError, _internal
+
+    if client_kind == "sync":
+        client = Client.connect(
+            "nfs-test://fixture/export", operation_timeout=0.01
+        )
+        _internal._arm_operation_test_barrier("remove")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            removing = executor.submit(client.remove, "safe-path")
+
+            async def wait_until_entered() -> None:
+                await _internal._wait_operation_test_entered()
+
+            asyncio.run(wait_until_entered())
+            try:
+                with pytest.raises(NfsTimeoutError, match="remove deadline exceeded"):
+                    removing.result(timeout=1)
+            finally:
+                _internal._release_operation_test_barrier()
+        client.close()
+        return
+
+    async def scenario() -> None:
+        client = await AsyncClient.connect(
+            "nfs-test://fixture/export", operation_timeout=0.01
+        )
+        _internal._arm_operation_test_barrier("remove")
+        removing = asyncio.create_task(client.remove("safe-path"))
+        await _internal._wait_operation_test_entered()
+        settled = _internal._wait_operation_test_settled()
+        try:
+            with pytest.raises(NfsTimeoutError, match="remove deadline exceeded"):
+                await removing
+        finally:
+            _internal._release_operation_test_barrier()
+            await settled
+        await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_shared_sync_client_survives_32_threads_and_close_races() -> None:
     from nfs_rs import Client, _internal
 

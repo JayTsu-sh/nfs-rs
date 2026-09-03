@@ -55,6 +55,22 @@ def test_sync_connect_releases_the_gil_while_runtime_blocks():
     client.close()
 
 
+@pytest.mark.parametrize("client_kind", ["sync", "async"])
+def test_connect_timeout_raises_public_timeout_error(client_kind):
+    from nfs_rs import NfsTimeoutError
+
+    if client_kind == "sync":
+        with pytest.raises(NfsTimeoutError, match="connection deadline exceeded"):
+            Client.connect("nfs-test://fixture/delay", connect_timeout=0.001)
+        return
+
+    async def scenario():
+        with pytest.raises(NfsTimeoutError, match="connection deadline exceeded"):
+            await AsyncClient.connect("nfs-test://fixture/delay", connect_timeout=0.001)
+
+    asyncio.run(scenario())
+
+
 def test_async_connect_keeps_loop_responsive_and_cross_loop_use_is_rejected():
     first_loop = asyncio.new_event_loop()
 
