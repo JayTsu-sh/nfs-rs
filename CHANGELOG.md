@@ -7,6 +7,24 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-03
+
+### Fixed
+
+- Prevent NFSv4.0 create rollback from deleting a concurrently created file
+  after an unchecked OPEN and failed SETATTR.
+- Preserve failed NFSv4.1 CLOSE state for cleanup retry and surface the
+  terminal cleanup error to Python callers.
+- Enforce configured operation and connection deadlines consistently across
+  synchronous and asynchronous Python clients.
+- Preserve write-only share access during NFSv4 file creation and reject
+  unknown NFS URL query options before connecting.
+
+### Testing
+
+- Gate release validation on Python 3.14 in addition to the supported lower
+  and intermediate Python versions.
+
 ## [0.6.0] - 2026-08-30
 
 ### Added
@@ -187,7 +205,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.6...v0.5.7
