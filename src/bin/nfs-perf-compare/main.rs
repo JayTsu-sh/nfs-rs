@@ -1,4 +1,9 @@
+#![allow(dead_code)]
+mod backend;
 mod cli;
+mod nfsrs;
+mod pattern;
+mod posix;
 mod stats;
 
 use std::env;
