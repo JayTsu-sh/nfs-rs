@@ -197,8 +197,16 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, CliError
     let suite = match suite_name.as_str() {
         "metadata" => Suite::Metadata {
             iters: if smoke { 1 } else { count("--iters", 200)? },
-            readdir_entries: if smoke { 10 } else { count("--readdir-entries", 1000)? },
-            readdir_iters: if smoke { 1 } else { count("--readdir-iters", 20)? },
+            readdir_entries: if smoke {
+                10
+            } else {
+                count("--readdir-entries", 1000)?
+            },
+            readdir_iters: if smoke {
+                1
+            } else {
+                count("--readdir-iters", 20)?
+            },
         },
         "data" => {
             let label = size_label()?;
@@ -273,7 +281,13 @@ mod tests {
     fn parses_data_suite_sizes_and_qd() {
         let c = parse("--target /mnt/x --workdir w --json o.json data --size 40m --qd 8").unwrap();
         match c.suite {
-            Suite::Data { size, qd, repeat, iters, .. } => {
+            Suite::Data {
+                size,
+                qd,
+                repeat,
+                iters,
+                ..
+            } => {
                 assert_eq!(size, 40 * 1024 * 1024);
                 assert_eq!(qd, 8);
                 assert_eq!(repeat, 5);
@@ -305,6 +319,13 @@ mod tests {
         assert!(matches!(c.io, IoMode::Direct));
         assert!(parse("--target /mnt/x --workdir w worker-read --path p").is_err());
         let c = parse("--target /mnt/x --workdir w worker-read --path p --bytes 4096").unwrap();
-        assert!(matches!(c.suite, Suite::WorkerRead { bytes: 4096, qd: 1, .. }));
+        assert!(matches!(
+            c.suite,
+            Suite::WorkerRead {
+                bytes: 4096,
+                qd: 1,
+                ..
+            }
+        ));
     }
 }

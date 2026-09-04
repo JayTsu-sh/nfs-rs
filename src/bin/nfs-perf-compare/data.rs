@@ -130,9 +130,21 @@ pub async fn run(
         } else {
             ("write", "read", "read_hot")
         };
-        let mut write = if small { Series::ms(w) } else { Series::mibps(w) };
-        let mut read = if small { Series::ms(r) } else { Series::mibps(r) };
-        let mut hot = if small { Series::ms(h) } else { Series::mibps(h) };
+        let mut write = if small {
+            Series::ms(w)
+        } else {
+            Series::mibps(w)
+        };
+        let mut read = if small {
+            Series::ms(r)
+        } else {
+            Series::mibps(r)
+        };
+        let mut hot = if small {
+            Series::ms(h)
+        } else {
+            Series::mibps(h)
+        };
         hot.reference_only = true;
         for p in &paths {
             let s = write_file(b.as_ref(), p, size, qd).await?;

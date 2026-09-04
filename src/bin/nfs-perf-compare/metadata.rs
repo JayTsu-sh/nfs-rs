@@ -90,7 +90,10 @@ mod tests {
         let names: Vec<&str> = series.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            ["mkdir", "create", "stat", "access", "chmod", "rename", "remove", "rmdir", "readdir"]
+            [
+                "mkdir", "create", "stat", "access", "chmod", "rename", "remove", "rmdir",
+                "readdir"
+            ]
         );
         assert!(series.iter().take(8).all(|s| s.samples.len() == 3));
         assert_eq!(series[8].samples.len(), 2);
