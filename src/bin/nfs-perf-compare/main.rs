@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 mod backend;
 mod cli;
+mod data;
+mod metadata;
 mod nfsrs;
 mod pattern;
 mod posix;
