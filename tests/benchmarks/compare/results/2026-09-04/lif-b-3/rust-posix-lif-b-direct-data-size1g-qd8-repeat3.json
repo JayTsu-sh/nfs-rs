@@ -1,0 +1,57 @@
+{
+  "backend": "posix",
+  "env": {
+    "captured_at_unix": 1788536836,
+    "commit": "31126d9",
+    "drop_caches": false,
+    "hostname": "node181",
+    "kernel": "5.14.0-427.13.1.el9_4.x86_64",
+    "nfs_rs_version": "0.6.1",
+    "rsize": 1048576,
+    "wsize": 1048576
+  },
+  "harness": "rust",
+  "io_mode": "direct",
+  "mount_variant": "lif-b",
+  "params": {
+    "bytes": 1073741824,
+    "iters": 200,
+    "qd": 8,
+    "repeat": 3,
+    "size": "1g"
+  },
+  "peak_rss_kib": 18468,
+  "protocol": "3",
+  "results": [
+    {
+      "max": 109.40507795600708,
+      "median": 106.3413650965913,
+      "min": 106.18951431589036,
+      "name": "write",
+      "reference_only": false,
+      "samples": [
+        106.3413650965913,
+        106.18951431589036,
+        109.40507795600708
+      ],
+      "unit": "MiB/s"
+    },
+    {
+      "max": 111.21825441605735,
+      "median": 109.86882194514975,
+      "min": 109.75790928932716,
+      "name": "read",
+      "reference_only": false,
+      "samples": [
+        111.21825441605735,
+        109.86882194514975,
+        109.75790928932716
+      ],
+      "unit": "MiB/s"
+    }
+  ],
+  "schema": 1,
+  "smoke": false,
+  "suite": "data",
+  "target": "/mnt/nfsrs_perf"
+}
