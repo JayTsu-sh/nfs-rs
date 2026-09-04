@@ -20,6 +20,25 @@ pub fn pattern_block() -> Bytes {
     Bytes::from(v).slice(off..off + len)
 }
 
+/// Pattern bytes for the absolute file range [offset, offset+len). Zero-copy
+/// unless the range wraps around the 1 MiB period (e.g. 1020 KiB chunks).
+pub fn pattern_at(block: &Bytes, offset: u64, len: usize) -> Bytes {
+    let pos = (offset % CHUNK) as usize;
+    if pos + len <= block.len() {
+        return block.slice(pos..pos + len);
+    }
+    let mut out = bytes::BytesMut::with_capacity(len);
+    let mut remaining = len;
+    let mut p = pos;
+    while remaining > 0 {
+        let n = remaining.min(block.len() - p);
+        out.extend_from_slice(&block[p..p + n]);
+        remaining -= n;
+        p = (p + n) % block.len();
+    }
+    out.freeze()
+}
+
 pub fn verify(block: &Bytes, offset: u64, chunk: &[u8]) -> bool {
     let mut pos = (offset % CHUNK) as usize;
     let mut rest = chunk;
@@ -46,6 +65,13 @@ mod tests {
         assert_eq!(b[1], 46);
         assert!(verify(&b, 0, &b));
         assert!(verify(&b, CHUNK * 7 + 100, &b[100..]));
+        // non-1MiB chunking (NFSv4.1 negotiates 1020 KiB payloads) must round-trip
+        let chunk = 1_044_480u64;
+        for i in 0..5u64 {
+            let data = pattern_at(&b, i * chunk, chunk as usize);
+            assert_eq!(data.len(), chunk as usize);
+            assert!(verify(&b, i * chunk, &data), "chunk {i}");
+        }
         let mut bad = b.to_vec();
         bad[5] ^= 1;
         assert!(!verify(&b, 0, &bad));

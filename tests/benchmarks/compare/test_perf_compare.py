@@ -48,4 +48,7 @@ def test_pattern_matches_rust_convention() -> None:
     assert perf_compare.PATTERN[0] == 29 and perf_compare.PATTERN[1] == 46
     assert perf_compare.verify(perf_compare.CHUNK * 3 + 10, perf_compare.PATTERN[10:100])
     assert not perf_compare.verify(1, perf_compare.PATTERN[:10])
+    chunk = 1044480
+    for i in range(5):
+        assert perf_compare.verify(i * chunk, perf_compare.pattern_at(i * chunk, chunk))
     assert perf_compare.percentile([5.0, 1.0, 3.0, 2.0, 4.0], 0.5) == 3.0

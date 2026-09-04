@@ -26,6 +26,13 @@ CHUNK = 1024 * 1024
 ALIGN = 4096
 SIZES = {"4k": 4096, "40m": 40 * CHUNK, "1g": 1024 * CHUNK}
 PATTERN = bytes((i * 17 + 29) % 251 for i in range(CHUNK))
+_PATTERN2 = PATTERN + PATTERN
+
+
+def pattern_at(offset: int, n: int) -> bytes:
+    """Pattern bytes for the absolute range [offset, offset+n); n <= CHUNK."""
+    pos = offset % CHUNK
+    return _PATTERN2[pos:pos + n]
 METADATA_OPS = ("mkdir", "create", "stat", "access", "chmod", "rename", "remove", "rmdir")
 
 
@@ -279,8 +286,9 @@ class NfsRsBackend:
                     offset = i * chunk
                     n = min(size - offset, chunk)
                     done = 0
+                    data = pattern_at(offset, n)
                     while done < n:
-                        w = await f.write_at(PATTERN[done:n], offset + done)
+                        w = await f.write_at(data[done:n], offset + done)
                         if w <= 0:
                             raise BenchError("short write")
                         done += w

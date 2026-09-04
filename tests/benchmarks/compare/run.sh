@@ -49,6 +49,7 @@ mount_kernel() {   # proto variant
     return 1
   fi
   mounted=1
+  rm -rf "$MNT/$run_id"-* 2>/dev/null   # leftovers from an interrupted run
   export PERF_MOUNT_VARIANT="$variant" PERF_PROTOCOL="$proto"
   log "mounted $LIF:$EXPORT vers=$proto ($variant): $(grep " $MNT " /proc/mounts | sed 's/.*(//;s/)//' | cut -c1-120)"
 }

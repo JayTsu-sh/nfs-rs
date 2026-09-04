@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::task::JoinSet;
 
 use super::backend::{Backend, BenchError, FileHandle, Result};
-use super::pattern::{pattern_block, verify};
+use super::pattern::{pattern_at, pattern_block, verify};
 use super::stats::{Series, mibps};
 
 type SharedHandle = Arc<Box<dyn FileHandle>>;
@@ -42,7 +42,7 @@ pub async fn write_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Re
                 }
                 let offset = i * chunk;
                 let len = (size - offset).min(chunk) as usize;
-                h.write_at(offset, block.slice(..len)).await?;
+                h.write_at(offset, pattern_at(&block, offset, len)).await?;
             }
         });
     }
