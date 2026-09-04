@@ -249,7 +249,8 @@ class NfsRsBackend:
     def stat(self, p: str) -> None: self._call(self._client.stat(p))
     def chmod(self, p: str, mode: int) -> None: self._call(self._client.chmod(p, mode))
     def rename(self, a: str, b: str) -> None: self._call(self._client.rename(a, b))
-    def readdir_count(self, p: str) -> int: return len(self._call(self._client.listdir(p)))
+    def readdir_count(self, p: str) -> int:
+        return sum(1 for name in self._call(self._client.listdir(p)) if name not in (".", ".."))
     def remove(self, p: str) -> None: self._call(self._client.remove(p))
     def rmdir(self, p: str) -> None: self._call(self._client.rmdir(p))
 

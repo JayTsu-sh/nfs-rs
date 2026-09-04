@@ -6,6 +6,7 @@
 # env:   LIF (10.128.61.200) LIF_B (10.128.61.201) EXPORT (/nfsrs_perf)
 #        MNT (/mnt/nfsrs_perf) BASE (/root/nfs-rs-perf) SMOKE=1 for a quick pass
 #        SKIP_LIF_B=1 to skip the cross-check on the second LIF
+#        DATA_REPEAT (5) / MC_REPEAT (3) repeats for large-file and multiclient cases
 set -uo pipefail
 
 run_id="${1:?run id required}"
@@ -21,6 +22,8 @@ BASE="${BASE:-/root/nfs-rs-perf}"
 BIN="$BASE/repo/target/release/nfs-perf-compare"
 PY="$BASE/venv/bin/python $BASE/repo/tests/benchmarks/compare/perf_compare.py"
 OUT="$BASE/results/$run_id"
+DATA_REPEAT="${DATA_REPEAT:-5}"
+MC_REPEAT="${MC_REPEAT:-3}"
 SMOKE_FLAG=""
 [[ "${SMOKE:-0}" == 1 ]] && SMOKE_FLAG="--smoke"
 export PERF_COMMIT="${PERF_COMMIT:-$(cat "$BASE/repo/COMMIT" 2>/dev/null || echo unknown)}"
@@ -66,7 +69,7 @@ invoke() {
   local json="$dir/$name.json"
   [[ -s "$json" ]] && { log "skip (exists) $proto/$name"; return 0; }
   local io_args=()
-  [[ "$backend" == posix ]] && io_args=(--io "$io")
+  [[ "$backend" == posix && "$io" != na ]] && io_args=(--io "$io")
   log "run $proto/$name"
   # shellcheck disable=SC2086
   if ! $(harness_cmd "$harness") --target "$TARGET" "${io_args[@]}" --workdir "$run_id-$harness-$backend" \
@@ -85,14 +88,14 @@ data_matrix() {   # proto harness backend variant io
   for size in 4k 40m 1g; do
     for qd in 1 8; do
       [[ "$size" == 4k && "$qd" == 8 ]] && continue
-      invoke "$@" data --size "$size" --qd "$qd"
+      invoke "$@" data --size "$size" --qd "$qd" --repeat "$DATA_REPEAT"
     done
   done
 }
 
 multiclient_matrix() {   # proto harness backend variant io
   for mode in same distinct; do
-    invoke "$@" multiclient --size 1g --clients 8 --mode "$mode"
+    invoke "$@" multiclient --size 1g --clients 8 --mode "$mode" --repeat "$MC_REPEAT"
   done
 }
 
@@ -136,12 +139,12 @@ if [[ "${SKIP_LIF_B:-0}" != 1 ]]; then
     if mount_kernel "$proto" default; then
       TARGET="$MNT"
       export PERF_MOUNT_VARIANT="lif-b"
-      invoke "lif-b-$proto" rust posix lif-b direct data --size 1g --qd 8
+      invoke "lif-b-$proto" rust posix lif-b direct data --size 1g --qd 8 --repeat "$DATA_REPEAT"
       cleanup
     fi
     TARGET="nfs://$LIF$EXPORT?version=$proto&rsize=1048576&wsize=1048576&uid=0&gid=0"
     unset PERF_MOUNT_VARIANT PERF_PROTOCOL
-    invoke "lif-b-$proto" rust nfsrs na na data --size 1g --qd 8
+    invoke "lif-b-$proto" rust nfsrs na na data --size 1g --qd 8 --repeat "$DATA_REPEAT"
   done
   LIF="$saved_lif"
 fi
