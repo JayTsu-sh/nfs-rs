@@ -1,22 +1,22 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::TryStreamExt;
-use nfs_rs::{Mount, NFSVersion, OPEN_READ, parse_url_and_mount};
+use nfs_rs::{BufferedFile, Mount, NFSVersion, OPEN_READ, parse_url_and_mount};
 
-use super::backend::{Backend, BackendInfo, BenchError, FileHandle, Result};
+use super::backend::{Backend, BackendInfo, FileHandle, Result};
 use super::cli::CHUNK;
 
 pub struct NfsRsBackend {
-    mount: Arc<Box<dyn Mount>>,
+    mount: Arc<dyn Mount>,
 }
 
 impl NfsRsBackend {
     pub async fn connect(url: &str) -> Result<Self> {
         let mount = parse_url_and_mount(url).await?;
         Ok(Self {
-            mount: Arc::new(mount),
+            mount: Arc::from(mount),
         })
     }
 }
@@ -84,18 +84,12 @@ impl Backend for NfsRsBackend {
 
     async fn open_write(&self, path: &str) -> Result<Box<dyn FileHandle>> {
         let obj = self.mount.create_path(path, Some(0o644)).await?;
-        Ok(Box::new(NfsFile {
-            mount: Arc::clone(&self.mount),
-            fh: obj.fh,
-        }))
+        Ok(Box::new(self.file(obj.fh)))
     }
 
     async fn open_read(&self, path: &str) -> Result<Box<dyn FileHandle>> {
         let obj = self.mount.open_path(path, OPEN_READ).await?;
-        Ok(Box::new(NfsFile {
-            mount: Arc::clone(&self.mount),
-            fh: obj.fh,
-        }))
+        Ok(Box::new(self.file(obj.fh)))
     }
 
     fn chunk_size(&self) -> u64 {
@@ -124,53 +118,37 @@ impl Backend for NfsRsBackend {
     }
 }
 
+impl NfsRsBackend {
+    /// Files go through `BufferedFile`, so the mount's `readahead` /
+    /// `writeback` URL parameters decide whether I/O is pipelined.
+    fn file(&self, fh: Bytes) -> NfsFile {
+        let io = BufferedFile::new(Arc::clone(&self.mount), fh.clone(), self.mount.io_options());
+        NfsFile {
+            mount: Arc::clone(&self.mount),
+            fh,
+            io,
+        }
+    }
+}
+
 struct NfsFile {
-    mount: Arc<Box<dyn Mount>>,
+    mount: Arc<dyn Mount>,
     fh: Bytes,
+    io: BufferedFile,
 }
 
 #[async_trait]
 impl FileHandle for NfsFile {
     async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
-        let mut done = 0usize;
-        while done < data.len() {
-            let n = self
-                .mount
-                .write(self.fh.clone(), offset + done as u64, data.slice(done..))
-                .await? as usize;
-            if n == 0 {
-                return Err(BenchError::Other("server accepted zero bytes".into()));
-            }
-            done += n;
-        }
-        Ok(())
+        Ok(self.io.write_at(offset, data).await?)
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
-        let first = self.mount.read(self.fh.clone(), offset, len as u32).await?;
-        if first.len() >= len || first.is_empty() {
-            return Ok(first);
-        }
-        let mut buf = BytesMut::with_capacity(len);
-        buf.extend_from_slice(&first);
-        while buf.len() < len {
-            let part = self
-                .mount
-                .read(
-                    self.fh.clone(),
-                    offset + buf.len() as u64,
-                    (len - buf.len()) as u32,
-                )
-                .await?;
-            if part.is_empty() {
-                break;
-            }
-            buf.extend_from_slice(&part);
-        }
-        Ok(buf.freeze())
+        Ok(self.io.read_at(offset, len as u32).await?)
     }
 
     async fn sync(&self) -> Result<()> {
+        self.io.flush().await?;
         Ok(self.mount.commit(self.fh.clone(), 0, 0).await?)
     }
 

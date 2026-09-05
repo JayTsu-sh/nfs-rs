@@ -236,7 +236,7 @@ class NfsRsBackend:
         options: dict[str, Any] = {}
         if "version" in query:
             options["versions"] = (query["version"],)
-        for key in ("uid", "gid", "rsize", "wsize"):
+        for key in ("uid", "gid", "rsize", "wsize", "readahead", "writeback"):
             if key in query:
                 options[key] = int(query[key])
         base = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
@@ -542,7 +542,7 @@ def main(argv: list[str]) -> int:
         "backend": b.name,
         "protocol": protocol,
         "target": args.target,
-        "mount_variant": os.environ.get("PERF_MOUNT_VARIANT") if is_posix else None,
+        "mount_variant": os.environ.get("PERF_MOUNT_VARIANT"),
         "io_mode": args.io if is_posix else None,
         "suite": args.suite,
         "smoke": args.smoke,

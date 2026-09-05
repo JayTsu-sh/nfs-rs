@@ -154,7 +154,7 @@ async fn run(config: Config) -> Result<()> {
         "backend": info.backend,
         "protocol": info.protocol.or_else(|| env::var("PERF_PROTOCOL").ok()),
         "target": config.target.as_arg(),
-        "mount_variant": if is_posix { env::var("PERF_MOUNT_VARIANT").ok() } else { None },
+        "mount_variant": env::var("PERF_MOUNT_VARIANT").ok(),
         "io_mode": if is_posix { Some(config.io.as_str()) } else { None },
         "suite": config.suite.name(),
         "smoke": config.smoke,

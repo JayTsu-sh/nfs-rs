@@ -31,6 +31,7 @@ use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
 #[derive(Debug)]
 struct Mount3 {
     m: Mount,
+    io_options: crate::IoOptions,
 }
 
 #[async_trait]
@@ -41,6 +42,10 @@ impl crate::Mount for Mount3 {
 
     fn get_max_write_size(&self) -> u32 {
         self.m.wsize
+    }
+
+    fn io_options(&self) -> crate::IoOptions {
+        self.io_options
     }
 
     async fn null(&self) -> Result<()> {
@@ -168,6 +173,15 @@ impl crate::Mount for Mount3 {
         data: Bytes,
     ) -> Result<crate::mount::WriteOutcome> {
         self.m.write_with_outcome(fh, offset, data).await
+    }
+
+    async fn write_unstable(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        self.m.write_unstable(fh, offset, data).await
     }
 
     async fn commit_with_verifier(
@@ -371,7 +385,10 @@ async fn mount_on_addr(
         "NFS mount complete, negotiated transfer sizes"
     );
 
-    Ok(Box::new(Mount3 { m }))
+    Ok(Box::new(Mount3 {
+        m,
+        io_options: args.io_options,
+    }))
 }
 
 /// Query the MOUNT service and return all exported file systems — the `showmount -e` equivalent.

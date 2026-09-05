@@ -23,8 +23,44 @@ impl Mount41 {
         self.mds_write(&fh, offset, data).await
     }
 
+    /// UNSTABLE4 write straight to the MDS; the caller COMMITs. pNFS layouts
+    /// are bypassed so a single COMMIT on the MDS covers every chunk.
+    pub(crate) async fn write_unstable(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<mount::WriteOutcome> {
+        let _io_guard = self.layout_manager.read_file_io(&fh).await;
+        let (count, committed, verifier) = self.mds_write_stable_how(&fh, offset, data, 0).await?;
+        Ok(mount::WriteOutcome {
+            count,
+            stable: committed == 2,
+            verifier: Some(verifier),
+        })
+    }
+
     /// Direct MDS write (used as fallback when pNFS is unavailable).
     async fn mds_write(&self, fh: &Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let (count, committed, _) = self.mds_write_stable_how(fh, offset, data, 2).await?;
+        // RFC 5661 §18.32.3: if stability was downgraded (committed != FILE_SYNC4),
+        // COMMIT to make the data durable before returning success to the caller.
+        if committed != 2
+        /* FILE_SYNC4 */
+        {
+            self.commit(fh.clone(), offset, count).await?;
+        }
+        Ok(count)
+    }
+
+    /// WRITE with the given `stable_how4`; returns `(count, committed, verifier)`.
+    async fn mds_write_stable_how(
+        &self,
+        fh: &Bytes,
+        offset: u64,
+        data: Bytes,
+        stable: u32,
+    ) -> Result<(u32, u32, [u8; 8])> {
         let sid = self
             .state
             .has_open(fh, AccessMode::Write)
@@ -37,7 +73,7 @@ impl Mount41 {
             .compound_write("write", data, |b| {
                 b.require_generation(sid.generation)
                     .putfh(&fh_ref)
-                    .write_header(&stateid, offset, 2 /* FILE_SYNC4 */, data_len)
+                    .write_header(&stateid, offset, stable, data_len)
             })
             .await?;
         resp.op_ok(1)?; // PUTFH
@@ -48,15 +84,9 @@ impl Mount41 {
         }
         let count = d.get_u32();
         let committed = d.get_u32();
-        d.advance(8); // writeverf — used in COMMIT response, not here
-        // RFC 5661 §18.32.3: if stability was downgraded (committed != FILE_SYNC4),
-        // COMMIT to make the data durable before returning success to the caller.
-        if committed != 2
-        /* FILE_SYNC4 */
-        {
-            self.commit(fh.clone(), offset, count).await?;
-        }
-        Ok(count)
+        let mut verifier = [0u8; 8];
+        d.copy_to_slice(&mut verifier);
+        Ok((count, committed, verifier))
     }
 
     pub(crate) async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {

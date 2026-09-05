@@ -26,6 +26,27 @@ impl Mount {
         offset: u64,
         data: Bytes,
     ) -> Result<crate::mount::WriteOutcome> {
+        self.write_with_stability(fh, offset, data, WriteStable::FileSync)
+            .await
+    }
+
+    pub async fn write_unstable(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        self.write_with_stability(fh, offset, data, WriteStable::Unstable)
+            .await
+    }
+
+    async fn write_with_stability(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+        stable: WriteStable,
+    ) -> Result<crate::mount::WriteOutcome> {
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput(
                 "data length exceeds maximum".to_string(),
@@ -35,7 +56,7 @@ impl Mount {
         let ok = self
             ._write(WRITE3args {
                 file: nfs_fh3 { data: fh },
-                stable: WriteStable::FileSync,
+                stable,
                 count,
                 data,
                 offset,

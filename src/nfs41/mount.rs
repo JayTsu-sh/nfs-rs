@@ -247,6 +247,7 @@ pub(crate) struct Mount41 {
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
     pub(crate) acl_supported: bool,
+    pub(crate) io_options: crate::IoOptions,
 }
 
 impl Mount41 {
@@ -910,6 +911,7 @@ async fn mount_on_addr(
         rsize,
         wsize,
         acl_supported,
+        io_options: args.io_options,
     };
 
     Ok(Box::new(Mount41Wrapper {
@@ -1519,6 +1521,10 @@ impl crate::Mount for Mount41Wrapper {
         self.m.wsize
     }
 
+    fn io_options(&self) -> crate::IoOptions {
+        self.m.io_options
+    }
+
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
         let session = self.m.session_holder.get().await;
         Some(Nfs41ChannelLimits {
@@ -1679,6 +1685,14 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
         self.m.write(fh, offset, data).await
+    }
+    async fn write_unstable(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        self.m.write_unstable(fh, offset, data).await
     }
     async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
         self.m.write_path(path, offset, data).await

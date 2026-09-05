@@ -7,6 +7,9 @@
 #        MNT (/mnt/nfsrs_perf) BASE (/root/nfs-rs-perf) SMOKE=1 for a quick pass
 #        SKIP_LIF_B=1 to skip the cross-check on the second LIF
 #        DATA_REPEAT (5) / MC_REPEAT (3) repeats for large-file and multiclient cases
+#        SKIP_KERNEL=1 to skip the kernel-mount cases, SKIP_METADATA=1 / SKIP_MULTICLIENT=1
+#        NFSRS_VARIANTS: space-separated "label:query" pairs appended to the nfs-rs URL,
+#          e.g. "base:readahead=0&writeback=0 opt:readahead=8&writeback=8" (default "na:")
 set -uo pipefail
 
 run_id="${1:?run id required}"
@@ -24,6 +27,7 @@ PY="$BASE/venv/bin/python $BASE/repo/tests/benchmarks/compare/perf_compare.py"
 OUT="$BASE/results/$run_id"
 DATA_REPEAT="${DATA_REPEAT:-5}"
 MC_REPEAT="${MC_REPEAT:-3}"
+NFSRS_VARIANTS="${NFSRS_VARIANTS:-na:}"
 SMOKE_FLAG=""
 [[ "${SMOKE:-0}" == 1 ]] && SMOKE_FLAG="--smoke"
 export PERF_COMMIT="${PERF_COMMIT:-$(cat "$BASE/repo/COMMIT" 2>/dev/null || echo unknown)}"
@@ -95,41 +99,56 @@ data_matrix() {   # proto harness backend variant io
 }
 
 multiclient_matrix() {   # proto harness backend variant io
+  [[ "${SKIP_MULTICLIENT:-0}" == 1 ]] && return 0
   for mode in same distinct; do
     invoke "$@" multiclient --size 1g --clients 8 --mode "$mode" --repeat "$MC_REPEAT"
   done
 }
 
+nfsrs_url() {   # proto query-suffix
+  local url="nfs://$LIF$EXPORT?version=$1&rsize=1048576&wsize=1048576&uid=0&gid=0"
+  [[ -n "$2" ]] && url="$url&$2"
+  echo "$url"
+}
+
 for proto in "${protocols[@]}"; do
   log "=== protocol $proto ==="
-  # kernel mount, default options
-  if mount_kernel "$proto" default; then
-    TARGET="$MNT"
-    for harness in rust python; do
-      invoke "$proto" "$harness" posix default na metadata
-      for io in direct buffered; do
-        data_matrix "$proto" "$harness" posix default "$io"
-        multiclient_matrix "$proto" "$harness" posix default "$io"
+  if [[ "${SKIP_KERNEL:-0}" != 1 ]]; then
+    # kernel mount, default options
+    if mount_kernel "$proto" default; then
+      TARGET="$MNT"
+      for harness in rust python; do
+        [[ "${SKIP_METADATA:-0}" == 1 ]] || invoke "$proto" "$harness" posix default na metadata
+        for io in direct buffered; do
+          data_matrix "$proto" "$harness" posix default "$io"
+          multiclient_matrix "$proto" "$harness" posix default "$io"
+        done
       done
-    done
-    cleanup
+      cleanup
+    fi
+    # kernel mount, lookupcache=none (metadata only)
+    if [[ "${SKIP_METADATA:-0}" != 1 ]] && mount_kernel "$proto" nolookup; then
+      TARGET="$MNT"
+      for harness in rust python; do
+        invoke "$proto" "$harness" posix nolookup na metadata
+      done
+      cleanup
+    fi
   fi
-  # kernel mount, lookupcache=none (metadata only)
-  if mount_kernel "$proto" nolookup; then
-    TARGET="$MNT"
+  # nfs-rs userspace client, one pass per variant
+  for entry in $NFSRS_VARIANTS; do
+    variant="${entry%%:*}"; query="${entry#*:}"
+    TARGET="$(nfsrs_url "$proto" "$query")"
+    unset PERF_PROTOCOL
+    if [[ "$variant" == na ]]; then unset PERF_MOUNT_VARIANT; else export PERF_MOUNT_VARIANT="$variant"; fi
+    log "nfs-rs variant $variant: $TARGET"
     for harness in rust python; do
-      invoke "$proto" "$harness" posix nolookup na metadata
+      [[ "${SKIP_METADATA:-0}" == 1 ]] || invoke "$proto" "$harness" nfsrs "$variant" na metadata
+      data_matrix "$proto" "$harness" nfsrs "$variant" na
+      multiclient_matrix "$proto" "$harness" nfsrs "$variant" na
     done
-    cleanup
-  fi
-  # nfs-rs userspace client
-  TARGET="nfs://$LIF$EXPORT?version=$proto&rsize=1048576&wsize=1048576&uid=0&gid=0"
-  unset PERF_MOUNT_VARIANT PERF_PROTOCOL
-  for harness in rust python; do
-    invoke "$proto" "$harness" nfsrs na na metadata
-    data_matrix "$proto" "$harness" nfsrs na na
-    multiclient_matrix "$proto" "$harness" nfsrs na na
   done
+  unset PERF_MOUNT_VARIANT
 done
 
 if [[ "${SKIP_LIF_B:-0}" != 1 ]]; then

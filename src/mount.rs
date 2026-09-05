@@ -241,6 +241,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     fn get_max_write_size(&self) -> u32;
 
+    /// Read-ahead / write-behind tunables for [`crate::BufferedFile`], taken
+    /// from the `readahead` and `writeback` URL parameters.
+    fn io_options(&self) -> crate::IoOptions {
+        crate::IoOptions::default()
+    }
+
     /// Return NFSv4.1 fore-channel limits, or `None` for other protocol versions.
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
         None
@@ -1049,6 +1055,14 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
             stable: false,
             verifier: None,
         })
+    }
+
+    /// WRITE with `stable = UNSTABLE`: the server may buffer the data, so the
+    /// caller must COMMIT before relying on it (RFC 1813 §3.3.7). Versions
+    /// without an UNSTABLE fast path fall back to a stable write.
+    #[doc(hidden)]
+    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        self.write_with_outcome(fh, offset, data).await
     }
 
     /// Same as [`Mount::write`] but instead of taking in a file handle, takes in a path for which file handle is

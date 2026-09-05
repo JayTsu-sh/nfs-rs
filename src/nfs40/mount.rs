@@ -129,6 +129,7 @@ struct Mount40 {
     rsize: u32,
     wsize: u32,
     acl_supported: bool,
+    io_options: crate::IoOptions,
 }
 
 #[derive(Clone)]
@@ -299,6 +300,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         rsize,
         wsize,
         acl_supported,
+        io_options: args.io_options,
     })
 }
 
@@ -1313,6 +1315,103 @@ impl Mount40 {
     }
 }
 
+impl Mount40 {
+    /// WRITE with the given `stable_how4`; returns `(count, committed, verifier)`.
+    /// A FILE_SYNC request that the server downgrades is COMMITted here;
+    /// an UNSTABLE request leaves the COMMIT to the caller.
+    async fn write_stable_how(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+        stable: u32,
+    ) -> Result<(u32, u32, [u8; 8])> {
+        let expected_generation = self.lease.begin_stateful("write")?;
+        if data.len() > u32::MAX as usize {
+            return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
+        }
+        let lane = self
+            .state
+            .for_fh(&fh, crate::OPEN_WRITE)
+            .await
+            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+        let io_guard = if let Some(callback_state) = &self.callback_state {
+            Some(callback_state.foreground_io(&fh).await)
+        } else {
+            None
+        };
+        let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
+            callback_state.mark_attributes_unknown(&fh)?
+        } else {
+            false
+        };
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let lease = Arc::clone(&self.lease);
+        let lane_for_settlement = Arc::clone(&lane);
+        let fh_for_settlement = fh.clone();
+        let settled = DetachedSettlement::new(async move {
+            let _io_guard = io_guard;
+            let (stateid, owner, next_seqid, _in_flight) = {
+                let guard = lane_for_settlement.lock().await;
+                if guard.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is closing or closed".into(),
+                    ));
+                }
+                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
+                (guard.stateid, guard.owner, guard.next_seqid, in_flight)
+            };
+            let request = CompoundBuilder::new("write")
+                .putfh(&fh_for_settlement)
+                .write_header(&stateid, offset, stable, data.len() as u32)
+                .encode_with_header(&auth);
+            let (class, ctx) = context("write", owner, next_seqid, OperationClass::ReplaySensitive);
+            let response = rpc
+                .call_with_data(
+                    request,
+                    data.clone(),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                )
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let (count, committed, verifier) = decode_write_response(response)
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+            if stable == 2 && committed != 2 {
+                let commit_request = CompoundBuilder::new("commit")
+                    .putfh(&fh_for_settlement)
+                    .commit(offset, count)
+                    .encode_with_header(&auth);
+                let (commit_class, commit_ctx) =
+                    context("commit", owner, 0, OperationClass::ReplaySensitive);
+                let commit_response = rpc
+                    .call(commit_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await
+                    .map_err(|error| {
+                        classify_sent_nfs40_error(commit_class, commit_ctx.clone(), error)
+                    })?;
+                let committed_verifier = decode_commit_response(commit_response)
+                    .map_err(|error| classify_sent_nfs40_error(commit_class, commit_ctx, error))?;
+                if committed_verifier != verifier {
+                    return Err(verifier_changed_error());
+                }
+            }
+            lease.finish_stateful(expected_generation, "write")?;
+            Ok::<_, NfsError>((count, committed, verifier, data))
+        })
+        .await?;
+        let (count, committed, verifier, data) = settled;
+        if count > data.len() as u32 {
+            return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
+        }
+        if refresh_delegation_attributes {
+            self.refresh_callback_attributes(&fh).await;
+        }
+        Ok((count, committed, verifier))
+    }
+}
+
 #[async_trait]
 impl Mount for Mount40 {
     fn capabilities(&self) -> crate::MountCapabilities {
@@ -1343,6 +1442,9 @@ impl Mount for Mount40 {
     }
     fn get_max_write_size(&self) -> u32 {
         self.wsize
+    }
+    fn io_options(&self) -> crate::IoOptions {
+        self.io_options
     }
     fn version(&self) -> NFSVersion {
         NFSVersion::NFSv4p0
@@ -2074,89 +2176,21 @@ impl Mount for Mount40 {
         Ok(settled)
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        let expected_generation = self.lease.begin_stateful("write")?;
-        if data.len() > u32::MAX as usize {
-            return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
-        }
-        let lane = self
-            .state
-            .for_fh(&fh, crate::OPEN_WRITE)
-            .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
-        let io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
-        let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
-            callback_state.mark_attributes_unknown(&fh)?
-        } else {
-            false
-        };
-        let rpc = self.rpc.clone();
-        let auth = self.auth.clone();
-        let lease = Arc::clone(&self.lease);
-        let lane_for_settlement = Arc::clone(&lane);
-        let fh_for_settlement = fh.clone();
-        let settled = DetachedSettlement::new(async move {
-            let _io_guard = io_guard;
-            let (stateid, owner, next_seqid, _in_flight) = {
-                let guard = lane_for_settlement.lock().await;
-                if guard.closing {
-                    return Err(NfsError::InvalidInput(
-                        "NFSv4.0 open state is closing or closed".into(),
-                    ));
-                }
-                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
-                (guard.stateid, guard.owner, guard.next_seqid, in_flight)
-            };
-            let request = CompoundBuilder::new("write")
-                .putfh(&fh_for_settlement)
-                .write_header(&stateid, offset, 2, data.len() as u32)
-                .encode_with_header(&auth);
-            let (class, ctx) = context("write", owner, next_seqid, OperationClass::ReplaySensitive);
-            let response = rpc
-                .call_with_data(
-                    request,
-                    data.clone(),
-                    ReplayPolicy::ONE_ATTEMPT,
-                    METADATA_TIMEOUT,
-                )
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            let (count, committed, verifier) = decode_write_response(response)
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            if committed != 2 {
-                let commit_request = CompoundBuilder::new("commit")
-                    .putfh(&fh_for_settlement)
-                    .commit(offset, count)
-                    .encode_with_header(&auth);
-                let (commit_class, commit_ctx) =
-                    context("commit", owner, 0, OperationClass::ReplaySensitive);
-                let commit_response = rpc
-                    .call(commit_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .map_err(|error| {
-                        classify_sent_nfs40_error(commit_class, commit_ctx.clone(), error)
-                    })?;
-                let committed_verifier = decode_commit_response(commit_response)
-                    .map_err(|error| classify_sent_nfs40_error(commit_class, commit_ctx, error))?;
-                if committed_verifier != verifier {
-                    return Err(verifier_changed_error());
-                }
-            }
-            lease.finish_stateful(expected_generation, "write")?;
-            Ok::<_, NfsError>((count, data))
-        })
-        .await?;
-        let (count, data) = settled;
-        if count > data.len() as u32 {
-            return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
-        }
-        if refresh_delegation_attributes {
-            self.refresh_callback_attributes(&fh).await;
-        }
+        let (count, _, _) = self.write_stable_how(fh, offset, data, 2).await?;
         Ok(count)
+    }
+    async fn write_unstable(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<mount::WriteOutcome> {
+        let (count, committed, verifier) = self.write_stable_how(fh, offset, data, 0).await?;
+        Ok(mount::WriteOutcome {
+            count,
+            stable: committed == 2,
+            verifier: Some(verifier),
+        })
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         Box::pin(
@@ -2384,6 +2418,7 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported,
+            io_options: Default::default(),
         })
     }
 
@@ -2455,6 +2490,7 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
+            io_options: Default::default(),
         })
     }
 
@@ -3038,6 +3074,7 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
+            io_options: Default::default(),
         });
         let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
         let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
@@ -3992,6 +4029,7 @@ mod tests {
             wsize: 1_048_576,
             noresvport: true,
             retain_delegations: false,
+            io_options: Default::default(),
         };
         let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
         assert_eq!(mount.get_max_read_size(), 65536);
@@ -4055,6 +4093,7 @@ mod tests {
             wsize: 0,
             noresvport: true,
             retain_delegations: true,
+            io_options: Default::default(),
         };
 
         let error = mount_on_addr(addr, &args, Auth::new_null())
@@ -4099,6 +4138,7 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
+            io_options: Default::default(),
         });
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
@@ -4462,6 +4502,7 @@ mod tests {
             wsize: 0,
             noresvport: true,
             retain_delegations: false,
+            io_options: Default::default(),
         };
         let task = tokio::spawn(async move { mount_on_addr(addr, &args, Auth::new_null()).await });
         identity_seen_rx.await.unwrap();

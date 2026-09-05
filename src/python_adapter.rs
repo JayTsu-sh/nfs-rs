@@ -260,6 +260,8 @@ enum FileBackend {
         file_handle: Bytes,
         max_read: u32,
         max_write: u32,
+        /// Read-ahead / write-behind window; `None` when both are disabled.
+        buffered: Option<Box<crate::BufferedFile>>,
     },
     #[cfg(feature = "python-test-support")]
     Test {
@@ -464,6 +466,14 @@ impl FileResource {
         let max_write = mount.get_max_write_size().max(1);
         let file_handle = file.file_handle();
         let recovery_generation = mount.health().generation;
+        let io_options = mount.io_options();
+        let buffered = (io_options.readahead > 0 || io_options.writeback > 0).then(|| {
+            Box::new(crate::BufferedFile::new(
+                mount.clone(),
+                file_handle.clone(),
+                io_options,
+            ))
+        });
         Arc::new(Self {
             safe_path,
             backend: FileBackend::Mount {
@@ -471,6 +481,7 @@ impl FileResource {
                 file_handle,
                 max_read,
                 max_write,
+                buffered,
             },
             mode,
             operation_gate: Arc::new(RwLock::new(())),
@@ -658,6 +669,9 @@ impl FileResource {
                 ),
             )));
         }
+        if let Some(buffered) = self.readahead() {
+            return buffered.read_at(offset, count).await;
+        }
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
@@ -671,6 +685,26 @@ impl FileResource {
                 let end = start.saturating_add(count as usize).min(data.len());
                 Ok(Bytes::copy_from_slice(&data[start..end]))
             }
+        }
+    }
+
+    fn readahead(&self) -> Option<&crate::BufferedFile> {
+        match &self.backend {
+            FileBackend::Mount {
+                buffered: Some(buffered),
+                ..
+            } if buffered.options().readahead > 0 => Some(buffered.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn writeback(&self) -> Option<&crate::BufferedFile> {
+        match &self.backend {
+            FileBackend::Mount {
+                buffered: Some(buffered),
+                ..
+            } if buffered.options().writeback > 0 => Some(buffered.as_ref()),
+            _ => None,
         }
     }
 
@@ -841,6 +875,19 @@ impl FileResource {
         if let Some(error) = injected_fault("write", "before-send").await {
             return Err(error);
         }
+        if let Some(buffered) = self.writeback() {
+            // Write-behind: the data is queued; durability and deferred
+            // failures surface on flush()/close().
+            let queued = data.len() as u64;
+            buffered
+                .write_at(offset, data)
+                .await
+                .map_err(|error| with_confirmed_bytes(error, 0, self.protocol_version()))?;
+            if let Some(error) = injected_fault("write", "after-send-before-response").await {
+                return Err(with_confirmed_bytes(error, queued, self.protocol_version()));
+            }
+            return Ok(queued);
+        }
         let mut current = offset;
         let mut confirmed = 0_u64;
         while confirmed < data.len() as u64 {
@@ -906,6 +953,9 @@ impl FileResource {
             ));
         }
         let position = if self.mode.append {
+            if let Some(buffered) = self.writeback() {
+                buffered.flush().await?;
+            }
             self.current_size().await?
         } else {
             self.position.load(Ordering::Acquire)
@@ -938,6 +988,9 @@ impl FileResource {
             return Err(error);
         }
         let size = size.unwrap_or_else(|| self.position.load(Ordering::Acquire));
+        if let Some(buffered) = self.writeback() {
+            buffered.flush().await?;
+        }
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
@@ -984,6 +1037,9 @@ impl FileResource {
         }
         if let Some(error) = injected_fault("commit", "before-send").await {
             return Err(error);
+        }
+        if let Some(buffered) = self.writeback() {
+            buffered.flush().await?;
         }
         let mut dirty = self.dirty_state.lock().await;
         let expected_verifier = dirty.verifier;
