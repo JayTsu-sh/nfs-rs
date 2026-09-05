@@ -238,18 +238,26 @@ impl BufferedFile {
     }
 
     /// Serve one chunk at `cur` from the read-ahead window (or directly) and
-    /// keep the window topped up for a sequential reader.
+    /// keep the window topped up ahead of the furthest reader.
+    ///
+    /// `next` is the frontier (one past the furthest chunk requested so far).
+    /// An access within one window of the frontier counts as sequential, so
+    /// several concurrent readers walking the same file out of order all
+    /// share the window; a far jump discards it and starts over.
     async fn read_chunk_ahead(&self, cur: u64, want: u32) -> Result<Bytes> {
+        let window = u64::from(self.read_chunk).saturating_mul(u64::from(self.opts.readahead));
         let hit = {
             let mut state = self.reads.lock().await;
-            let sequential = cur == state.next;
             let hit = state.pending.remove(&cur);
-            if hit.is_none() && !sequential {
+            let end = cur.saturating_add(u64::from(want));
+            if hit.is_none() && cur.abs_diff(state.next) > window {
                 // Random access: forget the old window (tasks finish on their own).
                 state.pending.clear();
-            }
-            state.next = cur.saturating_add(u64::from(want));
-            if hit.is_some() || sequential {
+                state.next = end;
+            } else {
+                state.next = state.next.max(end);
+                let floor = cur.saturating_sub(window);
+                state.pending.retain(|&key, _| key >= floor);
                 self.top_up(&mut state);
             }
             hit
@@ -272,23 +280,24 @@ impl BufferedFile {
         Ok(piece)
     }
 
+    /// Spawn reads from the frontier upward until `readahead` chunks are pending.
     fn top_up(&self, state: &mut ReadState) {
         let chunk = u64::from(self.read_chunk);
-        for k in 0..u64::from(self.opts.readahead) {
-            let key = state.next.saturating_add(k.saturating_mul(chunk));
+        let mut key = state.next;
+        while state.pending.len() < self.opts.readahead as usize {
             if state.eof.is_some_and(|eof| key >= eof) {
                 break;
             }
-            if state.pending.contains_key(&key) {
-                continue;
+            if !state.pending.contains_key(&key) {
+                let io = Arc::clone(&self.io);
+                let fh = self.fh.clone();
+                let count = self.read_chunk;
+                state.pending.insert(
+                    key,
+                    tokio::spawn(async move { io.read(fh, key, count).await }),
+                );
             }
-            let io = Arc::clone(&self.io);
-            let fh = self.fh.clone();
-            let count = self.read_chunk;
-            state.pending.insert(
-                key,
-                tokio::spawn(async move { io.read(fh, key, count).await }),
-            );
+            key = key.saturating_add(chunk);
         }
     }
 
@@ -701,16 +710,49 @@ mod tests {
     #[tokio::test]
     async fn random_reads_do_not_prefetch() {
         let fake = Arc::new(Fake {
-            data: AsyncMutex::new((0..40u8).collect()),
+            data: AsyncMutex::new((0..80u8).collect()),
             ..Default::default()
         });
+        // chunk 4 × readahead 3 = 12-byte window; every jump below is wider.
         let f = file(fake.clone(), 3, 0);
-        assert_eq!(&f.read_at(20, 4).await.unwrap()[..], &[20, 21, 22, 23]);
+        assert_eq!(&f.read_at(40, 4).await.unwrap()[..], &[40, 41, 42, 43]);
         assert_eq!(&f.read_at(4, 4).await.unwrap()[..], &[4, 5, 6, 7]);
-        assert_eq!(&f.read_at(32, 2).await.unwrap()[..], &[32, 33]);
+        assert_eq!(&f.read_at(64, 2).await.unwrap()[..], &[64, 65]);
         // Let any stray prefetch tasks finish before counting.
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn out_of_order_concurrent_readers_share_the_window() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let fake = Arc::new(Fake {
+            data: AsyncMutex::new(data.clone()),
+            ..Default::default()
+        });
+        let f = Arc::new(file(fake.clone(), 8, 0));
+        let mut tasks = Vec::new();
+        for k in 0..8u64 {
+            let f = Arc::clone(&f);
+            tasks.push(tokio::spawn(async move {
+                let mut got = Vec::new();
+                for i in (k..1024).step_by(8) {
+                    // Jitter so the eight readers arrive out of order.
+                    tokio::time::sleep(std::time::Duration::from_micros((i * 7) % 300)).await;
+                    got.push((i * 4, f.read_at(i * 4, 4).await.unwrap()));
+                }
+                got
+            }));
+        }
+        let mut all: Vec<(u64, Bytes)> = Vec::new();
+        for task in tasks {
+            all.extend(task.await.unwrap());
+        }
+        all.sort_by_key(|(offset, _)| *offset);
+        let joined: Vec<u8> = all.iter().flat_map(|(_, b)| b.iter().copied()).collect();
+        assert_eq!(joined, data);
+        // 1024 chunks; the window must not thrash into wholesale refetching.
+        assert!(fake.reads.load(Ordering::SeqCst) < 1024 + 64);
     }
 
     #[tokio::test]
