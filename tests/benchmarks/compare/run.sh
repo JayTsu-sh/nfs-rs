@@ -8,6 +8,7 @@
 #        SKIP_LIF_B=1 to skip the cross-check on the second LIF
 #        DATA_REPEAT (5) / MC_REPEAT (3) repeats for large-file and multiclient cases
 #        SKIP_KERNEL=1 to skip the kernel-mount cases, SKIP_METADATA=1 / SKIP_MULTICLIENT=1
+#        DATA_SIZES="4k 40m 1g" to restrict the data suite sizes
 #        NFSRS_VARIANTS: space-separated "label:query" pairs appended to the nfs-rs URL,
 #          e.g. "base:readahead=0&writeback=0 opt:readahead=8&writeback=8" (default "na:")
 set -uo pipefail
@@ -90,7 +91,8 @@ invoke() {
 }
 
 data_matrix() {   # proto harness backend variant io
-  for size in 4k 40m 1g; do
+  # shellcheck disable=SC2086
+  for size in ${DATA_SIZES:-4k 40m 1g}; do
     for qd in 1 8; do
       [[ "$size" == 4k && "$qd" == 8 ]] && continue
       invoke "$@" data --size "$size" --qd "$qd" --repeat "$DATA_REPEAT"
