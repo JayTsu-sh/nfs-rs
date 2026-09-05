@@ -21,6 +21,7 @@ from report import (
     fmt,
     load_results,
     multiclient_value,
+    one,
     posix_filters,
     ratio,
     select,
@@ -72,6 +73,40 @@ def delta_rows(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], prot
     return rows
 
 
+RSS_ROWS: list[tuple[str, dict[str, Any]]] = [
+    ("4 KiB 文件", {"suite": "data", "p_size": "4k", "p_qd": 1}),
+    ("1 GiB QD1 写+读", {"suite": "data", "p_size": "1g", "p_qd": 1}),
+    ("1 GiB QD8 写+读", {"suite": "data", "p_size": "1g", "p_qd": 8}),
+    ("8 进程各读 1 GiB（单 worker）", {"suite": "multiclient", "p_mode": "distinct"}),
+]
+
+
+def rss_mib(reports: list[dict[str, Any]], proto: str, filters: dict[str, Any], case: dict[str, Any]) -> float | None:
+    r = one(select(reports, protocol=proto, **filters, **case))
+    return r["peak_rss_kib"] / 1024 if r else None
+
+
+def render_rss(tuned: list[dict[str, Any]], variants: list[str]) -> str:
+    out: list[str] = ["## 峰值内存（RSS，MiB）\n"]
+    cols = [("内核 O_DIRECT", lambda h: posix_filters(h, "default", "direct")),
+            ("内核 buffered", lambda h: posix_filters(h, "default", "buffered")),
+            *[(f"nfs-rs {v}", (lambda v: lambda h: {"harness": h, "backend": "nfsrs", "mount_variant": v})(v)) for v in variants]]
+    for proto in PROTOCOLS:
+        if not select(tuned, protocol=proto):
+            continue
+        header = ["NFSv" + proto, *[f"{c} ({h})" for h in HARNESSES for c, _ in cols]]
+        out.append("| " + " | ".join(header) + " |")
+        out.append("|" + "---|" * len(header))
+        for label, case in RSS_ROWS:
+            row = [label]
+            for h in HARNESSES:
+                for _, f in cols:
+                    row.append(fmt(rss_mib(tuned, proto, f(h), case), 0))
+            out.append("| " + " | ".join(row) + " |")
+        out.append("")
+    return "\n".join(out)
+
+
 def render(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], variants: list[str]) -> str:
     out: list[str] = []
     header = ["负载", "内核 O_DIRECT", "内核 buffered 冷", "nfs-rs 昨日",
@@ -88,6 +123,7 @@ def render(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], variants
             for row in delta_rows(baseline, tuned, proto, harness, variants):
                 out.append("| " + " | ".join(row) + " |")
             out.append("")
+    out.append(render_rss(tuned, variants))
     return "\n".join(out)
 
 

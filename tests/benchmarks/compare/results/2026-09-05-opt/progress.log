@@ -126,3 +126,89 @@
 [21:44:38] run 4.1/rust-posix-default-direct-data-size1g-qd1-repeat3
 [21:45:53] run 4.1/rust-posix-default-direct-data-size1g-qd8-repeat3
 [21:46:50] run 4.1/rust-posix-default-direct-multiclient-size1g-clients8-modesame-repeat2
+[21:49:29] run 4.1/rust-posix-default-direct-multiclient-size1g-clients8-modedistinct-repeat2
+[21:53:14] run 4.1/rust-posix-default-buffered-data-size4k-qd1-repeat3
+[21:53:17] run 4.1/rust-posix-default-buffered-data-size40m-qd1-repeat3
+[21:53:19] run 4.1/rust-posix-default-buffered-data-size40m-qd8-repeat3
+[21:53:26] run 4.1/rust-posix-default-buffered-data-size1g-qd1-repeat3
+[21:54:34] run 4.1/rust-posix-default-buffered-data-size1g-qd8-repeat3
+[21:55:34] run 4.1/rust-posix-default-buffered-multiclient-size1g-clients8-modesame-repeat2
+[21:56:10] run 4.1/rust-posix-default-buffered-multiclient-size1g-clients8-modedistinct-repeat2
+[22:00:04] run 4.1/python-posix-default-direct-data-size4k-qd1-repeat3
+[22:00:05] run 4.1/python-posix-default-direct-data-size40m-qd1-repeat3
+[22:00:09] run 4.1/python-posix-default-direct-data-size40m-qd8-repeat3
+[22:00:12] run 4.1/python-posix-default-direct-data-size1g-qd1-repeat3
+[22:01:42] run 4.1/python-posix-default-direct-data-size1g-qd8-repeat3
+[22:02:40] run 4.1/python-posix-default-direct-multiclient-size1g-clients8-modesame-repeat2
+[22:05:20] run 4.1/python-posix-default-direct-multiclient-size1g-clients8-modedistinct-repeat2
+[22:09:07] run 4.1/python-posix-default-buffered-data-size4k-qd1-repeat3
+[22:09:09] run 4.1/python-posix-default-buffered-data-size40m-qd1-repeat3
+[22:09:12] run 4.1/python-posix-default-buffered-data-size40m-qd8-repeat3
+[22:09:16] run 4.1/python-posix-default-buffered-data-size1g-qd1-repeat3
+[22:10:36] run 4.1/python-posix-default-buffered-data-size1g-qd8-repeat3
+[22:11:54] run 4.1/python-posix-default-buffered-multiclient-size1g-clients8-modesame-repeat2
+[22:12:32] run 4.1/python-posix-default-buffered-multiclient-size1g-clients8-modedistinct-repeat2
+[22:16:28] nfs-rs variant base: nfs://10.128.61.200/nfsrs_perf?version=4.1&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=0&writeback=0
+[22:16:28] run 4.1/rust-nfsrs-base-na-data-size4k-qd1-repeat3
+[22:16:30] run 4.1/rust-nfsrs-base-na-data-size40m-qd1-repeat3
+[22:16:33] run 4.1/rust-nfsrs-base-na-data-size40m-qd8-repeat3
+[22:16:35] run 4.1/rust-nfsrs-base-na-data-size1g-qd1-repeat3
+[22:17:48] run 4.1/rust-nfsrs-base-na-data-size1g-qd8-repeat3
+[22:18:45] run 4.1/rust-nfsrs-base-na-multiclient-size1g-clients8-modesame-repeat2
+[22:21:23] run 4.1/rust-nfsrs-base-na-multiclient-size1g-clients8-modedistinct-repeat2
+[22:25:07] run 4.1/python-nfsrs-base-na-data-size4k-qd1-repeat3
+[22:25:10] run 4.1/python-nfsrs-base-na-data-size40m-qd1-repeat3
+[22:25:14] run 4.1/python-nfsrs-base-na-data-size40m-qd8-repeat3
+[22:25:16] run 4.1/python-nfsrs-base-na-data-size1g-qd1-repeat3
+[22:26:50] run 4.1/python-nfsrs-base-na-data-size1g-qd8-repeat3
+[22:27:47] run 4.1/python-nfsrs-base-na-multiclient-size1g-clients8-modesame-repeat2
+[22:30:26] run 4.1/python-nfsrs-base-na-multiclient-size1g-clients8-modedistinct-repeat2
+[22:34:11] nfs-rs variant opt: nfs://10.128.61.200/nfsrs_perf?version=4.1&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=8&writeback=8
+[22:34:11] run 4.1/rust-nfsrs-opt-na-data-size4k-qd1-repeat3
+[22:34:13] run 4.1/rust-nfsrs-opt-na-data-size40m-qd1-repeat3
+[22:34:15] run 4.1/rust-nfsrs-opt-na-data-size40m-qd8-repeat3
+[22:34:18] run 4.1/rust-nfsrs-opt-na-data-size1g-qd1-repeat3
+[22:35:15] run 4.1/rust-nfsrs-opt-na-data-size1g-qd8-repeat3
+[22:36:13] run 4.1/rust-nfsrs-opt-na-multiclient-size1g-clients8-modesame-repeat2
+[22:38:51] run 4.1/rust-nfsrs-opt-na-multiclient-size1g-clients8-modedistinct-repeat2
+[22:42:36] run 4.1/python-nfsrs-opt-na-data-size4k-qd1-repeat3
+[22:42:40] run 4.1/python-nfsrs-opt-na-data-size40m-qd1-repeat3
+[22:42:42] run 4.1/python-nfsrs-opt-na-data-size40m-qd8-repeat3
+[22:42:45] run 4.1/python-nfsrs-opt-na-data-size1g-qd1-repeat3
+[22:43:44] run 4.1/python-nfsrs-opt-na-data-size1g-qd8-repeat3
+[22:44:41] run 4.1/python-nfsrs-opt-na-multiclient-size1g-clients8-modesame-repeat2
+[22:47:19] run 4.1/python-nfsrs-opt-na-multiclient-size1g-clients8-modedistinct-repeat2
+[22:51:05] === done: 168 results, 0 failures ===
+[22:55:26] === protocol 3 ===
+[22:55:26] nfs-rs variant base: nfs://10.128.61.200/nfsrs_perf?version=3&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=0&writeback=0
+[22:55:26] run 3/rust-nfsrs-base-na-data-size4k-qd1-repeat7
+[22:55:28] run 3/rust-nfsrs-base-na-data-size40m-qd1-repeat7
+[22:55:34] run 3/rust-nfsrs-base-na-data-size40m-qd8-repeat7
+[22:55:39] run 3/python-nfsrs-base-na-data-size4k-qd1-repeat7
+[22:55:41] run 3/python-nfsrs-base-na-data-size40m-qd1-repeat7
+[22:55:50] run 3/python-nfsrs-base-na-data-size40m-qd8-repeat7
+[22:55:55] nfs-rs variant opt: nfs://10.128.61.200/nfsrs_perf?version=3&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=8&writeback=8
+[22:55:55] run 3/rust-nfsrs-opt-na-data-size4k-qd1-repeat7
+[22:55:57] run 3/rust-nfsrs-opt-na-data-size40m-qd1-repeat7
+[22:56:02] run 3/rust-nfsrs-opt-na-data-size40m-qd8-repeat7
+[22:56:07] run 3/python-nfsrs-opt-na-data-size4k-qd1-repeat7
+[22:56:09] run 3/python-nfsrs-opt-na-data-size40m-qd1-repeat7
+[22:56:14] run 3/python-nfsrs-opt-na-data-size40m-qd8-repeat7
+[22:56:20] === protocol 4.0 ===
+[22:56:20] nfs-rs variant base: nfs://10.128.61.200/nfsrs_perf?version=4.0&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=0&writeback=0
+[22:56:20] run 4.0/rust-nfsrs-base-na-data-size4k-qd1-repeat7
+[22:56:22] run 4.0/rust-nfsrs-base-na-data-size40m-qd1-repeat7
+[22:56:29] run 4.0/rust-nfsrs-base-na-data-size40m-qd8-repeat7
+[22:56:34] run 4.0/python-nfsrs-base-na-data-size4k-qd1-repeat7
+[22:56:37] run 4.0/python-nfsrs-base-na-data-size40m-qd1-repeat7
+[22:56:45] run 4.0/python-nfsrs-base-na-data-size40m-qd8-repeat7
+[22:56:51] nfs-rs variant opt: nfs://10.128.61.200/nfsrs_perf?version=4.0&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=8&writeback=8
+[22:56:51] run 4.0/rust-nfsrs-opt-na-data-size4k-qd1-repeat7
+[22:56:53] run 4.0/rust-nfsrs-opt-na-data-size40m-qd1-repeat7
+[22:56:58] run 4.0/rust-nfsrs-opt-na-data-size40m-qd8-repeat7
+[22:57:03] run 4.0/python-nfsrs-opt-na-data-size4k-qd1-repeat7
+[22:57:05] run 4.0/python-nfsrs-opt-na-data-size40m-qd1-repeat7
+[22:57:11] run 4.0/python-nfsrs-opt-na-data-size40m-qd8-repeat7
+[22:57:17] === protocol 4.1 ===
+[22:57:17] nfs-rs variant base: nfs://10.128.61.200/nfsrs_perf?version=4.1&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=0&writeback=0
+[22:57:17] run 4.1/rust-nfsrs-base-na-data-size4k-qd1-repeat7

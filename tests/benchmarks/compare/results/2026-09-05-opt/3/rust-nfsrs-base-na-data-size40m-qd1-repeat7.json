@@ -1,0 +1,65 @@
+{
+  "backend": "nfsrs",
+  "env": {
+    "captured_at_unix": 1788620134,
+    "commit": "8a0de2c",
+    "drop_caches": false,
+    "hostname": "node181",
+    "kernel": "5.14.0-427.13.1.el9_4.x86_64",
+    "nfs_rs_version": "0.6.1",
+    "rsize": 1048576,
+    "wsize": 1048576
+  },
+  "harness": "rust",
+  "io_mode": null,
+  "mount_variant": "base",
+  "params": {
+    "bytes": 41943040,
+    "iters": 200,
+    "qd": 1,
+    "repeat": 7,
+    "size": "40m"
+  },
+  "peak_rss_kib": 11900,
+  "protocol": "3",
+  "results": [
+    {
+      "max": 86.0624561139297,
+      "median": 85.49176384315982,
+      "min": 84.34891696233124,
+      "name": "write",
+      "reference_only": false,
+      "samples": [
+        86.0624561139297,
+        85.49176384315982,
+        85.0278082383996,
+        85.55350306047552,
+        85.55024623360603,
+        84.34891696233124,
+        84.94291521808559
+      ],
+      "unit": "MiB/s"
+    },
+    {
+      "max": 93.70502700435978,
+      "median": 92.44248739179226,
+      "min": 86.23436795926703,
+      "name": "read",
+      "reference_only": false,
+      "samples": [
+        93.70502700435978,
+        91.72662446269639,
+        86.23436795926703,
+        91.63973388251986,
+        93.53828894448888,
+        92.49134753849054,
+        92.44248739179226
+      ],
+      "unit": "MiB/s"
+    }
+  ],
+  "schema": 1,
+  "smoke": false,
+  "suite": "data",
+  "target": "nfs://10.128.61.200/nfsrs_perf?version=3&rsize=1048576&wsize=1048576&uid=0&gid=0&readahead=0&writeback=0"
+}
