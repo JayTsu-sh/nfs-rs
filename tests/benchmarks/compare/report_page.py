@@ -165,6 +165,101 @@ def multiclient_chart(reports, proto: str) -> str:
     return legend(series) + hbar_chart(rows, series, round(vmax / 100 + 0.5) * 100, "聚合 MiB/s", ceiling=LINK_CEILING)
 
 
+# ----------------------------------------------------------------------------
+# read-ahead / write-behind follow-up (separate results dir, nfs-rs variants)
+# ----------------------------------------------------------------------------
+
+OPT_SERIES = [("nfs-rs 优化前 (Rust)", "s-base"), ("nfs-rs 优化后 (Rust)", "s-nfs"), ("内核 O_DIRECT", "s-ker"),
+              ("内核 buffered 冷读", "s-buf"), ("nfs-rs 优化后 (Python)", "s-py")]
+
+
+def opt_filters() -> list[dict]:
+    return [{"harness": "rust", "backend": "nfsrs", "mount_variant": "base"},
+            {"harness": "rust", "backend": "nfsrs", "mount_variant": "opt"},
+            R.posix_filters("rust", "default", "direct"), R.posix_filters("rust", "default", "buffered"),
+            {"harness": "python", "backend": "nfsrs", "mount_variant": "opt"}]
+
+
+def opt_tiles(tuned, proto: str) -> str:
+    base, opt, kd, kb, _ = opt_filters()
+    def g(size, qd, d):
+        return R.ratio(R.data_value(tuned, proto, opt, size, qd, d), R.data_value(tuned, proto, base, size, qd, d))
+    tiles = [
+        ("1 GiB 写 QD1 提升", g("1g", 1, "write"), "优化后 / 优化前 吞吐"),
+        ("1 GiB 读 QD1 提升", g("1g", 1, "read"), "优化后 / 优化前 吞吐"),
+        ("1 GiB 写 QD1 vs 内核 buffered", R.ratio(R.data_value(tuned, proto, opt, "1g", 1, "write"), R.data_value(tuned, proto, kb, "1g", 1, "write")), "内核回写是内核的最好成绩"),
+        ("1 GiB 读 QD1 vs 内核 buffered 冷", R.ratio(R.data_value(tuned, proto, opt, "1g", 1, "read"), R.data_value(tuned, proto, kb, "1g", 1, "read")), "内核预读是内核的最好成绩"),
+        ("4 KiB 写延迟 优化前/后", R.ratio(R.data_value(tuned, proto, base, "4k", 1, "write"), R.data_value(tuned, proto, opt, "4k", 1, "write")), ">1 表示更快；单次小写仍是一个 FILE_SYNC 往返"),
+        ("8 进程各读 1 GiB 提升", R.ratio(R.multiclient_value(tuned, proto, opt, "distinct"), R.multiclient_value(tuned, proto, base, "distinct")), "每进程 QD1，预读生效"),
+    ]
+    out = ['<div class="tiles">']
+    for name, v, note in tiles:
+        cls = "na" if v is None else ("good" if v >= 1.0 else "warn" if v >= 0.9 else "bad")
+        out.append(f'<div class="tile {cls}"><div class="tile-name">{e(name)}</div><div class="tile-val">{fmt(v, 2)}</div><div class="tile-note">{e(note)}</div></div>')
+    out.append("</div>")
+    return "\n".join(out)
+
+
+def opt_data_chart(tuned, proto: str) -> str:
+    rows = []
+    for size, sl in (("40m", "40 MiB"), ("1g", "1 GiB")):
+        for qd in (1, 8):
+            for d, dl in (("write", "写"), ("read", "读")):
+                rows.append((f"{sl} QD{qd} {dl}", [R.data_value(tuned, proto, f, size, qd, d) for f in opt_filters()]))
+    return legend(OPT_SERIES) + hbar_chart(rows, OPT_SERIES, 125, "MiB/s", ceiling=LINK_CEILING)
+
+
+def opt_multiclient_chart(tuned, proto: str) -> str:
+    rows = [(lab, [R.multiclient_value(tuned, proto, f, mode) for f in opt_filters()])
+            for mode, lab in (("same", "8 进程读同一文件"), ("distinct", "8 进程各读自己的文件"))]
+    vmax = max([v for _, vs in rows for v in vs if v is not None] + [120.0])
+    return legend(OPT_SERIES) + hbar_chart(rows, OPT_SERIES, round(vmax / 100 + 0.5) * 100, "聚合 MiB/s", ceiling=LINK_CEILING)
+
+
+def opt_small_io_table(tuned, proto: str) -> str:
+    cols = list(zip([n for n, _ in OPT_SERIES], opt_filters()))
+    out = ['<table class="data"><thead><tr><th>4 KiB 单次操作 (ms, p50)</th>' + "".join(f"<th>{e(c)}</th>" for c, _ in cols) + "</tr></thead><tbody>"]
+    for d, dl in (("write", "写 + flush"), ("read", "读（冷）")):
+        out.append(f"<tr><td>{dl}</td>" + "".join(f"<td>{fmt(R.data_value(tuned, proto, f, '4k', 1, d), 2)}</td>" for _, f in cols) + "</tr>")
+    out.append("</tbody></table>")
+    return "\n".join(out)
+
+
+def opt_memory_table(tuned, protos: list[str]) -> str:
+    out = ['<table class="data"><thead><tr><th>峰值 RSS (MiB)，1 GiB QD1 写读</th>' + "".join(f"<th>{PROTO_LABEL[p]}</th>" for p in protos) + "</tr></thead><tbody>"]
+    for name, f in zip([n for n, _ in OPT_SERIES], opt_filters()):
+        cells = []
+        for p in protos:
+            r = R.one(R.select(tuned, protocol=p, suite="data", p_size="1g", p_qd=1, **f))
+            cells.append(fmt(r["peak_rss_kib"] / 1024, 0) if r else "—")
+        out.append(f"<tr><td>{e(name)}</td>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    out.append("</tbody></table>")
+    return "\n".join(out)
+
+
+def opt_section(tuned, opt_notes_html: str) -> list[str]:
+    protos = [p for p in R.PROTOCOLS if R.select(tuned, protocol=p, mount_variant="opt")]
+    if not protos:
+        return []
+    parts = [
+        '<h2 id="opt">读写路径优化：预读 + 回写（2026-09-05 复测）</h2>',
+        '<p class="lede">nfs-rs 新增 <code>BufferedFile</code>：单路顺序读时提前发出后续 8 个 READ（<code>readahead=8</code>）；写入改为 UNSTABLE WRITE 流水线、'
+        '在 <code>flush()</code> 和每 16 MiB 发一次 COMMIT，小写先合并成整块（<code>writeback=8</code>）。同一天、同一二进制分别以 <code>readahead=0&amp;writeback=0</code>（优化前）'
+        '与 <code>8/8</code>（优化后）跑数据与多客户端用例，内核挂载同场复测；本轮 harness 把校验耗时计入读时长（此前扣除会高估有预读/页缓存的一方）。元数据路径不受影响，未复测。</p>',
+        opt_notes_html,
+    ]
+    for p in protos:
+        parts += [
+            f'<h3>{PROTO_LABEL[p]}</h3>',
+            opt_tiles(tuned, p),
+            f'<div class="chartbox">{opt_data_chart(tuned, p)}</div>',
+            f'<div class="tablebox">{opt_small_io_table(tuned, p)}</div>',
+            f'<div class="chartbox">{opt_multiclient_chart(tuned, p)}</div>',
+        ]
+    parts += ["<h3>峰值内存（优化路径）</h3>", f'<div class="tablebox">{opt_memory_table(tuned, protos)}</div>']
+    return parts
+
+
 def memory_table(reports, protos: list[str]) -> str:
     rows = [("nfs-rs Rust", {"harness": "rust", "backend": "nfsrs"}), ("内核 O_DIRECT (Rust)", R.posix_filters("rust", "default", "direct")),
             ("内核 buffered (Rust)", R.posix_filters("rust", "default", "buffered")), ("nfs-rs Python", {"harness": "python", "backend": "nfsrs"}),
@@ -226,10 +321,10 @@ p{max-width:68ch}
 .chart .na{fill:var(--muted);font-size:10px}
 .chart .ceiling{stroke:var(--ceiling);stroke-dasharray:4 3;stroke-width:1.2}
 .chart .ceiling-label{fill:var(--ceiling)}
-.bar{fill:var(--buf)}.s-nfs{fill:var(--nfs)}.s-ker{fill:var(--ker)}.s-buf{fill:var(--buf)}.s-py{fill:var(--py)}
+.bar{fill:var(--buf)}.s-nfs{fill:var(--nfs)}.s-ker{fill:var(--ker)}.s-buf{fill:var(--buf)}.s-py{fill:var(--py)}.s-base{fill:var(--nfs);fill-opacity:.35}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12.5px;color:var(--muted);margin:0 0 8px}
 .legend .sw{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-1px;background:var(--buf)}
-.legend .s-nfs{background:var(--nfs)}.legend .s-ker{background:var(--ker)}.legend .s-buf{background:var(--buf)}.legend .s-py{background:var(--py)}
+.legend .s-nfs{background:var(--nfs)}.legend .s-ker{background:var(--ker)}.legend .s-buf{background:var(--buf)}.legend .s-py{background:var(--py)}.legend .s-base{background:var(--nfs);opacity:.35}
 .tablebox{overflow-x:auto;margin:10px 0}
 table.data{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
 table.data th,table.data td{padding:7px 10px;border-bottom:1px solid var(--rule);text-align:right;white-space:nowrap}
@@ -254,8 +349,9 @@ footer{margin-top:48px;padding-top:14px;border-top:1px solid var(--rule);font-si
 """
 
 
-def build_page(reports, failures, status: str, notes_html: str) -> str:
+def build_page(reports, failures, status: str, notes_html: str, tuned=None, opt_notes_html: str = "") -> str:
     protos = [p for p in R.PROTOCOLS if R.select(reports, protocol=p)]
+    tuned = tuned or []
     env = (R.one(reports) or {}).get("env", {})
     parts = [
         '<title>nfs-rs vs 内核挂载</title>',
@@ -265,7 +361,7 @@ def build_page(reports, failures, status: str, notes_html: str) -> str:
         "<header><div>",
         '<h1>nfs-rs vs 内核挂载<small>FAS2750 · NFSv3 / v4.0 / v4.1 · 元数据 · 4 KiB / 40 MiB / 1 GiB · Rust 与 Python</small></h1>',
         f'<span class="status">{e(status)}</span>',
-        '<nav class="proto-nav">' + "".join(f'<a href="#p{p.replace(".", "")}">{PROTO_LABEL[p]}</a>' for p in protos) + '<a href="#findings">发现</a><a href="#method">方法与限制</a></nav>',
+        '<nav class="proto-nav">' + "".join(f'<a href="#p{p.replace(".", "")}">{PROTO_LABEL[p]}</a>' for p in protos) + ('<a href="#opt">读写优化</a>' if tuned else '') + '<a href="#findings">发现</a><a href="#method">方法与限制</a></nav>',
         "</div>",
         f'<div class="meta"><span>客户端 <b>node181</b> · Rocky 9.4 · {e(env.get("kernel", ""))}</span>'
         f'<span>存储 <b>FAS2750</b> ONTAP 9.19.1 · SVM lizy · LIF 10.128.61.200</span>'
@@ -290,6 +386,7 @@ def build_page(reports, failures, status: str, notes_html: str) -> str:
             "<h3>多客户端 · 8 个独立进程各自完整读 1 GiB（2 次）</h3>",
             f'<div class="chartbox">{multiclient_chart(reports, p)}</div>',
         ]
+    parts += opt_section(tuned, opt_notes_html)
     parts += [
         '<h2 id="findings">发现</h2>',
         notes_html,
@@ -326,10 +423,14 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--status", default="")
     ap.add_argument("--notes", type=Path, help="HTML fragment for the findings section")
+    ap.add_argument("--opt-results-dir", type=Path, help="results of the read-ahead/write-behind re-run (nfs-rs variants base/opt)")
+    ap.add_argument("--opt-notes", type=Path, help="HTML fragment for the optimisation section")
     a = ap.parse_args()
     reports, failures = R.load_results(a.results_dir)
     notes = a.notes.read_text(encoding="utf-8") if a.notes else ""
-    a.out.write_text(build_page(reports, failures, a.status, notes), encoding="utf-8")
+    tuned = R.load_results(a.opt_results_dir)[0] if a.opt_results_dir else []
+    opt_notes = a.opt_notes.read_text(encoding="utf-8") if a.opt_notes else ""
+    a.out.write_text(build_page(reports, failures, a.status, notes, tuned, opt_notes), encoding="utf-8")
     print(f"{len(reports)} results -> {a.out}")
 
 
