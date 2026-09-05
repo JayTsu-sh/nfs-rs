@@ -24,7 +24,9 @@
 //! (RFC 1813 §3.3.7 / RFC 5661 §18.32: UNSTABLE writes need a COMMIT).
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -138,8 +140,19 @@ pub struct BufferedFile {
     read_chunk: u32,
     write_chunk: u32,
     reads: Mutex<ReadState>,
+    /// `read_at` calls currently in progress; read-ahead only engages for a
+    /// lone reader, callers that are already concurrent supply their own depth.
+    reads_in_flight: AtomicUsize,
     writes: Mutex<WriteState>,
     write_permits: Arc<Semaphore>,
+}
+
+struct InFlightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl std::fmt::Debug for BufferedFile {
@@ -174,6 +187,7 @@ impl BufferedFile {
                 pending: BTreeMap::new(),
                 eof: None,
             }),
+            reads_in_flight: AtomicUsize::new(0),
             writes: Mutex::new(WriteState {
                 inflight: Vec::new(),
                 staging: None,
@@ -201,6 +215,8 @@ impl BufferedFile {
         if self.opts.readahead == 0 {
             return self.read_direct(offset, len).await;
         }
+        self.reads_in_flight.fetch_add(1, Ordering::AcqRel);
+        let _guard = InFlightGuard(&self.reads_in_flight);
         let mut pieces: Vec<Bytes> = Vec::new();
         let mut cur = offset;
         let mut remaining = len;
@@ -241,11 +257,14 @@ impl BufferedFile {
     /// keep the window topped up ahead of the furthest reader.
     ///
     /// `next` is the frontier (one past the furthest chunk requested so far).
-    /// An access within one window of the frontier counts as sequential, so
-    /// several concurrent readers walking the same file out of order all
-    /// share the window; a far jump discards it and starts over.
+    /// An access within one window of the frontier counts as sequential; a far
+    /// jump discards the window and starts over. The window is only topped up
+    /// while this is the sole reader in flight: concurrent readers (QD > 1)
+    /// interleave in ways a single window cannot predict, and they already
+    /// keep the link busy by themselves.
     async fn read_chunk_ahead(&self, cur: u64, want: u32) -> Result<Bytes> {
         let window = u64::from(self.read_chunk).saturating_mul(u64::from(self.opts.readahead));
+        let solo = self.reads_in_flight.load(Ordering::Acquire) <= 1;
         let hit = {
             let mut state = self.reads.lock().await;
             let hit = state.pending.remove(&cur);
@@ -258,7 +277,9 @@ impl BufferedFile {
                 state.next = state.next.max(end);
                 let floor = cur.saturating_sub(window);
                 state.pending.retain(|&key, _| key >= floor);
-                self.top_up(&mut state);
+                if solo {
+                    self.top_up(&mut state);
+                }
             }
             hit
         };
@@ -288,14 +309,11 @@ impl BufferedFile {
             if state.eof.is_some_and(|eof| key >= eof) {
                 break;
             }
-            if !state.pending.contains_key(&key) {
+            if let Entry::Vacant(slot) = state.pending.entry(key) {
                 let io = Arc::clone(&self.io);
                 let fh = self.fh.clone();
                 let count = self.read_chunk;
-                state.pending.insert(
-                    key,
-                    tokio::spawn(async move { io.read(fh, key, count).await }),
-                );
+                slot.insert(tokio::spawn(async move { io.read(fh, key, count).await }));
             }
             key = key.saturating_add(chunk);
         }
@@ -588,7 +606,7 @@ fn concat(pieces: Vec<Bytes>, capacity: usize) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicU32;
     use tokio::sync::Mutex as AsyncMutex;
 
     #[derive(Default)]
@@ -724,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_order_concurrent_readers_share_the_window() {
+    async fn concurrent_readers_do_not_thrash_the_window() {
         let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
         let fake = Arc::new(Fake {
             data: AsyncMutex::new(data.clone()),
@@ -751,8 +769,9 @@ mod tests {
         all.sort_by_key(|(offset, _)| *offset);
         let joined: Vec<u8> = all.iter().flat_map(|(_, b)| b.iter().copied()).collect();
         assert_eq!(joined, data);
-        // 1024 chunks; the window must not thrash into wholesale refetching.
+        // 1024 chunks; concurrent readers must not trigger extra refetching.
         assert!(fake.reads.load(Ordering::SeqCst) < 1024 + 64);
+        assert!(fake.max_concurrent_reads.load(Ordering::SeqCst) >= 4);
     }
 
     #[tokio::test]
