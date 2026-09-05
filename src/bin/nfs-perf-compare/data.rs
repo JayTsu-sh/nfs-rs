@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::task::JoinSet;
@@ -67,35 +67,31 @@ pub async fn read_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Res
     let mut set = JoinSet::new();
     for _ in 0..qd {
         let (h, next, block) = (Arc::clone(&handle), Arc::clone(&next), block.clone());
+        // Verification stays inside the timed region: it is a memcmp, and
+        // subtracting it would over-credit any backend that overlaps
+        // transfer with verification (read-ahead, page cache).
         set.spawn(async move {
-            let mut verify_time = Duration::ZERO;
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
-                    return Ok::<Duration, BenchError>(verify_time);
+                    return Ok::<(), BenchError>(());
                 }
                 let offset = i * chunk;
                 let len = (size - offset).min(chunk) as usize;
                 let data = h.read_at(offset, len).await?;
-                let v = Instant::now();
                 if data.len() != len || !verify(&block, offset, &data) {
                     return Err(BenchError::Integrity(format!(
                         "chunk at offset {offset} mismatch ({} of {len} bytes)",
                         data.len()
                     )));
                 }
-                verify_time += v.elapsed();
             }
         });
     }
-    let mut verify_total = Duration::ZERO;
     while let Some(joined) = set.join_next().await {
-        verify_total += joined.map_err(|e| BenchError::Join(e.to_string()))??;
+        joined.map_err(|e| BenchError::Join(e.to_string()))??;
     }
-    let elapsed = started.elapsed();
-    let seconds = elapsed
-        .saturating_sub(verify_total / qd.max(1) as u32)
-        .as_secs_f64();
+    let seconds = started.elapsed().as_secs_f64();
     close_shared(handle).await?;
     Ok(seconds)
 }

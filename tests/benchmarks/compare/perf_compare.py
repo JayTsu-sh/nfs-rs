@@ -172,7 +172,6 @@ class PosixBackend:
         fd = self._open(p, False)
         try:
             total = -(-size // CHUNK)
-            verify_time = [0.0] * qd
             started = time.perf_counter()
 
             def worker(k: int) -> None:
@@ -187,13 +186,11 @@ class PosixBackend:
                         if r <= 0:
                             break
                         done += r
-                    v = time.perf_counter()
                     if done != n or not verify(offset, view[:n]):
                         raise BenchError(f"chunk at offset {offset} mismatch ({done} of {n} bytes)")
-                    verify_time[k] += time.perf_counter() - v
 
             _run_threads(worker, qd)
-            return time.perf_counter() - started - sum(verify_time) / qd
+            return time.perf_counter() - started
         finally:
             os.close(fd)
 
@@ -307,7 +304,6 @@ class NfsRsBackend:
         total = -(-size // chunk)
         f = await self._client.open(p, "rb")
         try:
-            verify_time = [0.0] * qd
             started = time.perf_counter()
 
             async def worker(k: int) -> None:
@@ -315,13 +311,11 @@ class NfsRsBackend:
                     offset = i * chunk
                     n = min(size - offset, chunk)
                     data = await f.read_at(offset, n)
-                    v = time.perf_counter()
                     if len(data) != n or not verify(offset, data):
                         raise BenchError(f"chunk at offset {offset} mismatch ({len(data)} of {n} bytes)")
-                    verify_time[k] += time.perf_counter() - v
 
             await asyncio.gather(*(worker(k) for k in range(qd)))
-            return time.perf_counter() - started - sum(verify_time) / qd
+            return time.perf_counter() - started
         finally:
             await f.close()
 
