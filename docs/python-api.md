@@ -59,6 +59,13 @@ Common options:
 | `readdir-buffer=` | Directory response limit, or `dircount,maxcount` |
 | `noresvport=true` | Use an unprivileged source port |
 | `retain-delegations=true` | Retain delegations when supported |
+| `readahead=` | READ chunks prefetched ahead of a lone sequential reader (default 8, `0` disables) |
+| `writeback=` | UNSTABLE WRITE chunks kept in flight behind a writer, COMMIT on `flush()`/`close()` (default 0) |
+
+With `writeback` enabled, `write()`/`write_at()` return once the data is queued;
+durability and deferred write errors surface on `flush()` and `close()`, like a
+buffered POSIX file. Leave it at 0 when every write must be acknowledged as
+stable before the call returns.
 
 The default `noresvport=false` binds below port 1024 for exports enforcing the
 secure-port convention and may require elevated privileges. Use
@@ -80,6 +87,8 @@ client = Client.connect(
     gid=1000,
     rsize=1024 * 1024,
     wsize=1024 * 1024,
+    readahead=8,
+    writeback=8,
     connect_timeout=10,
     operation_timeout=30,
     recovery_event_capacity=256,
