@@ -49,9 +49,11 @@ def delta_rows(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], prot
                variants: list[str]) -> list[list[str]]:
     rows = []
     nfs_before = {"harness": harness, "backend": "nfsrs"}
+    # Kernel columns come from the tuned run when it re-measured the kernel mount.
+    kernel = tuned if select(tuned, protocol=proto, backend="posix") else baseline
     for label, size, qd, direction, lower in DATA_ROWS:
-        k_direct = data_value(baseline, proto, posix_filters(harness, "default", "direct"), size, qd, direction)
-        k_buffered = data_value(baseline, proto, posix_filters(harness, "default", "buffered"), size, qd, direction)
+        k_direct = data_value(kernel, proto, posix_filters(harness, "default", "direct"), size, qd, direction)
+        k_buffered = data_value(kernel, proto, posix_filters(harness, "default", "buffered"), size, qd, direction)
         before = data_value(baseline, proto, nfs_before, size, qd, direction)
         values = [data_value(tuned, proto, {**nfs_before, "mount_variant": v}, size, qd, direction) for v in variants]
         last = values[-1] if values else None
@@ -59,8 +61,8 @@ def delta_rows(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], prot
         rows.append([label, fmt(k_direct), fmt(k_buffered), fmt(before), *[fmt(v) for v in values],
                      fmt(gain(first, last, lower)), fmt(gain(k_direct, last, lower)), fmt(gain(k_buffered, last, lower))])
     for mode, label in (("same", "8 客户端同文件 (MiB/s)"), ("distinct", "8 客户端不同文件 (MiB/s)")):
-        k_direct = multiclient_value(baseline, proto, posix_filters(harness, "default", "direct"), mode)
-        k_buffered = multiclient_value(baseline, proto, posix_filters(harness, "default", "buffered"), mode)
+        k_direct = multiclient_value(kernel, proto, posix_filters(harness, "default", "direct"), mode)
+        k_buffered = multiclient_value(kernel, proto, posix_filters(harness, "default", "buffered"), mode)
         before = multiclient_value(baseline, proto, nfs_before, mode)
         values = [multiclient_value(tuned, proto, {**nfs_before, "mount_variant": v}, mode) for v in variants]
         last = values[-1] if values else None
@@ -72,7 +74,7 @@ def delta_rows(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], prot
 
 def render(baseline: list[dict[str, Any]], tuned: list[dict[str, Any]], variants: list[str]) -> str:
     out: list[str] = []
-    header = ["负载", "内核 O_DIRECT", "内核 buffered 冷", "nfs-rs 优化前",
+    header = ["负载", "内核 O_DIRECT", "内核 buffered 冷", "nfs-rs 昨日",
               *[f"nfs-rs {v}" for v in variants], f"{variants[-1]}/{variants[0]}", "vs O_DIRECT", "vs buffered"]
     for proto in PROTOCOLS:
         if not select(tuned, protocol=proto):

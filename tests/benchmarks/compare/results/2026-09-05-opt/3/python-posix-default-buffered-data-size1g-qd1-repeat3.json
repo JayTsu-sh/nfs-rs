@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "harness": "python",
+  "backend": "posix",
+  "protocol": "3",
+  "target": "/mnt/nfsrs_perf",
+  "mount_variant": "default",
+  "io_mode": "buffered",
+  "suite": "data",
+  "smoke": false,
+  "params": {
+    "size": "1g",
+    "bytes": 1073741824,
+    "qd": 1,
+    "repeat": 3,
+    "iters": 200
+  },
+  "env": {
+    "hostname": "node181",
+    "kernel": "5.14.0-427.13.1.el9_4.x86_64",
+    "python": "3.11.7",
+    "nfs_rs_version": "0.6.1",
+    "commit": "d6b1b42",
+    "rsize": 1048576,
+    "wsize": 1048576,
+    "captured_at_unix": 1788609477,
+    "drop_caches": true
+  },
+  "peak_rss_kib": 30576,
+  "results": [
+    {
+      "name": "write",
+      "unit": "MiB/s",
+      "reference_only": false,
+      "samples": [
+        103.48668226508211,
+        101.52595622206714,
+        103.2210560100659
+      ],
+      "median": 103.2210560100659,
+      "min": 101.52595622206714,
+      "max": 103.48668226508211
+    },
+    {
+      "name": "read",
+      "unit": "MiB/s",
+      "reference_only": false,
+      "samples": [
+        98.81526545489275,
+        99.64229381844923,
+        99.0017509046595
+      ],
+      "median": 99.0017509046595,
+      "min": 98.81526545489275,
+      "max": 99.64229381844923
+    },
+    {
+      "name": "read_hot",
+      "unit": "MiB/s",
+      "reference_only": true,
+      "samples": [
+        234.76261901786307,
+        238.9500483734805,
+        242.12938122898063
+      ],
+      "median": 238.9500483734805,
+      "min": 234.76261901786307,
+      "max": 242.12938122898063
+    }
+  ]
+}

@@ -259,12 +259,13 @@ impl BufferedFile {
     /// `next` is the frontier (one past the furthest chunk requested so far).
     /// An access within one window of the frontier counts as sequential; a far
     /// jump discards the window and starts over. The window is only topped up
-    /// while this is the sole reader in flight: concurrent readers (QD > 1)
-    /// interleave in ways a single window cannot predict, and they already
-    /// keep the link busy by themselves.
+    /// for full-chunk requests from the sole reader in flight: a smaller read
+    /// is either a small file or a caller that does not stream, and
+    /// concurrent readers (QD > 1) interleave in ways a single window cannot
+    /// predict while already keeping the link busy by themselves.
     async fn read_chunk_ahead(&self, cur: u64, want: u32) -> Result<Bytes> {
         let window = u64::from(self.read_chunk).saturating_mul(u64::from(self.opts.readahead));
-        let solo = self.reads_in_flight.load(Ordering::Acquire) <= 1;
+        let solo = self.reads_in_flight.load(Ordering::Acquire) <= 1 && want == self.read_chunk;
         let hit = {
             let mut state = self.reads.lock().await;
             let hit = state.pending.remove(&cur);
@@ -772,6 +773,18 @@ mod tests {
         // 1024 chunks; concurrent readers must not trigger extra refetching.
         assert!(fake.reads.load(Ordering::SeqCst) < 1024 + 64);
         assert!(fake.max_concurrent_reads.load(Ordering::SeqCst) >= 4);
+    }
+
+    #[tokio::test]
+    async fn small_reads_do_not_prefetch() {
+        let fake = Arc::new(Fake {
+            data: AsyncMutex::new((0..40u8).collect()),
+            ..Default::default()
+        });
+        let f = file(fake.clone(), 3, 0);
+        assert_eq!(&f.read_at(0, 2).await.unwrap()[..], &[0, 1]);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
