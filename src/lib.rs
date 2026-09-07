@@ -32,7 +32,7 @@
 //!
 //! let created = mount.create_path("hello.txt", Some(0o644)).await?;
 //! mount
-//!     .write(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+//!     .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
 //!     .await?;
 //! mount.commit(created.fh.clone(), 0, 9).await?;
 //! mount.close(created.fh).await?;
@@ -256,6 +256,7 @@ mod client_core;
 #[cfg(test)]
 mod client_core_contract;
 pub mod error;
+mod fileio;
 mod mount;
 mod nfs3;
 mod nfs4;
@@ -270,6 +271,7 @@ pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, RequestId, RequestTransmission, Result,
 };
+pub use fileio::{BufferedFile, IoOptions};
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, Acl41Flags, AclSupport, Attr, CallbackStats, ExportEntry,
     FSInfo, FSStat, LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState,
@@ -341,6 +343,7 @@ struct MountArgs {
     wsize: u32,
     noresvport: bool,
     retain_delegations: bool,
+    io_options: IoOptions,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -353,7 +356,7 @@ struct MountArgs {
 ///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
-///         let num_bytes_written = mount.write(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
+///         let num_bytes_written = mount.write_stable(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
 ///         assert_eq!(num_bytes_written as usize, contents_len);
 ///         let bytes_read = mount.read(res.fh, 0, 16).await.unwrap_or_default();
 ///         assert_eq!(&bytes_read, "hello rust".as_bytes());
@@ -495,6 +498,19 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         false,
         "specified URL contains bad retain-delegations value",
     )?;
+    let io_defaults = IoOptions::default();
+    let readahead = get_url_query_param(
+        &parsed_url,
+        "readahead",
+        io_defaults.readahead,
+        "specified URL contains bad readahead value",
+    )?;
+    let writeback = get_url_query_param(
+        &parsed_url,
+        "writeback",
+        io_defaults.writeback,
+        "specified URL contains bad writeback value",
+    )?;
     let host = parsed_url.host_str().unwrap_or_default().to_string();
     Ok(MountArgs {
         versions,
@@ -510,6 +526,11 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         wsize,
         noresvport,
         retain_delegations,
+        io_options: IoOptions {
+            readahead,
+            writeback,
+            ..io_defaults
+        },
     })
 }
 
@@ -1019,6 +1040,7 @@ mod tests {
             wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1042,6 +1064,7 @@ mod tests {
             wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1065,6 +1088,7 @@ mod tests {
             wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1237,6 +1261,16 @@ mod tests {
             !args.noresvport,
             "default should be false (preserve legacy privileged-port behavior)"
         );
+    }
+
+    #[test]
+    fn parse_url_readahead_and_writeback() {
+        let default = parse_url("nfs://127.0.0.1/export").unwrap();
+        assert_eq!(default.io_options, IoOptions::default());
+        let tuned = parse_url("nfs://127.0.0.1/export?readahead=0&writeback=16").unwrap();
+        assert_eq!(tuned.io_options.readahead, 0);
+        assert_eq!(tuned.io_options.writeback, 16);
+        assert!(parse_url("nfs://127.0.0.1/export?writeback=many").is_err());
     }
 
     #[test]

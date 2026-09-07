@@ -7,6 +7,47 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `BufferedFile`: sequential read-ahead and write-behind (UNSTABLE WRITE with
+  batched COMMIT, small-write coalescing, verifier-change resend) on top of any
+  `Mount`; URL parameters `readahead=<chunks>` (default 8) and
+  `writeback=<chunks>` (default 0) and matching Python `connect()` options.
+  Python file objects use it automatically when either window is enabled.
+- **Breaking:** `Mount::write(fh, offset, data)` is now an UNSTABLE write:
+  it never issues a COMMIT and returns the server's `WriteOutcome` (count,
+  whether it was committed anyway, write verifier); the caller COMMITs. The
+  previous durable-on-return `write` is renamed `write_stable` (and
+  `write_path` → `write_stable_path`; the new `write_path` is UNSTABLE too).
+  Callers that relied on `write` being durable must switch to `write_stable`.
+- `Mount::commit_with_verifier` is implemented for NFSv4.0 and NFSv4.1, so
+  verifier changes are detected on every protocol.
+- `Mount::io_options` exposes the `readahead`/`writeback` settings.
+- `BufferedFile::close` flushes queued writes and then CLOSEs the file; a
+  `BufferedFile` dropped with queued data logs a warning and discards it.
+
+### Changed
+
+- Benchmark harness `nfs-perf-compare` keeps data verification inside the
+  timed region so read-ahead and page-cache backends are not over-credited.
+- `tests/benchmarks/compare/ontap_prepare.py` verifies the ONTAP management
+  certificate by default; `--insecure` opts out, `--ca-file` names a bundle.
+
+### Fixed
+
+- NFSv4.1 file layouts: `nfl_util` flags are decoded per RFC 5661 §13.3
+  (`NFL4_UFLG_DENSE` = 0x1, `NFL4_UFLG_COMMIT_THRU_MDS` = 0x2, stripe unit in
+  the upper 26 bits); the decoder previously read bit 30 as the dense flag.
+- NFSv4.1 pNFS `write_stable`: when a data server downgrades a FILE_SYNC
+  WRITE, the COMMIT is routed per RFC 5661 §13.7 (MDS with
+  `COMMIT_THRU_MDS`, otherwise the data server that took the WRITE), its
+  failure is reported instead of ignored, a write verifier mismatch is
+  surfaced as an uncertain write, and a LAYOUTCOMMIT follows so the
+  metadata server's size reflects the recovered data (RFC 5661 §12.5.4).
+- `BufferedFile` read-ahead: READs of a discarded window still count against
+  the `readahead` limit, so random access on a slow link cannot accumulate
+  more in-flight prefetches than the window allows.
+
 ## [0.6.1] - 2026-09-03
 
 ### Fixed

@@ -247,6 +247,7 @@ pub(crate) struct Mount41 {
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
     pub(crate) acl_supported: bool,
+    pub(crate) io_options: crate::IoOptions,
 }
 
 impl Mount41 {
@@ -910,6 +911,7 @@ async fn mount_on_addr(
         rsize,
         wsize,
         acl_supported,
+        io_options: args.io_options,
     };
 
     Ok(Box::new(Mount41Wrapper {
@@ -1519,6 +1521,10 @@ impl crate::Mount for Mount41Wrapper {
         self.m.wsize
     }
 
+    fn io_options(&self) -> crate::IoOptions {
+        self.m.io_options
+    }
+
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
         let session = self.m.session_holder.get().await;
         Some(Nfs41ChannelLimits {
@@ -1677,11 +1683,37 @@ impl crate::Mount for Mount41Wrapper {
     async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
         self.m.readdirplus_path(dir_path).await
     }
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write(fh, offset, data).await
+    async fn write(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::mount::WriteOutcome> {
+        self.m
+            .write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
+            .await
     }
-    async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write_path(path, offset, data).await
+    /// Durable on return: pNFS data servers first (COMMIT routed per RFC
+    /// 5661 §13.7 inside `pnfs_write`), otherwise the MDS with the shared
+    /// downgrade-COMMIT / verifier check.
+    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        if let Some(result) = self.m.write_stable_pnfs(&fh, offset, data.clone()).await {
+            return result;
+        }
+        let outcome = self
+            .m
+            .write_how(
+                fh.clone(),
+                offset,
+                data,
+                crate::mount::WriteStability::FileSync,
+            )
+            .await?;
+        crate::mount::finish_stable_write(self, fh, offset, outcome).await
+    }
+    async fn write_stable_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
+        let obj = self.m.lookup_path(path).await?;
+        self.write_stable(obj.fh, offset, data).await
     }
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
         self.m.open(dir_fh, filename, access).await
@@ -1805,6 +1837,14 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.m.commit(fh, offset, count).await
+    }
+    async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
+        self.m.commit_with_verifier(fh, offset, count).await
     }
     async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
         self.m.commit_path(path, offset, count).await

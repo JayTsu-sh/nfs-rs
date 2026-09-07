@@ -125,6 +125,8 @@ def test_async_context_preserves_body_exception_when_close_also_fails():
         ({"readdir_buffer": (1, 0)}, "readdir_buffer"),
         ({"readdir_buffer": (1, 2, 3)}, "readdir_buffer"),
         ({"operation_timeout": 0}, "operation_timeout"),
+        ({"readahead": -1}, "readahead"),
+        ({"writeback": 1000}, "writeback"),
     ],
 )
 def test_connection_option_validation_is_shared(options, message):

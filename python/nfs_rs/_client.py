@@ -373,6 +373,8 @@ def _configured_url(url: str, options: dict[str, Any]) -> str:
         "readdir-buffer",
         "noresvport",
         "retain-delegations",
+        "readahead",
+        "writeback",
     }
     unknown = sorted({name for name, _ in query_items} - allowed_query_names)
     if unknown:
@@ -388,6 +390,8 @@ def _configured_url(url: str, options: dict[str, Any]) -> str:
         "readdir_buffer": "readdir-buffer",
         "noresvport": "noresvport",
         "retain_delegations": "retain-delegations",
+        "readahead": "readahead",
+        "writeback": "writeback",
     }
     if "versions" in options:
         query["version"] = ",".join(options["versions"])
@@ -420,6 +424,8 @@ def _options(
     readdir_buffer: int | tuple[int, int] | None,
     noresvport: bool | None,
     retain_delegations: bool | None,
+    readahead: int | None,
+    writeback: int | None,
     connect_timeout: float | None,
     operation_timeout: float | None,
     recovery_event_capacity: int,
@@ -441,6 +447,9 @@ def _options(
     for name, size_value in (("rsize", rsize), ("wsize", wsize)):
         if size_value is not None and (isinstance(size_value, bool) or size_value <= 0):
             raise ValueError(f"{name} must be positive")
+    for name, window in (("readahead", readahead), ("writeback", writeback)):
+        if window is not None and (isinstance(window, bool) or not 0 <= window <= 256):
+            raise ValueError(f"{name} must be an integer between 0 and 256")
     for name, timeout_value in (
         ("connect_timeout", connect_timeout),
         ("operation_timeout", operation_timeout),
@@ -476,6 +485,8 @@ def _options(
             "readdir_buffer": readdir_buffer,
             "noresvport": noresvport,
             "retain_delegations": retain_delegations,
+            "readahead": readahead,
+            "writeback": writeback,
             "connect_timeout": connect_timeout,
             "operation_timeout": operation_timeout,
             "recovery_event_capacity": recovery_event_capacity,
@@ -501,6 +512,8 @@ class _ClientOptions:
         readdir_buffer: int | tuple[int, int] | None = None,
         noresvport: bool | None = None,
         retain_delegations: bool | None = None,
+        readahead: int | None = None,
+        writeback: int | None = None,
         connect_timeout: float | None = None,
         operation_timeout: float | None = None,
         recovery_event_capacity: int = 256,

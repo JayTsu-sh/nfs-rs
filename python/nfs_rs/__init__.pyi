@@ -249,7 +249,8 @@ class Client:
         uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
         mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
         readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
-        retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
+        retain_delegations: bool | None = ..., readahead: int | None = ...,
+        writeback: int | None = ..., connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
     ) -> Client: ...
     @property
@@ -312,7 +313,8 @@ class AsyncClient:
         uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
         mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
         readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
-        retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
+        retain_delegations: bool | None = ..., readahead: int | None = ...,
+        writeback: int | None = ..., connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
     ) -> AsyncClient: ...
     @property

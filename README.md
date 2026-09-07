@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
 
     let created = mount.create_path("hello.txt", Some(0o644)).await?;
     mount
-        .write(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+        .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
         .await?;
     mount.commit(created.fh.clone(), 0, 9).await?;
     mount.close(created.fh).await?;
@@ -103,6 +103,15 @@ Supported arguments:
 - `wsize=<bytes>` — maximum write request size.
 - `noresvport=<true|false>` — use an ephemeral source port when true. It
   defaults to false.
+- `readahead=<chunks>` — READ requests kept in flight ahead of a lone
+  sequential reader using `BufferedFile`. The default is 8; `0` disables it.
+- `writeback=<chunks>` — UNSTABLE WRITE requests kept in flight behind a
+  `BufferedFile` writer, with COMMIT on `flush()` and every 16 MiB. The default
+  is 0 (every write is synchronous and FILE_SYNC); when enabled, data is durable
+  only after `flush()`.
+
+`BufferedFile` wraps a file handle from `open`/`create` and applies both
+windows; `Mount::read`/`Mount::write` themselves are unaffected.
 
 When `noresvport=false`, the client binds below port 1024 for servers enforcing
 the RFC 1813 secure-port convention. This may require elevated privileges.
