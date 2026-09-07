@@ -104,7 +104,10 @@ struct ReadState {
     /// Offset the next sequential read is expected at.
     next: u64,
     /// In-flight read-ahead chunks keyed by file offset. Each covers
-    /// `read_chunk` bytes unless the file ends first.
+    /// `read_chunk` bytes unless the file ends first. A chunk dropped from
+    /// this map keeps running to completion but still holds its
+    /// `read_permits` slot, so the window bounds READs in flight, not just
+    /// the ones the reader still expects to consume.
     pending: BTreeMap<u64, JoinHandle<Result<Bytes>>>,
     /// Known end of file; nothing is prefetched at or beyond it.
     eof: Option<u64>,
@@ -143,6 +146,9 @@ pub struct BufferedFile {
     /// `read_at` calls currently in progress; read-ahead only engages for a
     /// lone reader, callers that are already concurrent supply their own depth.
     reads_in_flight: AtomicUsize,
+    /// One permit per read-ahead task, released when the READ completes,
+    /// whether or not the reader still wants the result.
+    read_permits: Arc<Semaphore>,
     writes: Mutex<WriteState>,
     write_permits: Arc<Semaphore>,
 }
@@ -188,6 +194,7 @@ impl BufferedFile {
                 eof: None,
             }),
             reads_in_flight: AtomicUsize::new(0),
+            read_permits: Arc::new(Semaphore::new(opts.readahead as usize)),
             writes: Mutex::new(WriteState {
                 inflight: Vec::new(),
                 staging: None,
@@ -271,7 +278,9 @@ impl BufferedFile {
             let hit = state.pending.remove(&cur);
             let end = cur.saturating_add(u64::from(want));
             if hit.is_none() && cur.abs_diff(state.next) > window {
-                // Random access: forget the old window (tasks finish on their own).
+                // Random access: forget the old window. Its tasks finish on
+                // their own and hand back their permits as they do, so a new
+                // window only opens as the old one drains.
                 state.pending.clear();
                 state.next = end;
             } else {
@@ -302,7 +311,8 @@ impl BufferedFile {
         Ok(piece)
     }
 
-    /// Spawn reads from the frontier upward until `readahead` chunks are pending.
+    /// Spawn reads from the frontier upward until `readahead` chunks are
+    /// pending or every permit is held by a READ still in flight.
     fn top_up(&self, state: &mut ReadState) {
         let chunk = u64::from(self.read_chunk);
         let mut key = state.next;
@@ -311,10 +321,16 @@ impl BufferedFile {
                 break;
             }
             if let Entry::Vacant(slot) = state.pending.entry(key) {
+                let Ok(permit) = Arc::clone(&self.read_permits).try_acquire_owned() else {
+                    break;
+                };
                 let io = Arc::clone(&self.io);
                 let fh = self.fh.clone();
                 let count = self.read_chunk;
-                slot.insert(tokio::spawn(async move { io.read(fh, key, count).await }));
+                slot.insert(tokio::spawn(async move {
+                    let _permit = permit;
+                    io.read(fh, key, count).await
+                }));
             }
             key = key.saturating_add(chunk);
         }
@@ -625,6 +641,8 @@ mod tests {
         fail_unstable_at: Option<u64>,
         report_stable: bool,
         commit_verifier_bump: bool,
+        /// Per-offset READ latency in milliseconds (default 5 ms).
+        read_delay: Option<fn(u64) -> u64>,
     }
 
     #[async_trait]
@@ -638,7 +656,8 @@ mod tests {
         async fn read(&self, _fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
             let now = self.concurrent_reads.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_concurrent_reads.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let delay = self.read_delay.map_or(5, |f| f(offset));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             self.reads.fetch_add(1, Ordering::SeqCst);
             let data = self.data.lock().await;
             let start = (offset as usize).min(data.len());
@@ -773,6 +792,31 @@ mod tests {
         // 1024 chunks; concurrent readers must not trigger extra refetching.
         assert!(fake.reads.load(Ordering::SeqCst) < 1024 + 64);
         assert!(fake.max_concurrent_reads.load(Ordering::SeqCst) >= 4);
+    }
+
+    #[tokio::test]
+    async fn discarded_windows_stay_within_the_readahead_bound() {
+        // A full-chunk read after a far jump opens a window; the next far jump
+        // discards it while its READs are still on the wire. Prefetch targets
+        // answer slowly so dropped windows pile up unless in-flight READs are
+        // bounded globally: the total must stay at readahead + the reader's
+        // own chunk no matter how many windows were dropped.
+        fn prefetch_targets_are_slow(offset: u64) -> u64 {
+            if offset % 400 >= 8 { 300 } else { 5 }
+        }
+        let fake = Arc::new(Fake {
+            data: AsyncMutex::new((0..=255u8).cycle().take(4096).collect()),
+            read_delay: Some(prefetch_targets_are_slow),
+            ..Default::default()
+        });
+        let f = file(fake.clone(), 3, 0);
+        for jump in 0..6u64 {
+            let offset = jump * 400;
+            assert_eq!(f.read_at(offset, 4).await.unwrap().len(), 4);
+            assert_eq!(f.read_at(offset + 4, 4).await.unwrap().len(), 4);
+        }
+        let peak = fake.max_concurrent_reads.load(Ordering::SeqCst);
+        assert!(peak <= 4, "in-flight READs escaped the window: {peak}");
     }
 
     #[tokio::test]
