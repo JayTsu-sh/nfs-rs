@@ -1106,6 +1106,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// `FILE_SYNC` is requested and, if the server downgrades it, a COMMIT
     /// follows and the write verifier is checked.
     ///
+    /// On NFSv4.1 with a pNFS file layout the data is stable on the data
+    /// servers when this returns. The size and mtime the metadata server
+    /// reports are synchronised by LAYOUTCOMMIT (RFC 5661 §12.5.4), which is
+    /// sent at [`Mount::close`] and after a downgraded data-server write; in
+    /// between, a GETATTR from another client may still show the old size.
+    ///
     /// # Example
     ///
     /// ```

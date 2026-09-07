@@ -61,6 +61,37 @@ struct DsWriteReply {
     ds_offset: u64,
 }
 
+/// Where the COMMITs for a batch of DS WRITE replies go (RFC 5661 §13.7).
+#[derive(Debug, PartialEq, Eq)]
+enum DsCommitPlan {
+    /// Every reply was FILE_SYNC: nothing to commit.
+    None,
+    /// `NFL4_UFLG_COMMIT_THRU_MDS`: one COMMIT to the MDS whose verifier must
+    /// match every WRITE verifier in the batch.
+    ThroughMds { expected: Vec<[u8; 8]> },
+    /// COMMIT on each data server that downgraded a WRITE (indices into the
+    /// reply batch).
+    PerDataServer { downgraded: Vec<usize> },
+}
+
+fn plan_ds_commits(commit_thru_mds: bool, replies: &[DsWriteReply]) -> DsCommitPlan {
+    let downgraded: Vec<usize> = replies
+        .iter()
+        .enumerate()
+        .filter(|(_, reply)| !reply.stable)
+        .map(|(index, _)| index)
+        .collect();
+    if downgraded.is_empty() {
+        DsCommitPlan::None
+    } else if commit_thru_mds {
+        DsCommitPlan::ThroughMds {
+            expected: replies.iter().map(|reply| reply.verifier).collect(),
+        }
+    } else {
+        DsCommitPlan::PerDataServer { downgraded }
+    }
+}
+
 /// RFC 5661 §13.7: a COMMIT verifier that differs from any WRITE verifier it
 /// covers means the server may have lost the uncommitted data.
 fn check_commit_verifier<'a>(
@@ -818,17 +849,16 @@ impl Mount41 {
                     .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
                     .await;
             }
-            if results.iter().any(|reply| !reply.stable)
-                && let Err(error) = self
-                    .commit_downgraded_ds_writes(
-                        fh,
-                        offset,
-                        total,
-                        layout.generation,
-                        commit_thru_mds,
-                        &results,
-                    )
-                    .await
+            if let Err(error) = self
+                .commit_downgraded_ds_writes(
+                    fh,
+                    offset,
+                    total,
+                    layout.generation,
+                    plan_ds_commits(commit_thru_mds, &results),
+                    &results,
+                )
+                .await
             {
                 return PnfsWriteOutcome::Attempted(Err(error));
             }
@@ -868,44 +898,55 @@ impl Mount41 {
         }
     }
 
-    /// Make DS writes that came back below FILE_SYNC durable (RFC 5661
-    /// §13.7). With `commit_thru_mds` one COMMIT goes to the MDS and its
-    /// verifier must match every DS WRITE verifier; otherwise each downgraded
-    /// stripe is committed on the data server that wrote it. A failed COMMIT
-    /// leaves the data uncertain, so the error is reported as such rather
-    /// than dropped.
+    /// Make DS writes that came back below FILE_SYNC durable and visible
+    /// (RFC 5661 §13.7, §12.5.4). COMMIT is routed per `plan`, each COMMIT
+    /// verifier is checked against the WRITE verifiers it covers, and a
+    /// LAYOUTCOMMIT then synchronises size/mtime to the MDS so the recovered
+    /// data is not left behind a stale layout. A failure anywhere leaves the
+    /// data uncertain, so the error is reported as such rather than dropped.
     async fn commit_downgraded_ds_writes(
         &self,
         fh: &Bytes,
         offset: u64,
         total: u32,
         generation: u64,
-        commit_thru_mds: bool,
+        plan: DsCommitPlan,
         replies: &[DsWriteReply],
     ) -> Result<()> {
-        if commit_thru_mds {
-            let committed = match self.commit_with_verifier(fh.clone(), offset, total).await {
-                Ok(Some(verifier)) => verifier,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(self.uncertain_after_ds_write(error).await),
-            };
-            return check_commit_verifier(replies.iter().map(|reply| &reply.verifier), committed);
+        match plan {
+            DsCommitPlan::None => return Ok(()),
+            DsCommitPlan::ThroughMds { expected } => {
+                match self.commit_with_verifier(fh.clone(), offset, total).await {
+                    Ok(Some(committed)) => check_commit_verifier(expected.iter(), committed)?,
+                    Ok(None) => {}
+                    Err(error) => return Err(self.uncertain_after_ds_write(error).await),
+                }
+            }
+            DsCommitPlan::PerDataServer { downgraded } => {
+                for reply in downgraded.iter().filter_map(|&index| replies.get(index)) {
+                    let committed = match self
+                        .ds_commit_chunk(
+                            reply.ds_addr,
+                            &reply.ds_fh,
+                            generation,
+                            reply.ds_offset,
+                            reply.written,
+                        )
+                        .await
+                    {
+                        Ok(verifier) => verifier,
+                        Err(error) => return Err(self.uncertain_after_ds_write(error).await),
+                    };
+                    check_commit_verifier([&reply.verifier], committed)?;
+                }
+            }
         }
-        for reply in replies.iter().filter(|reply| !reply.stable) {
-            let committed = match self
-                .ds_commit_chunk(
-                    reply.ds_addr,
-                    &reply.ds_fh,
-                    generation,
-                    reply.ds_offset,
-                    reply.written,
-                )
-                .await
-            {
-                Ok(verifier) => verifier,
-                Err(error) => return Err(self.uncertain_after_ds_write(error).await),
-            };
-            check_commit_verifier([&reply.verifier], committed)?;
+        // RFC 5661 §12.5.4: for file layouts the size attribute is only
+        // synchronised to the MDS by LAYOUTCOMMIT. A concurrent writer may
+        // extend the dirty range while it is in flight; that range stays
+        // pending for the next flush and does not affect this write.
+        if let Err(error) = self.layoutcommit_dirty(fh).await {
+            return Err(self.uncertain_after_ds_write(error).await);
         }
         Ok(())
     }
@@ -963,9 +1004,24 @@ impl Mount41 {
     /// Commit a versioned snapshot of the accumulated dirty range. The range
     /// remains pending across transport errors, operation errors, and task
     /// cancellation, and is acknowledged only after authoritative success.
+    /// Fails if a concurrent WRITE extended the range meanwhile, because the
+    /// caller is about to CLOSE or return the layout.
     pub(crate) async fn flush_layoutcommit(&self, fh: &Bytes) -> Result<()> {
+        if self.layoutcommit_dirty(fh).await? {
+            Ok(())
+        } else {
+            Err(NfsError::Rpc(
+                "pNFS dirty range changed during LAYOUTCOMMIT; retry before CLOSE".to_string(),
+            ))
+        }
+    }
+
+    /// LAYOUTCOMMIT the current dirty snapshot. Returns whether the snapshot
+    /// was acknowledged unchanged; `false` means a concurrent WRITE extended
+    /// the range, which stays pending for the next call.
+    async fn layoutcommit_dirty(&self, fh: &Bytes) -> Result<bool> {
         let Some(dirty) = self.layout_manager.snapshot_dirty(fh).await else {
-            return Ok(());
+            return Ok(true);
         };
         let Some(layout) = self.layout_manager.get_layout(fh).await else {
             return Err(NfsError::Rpc(
@@ -986,12 +1042,7 @@ impl Mount41 {
             .await?;
         response.op_ok(1)?; // PUTFH
         response.op_ok(2)?; // LAYOUTCOMMIT
-        if !self.layout_manager.acknowledge_dirty(fh, dirty).await {
-            return Err(NfsError::Rpc(
-                "pNFS dirty range changed during LAYOUTCOMMIT; retry before CLOSE".to_string(),
-            ));
-        }
-        Ok(())
+        Ok(self.layout_manager.acknowledge_dirty(fh, dirty).await)
     }
 
     // ─── pNFS Layout Return ──────────────────────────────────────────────
@@ -1178,6 +1229,46 @@ mod tests {
         let seg2 = find_covering_segment(&layout, 1500);
         assert!(seg2.is_some());
         assert_eq!(seg2.map(|s| s.offset), Some(1000));
+    }
+
+    fn reply(stable: bool, verifier: u8) -> DsWriteReply {
+        DsWriteReply {
+            written: 4,
+            stable,
+            verifier: [verifier; 8],
+            ds_addr: "127.0.0.1:2049".parse().unwrap(),
+            ds_fh: Bytes::from_static(b"ds-fh"),
+            ds_offset: 0,
+        }
+    }
+
+    #[test]
+    fn file_sync_replies_need_no_commit_whatever_the_flag() {
+        let replies = [reply(true, 1), reply(true, 1)];
+        assert_eq!(plan_ds_commits(false, &replies), DsCommitPlan::None);
+        assert_eq!(plan_ds_commits(true, &replies), DsCommitPlan::None);
+    }
+
+    #[test]
+    fn downgraded_reply_with_commit_thru_mds_commits_once_against_all_verifiers() {
+        let replies = [reply(true, 1), reply(false, 2)];
+        assert_eq!(
+            plan_ds_commits(true, &replies),
+            DsCommitPlan::ThroughMds {
+                expected: vec![[1; 8], [2; 8]]
+            }
+        );
+    }
+
+    #[test]
+    fn downgraded_reply_without_commit_thru_mds_commits_on_that_data_server() {
+        let replies = [reply(true, 1), reply(false, 2), reply(false, 3)];
+        assert_eq!(
+            plan_ds_commits(false, &replies),
+            DsCommitPlan::PerDataServer {
+                downgraded: vec![1, 2]
+            }
+        );
     }
 
     #[test]
