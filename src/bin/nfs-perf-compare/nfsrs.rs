@@ -122,18 +122,13 @@ impl NfsRsBackend {
     /// Files go through `BufferedFile`, so the mount's `readahead` /
     /// `writeback` URL parameters decide whether I/O is pipelined.
     fn file(&self, fh: Bytes) -> NfsFile {
-        let io = BufferedFile::new(Arc::clone(&self.mount), fh.clone(), self.mount.io_options());
         NfsFile {
-            mount: Arc::clone(&self.mount),
-            fh,
-            io,
+            io: BufferedFile::new(Arc::clone(&self.mount), fh, self.mount.io_options()),
         }
     }
 }
 
 struct NfsFile {
-    mount: Arc<dyn Mount>,
-    fh: Bytes,
     io: BufferedFile,
 }
 
@@ -147,15 +142,16 @@ impl FileHandle for NfsFile {
         Ok(self.io.read_at(offset, len as u32).await?)
     }
 
+    /// `fsync` equivalent. With write-behind, `flush` COMMITs exactly the
+    /// uncommitted range; without it every write was already FILE_SYNC, so
+    /// there is nothing left to commit and no extra round trip is charged.
     async fn sync(&self) -> Result<()> {
-        self.io.flush().await?;
-        Ok(self.mount.commit(self.fh.clone(), 0, 0).await?)
+        Ok(self.io.flush().await?)
     }
 
-    /// Data still queued in the write-behind window is committed before
-    /// CLOSE, so a caller that skips `sync` gets the same durability.
+    /// `BufferedFile::close` flushes before CLOSE, so a caller that skips
+    /// `sync` gets the same durability.
     async fn close(self: Box<Self>) -> Result<()> {
-        self.io.flush().await?;
-        Ok(self.mount.close(self.fh).await?)
+        Ok(self.io.close().await?)
     }
 }
