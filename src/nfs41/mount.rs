@@ -1693,11 +1693,27 @@ impl crate::Mount for Mount41Wrapper {
             .write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
             .await
     }
+    /// Durable on return: pNFS data servers first (COMMIT routed per RFC
+    /// 5661 §13.7 inside `pnfs_write`), otherwise the MDS with the shared
+    /// downgrade-COMMIT / verifier check.
     async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write_stable(fh, offset, data).await
+        if let Some(result) = self.m.write_stable_pnfs(&fh, offset, data.clone()).await {
+            return result;
+        }
+        let outcome = self
+            .m
+            .write_how(
+                fh.clone(),
+                offset,
+                data,
+                crate::mount::WriteStability::FileSync,
+            )
+            .await?;
+        crate::mount::finish_stable_write(self, fh, offset, outcome).await
     }
     async fn write_stable_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write_stable_path(path, offset, data).await
+        let obj = self.m.lookup_path(path).await?;
+        self.write_stable(obj.fh, offset, data).await
     }
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
         self.m.open(dir_fh, filename, access).await
