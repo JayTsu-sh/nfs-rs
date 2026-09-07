@@ -80,34 +80,21 @@ impl Mount {
             .await
     }
 
+    /// FILE_SYNC write that is durable when it returns: if the server
+    /// downgrades the stability level (RFC 1813 §3.3.7) a COMMIT follows.
     pub async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        if data.len() > u32::MAX as usize {
-            return Err(NfsError::InvalidInput(
-                "data length exceeds maximum".to_string(),
-            ));
-        }
-        let count = data.len() as u32;
-        let args = WRITE3args {
-            file: nfs_fh3 { data: fh.clone() },
-            stable: WriteStable::FileSync,
-            count,
-            data,
-            offset,
-        };
-        let ok = self._write(args).await?;
-        // RFC 1813 §3.3.7: server may downgrade stability. If we requested
-        // FILE_SYNC but the server returned UNSTABLE or DATA_SYNC, issue
-        // a COMMIT to ensure data reaches stable storage.
-        if ok.committed != stable_how::FILE_SYNC {
+        let outcome = self
+            .write_with_stability(fh.clone(), offset, data, WriteStable::FileSync)
+            .await?;
+        if !outcome.stable {
             tracing::debug!(
-                committed = ?ok.committed,
                 offset,
-                count = ok.count.0,
+                count = outcome.count,
                 "server downgraded write stability, issuing COMMIT"
             );
-            self.commit(fh, offset, ok.count.0).await?;
+            self.commit(fh, offset, outcome.count).await?;
         }
-        Ok(ok.count.0)
+        Ok(outcome.count)
     }
 }
 
