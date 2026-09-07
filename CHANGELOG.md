@@ -7,6 +7,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `BufferedFile`: sequential read-ahead and write-behind (UNSTABLE WRITE with
+  batched COMMIT, small-write coalescing, verifier-change resend) on top of any
+  `Mount`; URL parameters `readahead=<chunks>` (default 8) and
+  `writeback=<chunks>` (default 0) and matching Python `connect()` options.
+  Python file objects use it automatically when either window is enabled.
+- **Breaking:** `Mount::write(fh, offset, data)` is now an UNSTABLE write:
+  it never issues a COMMIT and returns the server's `WriteOutcome` (count,
+  whether it was committed anyway, write verifier); the caller COMMITs. The
+  previous durable-on-return `write` is renamed `write_stable` (and
+  `write_path` → `write_stable_path`; the new `write_path` is UNSTABLE too).
+  Callers that relied on `write` being durable must switch to `write_stable`.
+- `Mount::commit_with_verifier` is implemented for NFSv4.0 and NFSv4.1, so
+  verifier changes are detected on every protocol.
+- `Mount::io_options` exposes the `readahead`/`writeback` settings.
+
+### Changed
+
+- Benchmark harness `nfs-perf-compare` keeps data verification inside the
+  timed region so read-ahead and page-cache backends are not over-credited.
+
 ## [0.6.1] - 2026-09-03
 
 ### Fixed

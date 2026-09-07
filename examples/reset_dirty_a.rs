@@ -48,7 +48,7 @@ async fn main() {
         .await
         .expect("create file a failed");
     let written = mount
-        .write(obj.fh, 0, Bytes::from_static(b"b/c/d.txt"))
+        .write_stable(obj.fh, 0, Bytes::from_static(b"b/c/d.txt"))
         .await
         .expect("write file a failed");
     println!("created dirty file 'a' ({written} bytes)");

@@ -6,28 +6,55 @@ use super::compound::OpenArgs;
 use super::mount::{Mount41, decode_fh, extract_open_delegation, extract_stateid};
 use super::pnfs_io::PnfsWriteOutcome;
 use super::state::{AccessMode, StateId};
+use crate::NFSVersion;
 use crate::error::{NfsError, Result};
 use crate::mount;
+use crate::mount::{WriteOutcome, WriteStability, write_verifier_changed};
 use crate::nfs4::attrs::{decode_getattr_response, encode_setattr, standard_getattr_bitmap};
 
 impl Mount41 {
-    pub(crate) async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+    /// FILE_SYNC write that is durable on return: pNFS data servers first
+    /// (when a layout is held), otherwise the MDS with a COMMIT if the
+    /// server downgraded the stability level.
+    pub(crate) async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
         self.refresh_layout_for_write(&fh, offset).await?;
-        let _io_guard = self.layout_manager.read_file_io(&fh).await;
-        // Try pNFS parallel write first
-        match self.pnfs_write(&fh, offset, data.clone()).await {
-            PnfsWriteOutcome::NotAttempted => {}
-            PnfsWriteOutcome::Attempted(result) => return result,
+        {
+            let _io_guard = self.layout_manager.read_file_io(&fh).await;
+            match self.pnfs_write(&fh, offset, data.clone()).await {
+                PnfsWriteOutcome::NotAttempted => {}
+                PnfsWriteOutcome::Attempted(result) => return result,
+            }
         }
-        // Fallback: MDS write
-        self.mds_write(&fh, offset, data).await
+        let outcome = self
+            .write_how(fh.clone(), offset, data, WriteStability::FileSync)
+            .await?;
+        if !outcome.stable {
+            // RFC 5661 §18.32.3: downgraded stability needs a COMMIT before
+            // the caller may rely on the data.
+            let verifier = self.commit_with_verifier(fh, offset, outcome.count).await?;
+            if let (Some(expected), Some(actual)) = (outcome.verifier, verifier)
+                && expected != actual
+            {
+                return Err(write_verifier_changed(NFSVersion::NFSv4p1));
+            }
+        }
+        Ok(outcome.count)
     }
 
-    /// Direct MDS write (used as fallback when pNFS is unavailable).
-    async fn mds_write(&self, fh: &Bytes, offset: u64, data: Bytes) -> Result<u32> {
+    /// WRITE to the MDS with the requested stability level; no COMMIT is
+    /// issued here. pNFS layouts are bypassed so that one COMMIT on the MDS
+    /// covers every chunk written this way.
+    pub(crate) async fn write_how(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+        stability: WriteStability,
+    ) -> Result<WriteOutcome> {
+        let _io_guard = self.layout_manager.read_file_io(&fh).await;
         let sid = self
             .state
-            .has_open(fh, AccessMode::Write)
+            .has_open(&fh, AccessMode::Write)
             .await
             .unwrap_or_else(StateId::anonymous);
         let stateid = sid.raw;
@@ -37,7 +64,7 @@ impl Mount41 {
             .compound_write("write", data, |b| {
                 b.require_generation(sid.generation)
                     .putfh(&fh_ref)
-                    .write_header(&stateid, offset, 2 /* FILE_SYNC4 */, data_len)
+                    .write_header(&stateid, offset, stability.stable_how(), data_len)
             })
             .await?;
         resp.op_ok(1)?; // PUTFH
@@ -48,20 +75,23 @@ impl Mount41 {
         }
         let count = d.get_u32();
         let committed = d.get_u32();
-        d.advance(8); // writeverf — used in COMMIT response, not here
-        // RFC 5661 §18.32.3: if stability was downgraded (committed != FILE_SYNC4),
-        // COMMIT to make the data durable before returning success to the caller.
-        if committed != 2
-        /* FILE_SYNC4 */
-        {
-            self.commit(fh.clone(), offset, count).await?;
-        }
-        Ok(count)
+        let mut verifier = [0u8; 8];
+        d.copy_to_slice(&mut verifier);
+        Ok(WriteOutcome {
+            count,
+            stable: committed == 2, // FILE_SYNC4
+            verifier: Some(verifier),
+        })
     }
 
-    pub(crate) async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
+    pub(crate) async fn write_stable_path(
+        &self,
+        path: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<u32> {
         let obj = self.lookup_path(path).await?;
-        self.write(obj.fh, offset, data).await
+        self.write_stable(obj.fh, offset, data).await
     }
 
     pub(crate) async fn open(

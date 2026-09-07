@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use super::mount::{Mount41, extract_stateid};
 use super::state::StateId;
@@ -153,12 +153,30 @@ impl Mount41 {
     }
 
     pub(crate) async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
+        self.commit_with_verifier(fh, offset, count)
+            .await
+            .map(|_| ())
+    }
+
+    /// COMMIT returning the server write verifier (COMMIT4resok.writeverf).
+    pub(crate) async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
         let resp = self
             .compound("commit", |b| b.putfh(&fh).commit(offset, count))
             .await?;
         resp.op_ok(1)?; // PUTFH
-        resp.op_ok(2)?; // COMMIT
-        Ok(())
+        let commit_op = resp.op_ok(2)?; // COMMIT
+        let mut d = commit_op.data.clone();
+        if d.remaining() < 8 {
+            return Err(NfsError::Xdr("COMMIT result too short".to_string()));
+        }
+        let mut verifier = [0u8; 8];
+        d.copy_to_slice(&mut verifier);
+        Ok(Some(verifier))
     }
 
     pub(crate) async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {

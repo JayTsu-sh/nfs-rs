@@ -1,3 +1,5 @@
 /target
 __pycache__/
 *.py[cod]
+COMMIT
+python/nfs_rs/_internal.abi3.so

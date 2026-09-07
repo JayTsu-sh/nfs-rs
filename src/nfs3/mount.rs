@@ -26,11 +26,13 @@ use super::{
     mountres3_ok, rpc_header,
 };
 use crate::error::{NfsError, Result};
+use crate::mount::{WriteOutcome, WriteStability, finish_stable_write};
 use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
 
 #[derive(Debug)]
 struct Mount3 {
     m: Mount,
+    io_options: crate::IoOptions,
 }
 
 #[async_trait]
@@ -41,6 +43,10 @@ impl crate::Mount for Mount3 {
 
     fn get_max_write_size(&self) -> u32 {
         self.m.wsize
+    }
+
+    fn io_options(&self) -> crate::IoOptions {
+        self.io_options
     }
 
     async fn null(&self) -> Result<()> {
@@ -157,17 +163,18 @@ impl crate::Mount for Mount3 {
         self.m.read(fh, offset, count).await
     }
 
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write(fh, offset, data).await
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        self.m
+            .write_how(fh, offset, data, WriteStability::Unstable)
+            .await
     }
 
-    async fn write_with_outcome(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-    ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_with_outcome(fh, offset, data).await
+    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let outcome = self
+            .m
+            .write_how(fh.clone(), offset, data, WriteStability::FileSync)
+            .await?;
+        finish_stable_write(self, fh, offset, outcome).await
     }
 
     async fn commit_with_verifier(
@@ -371,7 +378,10 @@ async fn mount_on_addr(
         "NFS mount complete, negotiated transfer sizes"
     );
 
-    Ok(Box::new(Mount3 { m }))
+    Ok(Box::new(Mount3 {
+        m,
+        io_options: args.io_options,
+    }))
 }
 
 /// Query the MOUNT service and return all exported file systems — the `showmount -e` equivalent.
