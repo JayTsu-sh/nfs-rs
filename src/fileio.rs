@@ -71,6 +71,7 @@ pub(crate) trait ChunkIo: Send + Sync + 'static {
     async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
     async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32>;
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<Option<[u8; 8]>>;
+    async fn close(&self, fh: Bytes) -> Result<()>;
 }
 
 #[async_trait]
@@ -97,6 +98,10 @@ impl ChunkIo for Arc<dyn Mount> {
 
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<Option<[u8; 8]>> {
         Mount::commit_with_verifier(self.as_ref(), fh, offset, count).await
+    }
+
+    async fn close(&self, fh: Bytes) -> Result<()> {
+        Mount::close(self.as_ref(), fh).await
     }
 }
 
@@ -136,6 +141,12 @@ struct WriteState {
 ///
 /// Reads and writes may be issued concurrently from multiple tasks; the file
 /// serialises bookkeeping but never holds a lock across the network.
+///
+/// Data queued by [`BufferedFile::write_at`] is only durable after
+/// [`BufferedFile::flush`] or [`BufferedFile::close`]. `close` owns the
+/// CLOSE: it flushes first, so the file handle must not be closed on the
+/// `Mount` directly. Dropping a `BufferedFile` with queued data discards it
+/// (a warning is logged); there is no implicit flush.
 pub struct BufferedFile {
     io: Arc<dyn ChunkIo>,
     fh: Bytes,
@@ -439,6 +450,21 @@ impl BufferedFile {
         self.commit_locked(&mut state).await
     }
 
+    /// Flush queued writes, then CLOSE the file on the mount. The CLOSE is
+    /// sent even when the flush fails, and the flush error is what is
+    /// returned in that case.
+    pub async fn close(self) -> Result<()> {
+        let flushed = self.flush().await;
+        let closed = self.io.close(self.fh.clone()).await;
+        {
+            let mut state = self.writes.lock().await;
+            state.staging = None;
+            state.uncommitted.clear();
+            state.uncommitted_bytes = 0;
+        }
+        flushed.and(closed)
+    }
+
     /// Make in-flight writes visible to a subsequent read (no COMMIT needed).
     async fn settle_writes(&self) -> Result<()> {
         if self.opts.writeback == 0 {
@@ -510,6 +536,20 @@ impl BufferedFile {
             done += n;
         }
         Ok(())
+    }
+}
+
+impl Drop for BufferedFile {
+    fn drop(&mut self) {
+        if let Ok(state) = self.writes.try_lock()
+            && (state.staging.is_some() || !state.uncommitted.is_empty())
+        {
+            warn!(
+                staged = state.staging.as_ref().map_or(0, |(_, buf)| buf.len()),
+                uncommitted = state.uncommitted_bytes,
+                "BufferedFile dropped with queued writes; call flush() or close() first"
+            );
+        }
     }
 }
 
@@ -633,6 +673,7 @@ mod tests {
         unstable_writes: AtomicUsize,
         stable_writes: AtomicUsize,
         commits: AtomicUsize,
+        closes: AtomicUsize,
         max_concurrent_reads: AtomicUsize,
         concurrent_reads: AtomicUsize,
         max_concurrent_writes: AtomicUsize,
@@ -696,6 +737,10 @@ mod tests {
             self.commits.fetch_add(1, Ordering::SeqCst);
             let v = self.verifier.load(Ordering::SeqCst) + u32::from(self.commit_verifier_bump);
             Ok(Some([v as u8; 8]))
+        }
+        async fn close(&self, _fh: Bytes) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -907,6 +952,34 @@ mod tests {
         f.flush().await.unwrap();
         assert_eq!(fake.stable_writes.load(Ordering::SeqCst), 2);
         assert_eq!(&fake.data.lock().await[..], b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn close_commits_queued_writes_before_closing() {
+        // One full chunk in flight UNSTABLE plus a staged tail: close must
+        // push the tail, COMMIT, and only then CLOSE.
+        let fake = Arc::new(Fake::default());
+        let f = file(fake.clone(), 0, 2);
+        f.write_at(0, Bytes::from_static(b"abcde")).await.unwrap();
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 0);
+        f.close().await.unwrap();
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.data.lock().await.as_slice(), b"abcde");
+    }
+
+    #[tokio::test]
+    async fn close_reports_the_flush_error_and_still_closes() {
+        let fake = Arc::new(Fake {
+            fail_unstable_at: Some(0),
+            ..Default::default()
+        });
+        let f = file(fake.clone(), 0, 2);
+        f.write_at(0, Bytes::from_static(b"abcdefgh"))
+            .await
+            .unwrap();
+        assert!(f.close().await.is_err());
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
