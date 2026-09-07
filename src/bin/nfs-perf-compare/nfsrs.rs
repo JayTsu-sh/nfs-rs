@@ -152,7 +152,10 @@ impl FileHandle for NfsFile {
         Ok(self.mount.commit(self.fh.clone(), 0, 0).await?)
     }
 
+    /// Data still queued in the write-behind window is committed before
+    /// CLOSE, so a caller that skips `sync` gets the same durability.
     async fn close(self: Box<Self>) -> Result<()> {
+        self.io.flush().await?;
         Ok(self.mount.close(self.fh).await?)
     }
 }
