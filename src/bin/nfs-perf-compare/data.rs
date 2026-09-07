@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -22,33 +23,51 @@ async fn close_shared(handle: SharedHandle) -> Result<()> {
     }
 }
 
-/// Writes `size` bytes of pattern data with `qd` concurrent in-flight chunks,
-/// then syncs. Returns elapsed seconds (create → sync complete).
-pub async fn write_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64> {
-    let chunk = b.chunk_size();
-    let handle: SharedHandle = Arc::new(b.open_write(path).await?);
-    let block = pattern_block();
+/// Runs `qd` workers that pull chunk indices from a shared counter until
+/// `total` chunks are done. The first I/O or join error stops the run.
+async fn run_workers<F, Fut>(qd: usize, total: u64, work: F) -> Result<()>
+where
+    F: Fn(u64) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
     let next = Arc::new(AtomicU64::new(0));
-    let total = chunk_plan(size, chunk);
-    let started = Instant::now();
     let mut set = JoinSet::new();
     for _ in 0..qd {
-        let (h, next, block) = (Arc::clone(&handle), Arc::clone(&next), block.clone());
+        let (next, work) = (Arc::clone(&next), work.clone());
         set.spawn(async move {
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     return Ok::<(), BenchError>(());
                 }
-                let offset = i * chunk;
-                let len = (size - offset).min(chunk) as usize;
-                h.write_at(offset, pattern_at(&block, offset, len)).await?;
+                work(i).await?;
             }
         });
     }
     while let Some(joined) = set.join_next().await {
         joined.map_err(|e| BenchError::Join(e.to_string()))??;
     }
+    Ok(())
+}
+
+/// Writes `size` bytes of pattern data with `qd` concurrent in-flight chunks,
+/// then syncs. Returns elapsed seconds (create → sync complete).
+pub async fn write_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64> {
+    let chunk = b.chunk_size();
+    let handle: SharedHandle = Arc::new(b.open_write(path).await?);
+    let block = pattern_block();
+    let total = chunk_plan(size, chunk);
+    let started = Instant::now();
+    let (h, block) = (Arc::clone(&handle), block.clone());
+    run_workers(qd, total, move |i| {
+        let (h, block) = (Arc::clone(&h), block.clone());
+        async move {
+            let offset = i * chunk;
+            let len = (size - offset).min(chunk) as usize;
+            h.write_at(offset, pattern_at(&block, offset, len)).await
+        }
+    })
+    .await?;
     handle.sync().await?;
     let seconds = started.elapsed().as_secs_f64();
     close_shared(handle).await?;
@@ -56,41 +75,32 @@ pub async fn write_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Re
 }
 
 /// Reads `size` bytes with `qd` concurrent in-flight chunks and verifies the
-/// pattern inline. Returns elapsed seconds with verification time subtracted.
+/// pattern inline. Verification stays inside the timed region: it is a
+/// memcmp, and subtracting it would over-credit any backend that overlaps
+/// transfer with verification (read-ahead, page cache).
 pub async fn read_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64> {
     let chunk = b.chunk_size();
     let handle: SharedHandle = Arc::new(b.open_read(path).await?);
     let block: Bytes = pattern_block();
-    let next = Arc::new(AtomicU64::new(0));
     let total = chunk_plan(size, chunk);
     let started = Instant::now();
-    let mut set = JoinSet::new();
-    for _ in 0..qd {
-        let (h, next, block) = (Arc::clone(&handle), Arc::clone(&next), block.clone());
-        // Verification stays inside the timed region: it is a memcmp, and
-        // subtracting it would over-credit any backend that overlaps
-        // transfer with verification (read-ahead, page cache).
-        set.spawn(async move {
-            loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= total {
-                    return Ok::<(), BenchError>(());
-                }
-                let offset = i * chunk;
-                let len = (size - offset).min(chunk) as usize;
-                let data = h.read_at(offset, len).await?;
-                if data.len() != len || !verify(&block, offset, &data) {
-                    return Err(BenchError::Integrity(format!(
-                        "chunk at offset {offset} mismatch ({} of {len} bytes)",
-                        data.len()
-                    )));
-                }
+    let (h, block) = (Arc::clone(&handle), block.clone());
+    run_workers(qd, total, move |i| {
+        let (h, block) = (Arc::clone(&h), block.clone());
+        async move {
+            let offset = i * chunk;
+            let len = (size - offset).min(chunk) as usize;
+            let data = h.read_at(offset, len).await?;
+            if data.len() != len || !verify(&block, offset, &data) {
+                return Err(BenchError::Integrity(format!(
+                    "chunk at offset {offset} mismatch ({} of {len} bytes)",
+                    data.len()
+                )));
             }
-        });
-    }
-    while let Some(joined) = set.join_next().await {
-        joined.map_err(|e| BenchError::Join(e.to_string()))??;
-    }
+            Ok(())
+        }
+    })
+    .await?;
     let seconds = started.elapsed().as_secs_f64();
     close_shared(handle).await?;
     Ok(seconds)

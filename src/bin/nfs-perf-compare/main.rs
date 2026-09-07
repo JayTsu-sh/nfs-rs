@@ -77,7 +77,6 @@ async fn run_suite(config: &Config, b: &Arc<dyn Backend>, is_posix: bool) -> Res
         }
         Suite::Data {
             size,
-            size_label,
             qd,
             repeat,
             iters,
@@ -86,7 +85,7 @@ async fn run_suite(config: &Config, b: &Arc<dyn Backend>, is_posix: bool) -> Res
             let (series, dropped) = data::run(
                 Arc::clone(b),
                 &config.workdir,
-                *size,
+                size.bytes(),
                 *qd,
                 *repeat,
                 *iters,
@@ -94,8 +93,8 @@ async fn run_suite(config: &Config, b: &Arc<dyn Backend>, is_posix: bool) -> Res
             )
             .await?;
             let params = json!({
-                "size": size_label,
-                "bytes": size,
+                "size": size.label(),
+                "bytes": size.bytes(),
                 "qd": qd,
                 "repeat": repeat,
                 "iters": iters,
@@ -104,16 +103,22 @@ async fn run_suite(config: &Config, b: &Arc<dyn Backend>, is_posix: bool) -> Res
         }
         Suite::Multiclient {
             size,
-            size_label,
             clients,
             mode,
             repeat,
         } => {
-            let (series, rss) =
-                multiclient::run(Arc::clone(b), config, *size, *clients, *mode, *repeat).await?;
+            let (series, rss) = multiclient::run(
+                Arc::clone(b),
+                config,
+                size.bytes(),
+                *clients,
+                *mode,
+                *repeat,
+            )
+            .await?;
             let params = json!({
-                "size": size_label,
-                "bytes": size,
+                "size": size.label(),
+                "bytes": size.bytes(),
                 "clients": clients,
                 "mode": mode.as_str(),
                 "repeat": repeat,

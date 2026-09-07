@@ -64,15 +64,13 @@ pub enum Suite {
         readdir_iters: usize,
     },
     Data {
-        size: u64,
-        size_label: String,
+        size: BenchmarkSize,
         qd: usize,
         repeat: usize,
         iters: usize,
     },
     Multiclient {
-        size: u64,
-        size_label: String,
+        size: BenchmarkSize,
         clients: usize,
         mode: ClientMode,
         repeat: usize,
@@ -105,14 +103,41 @@ pub struct Config {
     pub smoke: bool,
 }
 
-pub fn parse_size(label: &str) -> Result<u64, CliError> {
-    match label {
-        "4k" => Ok(4096),
-        "40m" => Ok(40 * CHUNK),
-        "1g" => Ok(1024 * CHUNK),
-        other => Err(CliError::Usage(format!(
-            "--size must be 4k|40m|1g, got {other}"
-        ))),
+/// The accepted `--size` vocabulary. One authority for both the byte count
+/// the suites run and the label the JSON reports carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkSize {
+    Kib4,
+    Mib40,
+    Gib1,
+}
+
+impl BenchmarkSize {
+    pub fn parse(label: &str) -> Result<Self, CliError> {
+        match label {
+            "4k" => Ok(BenchmarkSize::Kib4),
+            "40m" => Ok(BenchmarkSize::Mib40),
+            "1g" => Ok(BenchmarkSize::Gib1),
+            other => Err(CliError::Usage(format!(
+                "--size must be 4k|40m|1g, got {other}"
+            ))),
+        }
+    }
+
+    pub fn bytes(self) -> u64 {
+        match self {
+            BenchmarkSize::Kib4 => 4096,
+            BenchmarkSize::Mib40 => 40 * CHUNK,
+            BenchmarkSize::Gib1 => 1024 * CHUNK,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BenchmarkSize::Kib4 => "4k",
+            BenchmarkSize::Mib40 => "40m",
+            BenchmarkSize::Gib1 => "1g",
+        }
     }
 }
 
@@ -189,10 +214,10 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, CliError
     let count = |key: &str, default: usize| -> Result<usize, CliError> {
         opts.get(key).map_or(Ok(default), |v| positive(key, v))
     };
-    let size_label = || -> Result<String, CliError> {
+    let size = || -> Result<BenchmarkSize, CliError> {
         opts.get("--size")
-            .map(|s| s.to_string())
             .ok_or_else(|| CliError::Usage("--size is required".into()))
+            .and_then(|label| BenchmarkSize::parse(label))
     };
     let suite = match suite_name.as_str() {
         "metadata" => Suite::Metadata {
@@ -209,29 +234,27 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, CliError
             },
         },
         "data" => {
-            let label = size_label()?;
+            let size = size()?;
             let qd = count("--qd", 1)?;
             if qd != 1 && qd != 8 {
                 return Err(CliError::Usage("--qd must be 1 or 8".into()));
             }
             Suite::Data {
-                size: parse_size(&label)?,
-                size_label: label,
+                size,
                 qd,
                 repeat: if smoke { 1 } else { count("--repeat", 5)? },
                 iters: if smoke { 1 } else { count("--iters", 200)? },
             }
         }
         "multiclient" => {
-            let label = size_label()?;
+            let size = size()?;
             let mode = match opts.get("--mode").copied() {
                 Some("same") | None => ClientMode::Same,
                 Some("distinct") => ClientMode::Distinct,
                 _ => return Err(CliError::Usage("--mode must be same|distinct".into())),
             };
             Suite::Multiclient {
-                size: parse_size(&label)?,
-                size_label: label,
+                size,
                 clients: count("--clients", 8)?,
                 mode,
                 repeat: if smoke { 1 } else { count("--repeat", 3)? },
@@ -288,7 +311,9 @@ mod tests {
                 iters,
                 ..
             } => {
-                assert_eq!(size, 40 * 1024 * 1024);
+                assert_eq!(size, BenchmarkSize::Mib40);
+                assert_eq!(size.bytes(), 40 * 1024 * 1024);
+                assert_eq!(size.label(), "40m");
                 assert_eq!(qd, 8);
                 assert_eq!(repeat, 5);
                 assert_eq!(iters, 200);
