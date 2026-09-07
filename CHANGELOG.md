@@ -23,6 +23,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `Mount::commit_with_verifier` is implemented for NFSv4.0 and NFSv4.1, so
   verifier changes are detected on every protocol.
 - `Mount::io_options` exposes the `readahead`/`writeback` settings.
+- `BufferedFile::close` flushes queued writes and then CLOSEs the file; a
+  `BufferedFile` dropped with queued data logs a warning and discards it.
 
 ### Changed
 
@@ -39,8 +41,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - NFSv4.1 pNFS `write_stable`: when a data server downgrades a FILE_SYNC
   WRITE, the COMMIT is routed per RFC 5661 §13.7 (MDS with
   `COMMIT_THRU_MDS`, otherwise the data server that took the WRITE), its
-  failure is reported instead of ignored, and a write verifier mismatch is
-  surfaced as an uncertain write.
+  failure is reported instead of ignored, a write verifier mismatch is
+  surfaced as an uncertain write, and a LAYOUTCOMMIT follows so the
+  metadata server's size reflects the recovered data (RFC 5661 §12.5.4).
 - `BufferedFile` read-ahead: READs of a discarded window still count against
   the `readahead` limit, so random access on a slow link cannot accumulate
   more in-flight prefetches than the window allows.
