@@ -784,7 +784,12 @@ impl FileResource {
                 mount, file_handle, ..
             } => {
                 mount
-                    .write_with_outcome(file_handle.clone(), offset, data)
+                    .write_with(
+                        file_handle.clone(),
+                        offset,
+                        data,
+                        crate::WriteStability::FileSync,
+                    )
                     .await
             }
             #[cfg(feature = "python-test-support")]

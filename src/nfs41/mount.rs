@@ -1686,13 +1686,14 @@ impl crate::Mount for Mount41Wrapper {
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
         self.m.write(fh, offset, data).await
     }
-    async fn write_unstable(
+    async fn write_with(
         &self,
         fh: Bytes,
         offset: u64,
         data: Bytes,
+        stability: crate::WriteStability,
     ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_unstable(fh, offset, data).await
+        self.m.write_with(fh, offset, data, stability).await
     }
     async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
         self.m.write_path(path, offset, data).await
@@ -1819,6 +1820,14 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.m.commit(fh, offset, count).await
+    }
+    async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
+        self.m.commit_with_verifier(fh, offset, count).await
     }
     async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
         self.m.commit_path(path, offset, count).await

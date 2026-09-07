@@ -162,26 +162,14 @@ impl crate::Mount for Mount3 {
         self.m.read(fh, offset, count).await
     }
 
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write(fh, offset, data).await
-    }
-
-    async fn write_with_outcome(
+    async fn write_with(
         &self,
         fh: Bytes,
         offset: u64,
         data: Bytes,
+        stability: crate::WriteStability,
     ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_with_outcome(fh, offset, data).await
-    }
-
-    async fn write_unstable(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-    ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_unstable(fh, offset, data).await
+        self.m.write_with(fh, offset, data, stability).await
     }
 
     async fn commit_with_verifier(

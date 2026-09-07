@@ -16,43 +16,29 @@
 
 use super::{Mount, WRITE3args, WriteStable, nfs_fh3, stable_how};
 use crate::error::{NfsError, Result};
+use crate::mount::{WriteOutcome, WriteStability};
 use bytes::Bytes;
 
-#[allow(unused)]
 impl Mount {
-    pub async fn write_with_outcome(
+    /// WRITE with the requested stability level; no COMMIT is issued here.
+    pub async fn write_with(
         &self,
         fh: Bytes,
         offset: u64,
         data: Bytes,
-    ) -> Result<crate::mount::WriteOutcome> {
-        self.write_with_stability(fh, offset, data, WriteStable::FileSync)
-            .await
-    }
-
-    pub async fn write_unstable(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-    ) -> Result<crate::mount::WriteOutcome> {
-        self.write_with_stability(fh, offset, data, WriteStable::Unstable)
-            .await
-    }
-
-    async fn write_with_stability(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-        stable: WriteStable,
-    ) -> Result<crate::mount::WriteOutcome> {
+        stability: WriteStability,
+    ) -> Result<WriteOutcome> {
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput(
                 "data length exceeds maximum".to_string(),
             ));
         }
         let count = data.len() as u32;
+        let stable = match stability {
+            WriteStability::Unstable => WriteStable::Unstable,
+            WriteStability::DataSync => WriteStable::DataSync,
+            WriteStability::FileSync => WriteStable::FileSync,
+        };
         let ok = self
             ._write(WRITE3args {
                 file: nfs_fh3 { data: fh },
@@ -68,33 +54,11 @@ impl Mount {
             .as_ref()
             .try_into()
             .map_err(|_| NfsError::Xdr("WRITE verifier must be 8 bytes".to_string()))?;
-        Ok(crate::mount::WriteOutcome {
+        Ok(WriteOutcome {
             count: ok.count.0,
             stable: ok.committed == stable_how::FILE_SYNC,
             verifier: Some(verifier),
         })
-    }
-
-    pub async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        self.write(self.lookup_path(path).await?.fh, offset, data)
-            .await
-    }
-
-    /// FILE_SYNC write that is durable when it returns: if the server
-    /// downgrades the stability level (RFC 1813 §3.3.7) a COMMIT follows.
-    pub async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        let outcome = self
-            .write_with_stability(fh.clone(), offset, data, WriteStable::FileSync)
-            .await?;
-        if !outcome.stable {
-            tracing::debug!(
-                offset,
-                count = outcome.count,
-                "server downgraded write stability, issuing COMMIT"
-            );
-            self.commit(fh, offset, outcome.count).await?;
-        }
-        Ok(outcome.count)
     }
 }
 
@@ -116,7 +80,9 @@ mod tests {
             wsize: 16384,
         };
         let data = vec![0u8; (u32::MAX as usize) + 1];
-        let res = mount.write(Bytes::new(), 0, Bytes::from(data)).await;
+        let res = mount
+            .write_with(Bytes::new(), 0, Bytes::from(data), WriteStability::FileSync)
+            .await;
         assert!(matches!(res, Err(NfsError::InvalidInput(_))));
     }
 }

@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::error::{NfsError, Result};
-use crate::mount::{Mount, WriteOutcome};
+use crate::mount::{Mount, WriteOutcome, WriteStability};
 
 /// Tunables for [`BufferedFile`]. Parsed from the `readahead` / `writeback`
 /// URL query parameters and exposed by [`Mount::io_options`].
@@ -88,7 +88,7 @@ impl ChunkIo for Arc<dyn Mount> {
     }
 
     async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
-        Mount::write_unstable(self.as_ref(), fh, offset, data).await
+        Mount::write_with(self.as_ref(), fh, offset, data, WriteStability::Unstable).await
     }
 
     async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {

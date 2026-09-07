@@ -14,7 +14,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `Mount`; URL parameters `readahead=<chunks>` (default 8) and
   `writeback=<chunks>` (default 0) and matching Python `connect()` options.
   Python file objects use it automatically when either window is enabled.
-- `Mount::write_unstable` and `Mount::io_options` (hidden/advanced API).
+- `Mount::write_with(fh, offset, data, WriteStability)` is now the single
+  WRITE primitive (no implicit COMMIT; reports the server's `WriteOutcome`);
+  `Mount::write` stays durable-on-return and is a default method built on it.
+  `Mount::commit_with_verifier` is implemented for NFSv4.0 and NFSv4.1.
+  `Mount::io_options` exposes the `readahead`/`writeback` settings.
 
 ### Changed
 

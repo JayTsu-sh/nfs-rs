@@ -41,12 +41,56 @@ pub const OPEN_WRITE: u32 = 2;
 pub const OPEN_BOTH: u32 = 3;
 
 /// Protocol write acknowledgement used by higher-level durability adapters.
-#[doc(hidden)]
+/// Result of one WRITE as reported by the server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteOutcome {
+    /// Bytes the server accepted (may be fewer than requested).
     pub count: u32,
+    /// `true` when the server committed the data to stable storage
+    /// (`FILE_SYNC`); `false` means a COMMIT is still required.
     pub stable: bool,
+    /// Server write verifier; a change between WRITE and COMMIT means the
+    /// server lost uncommitted data and it must be rewritten.
     pub verifier: Option<[u8; 8]>,
+}
+
+/// Stability level requested for a WRITE (`stable_how` in RFC 1813 §3.3.7,
+/// `stable_how4` in RFC 5661 §18.32).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteStability {
+    /// The server may buffer the data; COMMIT before relying on it.
+    Unstable,
+    /// File data is stable when the reply arrives; metadata may not be.
+    DataSync,
+    /// Data and metadata are stable when the reply arrives.
+    FileSync,
+}
+
+impl WriteStability {
+    /// Wire value shared by NFSv3 `stable_how` and NFSv4 `stable_how4`.
+    pub fn stable_how(self) -> u32 {
+        match self {
+            WriteStability::Unstable => 0,
+            WriteStability::DataSync => 1,
+            WriteStability::FileSync => 2,
+        }
+    }
+}
+
+/// Error for a write verifier that changed between WRITE and COMMIT: the
+/// server restarted and the uncommitted data must be rewritten.
+pub(crate) fn write_verifier_changed(protocol: NFSVersion) -> NfsError {
+    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+        crate::error::OperationOutcome::Uncertain,
+        crate::error::OperationClass::ReplaySensitive,
+        crate::error::RecoveryAction::VerifyThenResume,
+        crate::error::RequestContext {
+            operation: "write_verifier".into(),
+            protocol,
+            request_id: None,
+        },
+        NfsError::Rpc("WRITE verifier changed before COMMIT".into()),
+    )))
 }
 
 /// Negotiated and currently effective NFSv4.1 fore-channel bounds.
@@ -1017,7 +1061,23 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.read(res.fh, offset, count).await
     }
 
-    /// Procedure WRITE writes data to a file.
+    /// Procedure WRITE with an explicit stability level. This is the single
+    /// WRITE primitive: it never issues a COMMIT, and reports what the server
+    /// actually did in the returned [`WriteOutcome`] (the server may
+    /// downgrade the requested level). Use [`Mount::write`] for a write that
+    /// is durable when it returns, or [`crate::BufferedFile`] for pipelined
+    /// UNSTABLE writes with batched COMMITs.
+    async fn write_with(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+        stability: WriteStability,
+    ) -> Result<WriteOutcome>;
+
+    /// Procedure WRITE writes data to a file and returns once it is durable:
+    /// `FILE_SYNC` is requested and, if the server downgrades it, a COMMIT
+    /// follows and the write verifier is checked.
     ///
     /// # Example
     ///
@@ -1041,28 +1101,19 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     }
     /// }
     /// ```
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32>;
-
-    #[doc(hidden)]
-    async fn write_with_outcome(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-    ) -> Result<WriteOutcome> {
-        Ok(WriteOutcome {
-            count: self.write(fh, offset, data).await?,
-            stable: false,
-            verifier: None,
-        })
-    }
-
-    /// WRITE with `stable = UNSTABLE`: the server may buffer the data, so the
-    /// caller must COMMIT before relying on it (RFC 1813 §3.3.7). Versions
-    /// without an UNSTABLE fast path fall back to a stable write.
-    #[doc(hidden)]
-    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
-        self.write_with_outcome(fh, offset, data).await
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let outcome = self
+            .write_with(fh.clone(), offset, data, WriteStability::FileSync)
+            .await?;
+        if !outcome.stable {
+            let verifier = self.commit_with_verifier(fh, offset, outcome.count).await?;
+            if let (Some(expected), Some(actual)) = (outcome.verifier, verifier)
+                && expected != actual
+            {
+                return Err(write_verifier_changed(self.version()));
+            }
+        }
+        Ok(outcome.count)
     }
 
     /// Same as [`Mount::write`] but instead of taking in a file handle, takes in a path for which file handle is

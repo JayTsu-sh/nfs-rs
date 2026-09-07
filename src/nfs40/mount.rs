@@ -1220,20 +1220,6 @@ fn unsupported<T>(operation: &str) -> Result<T> {
     )))
 }
 
-fn verifier_changed_error() -> NfsError {
-    NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
-        crate::error::OperationOutcome::Uncertain,
-        OperationClass::ReplaySensitive,
-        crate::error::RecoveryAction::VerifyThenResume,
-        RequestContext {
-            operation: "write_verifier".into(),
-            protocol: NFSVersion::NFSv4p0,
-            request_id: None,
-        },
-        NfsError::Rpc("NFSv4.0 WRITE verifier changed before COMMIT".into()),
-    )))
-}
-
 fn classify_create_compound_error(
     response: &Bytes,
     class: OperationClass,
@@ -1317,8 +1303,7 @@ impl Mount40 {
 
 impl Mount40 {
     /// WRITE with the given `stable_how4`; returns `(count, committed, verifier)`.
-    /// A FILE_SYNC request that the server downgrades is COMMITted here;
-    /// an UNSTABLE request leaves the COMMIT to the caller.
+    /// No COMMIT is issued here; `Mount::write` handles a downgraded reply.
     async fn write_stable_how(
         &self,
         fh: Bytes,
@@ -1378,25 +1363,6 @@ impl Mount40 {
                 .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
             let (count, committed, verifier) = decode_write_response(response)
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            if stable == 2 && committed != 2 {
-                let commit_request = CompoundBuilder::new("commit")
-                    .putfh(&fh_for_settlement)
-                    .commit(offset, count)
-                    .encode_with_header(&auth);
-                let (commit_class, commit_ctx) =
-                    context("commit", owner, 0, OperationClass::ReplaySensitive);
-                let commit_response = rpc
-                    .call(commit_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .map_err(|error| {
-                        classify_sent_nfs40_error(commit_class, commit_ctx.clone(), error)
-                    })?;
-                let committed_verifier = decode_commit_response(commit_response)
-                    .map_err(|error| classify_sent_nfs40_error(commit_class, commit_ctx, error))?;
-                if committed_verifier != verifier {
-                    return Err(verifier_changed_error());
-                }
-            }
             lease.finish_stateful(expected_generation, "write")?;
             Ok::<_, NfsError>((count, committed, verifier, data))
         })
@@ -1558,6 +1524,16 @@ impl Mount for Mount40 {
         self.close_lane(lane).await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
+        self.commit_with_verifier(fh, offset, count)
+            .await
+            .map(|_| ())
+    }
+    async fn commit_with_verifier(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+    ) -> Result<Option<[u8; 8]>> {
         let lane = self.state.for_fh(&fh, crate::OPEN_WRITE).await;
         let expected_generation = if lane.is_some() {
             Some(self.lease.begin_stateful("commit")?)
@@ -1575,11 +1551,11 @@ impl Mount for Mount40 {
                 .write_verifier
                 .is_some_and(|expected| expected != verifier)
             {
-                return Err(verifier_changed_error());
+                return Err(mount::write_verifier_changed(NFSVersion::NFSv4p0));
             }
             lane.write_verifier = None;
         }
-        Ok(())
+        Ok(Some(verifier))
     }
     async fn create(
         &self,
@@ -2175,17 +2151,16 @@ impl Mount for Mount40 {
         .await?;
         Ok(settled)
     }
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        let (count, _, _) = self.write_stable_how(fh, offset, data, 2).await?;
-        Ok(count)
-    }
-    async fn write_unstable(
+    async fn write_with(
         &self,
         fh: Bytes,
         offset: u64,
         data: Bytes,
+        stability: mount::WriteStability,
     ) -> Result<mount::WriteOutcome> {
-        let (count, committed, verifier) = self.write_stable_how(fh, offset, data, 0).await?;
+        let (count, committed, verifier) = self
+            .write_stable_how(fh, offset, data, stability.stable_how())
+            .await?;
         Ok(mount::WriteOutcome {
             count,
             stable: committed == 2,
