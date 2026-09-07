@@ -26,6 +26,7 @@ use super::{
     mountres3_ok, rpc_header,
 };
 use crate::error::{NfsError, Result};
+use crate::mount::{WriteOutcome, WriteStability, finish_stable_write};
 use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
 
 #[derive(Debug)]
@@ -162,14 +163,18 @@ impl crate::Mount for Mount3 {
         self.m.read(fh, offset, count).await
     }
 
-    async fn write_with(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-        stability: crate::WriteStability,
-    ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_with(fh, offset, data, stability).await
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        self.m
+            .write_how(fh, offset, data, WriteStability::Unstable)
+            .await
+    }
+
+    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let outcome = self
+            .m
+            .write_how(fh.clone(), offset, data, WriteStability::FileSync)
+            .await?;
+        finish_stable_write(self, fh, offset, outcome).await
     }
 
     async fn commit_with_verifier(

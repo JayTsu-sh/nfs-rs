@@ -110,7 +110,7 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
         while written < payload.len() {
             let end = (written + mount.get_max_write_size() as usize).min(payload.len());
             let count = mount
-                .write(
+                .write_stable(
                     created.fh.clone(),
                     written as u64,
                     payload.slice(written..end),
@@ -1348,7 +1348,7 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
         let created_payload = Bytes::from_static(b"created-through-common-mount-api");
         ensure(
             mount
-                .write(created_file.fh.clone(), 0, created_payload.clone())
+                .write_stable(created_file.fh.clone(), 0, created_payload.clone())
                 .await?
                 == created_payload.len() as u32,
             format!("NFSv4.0 CREATE write count mismatch through {url}"),
@@ -1472,7 +1472,7 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             while written < expected.len() {
                 let end = (written + mount.get_max_write_size() as usize).min(expected.len());
                 let count = mount
-                    .write(fh.clone(), written as u64, expected.slice(written..end))
+                    .write_stable(fh.clone(), written as u64, expected.slice(written..end))
                     .await? as usize;
                 ensure(
                     count != 0 && count <= end - written,
@@ -1490,7 +1490,7 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             while restored < original.len() {
                 let end = (restored + mount.get_max_write_size() as usize).min(original.len());
                 restored += mount
-                    .write(
+                    .write_stable(
                         opened.object.fh.clone(),
                         restored as u64,
                         original.slice(restored..end),
@@ -1581,7 +1581,7 @@ async fn run_v40_performance_task(
                 let chunk = payload.slice(offset..end);
                 let chunk_started = Instant::now();
                 let written = mount
-                    .write(created.fh.clone(), offset as u64, chunk.clone())
+                    .write_stable(created.fh.clone(), offset as u64, chunk.clone())
                     .await?;
                 ensure(written as usize == chunk.len(), "short performance write")?;
                 write_latencies.push(chunk_started.elapsed().as_secs_f64() * 1_000.0);
@@ -1811,7 +1811,9 @@ async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
             let fh = created.fh.clone();
             let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
             writes.spawn(async move {
-                let written = mount.write(fh, (chunk * chunk_size) as u64, data).await?;
+                let written = mount
+                    .write_stable(fh, (chunk * chunk_size) as u64, data)
+                    .await?;
                 ensure(
                     written as usize == chunk_size,
                     format!("short concurrent WRITE for chunk {chunk}"),
@@ -1898,7 +1900,9 @@ async fn measure_data_mover_same_file_sample(
         let fh = created.fh.clone();
         let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
         writes.push(async move {
-            let written = mount.write(fh, (chunk * chunk_size) as u64, data).await?;
+            let written = mount
+                .write_stable(fh, (chunk * chunk_size) as u64, data)
+                .await?;
             ensure(
                 written as usize == chunk_size,
                 format!("short data-mover WRITE for chunk {chunk}"),
@@ -2527,7 +2531,7 @@ async fn write_all_with_chunk_size(
     while offset < data.len() {
         let end = (offset + chunk_size).min(data.len());
         let written = mount
-            .write(fh.clone(), offset as u64, data.slice(offset..end))
+            .write_stable(fh.clone(), offset as u64, data.slice(offset..end))
             .await? as usize;
         ensure(written > 0, format!("zero-byte write at offset {offset}"))?;
         ensure(
@@ -2892,9 +2896,11 @@ async fn nfs_v41_pnfs_multifile_active_layout_refresh() -> TestResult {
             let created = mount.create_path(&file, Some(0o600)).await?;
             let head = pnfs_pattern(index * 64 * 1024, 64 * 1024);
             let tail = pnfs_pattern((index + 32) * 64 * 1024, 64 * 1024);
-            mount.write(created.fh.clone(), 0, head.clone()).await?;
             mount
-                .write(created.fh.clone(), 1024 * 1024 * 1024, tail.clone())
+                .write_stable(created.fh.clone(), 0, head.clone())
+                .await?;
+            mount
+                .write_stable(created.fh.clone(), 1024 * 1024 * 1024, tail.clone())
                 .await?;
             mount.close(created.fh).await?;
 
@@ -3016,7 +3022,7 @@ async fn nfs_v41_pnfs_ds_reset_returns_uncertain() -> TestResult {
 
         let fault_payload = Bytes::from(vec![0xc3; 64 * 1024]);
         let error = mount
-            .write(created.fh.clone(), seed.len() as u64, fault_payload)
+            .write_stable(created.fh.clone(), seed.len() as u64, fault_payload)
             .await
             .expect_err("DS reset after send must not fall back to a successful MDS WRITE");
         let outcome = error
@@ -3201,7 +3207,7 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
         for (chunk_index, chunk_start) in (0..expected.len()).step_by(512 * 1024).enumerate() {
             let chunk_end = (chunk_start + 512 * 1024).min(expected.len());
             mount
-                .write(
+                .write_stable(
                     created.fh.clone(),
                     chunk_start as u64,
                     expected.slice(chunk_start..chunk_end),
@@ -3273,7 +3279,7 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
     tokio::time::timeout(Duration::from_secs(90), async {
         while !std::path::Path::new(&completed).exists() {
             let writes = (0..64u64).map(|index| {
-                mount.write(
+                mount.write_stable(
                     created.fh.clone(),
                     index * chunk.len() as u64,
                     chunk.clone(),
@@ -3336,7 +3342,7 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     tokio::time::timeout(Duration::from_secs(120), async {
         while !std::path::Path::new(&completed).exists() {
             let writes = (0..64u64).map(|index| {
-                mount.write(
+                mount.write_stable(
                     created.fh.clone(),
                     index * chunk.len() as u64,
                     chunk.clone(),

@@ -1683,20 +1683,21 @@ impl crate::Mount for Mount41Wrapper {
     async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
         self.m.readdirplus_path(dir_path).await
     }
-    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write(fh, offset, data).await
-    }
-    async fn write_with(
+    async fn write(
         &self,
         fh: Bytes,
         offset: u64,
         data: Bytes,
-        stability: crate::WriteStability,
     ) -> Result<crate::mount::WriteOutcome> {
-        self.m.write_with(fh, offset, data, stability).await
+        self.m
+            .write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
+            .await
     }
-    async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        self.m.write_path(path, offset, data).await
+    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        self.m.write_stable(fh, offset, data).await
+    }
+    async fn write_stable_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
+        self.m.write_stable_path(path, offset, data).await
     }
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
         self.m.open(dir_fh, filename, access).await

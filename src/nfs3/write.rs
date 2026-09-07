@@ -21,7 +21,7 @@ use bytes::Bytes;
 
 impl Mount {
     /// WRITE with the requested stability level; no COMMIT is issued here.
-    pub async fn write_with(
+    pub async fn write_how(
         &self,
         fh: Bytes,
         offset: u64,
@@ -36,7 +36,6 @@ impl Mount {
         let count = data.len() as u32;
         let stable = match stability {
             WriteStability::Unstable => WriteStable::Unstable,
-            WriteStability::DataSync => WriteStable::DataSync,
             WriteStability::FileSync => WriteStable::FileSync,
         };
         let ok = self
@@ -81,7 +80,7 @@ mod tests {
         };
         let data = vec![0u8; (u32::MAX as usize) + 1];
         let res = mount
-            .write_with(Bytes::new(), 0, Bytes::from(data), WriteStability::FileSync)
+            .write_how(Bytes::new(), 0, Bytes::from(data), WriteStability::FileSync)
             .await;
         assert!(matches!(res, Err(NfsError::InvalidInput(_))));
     }

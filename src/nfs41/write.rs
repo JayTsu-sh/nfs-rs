@@ -16,7 +16,7 @@ impl Mount41 {
     /// FILE_SYNC write that is durable on return: pNFS data servers first
     /// (when a layout is held), otherwise the MDS with a COMMIT if the
     /// server downgraded the stability level.
-    pub(crate) async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+    pub(crate) async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
         self.refresh_layout_for_write(&fh, offset).await?;
         {
             let _io_guard = self.layout_manager.read_file_io(&fh).await;
@@ -26,7 +26,7 @@ impl Mount41 {
             }
         }
         let outcome = self
-            .write_with(fh.clone(), offset, data, WriteStability::FileSync)
+            .write_how(fh.clone(), offset, data, WriteStability::FileSync)
             .await?;
         if !outcome.stable {
             // RFC 5661 §18.32.3: downgraded stability needs a COMMIT before
@@ -44,7 +44,7 @@ impl Mount41 {
     /// WRITE to the MDS with the requested stability level; no COMMIT is
     /// issued here. pNFS layouts are bypassed so that one COMMIT on the MDS
     /// covers every chunk written this way.
-    pub(crate) async fn write_with(
+    pub(crate) async fn write_how(
         &self,
         fh: Bytes,
         offset: u64,
@@ -84,9 +84,14 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
+    pub(crate) async fn write_stable_path(
+        &self,
+        path: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<u32> {
         let obj = self.lookup_path(path).await?;
-        self.write(obj.fh, offset, data).await
+        self.write_stable(obj.fh, offset, data).await
     }
 
     pub(crate) async fn open(

@@ -1302,8 +1302,25 @@ impl Mount40 {
 }
 
 impl Mount40 {
+    async fn write_how(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+        stability: mount::WriteStability,
+    ) -> Result<mount::WriteOutcome> {
+        let (count, committed, verifier) = self
+            .write_stable_how(fh, offset, data, stability.stable_how())
+            .await?;
+        Ok(mount::WriteOutcome {
+            count,
+            stable: committed == 2,
+            verifier: Some(verifier),
+        })
+    }
+
     /// WRITE with the given `stable_how4`; returns `(count, committed, verifier)`.
-    /// No COMMIT is issued here; `Mount::write` handles a downgraded reply.
+    /// No COMMIT is issued here; `Mount::write_stable` handles a downgraded reply.
     async fn write_stable_how(
         &self,
         fh: Bytes,
@@ -2151,21 +2168,15 @@ impl Mount for Mount40 {
         .await?;
         Ok(settled)
     }
-    async fn write_with(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-        stability: mount::WriteStability,
-    ) -> Result<mount::WriteOutcome> {
-        let (count, committed, verifier) = self
-            .write_stable_how(fh, offset, data, stability.stable_how())
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<mount::WriteOutcome> {
+        self.write_how(fh, offset, data, mount::WriteStability::Unstable)
+            .await
+    }
+    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
+        let outcome = self
+            .write_how(fh.clone(), offset, data, mount::WriteStability::FileSync)
             .await?;
-        Ok(mount::WriteOutcome {
-            count,
-            stable: committed == 2,
-            verifier: Some(verifier),
-        })
+        mount::finish_stable_write(self, fh, offset, outcome).await
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         Box::pin(
@@ -4228,7 +4239,7 @@ mod tests {
         assert_eq!(mount.callback_stats().await.returns_completed, 1);
         assert_eq!(
             mount
-                .write(opened.fh.clone(), 0, Bytes::from_static(b"data"))
+                .write_stable(opened.fh.clone(), 0, Bytes::from_static(b"data"))
                 .await
                 .unwrap(),
             4
@@ -5543,8 +5554,8 @@ mod tests {
         });
 
         let (first, second) = tokio::join!(
-            mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
-            mount.write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
+            mount.write_stable(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
+            mount.write_stable(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
         );
         assert_eq!(first.unwrap(), 1);
         assert_eq!(second.unwrap(), 1);
@@ -5681,13 +5692,13 @@ mod tests {
         let first_mount = Arc::clone(&mount);
         let first = tokio::spawn(async move {
             first_mount
-                .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
+                .write_stable(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
                 .await
         });
         let second_mount = Arc::clone(&mount);
         let second = tokio::spawn(async move {
             second_mount
-                .write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
+                .write_stable(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
                 .await
         });
         writes_seen_rx.await.unwrap();

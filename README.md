@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
 
     let created = mount.create_path("hello.txt", Some(0o644)).await?;
     mount
-        .write(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+        .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
         .await?;
     mount.commit(created.fh.clone(), 0, 9).await?;
     mount.close(created.fh).await?;

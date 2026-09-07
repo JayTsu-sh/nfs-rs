@@ -185,7 +185,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 while offset < payload.len() {
                     let end = (offset + max_write as usize).min(payload.len());
                     let written = mount
-                        .write(
+                        .write_stable(
                             created.fh.clone(),
                             offset as u64,
                             payload.slice(offset..end),

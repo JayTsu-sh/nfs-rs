@@ -783,14 +783,14 @@ impl FileResource {
             FileBackend::Mount {
                 mount, file_handle, ..
             } => {
-                mount
-                    .write_with(
-                        file_handle.clone(),
-                        offset,
-                        data,
-                        crate::WriteStability::FileSync,
-                    )
-                    .await
+                let count = mount
+                    .write_stable(file_handle.clone(), offset, data)
+                    .await?;
+                Ok(crate::WriteOutcome {
+                    count,
+                    stable: true,
+                    verifier: None,
+                })
             }
             #[cfg(feature = "python-test-support")]
             FileBackend::Test {

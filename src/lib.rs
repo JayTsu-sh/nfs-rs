@@ -32,7 +32,7 @@
 //!
 //! let created = mount.create_path("hello.txt", Some(0o644)).await?;
 //! mount
-//!     .write(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+//!     .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
 //!     .await?;
 //! mount.commit(created.fh.clone(), 0, 9).await?;
 //! mount.close(created.fh).await?;
@@ -277,7 +277,7 @@ pub use mount::{
     FSInfo, FSStat, LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState,
     NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, NfsAcl41, OPEN_BOTH, OPEN_READ,
     OPEN_WRITE, ObjRes, OpenFile, Pathconf, PathconfSupport, ReaddirEntry, ReaddirStream,
-    ReaddirplusEntry, ReaddirplusStream, SupportedPathconf, WriteOutcome, WriteStability,
+    ReaddirplusEntry, ReaddirplusStream, SupportedPathconf, WriteOutcome,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
@@ -356,7 +356,7 @@ struct MountArgs {
 ///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
-///         let num_bytes_written = mount.write(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
+///         let num_bytes_written = mount.write_stable(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
 ///         assert_eq!(num_bytes_written as usize, contents_len);
 ///         let bytes_read = mount.read(res.fh, 0, 16).await.unwrap_or_default();
 ///         assert_eq!(&bytes_read, "hello rust".as_bytes());
