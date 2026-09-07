@@ -28,6 +28,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Benchmark harness `nfs-perf-compare` keeps data verification inside the
   timed region so read-ahead and page-cache backends are not over-credited.
+- `tests/benchmarks/compare/ontap_prepare.py` verifies the ONTAP management
+  certificate by default; `--insecure` opts out, `--ca-file` names a bundle.
+
+### Fixed
+
+- NFSv4.1 file layouts: `nfl_util` flags are decoded per RFC 5661 §13.3
+  (`NFL4_UFLG_DENSE` = 0x1, `NFL4_UFLG_COMMIT_THRU_MDS` = 0x2, stripe unit in
+  the upper 26 bits); the decoder previously read bit 30 as the dense flag.
+- NFSv4.1 pNFS `write_stable`: when a data server downgrades a FILE_SYNC
+  WRITE, the COMMIT is routed per RFC 5661 §13.7 (MDS with
+  `COMMIT_THRU_MDS`, otherwise the data server that took the WRITE), its
+  failure is reported instead of ignored, and a write verifier mismatch is
+  surfaced as an uncertain write.
+- `BufferedFile` read-ahead: READs of a discarded window still count against
+  the `readahead` limit, so random access on a slow link cannot accumulate
+  more in-flight prefetches than the window allows.
 
 ## [0.6.1] - 2026-09-03
 

@@ -1131,7 +1131,7 @@ git add src/bin/nfs-perf-compare && git commit -m "feat(perf-compare): add metad
 - Consumes: `Backend`（`Arc<dyn Backend>`）、`pattern`、`Series`、`stats::mibps`。
 - Produces:
   - `pub async fn write_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64>`（返回秒，含 sync）
-  - `pub async fn read_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64>`（返回秒，已扣除校验耗时；校验失败返回 `Integrity`）
+  - `pub async fn read_file(b: &dyn Backend, path: &str, size: u64, qd: usize) -> Result<f64>`（返回秒，校验计入计时，见设计文档 §3.2 方法修订；校验失败返回 `Integrity`）
   - `pub async fn run(b: Arc<dyn Backend>, workdir: &str, size: u64, qd: usize, repeat: usize, iters: usize, buffered_posix: bool) -> Result<(Vec<Series>, bool)>`（第二个返回值 = 是否成功 drop_caches）
 
 - [ ] **Step 1: 测试**

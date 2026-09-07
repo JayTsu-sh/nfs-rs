@@ -15,8 +15,13 @@ Date: 2026-09-04
 产出一份可追溯的报告（Markdown 进仓库 + 同内容 HTML），结构参考
 `nfs-rs-test-report.html`（执行摘要 → 环境 → 方法 → 结果 → 分析 → 限制）。
 
-非目标：不做 CI gate、不改动现有 `nfs-storage-benchmark` 及其基线体系、
-不优化 nfs-rs 本身。发现的性能问题只记录，不在本任务内修。
+非目标：不做 CI gate、不改动现有 `nfs-storage-benchmark` 的行为及其基线体系
+（`docs/benchmarks/baseline-2026-05-05.md` 保持不动；`Mount::write` 拆分为
+`write` / `write_stable` 后，其调用点做了同语义的重命名，仍是 FILE_SYNC 写）。
+
+范围修订（2026-09-05）：基线报告出来后，决定在同一分支实现 nfs-rs 的顺序读
+预读与写回（`BufferedFile`，URL `readahead=` / `writeback=`），并用本 harness
+以 `NFSRS_VARIANTS` 开关前后复测。其余发现的性能问题仍只记录 issue，不在本任务内修。
 
 ## 2. 环境
 
@@ -108,7 +113,11 @@ nfs-rs 的 `_path` 方法每次从根逐级 LOOKUP、无缓存（路径保持 3�
 
 - 写：创建文件 → 按 1 MiB 分块写满 S 字节（QD 路并发 in-flight）→ COMMIT/`fsync` → close。
   计时范围 create → fsync 完成。
-- 读：open → 按 1 MiB 分块读满（QD 路并发）→ close，计时后**在计时外**校验内容。
+- 读：open → 按 1 MiB 分块读满（QD 路并发）→ close，每块读到即校验，**校验计入计时**。
+  方法修订（2026-09-05）：初版把校验时间从读时长中扣除，但校验是 memcmp 级别的
+  开销，扣除会高估任何把传输与校验重叠的一方（预读、page cache），曾让内核 buffered
+  冷读的数字超过链路上限。Rust 与 Python harness 对此等价：两者的 worker 都在
+  读完一块后立即校验，内核和 nfs-rs 各后端同一规则，内核用例在修订后同场复测。
 - 数据模式：1 MiB 周期性模式块重复（`byte = (i*17+29) % 251`），Rust/Python 用
   相同模式，校验只需按块比较。
 - 4 KiB：单次 write+commit、单次 read，200 个文件，报延迟分布；QD 维度不适用。
