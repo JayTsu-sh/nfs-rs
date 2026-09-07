@@ -115,13 +115,27 @@ def plan_rollback(state: State, cfg: Config, restore_transfer_size: bool, delete
 # REST client
 # ----------------------------------------------------------------------------
 
+def tls_context(insecure: bool, ca_file: str | None) -> ssl.SSLContext:
+    """Certificate verification is on by default: the requests carry Basic Auth
+    credentials and can mutate storage. ``--insecure`` is an explicit opt-out
+    for clusters that still run the self-signed factory certificate."""
+    if insecure:
+        print("WARNING: --insecure disables TLS certificate verification; "
+              "ONTAP credentials and requests can be intercepted on this connection", file=sys.stderr)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    return ssl.create_default_context(cafile=ca_file)
+
+
 class Ontap:
-    def __init__(self, mgmt: str, user: str, password: str) -> None:
+    def __init__(self, mgmt: str, user: str, password: str, ctx: ssl.SSLContext) -> None:
         self.base = f"https://{mgmt}"
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         self.headers = {"Authorization": f"Basic {token}", "Accept": "application/json",
                         "Content-Type": "application/json"}
-        self.ctx = ssl._create_unverified_context()
+        self.ctx = ctx
 
     def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         data = json.dumps(body).encode() if body is not None else None
@@ -191,6 +205,9 @@ def main() -> int:
     parser.add_argument("--size-gb", type=int, default=50)
     parser.add_argument("--client", required=True, help="client IP allowed by the export policy")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--ca-file", help="PEM bundle that signs the cluster management certificate")
+    parser.add_argument("--insecure", action="store_true",
+                        help="skip TLS certificate verification (self-signed cluster certificate)")
     parser.add_argument("--restore-transfer-size", action="store_true")
     parser.add_argument("--delete-volume", action="store_true")
     parser.add_argument("action", choices=("prepare", "rollback", "status"))
@@ -200,7 +217,7 @@ def main() -> int:
         print("ONTAP_USER and ONTAP_PASS are required", file=sys.stderr)
         return 2
     cfg = Config(svm=args.svm, volume=args.volume, size_gb=args.size_gb, client=args.client)
-    api = Ontap(args.mgmt, user, password)
+    api = Ontap(args.mgmt, user, password, tls_context(args.insecure, args.ca_file))
     state = collect_state(api, cfg)
     print(json.dumps({"before": state_json(state)}, indent=2))
     if args.action == "status":
