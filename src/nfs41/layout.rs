@@ -94,10 +94,13 @@ pub(crate) enum LayoutContent {
     /// nfsv4_1_file_layout4 (RFC 5661 §13.3)
     FilesLayout {
         device_id: [u8; 16],
-        /// nfl_util low 30 bits: stripe unit size in bytes.
+        /// `nfl_util & NFL4_UFLG_STRIPE_UNIT_SIZE_MASK`: stripe unit size in bytes.
         stripe_unit: u32,
-        /// nfl_util bit 30: NFL4_UFLG_DENSE flag.
+        /// `nfl_util & NFL4_UFLG_DENSE`: dense packing (RFC 5661 §13.4.4).
         is_dense: bool,
+        /// `nfl_util & NFL4_UFLG_COMMIT_THRU_MDS`: COMMIT goes to the MDS
+        /// instead of each data server (RFC 5661 §13.7).
+        commit_thru_mds: bool,
         /// NFSv4.1 file layout uses striping across data servers.
         /// first_stripe_index indicates which DS gets the first stripe.
         first_stripe_index: u32,
@@ -782,6 +785,11 @@ pub(crate) fn decode_layoutget_response(data: &mut Bytes) -> Result<Layout> {
     })
 }
 
+/// `nfl_util` flag bits (RFC 5661 §13.3).
+const NFL4_UFLG_DENSE: u32 = 0x0000_0001;
+const NFL4_UFLG_COMMIT_THRU_MDS: u32 = 0x0000_0002;
+const NFL4_UFLG_STRIPE_UNIT_SIZE_MASK: u32 = 0xFFFF_FFC0;
+
 /// Decode nfsv4_1_file_layout4 content (RFC 5661 §13.3).
 fn decode_files_layout(data: &mut Bytes) -> Result<LayoutContent> {
     // deviceid4 (16 bytes)
@@ -791,13 +799,15 @@ fn decode_files_layout(data: &mut Bytes) -> Result<LayoutContent> {
     let mut device_id = [0u8; 16];
     data.copy_to_slice(&mut device_id);
 
-    // nfl_util: uint32 — low 30 bits = stripe unit, bit 30 = NFL4_UFLG_DENSE
+    // nfl_util: uint32 (RFC 5661 §13.3) — NFL4_UFLG_DENSE = 0x1,
+    // NFL4_UFLG_COMMIT_THRU_MDS = 0x2, stripe unit in the upper 26 bits.
     if data.remaining() < 4 {
         return Err(NfsError::Xdr("files_layout nfl_util truncated".to_string()));
     }
     let nfl_util = data.get_u32();
-    let stripe_unit = nfl_util & 0x3FFF_FFFF;
-    let is_dense = (nfl_util & 0x4000_0000) != 0;
+    let stripe_unit = nfl_util & NFL4_UFLG_STRIPE_UNIT_SIZE_MASK;
+    let is_dense = (nfl_util & NFL4_UFLG_DENSE) != 0;
+    let commit_thru_mds = (nfl_util & NFL4_UFLG_COMMIT_THRU_MDS) != 0;
 
     // nfl_first_stripe_index: uint32
     if data.remaining() < 4 {
@@ -847,6 +857,7 @@ fn decode_files_layout(data: &mut Bytes) -> Result<LayoutContent> {
         device_id,
         stripe_unit,
         is_dense,
+        commit_thru_mds,
         first_stripe_index,
         pattern_offset,
         fh_list,
@@ -1578,6 +1589,7 @@ mod tests {
                 device_id,
                 stripe_unit,
                 is_dense,
+                commit_thru_mds,
                 first_stripe_index,
                 pattern_offset,
                 fh_list,
@@ -1585,6 +1597,7 @@ mod tests {
                 assert_eq!(device_id, [0xAAu8; 16]);
                 assert_eq!(stripe_unit, 65536);
                 assert!(!is_dense);
+                assert!(!commit_thru_mds);
                 assert_eq!(first_stripe_index, 0);
                 assert_eq!(pattern_offset, 0);
                 assert_eq!(fh_list.len(), 2);
@@ -1619,8 +1632,8 @@ mod tests {
     fn decode_files_layout_dense_flag() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0xBBu8; 16]); // device_id
-        // nfl_util with dense flag (bit 30) set + stripe_unit = 4096
-        let nfl_util: u32 = 0x4000_0000 | 4096;
+        // nfl_util: NFL4_UFLG_DENSE | NFL4_UFLG_COMMIT_THRU_MDS + stripe_unit = 4096
+        let nfl_util: u32 = 0x1 | 0x2 | 4096;
         put_u32(&mut buf, nfl_util);
         put_u32(&mut buf, 2); // first_stripe_index
         put_u64(&mut buf, 1024); // pattern_offset
@@ -1634,12 +1647,14 @@ mod tests {
             LayoutContent::FilesLayout {
                 stripe_unit,
                 is_dense,
+                commit_thru_mds,
                 first_stripe_index,
                 pattern_offset,
                 ..
             } => {
                 assert_eq!(stripe_unit, 4096);
                 assert!(is_dense);
+                assert!(commit_thru_mds);
                 assert_eq!(first_stripe_index, 2);
                 assert_eq!(pattern_offset, 1024);
             }
