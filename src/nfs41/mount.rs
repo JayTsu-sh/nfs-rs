@@ -247,7 +247,6 @@ pub(crate) struct Mount41 {
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
     pub(crate) acl_supported: bool,
-    pub(crate) io_options: crate::IoOptions,
 }
 
 impl Mount41 {
@@ -825,7 +824,7 @@ async fn mount_on_addr(
 
     // 4. Get filesystem limits via GETATTR
     let (rsize, wsize, renewal_interval, acl_supported) =
-        get_fs_limits(&client, &session, auth, &root_fh, args.rsize, args.wsize).await?;
+        get_fs_limits(&client, &session, auth, &root_fh).await?;
     info!(
         rsize,
         wsize,
@@ -911,7 +910,6 @@ async fn mount_on_addr(
         rsize,
         wsize,
         acl_supported,
-        io_options: args.io_options,
     };
 
     Ok(Box::new(Mount41Wrapper {
@@ -1283,8 +1281,6 @@ async fn get_fs_limits(
     session: &Session,
     auth: &Auth,
     root_fh: &Bytes,
-    requested_rsize: u32,
-    requested_wsize: u32,
 ) -> Result<(u32, u32, std::time::Duration, bool)> {
     // NFSv4.1: lease_time=10, maxread=30, maxwrite=31
     let bitmap = [(1u32 << 0) | (1u32 << 10) | (1u32 << 30) | (1u32 << 31)];
@@ -1399,30 +1395,8 @@ async fn get_fs_limits(
     let renewal_secs = (server_lease_secs / 2).clamp(5, 45);
     let renewal_interval = std::time::Duration::from_secs(renewal_secs as u64);
 
-    // Clamp requested sizes to server limits (same logic as v3).
-    // A WRITE request also contains RPC, authentication, COMPOUND, SEQUENCE,
-    // PUTFH, and WRITE metadata. Reserve conservative headroom so the encoded
-    // request stays below the fore-channel ca_maxrequestsize negotiated by
-    // CREATE_SESSION (RFC 5661 §2.10.1).
-    let rsize_max: u32 = 4_194_304; // 4 MiB
-    let wsize_max: u32 = 4_194_304;
-    let rsize_min: u32 = 8192;
-    let wsize_min: u32 = 8192;
-
-    let rsize = effective_rsize(
-        requested_rsize,
-        server_maxread,
-        rsize_max,
-        rsize_min,
-        session.max_response_size(),
-    )?;
-    let wsize = effective_wsize(
-        requested_wsize,
-        server_maxwrite,
-        wsize_max,
-        wsize_min,
-        session.max_request_size(),
-    )?;
+    let rsize = effective_rsize(server_maxread, session.max_response_size())?;
+    let wsize = effective_wsize(server_maxwrite, session.max_request_size())?;
 
     let acl_supported = supported_attrs
         .first()
@@ -1433,13 +1407,7 @@ async fn get_fs_limits(
 const NFS41_WRITE_REQUEST_HEADROOM: u32 = 4 * 1024;
 const NFS41_READ_RESPONSE_HEADROOM: u32 = 4 * 1024;
 
-fn effective_rsize(
-    requested_rsize: u32,
-    server_maxread: u64,
-    client_rsize_max: u32,
-    client_rsize_min: u32,
-    session_max_response_size: u32,
-) -> Result<u32> {
+pub(super) fn effective_rsize(server_maxread: u64, session_max_response_size: u32) -> Result<u32> {
     let session_payload_limit = session_max_response_size
         .checked_sub(NFS41_READ_RESPONSE_HEADROOM)
         .filter(|limit| *limit > 0)
@@ -1449,19 +1417,10 @@ fn effective_rsize(
                 session_max_response_size
             ))
         })?;
-    Ok(requested_rsize
-        .min(server_maxread.min(client_rsize_max as u64) as u32)
-        .max(client_rsize_min)
-        .min(session_payload_limit))
+    Ok(crate::mount::negotiated_io_size(server_maxread)?.min(session_payload_limit))
 }
 
-fn effective_wsize(
-    requested_wsize: u32,
-    server_maxwrite: u64,
-    client_wsize_max: u32,
-    client_wsize_min: u32,
-    session_max_request_size: u32,
-) -> Result<u32> {
+pub(super) fn effective_wsize(server_maxwrite: u64, session_max_request_size: u32) -> Result<u32> {
     let session_payload_limit = session_max_request_size
         .checked_sub(NFS41_WRITE_REQUEST_HEADROOM)
         .filter(|limit| *limit > 0)
@@ -1472,10 +1431,7 @@ fn effective_wsize(
             ))
         })?;
 
-    Ok(requested_wsize
-        .min(server_maxwrite.min(client_wsize_max as u64) as u32)
-        .max(client_wsize_min)
-        .min(session_payload_limit))
+    Ok(crate::mount::negotiated_io_size(server_maxwrite)?.min(session_payload_limit))
 }
 
 // ─── Mount trait implementation ──────────────────────────────────────────────
@@ -1519,10 +1475,6 @@ impl crate::Mount for Mount41Wrapper {
 
     fn get_max_write_size(&self) -> u32 {
         self.m.wsize
-    }
-
-    fn io_options(&self) -> crate::IoOptions {
-        self.m.io_options
     }
 
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
@@ -1689,31 +1641,12 @@ impl crate::Mount for Mount41Wrapper {
         offset: u64,
         data: Bytes,
     ) -> Result<crate::mount::WriteOutcome> {
+        if let Some(result) = self.m.write_pnfs(&fh, offset, data.clone()).await {
+            return result;
+        }
         self.m
             .write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
             .await
-    }
-    /// Durable on return: pNFS data servers first (COMMIT routed per RFC
-    /// 5661 §13.7 inside `pnfs_write`), otherwise the MDS with the shared
-    /// downgrade-COMMIT / verifier check.
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        if let Some(result) = self.m.write_stable_pnfs(&fh, offset, data.clone()).await {
-            return result;
-        }
-        let outcome = self
-            .m
-            .write_how(
-                fh.clone(),
-                offset,
-                data,
-                crate::mount::WriteStability::FileSync,
-            )
-            .await?;
-        crate::mount::finish_stable_write(self, fh, offset, outcome).await
-    }
-    async fn write_stable_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        let obj = self.m.lookup_path(path).await?;
-        self.write_stable(obj.fh, offset, data).await
     }
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
         self.m.open(dir_fh, filename, access).await
@@ -1838,6 +1771,33 @@ impl crate::Mount for Mount41Wrapper {
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.m.commit(fh, offset, count).await
     }
+    async fn commit_write_batch(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[crate::WriteOutcome],
+    ) -> Result<()> {
+        let _guard = self.m.layout_manager.read_file_io(&fh).await;
+        let ordinary: Vec<_> = writes
+            .iter()
+            .filter(|w| w.pnfs.is_none())
+            .cloned()
+            .collect();
+        if ordinary
+            .iter()
+            .any(|w| w.committed != crate::WriteCommitted::FileSync)
+        {
+            let actual = self
+                .m
+                .commit_with_verifier(fh.clone(), offset, count)
+                .await?;
+            crate::mount::verify_write_batch(crate::NFSVersion::NFSv4p1, &ordinary, actual)?;
+        }
+        let pending: Vec<_> = writes.iter().filter_map(|w| w.pnfs.clone()).collect();
+        self.m.commit_pending_writes(&fh, &pending).await
+    }
+
     async fn commit_with_verifier(
         &self,
         fh: Bytes,
@@ -2329,22 +2289,31 @@ mod tests {
     }
 
     #[test]
+    fn automatic_sizes_respect_small_server_and_large_session() {
+        for server_max in [4096, 2 * 1024 * 1024] {
+            assert_eq!(
+                effective_rsize(server_max, 4_194_304).unwrap(),
+                server_max as u32
+            );
+            assert_eq!(
+                effective_wsize(server_max, 4_194_304).unwrap(),
+                server_max as u32
+            );
+        }
+        assert!(effective_rsize(0, 1_048_576).is_err());
+        assert!(effective_wsize(0, 1_048_576).is_err());
+    }
+
+    #[test]
     fn effective_wsize_preserves_server_maxwrite_negotiation() {
-        let wsize = effective_wsize(1_048_576, 64 * 1024, 4_194_304, 8192, 1_048_576).unwrap();
+        let wsize = effective_wsize(64 * 1024, 1_048_576).unwrap();
         assert_eq!(wsize, 64 * 1024);
     }
 
     #[test]
     fn effective_wsize_reserves_session_request_headroom() {
         let session_max_request_size = 1_048_576;
-        let wsize = effective_wsize(
-            1_048_576,
-            4_194_304,
-            4_194_304,
-            8192,
-            session_max_request_size,
-        )
-        .unwrap();
+        let wsize = effective_wsize(4_194_304, session_max_request_size).unwrap();
         assert_eq!(
             wsize,
             session_max_request_size - NFS41_WRITE_REQUEST_HEADROOM
@@ -2355,41 +2324,28 @@ mod tests {
     #[test]
     fn effective_wsize_never_exceeds_small_session_limit() {
         let session_max_request_size = NFS41_WRITE_REQUEST_HEADROOM + 4096;
-        let wsize = effective_wsize(
-            1_048_576,
-            4_194_304,
-            4_194_304,
-            8192,
-            session_max_request_size,
-        )
-        .unwrap();
+        let wsize = effective_wsize(4_194_304, session_max_request_size).unwrap();
         assert_eq!(wsize, 4096);
         assert!(wsize < session_max_request_size);
     }
 
     #[test]
     fn effective_wsize_rejects_session_without_payload_capacity() {
-        let result = effective_wsize(
-            1_048_576,
-            4_194_304,
-            4_194_304,
-            8192,
-            NFS41_WRITE_REQUEST_HEADROOM,
-        );
+        let result = effective_wsize(4_194_304, NFS41_WRITE_REQUEST_HEADROOM);
         assert!(result.is_err());
     }
 
     #[test]
     fn effective_rsize_reserves_negotiated_response_headroom() {
         let maximum = 1_048_576;
-        let rsize = effective_rsize(4_194_304, u64::MAX, 4_194_304, 8192, maximum).unwrap();
+        let rsize = effective_rsize(u64::MAX, maximum).unwrap();
         assert_eq!(rsize, maximum - NFS41_READ_RESPONSE_HEADROOM);
         assert!(rsize < maximum);
     }
 
     #[test]
     fn effective_rsize_rejects_response_without_payload_capacity() {
-        assert!(effective_rsize(8192, u64::MAX, 4_194_304, 8192, 4096).is_err());
+        assert!(effective_rsize(u64::MAX, 4096).is_err());
     }
 
     #[test]

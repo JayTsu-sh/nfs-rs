@@ -31,10 +31,8 @@
 //! .await?;
 //!
 //! let created = mount.create_path("hello.txt", Some(0o644)).await?;
-//! mount
-//!     .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+//! nfs_rs::write_all(&*mount, created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
 //!     .await?;
-//! mount.commit(created.fh.clone(), 0, 9).await?;
 //! mount.close(created.fh).await?;
 //!
 //! let opened = mount.open_path("hello.txt", OPEN_READ).await?;
@@ -271,13 +269,13 @@ pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, RequestId, RequestTransmission, Result,
 };
-pub use fileio::{BufferedFile, IoOptions};
+pub use fileio::{BufferedFile, write_all};
 pub use mount::{
     AceFlags, AceMask, AceType, Acl, Acl41Flags, AclSupport, Attr, CallbackStats, ExportEntry,
     FSInfo, FSStat, LockToken, Mount, MountCapabilities, MountHealth, MountLifecycleState,
     NFSVersion, Nfs41CallbackStats, Nfs41ChannelLimits, NfsAce, NfsAcl41, OPEN_BOTH, OPEN_READ,
     OPEN_WRITE, ObjRes, OpenFile, Pathconf, PathconfSupport, ReaddirEntry, ReaddirStream,
-    ReaddirplusEntry, ReaddirplusStream, SupportedPathconf, WriteOutcome,
+    ReaddirplusEntry, ReaddirplusStream, SupportedPathconf, WriteCommitted, WriteOutcome,
 };
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
@@ -339,11 +337,8 @@ struct MountArgs {
     gid: u32,
     dircount: u32,
     maxcount: u32,
-    rsize: u32,
-    wsize: u32,
     noresvport: bool,
     retain_delegations: bool,
-    io_options: IoOptions,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -356,7 +351,7 @@ struct MountArgs {
 ///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
-///         let num_bytes_written = mount.write_stable(res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
+///         let num_bytes_written = nfs_rs::write_all(&*mount, res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
 ///         assert_eq!(num_bytes_written as usize, contents_len);
 ///         let bytes_read = mount.read(res.fh, 0, 16).await.unwrap_or_default();
 ///         assert_eq!(&bytes_read, "hello rust".as_bytes());
@@ -473,19 +468,6 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         Default::default(),
         "specified URL contains bad mount port",
     )?;
-    let txsize_def: u32 = 1048576; // mimic libnfs default of 1 MiB
-    let rsize = get_url_query_param(
-        &parsed_url,
-        "rsize",
-        txsize_def,
-        "specified URL contains bad max read size value",
-    )?;
-    let wsize = get_url_query_param(
-        &parsed_url,
-        "wsize",
-        txsize_def,
-        "specified URL contains bad max write size value",
-    )?;
     let noresvport = get_url_query_param(
         &parsed_url,
         "noresvport",
@@ -498,19 +480,25 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         false,
         "specified URL contains bad retain-delegations value",
     )?;
-    let io_defaults = IoOptions::default();
-    let readahead = get_url_query_param(
-        &parsed_url,
-        "readahead",
-        io_defaults.readahead,
-        "specified URL contains bad readahead value",
-    )?;
-    let writeback = get_url_query_param(
-        &parsed_url,
-        "writeback",
-        io_defaults.writeback,
-        "specified URL contains bad writeback value",
-    )?;
+    if parsed_url
+        .query_pairs()
+        .any(|(key, _)| key == "writeback" || key == "commit_threshold")
+    {
+        return Err(NfsError::InvalidInput("writeback and commit_threshold are no longer supported; writes commit before returning".into()));
+    }
+    if parsed_url
+        .query_pairs()
+        .any(|(key, _)| key == "rsize" || key == "wsize")
+    {
+        return Err(NfsError::InvalidInput(
+            "rsize and wsize are negotiated automatically and cannot be configured".into(),
+        ));
+    }
+    if parsed_url.query_pairs().any(|(key, _)| key == "readahead") {
+        return Err(NfsError::InvalidInput(
+            "readahead is no longer supported; reads cover only the requested buffer".into(),
+        ));
+    }
     let host = parsed_url.host_str().unwrap_or_default().to_string();
     Ok(MountArgs {
         versions,
@@ -522,15 +510,8 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         gid,
         dircount,
         maxcount,
-        rsize,
-        wsize,
         noresvport,
         retain_delegations,
-        io_options: IoOptions {
-            readahead,
-            writeback,
-            ..io_defaults
-        },
     })
 }
 
@@ -822,22 +803,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_url_with_bad_rsize() {
-        let res = parse_url("nfs://127.0.0.1/some/export/path?rsize=sizable");
-        assert!(res.is_err());
-        let err = res.unwrap_err();
+    fn parse_url_rejects_bad_rsize() {
+        let error = parse_url("nfs://127.0.0.1/export?rsize=invalid").unwrap_err();
         assert!(
-            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max read size value")
+            matches!(error, NfsError::InvalidInput(message) if message.contains("negotiated automatically"))
         );
     }
 
     #[test]
-    fn parse_url_with_bad_wsize() {
-        let res = parse_url("nfs://127.0.0.1/some/export/path?wsize=4mib");
-        assert!(res.is_err());
-        let err = res.unwrap_err();
+    fn parse_url_rejects_bad_wsize() {
+        let error = parse_url("nfs://127.0.0.1/export?wsize=invalid").unwrap_err();
         assert!(
-            matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL contains bad max write size value")
+            matches!(error, NfsError::InvalidInput(message) if message.contains("negotiated automatically"))
         );
     }
 
@@ -853,7 +830,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -871,7 +847,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), (616, 666));
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -886,7 +861,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -901,7 +875,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -916,7 +889,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -931,7 +903,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -946,7 +917,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -961,37 +931,22 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
-    fn parse_url_with_rsize() {
-        let res = parse_url("nfs://127.0.0.1/some/export/path?rsize=16384");
-        assert!(res.is_ok(), "err = {}", res.unwrap_err());
-        let args = res.unwrap();
-        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
-        assert_eq!(args.host, "127.0.0.1".to_string());
-        assert_eq!(args.nfsport, 0);
-        assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
-        assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (16384, 1048576));
+    fn parse_url_rejects_rsize() {
+        let error = parse_url("nfs://127.0.0.1/export?rsize=16384").unwrap_err();
+        assert!(
+            matches!(error, NfsError::InvalidInput(message) if message.contains("negotiated automatically"))
+        );
     }
 
     #[test]
-    fn parse_url_with_wsize() {
-        let res = parse_url("nfs://127.0.0.1/some/export/path?wsize=16384");
-        assert!(res.is_ok(), "err = {}", res.unwrap_err());
-        let args = res.unwrap();
-        assert_eq!(args.versions, vec![NFSVersion::NFSv3]);
-        assert_eq!(args.host, "127.0.0.1".to_string());
-        assert_eq!(args.nfsport, 0);
-        assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
-        assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
-        assert_eq!((args.rsize, args.wsize), (1048576, 16384));
+    fn parse_url_rejects_wsize() {
+        let error = parse_url("nfs://127.0.0.1/export?wsize=16384").unwrap_err();
+        assert!(
+            matches!(error, NfsError::InvalidInput(message) if message.contains("negotiated automatically"))
+        );
     }
 
     #[test]
@@ -1006,7 +961,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (4096, 4096));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[test]
@@ -1021,7 +975,6 @@ mod tests {
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!((args.dircount, args.maxcount), (2048, 4096));
-        assert_eq!((args.rsize, args.wsize), (1048576, 1048576));
     }
 
     #[tokio::test]
@@ -1036,11 +989,8 @@ mod tests {
             uid: Default::default(),
             dircount: Default::default(),
             maxcount: Default::default(),
-            rsize: Default::default(),
-            wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
-            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1060,11 +1010,8 @@ mod tests {
             uid: Default::default(),
             dircount: Default::default(),
             maxcount: Default::default(),
-            rsize: Default::default(),
-            wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
-            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1084,11 +1031,8 @@ mod tests {
             uid: Default::default(),
             dircount: Default::default(),
             maxcount: Default::default(),
-            rsize: Default::default(),
-            wsize: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
-            io_options: Default::default(),
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1264,13 +1208,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_url_readahead_and_writeback() {
-        let default = parse_url("nfs://127.0.0.1/export").unwrap();
-        assert_eq!(default.io_options, IoOptions::default());
-        let tuned = parse_url("nfs://127.0.0.1/export?readahead=0&writeback=16").unwrap();
-        assert_eq!(tuned.io_options.readahead, 0);
-        assert_eq!(tuned.io_options.writeback, 16);
-        assert!(parse_url("nfs://127.0.0.1/export?writeback=many").is_err());
+    fn parse_url_rejects_removed_io_options() {
+        for option in [
+            "readahead=0",
+            "readahead=8",
+            "writeback=0",
+            "commit_threshold=16",
+        ] {
+            assert!(parse_url(&format!("nfs://127.0.0.1/export?{option}")).is_err());
+        }
     }
 
     #[test]

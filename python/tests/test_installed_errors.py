@@ -119,7 +119,7 @@ def test_async_native_invalid_mode_and_read_size_match_sync() -> None:
 
 
 def test_local_file_errors_have_dedicated_public_classes() -> None:
-    from nfs_rs import Client, NfsClientCloseError, NfsClosedResourceError, NfsFileCloseError, NfsModeError
+    from nfs_rs import Client, NfsClientCloseError, NfsClosedResourceError, NfsFileCloseError, NfsModeError, NfsUncertainOutcomeError
 
     client = Client.connect("nfs-test://fixture/export")
     file = client.open("fixture.bin", "rb")
@@ -133,13 +133,15 @@ def test_local_file_errors_have_dedicated_public_classes() -> None:
 
     failed_client = Client.connect("nfs-test://fixture/export")
     failed = failed_client.open("__commit_close_error__", "w+b")
-    failed.write(b"dirty")
+    with pytest.raises(NfsUncertainOutcomeError):
+        failed.write(b"dirty")
     with pytest.raises(NfsFileCloseError) as file_close:
         failed.close()
-    assert len(file_close.value.errors) == 2
-    assert [error.operation for error in file_close.value.errors] == ["commit", "close"]
-    second = failed_client.open("__commit_error__", "w+b")
-    second.write(b"dirty")
+    assert len(file_close.value.errors) == 1
+    assert [error.operation for error in file_close.value.errors] == ["close"]
+    second = failed_client.open("__commit_close_error__", "w+b")
+    with pytest.raises(NfsUncertainOutcomeError):
+        second.write(b"dirty")
     with pytest.raises(NfsClientCloseError) as client_close:
         failed_client.close()
     assert len(client_close.value.errors) == 1

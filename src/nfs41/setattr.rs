@@ -18,6 +18,15 @@ impl Mount41 {
         atime: Option<crate::Time>,
         mtime: Option<crate::Time>,
     ) -> Result<()> {
+        // Complete retained DS writes before changing EOF. A later recall
+        // must never replay pre-truncate data and extend the file again.
+        let _io_guard = if size.is_some() {
+            let guard = self.layout_manager.write_file_io(&fh).await;
+            self.flush_layoutcommit(&fh).await?;
+            Some(guard)
+        } else {
+            None
+        };
         // Build fattr4 bitmap + attr_vals for the requested attributes
         let (attrmask, attr_vals) = encode_setattr(mode, uid, gid, size, atime, mtime);
         let stateid = [0u8; 16]; // anonymous stateid

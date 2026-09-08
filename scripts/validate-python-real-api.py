@@ -299,7 +299,7 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         client.utime(data, ns=expected_times)
         timed = client.stat(data)
-        check((timed.atime_ns, timed.mtime_ns) == expected_times, "Client.utime", checks)
+        check((timed.atime, timed.mtime) == expected_times, "Client.utime", checks)
         client.truncate(data, 4)
         check(client.stat(data).size == 4, "Client.truncate", checks)
 
@@ -479,7 +479,7 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         expected_times = (1_700_000_000_000_000_000, 1_700_000_001_000_000_000)
         await client.utime(data, ns=expected_times)
         timed = await client.stat(data)
-        check((timed.atime_ns, timed.mtime_ns) == expected_times, "AsyncClient.utime", checks)
+        check((timed.atime, timed.mtime) == expected_times, "AsyncClient.utime", checks)
         await client.truncate(data, 4)
         check((await client.stat(data)).size == 4, "AsyncClient.truncate", checks)
 

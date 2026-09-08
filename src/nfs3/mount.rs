@@ -26,13 +26,12 @@ use super::{
     mountres3_ok, rpc_header,
 };
 use crate::error::{NfsError, Result};
-use crate::mount::{WriteOutcome, WriteStability, finish_stable_write};
+use crate::mount::{WriteOutcome, WriteStability};
 use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
 
 #[derive(Debug)]
 struct Mount3 {
     m: Mount,
-    io_options: crate::IoOptions,
 }
 
 #[async_trait]
@@ -43,10 +42,6 @@ impl crate::Mount for Mount3 {
 
     fn get_max_write_size(&self) -> u32 {
         self.m.wsize
-    }
-
-    fn io_options(&self) -> crate::IoOptions {
-        self.io_options
     }
 
     async fn null(&self) -> Result<()> {
@@ -167,14 +162,6 @@ impl crate::Mount for Mount3 {
         self.m
             .write_how(fh, offset, data, WriteStability::Unstable)
             .await
-    }
-
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        let outcome = self
-            .m
-            .write_how(fh.clone(), offset, data, WriteStability::FileSync)
-            .await?;
-        finish_stable_write(self, fh, offset, outcome).await
     }
 
     async fn commit_with_verifier(
@@ -316,9 +303,6 @@ async fn mount_on_addr(
     let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
     let dir: String = args.dirpath.to_owned();
     let (dircount, maxcount) = (args.dircount, args.maxcount);
-    let (rsize, wsize) = (args.rsize, args.wsize);
-    let (rsize_max, wsize_max) = (4194304, 4194304); // XXX: according to libnfs, maximum read/write size is 4 MiB
-    let (rsize_min, wsize_min) = (8192, 8192); // XXX: according to libnfs, minimum read/write size is 8 KiB
     let mount_mux = if mountport != addr.port() {
         let mut mount_addr = *addr;
         mount_addr.set_port(mountport);
@@ -358,8 +342,8 @@ async fn mount_on_addr(
         dir,
         dircount,
         maxcount,
-        rsize,
-        wsize,
+        rsize: 0,
+        wsize: 0,
     };
     // NFS NULL is skipped: the FSINFO call below already validates the connection.
     let fsinfo_ok = m
@@ -368,8 +352,8 @@ async fn mount_on_addr(
         })
         .await?;
     let fsinfo = crate::mount::FSInfo::from(fsinfo_ok);
-    m.rsize = fsinfo.rtmax.min(m.rsize).min(rsize_max).max(rsize_min);
-    m.wsize = fsinfo.wtmax.min(m.wsize).min(wsize_max).max(wsize_min);
+    m.rsize = crate::mount::negotiated_io_size(u64::from(fsinfo.rtmax))?;
+    m.wsize = crate::mount::negotiated_io_size(u64::from(fsinfo.wtmax))?;
     info!(
         rsize = m.rsize,
         wsize = m.wsize,
@@ -378,10 +362,7 @@ async fn mount_on_addr(
         "NFS mount complete, negotiated transfer sizes"
     );
 
-    Ok(Box::new(Mount3 {
-        m,
-        io_options: args.io_options,
-    }))
+    Ok(Box::new(Mount3 { m }))
 }
 
 /// Query the MOUNT service and return all exported file systems — the `showmount -e` equivalent.

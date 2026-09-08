@@ -60,6 +60,7 @@ struct Sample {
     pathconf_ms: Option<f64>,
     pathconf_status: String,
     write_ms: f64,
+    batch_commit_ms: f64,
     commit_ms: f64,
     close_ms: f64,
     open_ms: f64,
@@ -181,23 +182,37 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 let pathconf_status = pathconf_status(pathconf.available);
 
                 let started = Instant::now();
+                // Measure protocol WRITE separately from batch durability settlement.
+                let mut writes = Vec::new();
                 let mut offset = 0usize;
                 while offset < payload.len() {
                     let end = (offset + max_write as usize).min(payload.len());
-                    let written = mount
-                        .write_stable(
+                    let outcome = mount
+                        .write(
                             created.fh.clone(),
                             offset as u64,
                             payload.slice(offset..end),
                         )
-                        .await? as usize;
+                        .await?;
+                    let written = outcome.count as usize;
                     if written == 0 || written > end - offset {
                         return Err("invalid NFS WRITE count".into());
                     }
+                    writes.push(outcome);
                     offset += written;
                 }
-                let write_ms = millis(started);
+                let raw_write_ms = millis(started);
 
+                let started = Instant::now();
+                mount
+                    .commit_write_batch(created.fh.clone(), 0, payload.len() as u32, &writes)
+                    .await?;
+                let batch_commit_ms = millis(started);
+                let write_ms = raw_write_ms + batch_commit_ms;
+
+                // Keep the historical commit_ms metric: an independent COMMIT
+                // RPC latency probe after durable writes, not write settlement.
+                // Production write_all does not issue this extra probe.
                 let started = Instant::now();
                 mount
                     .commit(created.fh.clone(), 0, payload.len() as u32)
@@ -270,6 +285,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                     pathconf_ms,
                     pathconf_status,
                     write_ms,
+                    batch_commit_ms,
                     commit_ms,
                     close_ms,
                     open_ms,
@@ -348,6 +364,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 "pathconf_ms": sample.pathconf_ms,
                 "pathconf_status": sample.pathconf_status,
                 "write_ms": sample.write_ms,
+                "batch_commit_ms": sample.batch_commit_ms,
                 "commit_ms": sample.commit_ms,
                 "close_ms": sample.close_ms,
                 "open_ms": sample.open_ms,
@@ -370,6 +387,9 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
         "{}",
         serde_json::to_string_pretty(&json!({
         "schema_version": 2,
+        "write_semantics": "sequential_unstable_chunks_then_batch_commit",
+        "write_throughput_includes_commit": true,
+        "commit_semantics": "standalone_rpc_after_durable_write",
         "environment": config.environment,
         "run_id": config.run_id,
         "window_id": config.window_id,

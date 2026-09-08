@@ -7,46 +7,76 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrent write failures preserve uncertainty from every failed chunk even
+  when the selected lowest-offset error is definite and no bytes were acknowledged.
+- Python `flush` waits for active writes and their commits, including owned
+  operations settling after caller cancellation or timeout.
+- In-progress pNFS commits are no longer marked failed. Failed or cancelled
+  commits retain failure state; incoming writes check it after the file I/O gate.
+
 ### Added
 
-- `BufferedFile`: sequential read-ahead and write-behind (UNSTABLE WRITE with
-  batched COMMIT, small-write coalescing, verifier-change resend) on top of any
-  `Mount`; URL parameters `readahead=<chunks>` (default 8) and
-  `writeback=<chunks>` (default 0) and matching Python `connect()` options.
-  Python file objects use it automatically when either window is enabled.
-- **Breaking:** `Mount::write(fh, offset, data)` is now an UNSTABLE write:
-  it never issues a COMMIT and returns the server's `WriteOutcome` (count,
-  whether it was committed anyway, write verifier); the caller COMMITs. The
-  previous durable-on-return `write` is renamed `write_stable` (and
-  `write_path` → `write_stable_path`; the new `write_path` is UNSTABLE too).
-  Callers that relied on `write` being durable must switch to `write_stable`.
-- `Mount::commit_with_verifier` is implemented for NFSv4.0 and NFSv4.1, so
-  verifier changes are detected on every protocol.
-- `Mount::io_options` exposes the `readahead`/`writeback` settings.
-- `BufferedFile::close` flushes queued writes and then CLOSEs the file; a
-  `BufferedFile` dropped with queued data logs a warning and discards it.
+- **Breaking:** `WriteOutcome.stable` is replaced by `committed: WriteCommitted`
+  (`Unstable`, `DataSync`, `FileSync`), preserving the server's full WRITE
+  commitment response. `WriteOutcome::new` takes this enum instead of a bool.
+  pNFS reports the weakest level across the contributing DS replies and retains
+  individual verifiers and routing information for batch commit.
+
+- **Breaking:** Python `FileInfo.atime_ns`, `mtime_ns`, and `ctime_ns` are
+  renamed to `atime`, `mtime`, and `ctime`. Values remain integer nanoseconds
+  since Unix epoch; units are documented in field comments and the API guide.
+
+- Python `scandir` accepts `DirectoryRef(path, fh=None)` and `DirEntry`.
+  Supplied handles go directly to `readdirplus`; only absent handles require
+  path lookup. Returned `DirEntry.fh` enables handle reuse during recursive scans.
+
+- Python sync/async directory scans transfer bounded batches of up to 128
+  entries across the native boundary, avoiding per-entry producer GIL handoffs
+  and runtime waits while retaining public per-entry iteration.
+
+- **Breaking:** URL and Python `rsize`/`wsize` options are removed. Mounts automatically derive I/O sizes from server limits and client/session capacities; pNFS also respects each DS session capacity.
+
+- **Breaking:** Remove `readahead`, `IoOptions`, and `Mount::io_options`.
+  `BufferedFile::new` now takes only mount and file handle. Reads cover only the
+  requested range, with bounded concurrency and no retained read cache.
+- Python `readinto` / `readinto_at` fill the entire writable caller buffer via
+  up to 8 concurrent negotiated-size reads, continue short responses, and
+  return the contiguous byte count. RPC payloads copy directly into the target
+  without intermediate Python bytes. Cancellation and timeout prevent late
+  buffer writes.
+- **Breaking:** `Mount::write` / `write_path` (and their blocking variants)
+  request UNSTABLE and return `WriteOutcome`. `write_stable` and
+  `write_stable_path` have been removed. Use `write_all` for complete durable
+  writes, or retain acknowledgements and call `Mount::commit_write_batch`.
+- Python `write` / `write_at` and Rust `write_all` now use at most 8 concurrent
+  UNSTABLE chunks, each bounded by negotiated `max_write`. Short writes are
+  completed within each chunk; failures stop new chunks and settle active work.
+  Successful calls finish their
+  batch commit before returning successfully, across NFSv3, v4.0, and v4.1.
+  The `writeback` option and 16 MiB commit threshold have been removed.
+- pNFS writes request UNSTABLE on data servers. Batch commit groups requests
+  by DS filehandle or routes them through the MDS as required by the layout,
+  validates verifiers, and completes necessary LAYOUTCOMMITs before success.
+  Payloads are retained for bounded recovery; recall/close settle pending DS
+  writes before returning a layout.
+- `flush` waits for active writes and `close` releases file state; neither
+  postpones durability or errors from successful Python writes.
 
 ### Changed
 
-- Benchmark harness `nfs-perf-compare` keeps data verification inside the
-  timed region so read-ahead and page-cache backends are not over-credited.
-- `tests/benchmarks/compare/ontap_prepare.py` verifies the ONTAP management
-  certificate by default; `--insecure` opts out, `--ca-file` names a bundle.
+- Storage benchmark reports durable `write_ms` and its `batch_commit_ms`
+  component. The historical `commit_ms` remains an independent COMMIT RPC
+  latency probe after durable writes, preserving the baseline metric meaning.
+  This diagnostic probe is separate from production batch settlement, which
+  skips extra COMMIT RPCs for all-FILE_SYNC batches.
 
 ### Fixed
 
 - NFSv4.1 file layouts: `nfl_util` flags are decoded per RFC 5661 §13.3
   (`NFL4_UFLG_DENSE` = 0x1, `NFL4_UFLG_COMMIT_THRU_MDS` = 0x2, stripe unit in
   the upper 26 bits); the decoder previously read bit 30 as the dense flag.
-- NFSv4.1 pNFS `write_stable`: when a data server downgrades a FILE_SYNC
-  WRITE, the COMMIT is routed per RFC 5661 §13.7 (MDS with
-  `COMMIT_THRU_MDS`, otherwise the data server that took the WRITE), its
-  failure is reported instead of ignored, a write verifier mismatch is
-  surfaced as an uncertain write, and a LAYOUTCOMMIT follows so the
-  metadata server's size reflects the recovered data (RFC 5661 §12.5.4).
-- `BufferedFile` read-ahead: READs of a discarded window still count against
-  the `readahead` limit, so random access on a slow link cannot accumulate
-  more in-flight prefetches than the window allows.
 
 ## [0.6.1] - 2026-09-03
 

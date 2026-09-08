@@ -49,10 +49,7 @@ enum AclObjectKind {
 #[ignore = "requires an NFSv4.0 server for raw MAXREAD/MAXWRITE observation"]
 async fn nfs_v40_server_max_io_attributes() -> TestResult {
     for configured_url in env::var(LAB_V40_URLS_ENV)?.split(',') {
-        let mut url = url::Url::parse(configured_url)?;
-        url.query_pairs_mut()
-            .append_pair("rsize", &u32::MAX.to_string())
-            .append_pair("wsize", &u32::MAX.to_string());
+        let url = url::Url::parse(configured_url)?;
         let mount = parse_url_and_mount(url.as_str()).await?;
         let fsinfo = mount.fsinfo().await?;
         println!(
@@ -109,13 +106,13 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
         let mut written = 0usize;
         while written < payload.len() {
             let end = (written + mount.get_max_write_size() as usize).min(payload.len());
-            let count = mount
-                .write_stable(
-                    created.fh.clone(),
-                    written as u64,
-                    payload.slice(written..end),
-                )
-                .await? as usize;
+            let count = nfs_rs::write_all(
+                &*mount,
+                created.fh.clone(),
+                written as u64,
+                payload.slice(written..end),
+            )
+            .await? as usize;
             ensure(count != 0 && count <= end - written, "invalid WRITE count")?;
             written += count;
         }
@@ -1347,10 +1344,8 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
         )?;
         let created_payload = Bytes::from_static(b"created-through-common-mount-api");
         ensure(
-            mount
-                .write_stable(created_file.fh.clone(), 0, created_payload.clone())
-                .await?
-                == created_payload.len() as u32,
+            nfs_rs::write_all(&*mount, created_file.fh.clone(), 0, created_payload.clone()).await?
+                == created_payload.len() as u64,
             format!("NFSv4.0 CREATE write count mismatch through {url}"),
         )?;
         mount.close(created_file.fh).await?;
@@ -1471,9 +1466,13 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             let mut written = 0usize;
             while written < expected.len() {
                 let end = (written + mount.get_max_write_size() as usize).min(expected.len());
-                let count = mount
-                    .write_stable(fh.clone(), written as u64, expected.slice(written..end))
-                    .await? as usize;
+                let count = nfs_rs::write_all(
+                    &*mount,
+                    fh.clone(),
+                    written as u64,
+                    expected.slice(written..end),
+                )
+                .await? as usize;
                 ensure(
                     count != 0 && count <= end - written,
                     "invalid NFSv4.0 WRITE count",
@@ -1489,13 +1488,13 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             let mut restored = 0usize;
             while restored < original.len() {
                 let end = (restored + mount.get_max_write_size() as usize).min(original.len());
-                restored += mount
-                    .write_stable(
-                        opened.object.fh.clone(),
-                        restored as u64,
-                        original.slice(restored..end),
-                    )
-                    .await? as usize;
+                restored += nfs_rs::write_all(
+                    &*mount,
+                    opened.object.fh.clone(),
+                    restored as u64,
+                    original.slice(restored..end),
+                )
+                .await? as usize;
             }
             mount
                 .commit(opened.object.fh.clone(), 0, restored as u32)
@@ -1580,9 +1579,9 @@ async fn run_v40_performance_task(
                 let end = (offset + write_chunk_size).min(payload.len());
                 let chunk = payload.slice(offset..end);
                 let chunk_started = Instant::now();
-                let written = mount
-                    .write_stable(created.fh.clone(), offset as u64, chunk.clone())
-                    .await?;
+                let written =
+                    nfs_rs::write_all(&*mount, created.fh.clone(), offset as u64, chunk.clone())
+                        .await?;
                 ensure(written as usize == chunk.len(), "short performance write")?;
                 write_latencies.push(chunk_started.elapsed().as_secs_f64() * 1_000.0);
             }
@@ -1811,9 +1810,8 @@ async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
             let fh = created.fh.clone();
             let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
             writes.spawn(async move {
-                let written = mount
-                    .write_stable(fh, (chunk * chunk_size) as u64, data)
-                    .await?;
+                let written =
+                    nfs_rs::write_all(&*mount, fh, (chunk * chunk_size) as u64, data).await?;
                 ensure(
                     written as usize == chunk_size,
                     format!("short concurrent WRITE for chunk {chunk}"),
@@ -1900,9 +1898,7 @@ async fn measure_data_mover_same_file_sample(
         let fh = created.fh.clone();
         let data = payload.slice(chunk * chunk_size..(chunk + 1) * chunk_size);
         writes.push(async move {
-            let written = mount
-                .write_stable(fh, (chunk * chunk_size) as u64, data)
-                .await?;
+            let written = nfs_rs::write_all(&*mount, fh, (chunk * chunk_size) as u64, data).await?;
             ensure(
                 written as usize == chunk_size,
                 format!("short data-mover WRITE for chunk {chunk}"),
@@ -2510,8 +2506,8 @@ async fn recover_pnfs_file_from_checkpoint(
 }
 
 async fn write_all(mount: &dyn Mount, fh: Bytes, data: &Bytes) -> TestResult {
-    let chunk_size = negotiated_io_chunk_size(mount.get_max_write_size())?;
-    write_all_with_chunk_size(mount, fh, data, chunk_size).await
+    let written = nfs_rs::write_all(mount, fh, 0, data.clone()).await?;
+    ensure(written as usize == data.len(), "incomplete durable write")
 }
 
 fn negotiated_io_chunk_size(server_max: u32) -> TestResult<usize> {
@@ -2530,8 +2526,7 @@ async fn write_all_with_chunk_size(
     let mut offset = 0usize;
     while offset < data.len() {
         let end = (offset + chunk_size).min(data.len());
-        let written = mount
-            .write_stable(fh.clone(), offset as u64, data.slice(offset..end))
+        let written = nfs_rs::write_all(mount, fh.clone(), offset as u64, data.slice(offset..end))
             .await? as usize;
         ensure(written > 0, format!("zero-byte write at offset {offset}"))?;
         ensure(
@@ -2540,7 +2535,6 @@ async fn write_all_with_chunk_size(
         )?;
         offset += written;
     }
-    mount.commit(fh, 0, data.len() as u32).await?;
     Ok(())
 }
 
@@ -2896,12 +2890,14 @@ async fn nfs_v41_pnfs_multifile_active_layout_refresh() -> TestResult {
             let created = mount.create_path(&file, Some(0o600)).await?;
             let head = pnfs_pattern(index * 64 * 1024, 64 * 1024);
             let tail = pnfs_pattern((index + 32) * 64 * 1024, 64 * 1024);
-            mount
-                .write_stable(created.fh.clone(), 0, head.clone())
-                .await?;
-            mount
-                .write_stable(created.fh.clone(), 1024 * 1024 * 1024, tail.clone())
-                .await?;
+            nfs_rs::write_all(&*mount, created.fh.clone(), 0, head.clone()).await?;
+            nfs_rs::write_all(
+                &*mount,
+                created.fh.clone(),
+                1024 * 1024 * 1024,
+                tail.clone(),
+            )
+            .await?;
             mount.close(created.fh).await?;
 
             let opened = mount.open_path(&file, OPEN_READ).await?;
@@ -3021,10 +3017,14 @@ async fn nfs_v41_pnfs_ds_reset_returns_uncertain() -> TestResult {
         wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
 
         let fault_payload = Bytes::from(vec![0xc3; 64 * 1024]);
-        let error = mount
-            .write_stable(created.fh.clone(), seed.len() as u64, fault_payload)
-            .await
-            .expect_err("DS reset after send must not fall back to a successful MDS WRITE");
+        let error = nfs_rs::write_all(
+            &*mount,
+            created.fh.clone(),
+            seed.len() as u64,
+            fault_payload,
+        )
+        .await
+        .expect_err("DS reset after send must not fall back to a successful MDS WRITE");
         let outcome = error
             .operation_outcome()
             .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
@@ -3132,22 +3132,56 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
                 .map(|index| ((index * 29 + 43) % 251) as u8)
                 .collect::<Vec<_>>(),
         );
-        write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
-        std::fs::write(&ready, b"ds-write-complete-layoutcommit-pending")?;
+        // Keep raw WRITE receipts pending so the fault targets batch commit,
+        // rather than CLOSE after an already durable write_all call.
+        let chunk_size = negotiated_io_chunk_size(mount.get_max_write_size())?;
+        let mut writes = Vec::new();
+        let mut offset = 0usize;
+        while offset < expected.len() {
+            let end = (offset + chunk_size).min(expected.len());
+            let outcome = mount
+                .write(
+                    created.fh.clone(),
+                    offset as u64,
+                    expected.slice(offset..end),
+                )
+                .await?;
+            ensure(
+                outcome.count > 0 && outcome.count as usize <= end - offset,
+                "invalid raw WRITE count before commit fault",
+            )?;
+            offset += outcome.count as usize;
+            writes.push(outcome);
+        }
+        let all_file_sync = writes
+            .iter()
+            .all(|write| write.committed == nfs_rs::WriteCommitted::FileSync);
+        std::fs::write(&ready, b"ds-write-complete")?;
         wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
 
-        let error = mount
-            .close(created.fh.clone())
-            .await
-            .expect_err("lost LAYOUTCOMMIT reply must fail CLOSE");
-        let outcome = error
-            .operation_outcome()
-            .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
-        ensure(
-            outcome.outcome == nfs_rs::OperationOutcome::Uncertain,
-            format!("unexpected LAYOUTCOMMIT outcome: {:?}", outcome.outcome),
-        )?;
-        std::fs::write(&uncertain, b"layoutcommit-uncertain-dirty-retained")?;
+        if all_file_sync {
+            // FILE_SYNC receipts require neither COMMIT nor LAYOUTCOMMIT.
+            // MDS isolation must therefore not delay batch completion.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                mount.commit_write_batch(created.fh.clone(), 0, expected.len() as u32, &writes),
+            )
+            .await??;
+            std::fs::write(&uncertain, b"filesync-commit-skipped")?;
+        } else {
+            let error = mount
+                .commit_write_batch(created.fh.clone(), 0, expected.len() as u32, &writes)
+                .await
+                .expect_err("lost commit reply must fail batch commit");
+            let outcome = error
+                .operation_outcome()
+                .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
+            ensure(
+                outcome.outcome == nfs_rs::OperationOutcome::Uncertain,
+                format!("unexpected commit outcome: {:?}", outcome.outcome),
+            )?;
+            std::fs::write(&uncertain, b"commit-uncertain-dirty-retained")?;
+        }
         wait_for_lab_file(&restored, Duration::from_secs(120)).await?;
 
         // A full MDS isolation can invalidate the old connection/session. Follow
@@ -3168,7 +3202,7 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
     .await;
 
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
-    // The original session was deliberately fenced by the MDS fault. Its
+    // The original session may have been fenced by the MDS fault. Its
     // ordered LAYOUTRETURN may correctly remain uncertain; authoritative
     // recovery was verified above on a fresh mount.
     let _ = mount.umount().await;
@@ -3206,13 +3240,13 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
         );
         for (chunk_index, chunk_start) in (0..expected.len()).step_by(512 * 1024).enumerate() {
             let chunk_end = (chunk_start + 512 * 1024).min(expected.len());
-            mount
-                .write_stable(
-                    created.fh.clone(),
-                    chunk_start as u64,
-                    expected.slice(chunk_start..chunk_end),
-                )
-                .await?;
+            nfs_rs::write_all(
+                &*mount,
+                created.fh.clone(),
+                chunk_start as u64,
+                expected.slice(chunk_start..chunk_end),
+            )
+            .await?;
             if chunk_index == 0 {
                 std::fs::write(&ready, b"pnfs-write-active")?;
             }
@@ -3279,7 +3313,8 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
     tokio::time::timeout(Duration::from_secs(90), async {
         while !std::path::Path::new(&completed).exists() {
             let writes = (0..64u64).map(|index| {
-                mount.write_stable(
+                nfs_rs::write_all(
+                    &*mount,
                     created.fh.clone(),
                     index * chunk.len() as u64,
                     chunk.clone(),
@@ -3342,7 +3377,8 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     tokio::time::timeout(Duration::from_secs(120), async {
         while !std::path::Path::new(&completed).exists() {
             let writes = (0..64u64).map(|index| {
-                mount.write_stable(
+                nfs_rs::write_all(
+                    &*mount,
                     created.fh.clone(),
                     index * chunk.len() as u64,
                     chunk.clone(),

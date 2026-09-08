@@ -129,17 +129,23 @@ class FileInfo:
     used: int
     fsid: int
     fileid: int
-    atime_ns: int
-    mtime_ns: int
-    ctime_ns: int
+    atime: int  # Last access; ns since Unix epoch (UTC).
+    mtime: int  # Last data modification; ns since Unix epoch (UTC).
+    ctime: int  # Last metadata/status change; ns since Unix epoch (UTC).
     owner: str | None
     group: str | None
+
+@dataclass(frozen=True)
+class DirectoryRef:
+    path: os.PathLike[str] | str
+    fh: bytes | None = ...
 
 @dataclass(frozen=True)
 class DirEntry:
     name: str
     path: str
     info: FileInfo
+    fh: bytes | None = ...
 
 @dataclass(frozen=True)
 class ExportEntry:
@@ -247,10 +253,10 @@ class Client:
     def connect(
         cls, url: str, *, versions: tuple[str, ...] | list[str] | None = ...,
         uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
-        mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
+        mount_port: int | None = ...,
         readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
-        retain_delegations: bool | None = ..., readahead: int | None = ...,
-        writeback: int | None = ..., connect_timeout: float | None = ...,
+        retain_delegations: bool | None = ...,
+        connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
     ) -> Client: ...
     @property
@@ -270,7 +276,7 @@ class Client:
     def close(self) -> None: ...
     def stat(self, path: os.PathLike[str] | str) -> FileInfo: ...
     def exists(self, path: os.PathLike[str] | str) -> bool: ...
-    def scandir(self, path: os.PathLike[str] | str = ...) -> Iterator[DirEntry]: ...
+    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ...) -> Iterator[DirEntry]: ...
     def listdir(self, path: os.PathLike[str] | str = ...) -> list[str]: ...
     def chmod(self, path: os.PathLike[str] | str, mode: int) -> None: ...
     def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None: ...
@@ -311,10 +317,10 @@ class AsyncClient:
     async def connect(
         cls, url: str, *, versions: tuple[str, ...] | list[str] | None = ...,
         uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
-        mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
+        mount_port: int | None = ...,
         readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
-        retain_delegations: bool | None = ..., readahead: int | None = ...,
-        writeback: int | None = ..., connect_timeout: float | None = ...,
+        retain_delegations: bool | None = ...,
+        connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
     ) -> AsyncClient: ...
     @property
@@ -334,7 +340,7 @@ class AsyncClient:
     async def close(self) -> None: ...
     async def stat(self, path: os.PathLike[str] | str) -> FileInfo: ...
     async def exists(self, path: os.PathLike[str] | str) -> bool: ...
-    def scandir(self, path: os.PathLike[str] | str = ...) -> AsyncIterator[DirEntry]: ...
+    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ...) -> AsyncIterator[DirEntry]: ...
     async def listdir(self, path: os.PathLike[str] | str = ...) -> list[str]: ...
     async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None: ...
     async def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None: ...
@@ -422,7 +428,7 @@ class AsyncFile:
 def list_exports(
     host: str, *, versions: tuple[str, ...] | list[str] | None = ...,
     uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
-    mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
+    mount_port: int | None = ...,
     readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
     retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
     operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
@@ -430,7 +436,7 @@ def list_exports(
 async def list_exports_async(
     host: str, *, versions: tuple[str, ...] | list[str] | None = ...,
     uid: int | None = ..., gid: int | None = ..., nfs_port: int | None = ...,
-    mount_port: int | None = ..., rsize: int | None = ..., wsize: int | None = ...,
+    mount_port: int | None = ...,
     readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
     retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
     operation_timeout: float | None = ..., recovery_event_capacity: int = ...,

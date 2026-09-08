@@ -81,7 +81,7 @@ MUTATION_CASES = {
     "mkdir": MutationCase("client", Call("mkdir", ("directory",))),
     "link": MutationCase("client", Call("link", ("source", "link"))),
     "symlink": MutationCase("client", Call("symlink", ("target", "link"))),
-    "commit": MutationCase("file", Call("flush"), "w+b", prepare_dirty=True),
+    "commit": MutationCase("file", Call("write", (b"value",)), "w+b"),
     "open": MutationCase("client", Call("open", ("fixture.bin", "rb"))),
 }
 
@@ -178,7 +178,7 @@ def test_every_first_release_mutation_has_a_deterministic_fault_gate(
     )
 
     error = asyncio.run(_run_fault(client_kind, operation, phase))
-    if phase == "before-send":
+    if phase == "before-send" and operation != "commit":
         assert isinstance(error, NfsOperationOutcomeError)
         assert error.outcome is OperationOutcome.DEFINITE_FAILURE
         assert error.recovery_action is RecoveryAction.RETRY
@@ -187,7 +187,7 @@ def test_every_first_release_mutation_has_a_deterministic_fault_gate(
         assert isinstance(error, NfsUncertainOutcomeError)
         assert error.outcome is OperationOutcome.UNCERTAIN
         assert error.recovery_action is RecoveryAction.VERIFY_THEN_RESUME
-        if operation == "write":
+        if operation in {"write", "commit"}:
             assert error.completed_bytes == 5
     assert error.operation_class is OperationClass.REPLAY_SENSITIVE
     assert error.operation in {operation, "flush"}

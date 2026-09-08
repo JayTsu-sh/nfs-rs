@@ -36,7 +36,6 @@ impl Mount {
         let count = data.len() as u32;
         let stable = match stability {
             WriteStability::Unstable => WriteStable::Unstable,
-            WriteStability::FileSync => WriteStable::FileSync,
         };
         let ok = self
             ._write(WRITE3args {
@@ -54,8 +53,13 @@ impl Mount {
             .try_into()
             .map_err(|_| NfsError::Xdr("WRITE verifier must be 8 bytes".to_string()))?;
         Ok(WriteOutcome {
+            pnfs: None,
             count: ok.count.0,
-            stable: ok.committed == stable_how::FILE_SYNC,
+            committed: match ok.committed {
+                stable_how::UNSTABLE => crate::WriteCommitted::Unstable,
+                stable_how::DATA_SYNC => crate::WriteCommitted::DataSync,
+                stable_how::FILE_SYNC => crate::WriteCommitted::FileSync,
+            },
             verifier: Some(verifier),
         })
     }
@@ -80,7 +84,7 @@ mod tests {
         };
         let data = vec![0u8; (u32::MAX as usize) + 1];
         let res = mount
-            .write_how(Bytes::new(), 0, Bytes::from(data), WriteStability::FileSync)
+            .write_how(Bytes::new(), 0, Bytes::from(data), WriteStability::Unstable)
             .await;
         assert!(matches!(res, Err(NfsError::InvalidInput(_))));
     }

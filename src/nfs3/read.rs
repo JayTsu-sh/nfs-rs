@@ -25,12 +25,15 @@ impl Mount {
     }
 
     pub async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
         let args = READ3args {
             file: nfs_fh3 { data: fh },
             offset,
             count: count.min(self.rsize),
         };
         let ok = self._read(args).await?;
-        Ok(ok.data)
+        crate::mount::read_reply(ok.data, ok.eof)
     }
 }

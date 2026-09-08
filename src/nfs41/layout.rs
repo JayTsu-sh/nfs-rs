@@ -214,6 +214,7 @@ pub(crate) struct LayoutManager {
     /// exclusive guard so different files and same-file parallel WRITEs remain
     /// concurrent while layout lifecycle transitions are serialized.
     file_io_gates: Mutex<HashMap<Bytes, std::sync::Weak<RwLock<()>>>>,
+    pending_writes: Mutex<HashMap<Bytes, Vec<std::sync::Arc<super::pnfs_io::PendingWrite>>>>,
     /// 退化拓扑 info 提示是否已打印（每个 mount 只提示一次，避免刷屏）。
     degenerate_logged: AtomicBool,
     /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
@@ -245,6 +246,7 @@ impl LayoutManager {
             dirty: RwLock::new(HashMap::new()),
             layout_refresh_offsets: RwLock::new(HashMap::new()),
             file_io_gates: Mutex::new(HashMap::new()),
+            pending_writes: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: RwLock::new(HashSet::new()),
             noresvport,
@@ -266,6 +268,7 @@ impl LayoutManager {
         self.data_server_init_gates.lock().await.clear();
         devices.clear();
         dirty.clear();
+        self.pending_writes.lock().await.clear();
         self.unreachable_ds.write().await.clear();
         self.layout_refresh_offsets.write().await.clear();
     }
@@ -301,6 +304,41 @@ impl LayoutManager {
         let gate = Arc::new(RwLock::new(()));
         gates.insert(fh.clone(), Arc::downgrade(&gate));
         gate
+    }
+
+    pub(crate) async fn register_write(
+        &self,
+        fh: &Bytes,
+        write: std::sync::Arc<super::pnfs_io::PendingWrite>,
+    ) {
+        self.pending_writes
+            .lock()
+            .await
+            .entry(fh.clone())
+            .or_default()
+            .push(write);
+    }
+
+    pub(crate) async fn pending_writes(
+        &self,
+        fh: &Bytes,
+    ) -> Vec<std::sync::Arc<super::pnfs_io::PendingWrite>> {
+        self.pending_writes
+            .lock()
+            .await
+            .get(fh)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn prune_completed_writes(&self, fh: &Bytes) {
+        let mut pending = self.pending_writes.lock().await;
+        if let Some(writes) = pending.get_mut(fh) {
+            writes.retain(|w| !w.is_done());
+            if writes.is_empty() {
+                pending.remove(fh);
+            }
+        }
     }
 
     pub async fn read_file_io(&self, fh: &Bytes) -> OwnedRwLockReadGuard<()> {
@@ -443,6 +481,7 @@ impl LayoutManager {
         map.clear();
         devices.clear();
         dirty.clear();
+        self.pending_writes.lock().await.clear();
         self.layout_refresh_offsets.write().await.clear();
     }
 
