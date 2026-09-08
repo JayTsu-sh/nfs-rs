@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-08
+
 ### Fixed
 
 - Concurrent write failures preserve uncertainty from every failed chunk even
@@ -276,7 +278,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.7...v0.5.8
