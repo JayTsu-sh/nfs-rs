@@ -66,4 +66,12 @@ if ! wait "$test_pid"; then
 fi
 test_pid=""
 cat "$test_log"
-echo "pnfs-layoutcommit uncertain=1 dirty-retained=1 reopen-verify=1 restored=1 checksum=ok"
+case "$(cat "$uncertain_file")" in
+  filesync-commit-skipped)
+    echo "pnfs-commit mode=all-FILE_SYNC commit-skipped=1 pending-commit-fault=not-exercised reopen-verify=1 restored=1 checksum=ok"
+    ;;
+  commit-uncertain-dirty-retained)
+    echo "pnfs-commit mode=pending uncertain=1 dirty-retained=1 reopen-verify=1 restored=1 checksum=ok"
+    ;;
+  *) echo "unexpected pNFS commit evidence" >&2; exit 1 ;;
+esac

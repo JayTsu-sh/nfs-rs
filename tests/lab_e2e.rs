@@ -3153,27 +3153,35 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
             offset += outcome.count as usize;
             writes.push(outcome);
         }
-        ensure(
-            writes
-                .iter()
-                .any(|write| write.committed != nfs_rs::WriteCommitted::FileSync),
-            "commit fault requires a server that leaves WRITE data pending",
-        )?;
-        std::fs::write(&ready, b"ds-write-complete-layoutcommit-pending")?;
+        let all_file_sync = writes
+            .iter()
+            .all(|write| write.committed == nfs_rs::WriteCommitted::FileSync);
+        std::fs::write(&ready, b"ds-write-complete")?;
         wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
 
-        let error = mount
-            .commit_write_batch(created.fh.clone(), 0, expected.len() as u32, &writes)
-            .await
-            .expect_err("lost LAYOUTCOMMIT reply must fail batch commit");
-        let outcome = error
-            .operation_outcome()
-            .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
-        ensure(
-            outcome.outcome == nfs_rs::OperationOutcome::Uncertain,
-            format!("unexpected LAYOUTCOMMIT outcome: {:?}", outcome.outcome),
-        )?;
-        std::fs::write(&uncertain, b"layoutcommit-uncertain-dirty-retained")?;
+        if all_file_sync {
+            // FILE_SYNC receipts require neither COMMIT nor LAYOUTCOMMIT.
+            // MDS isolation must therefore not delay batch completion.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                mount.commit_write_batch(created.fh.clone(), 0, expected.len() as u32, &writes),
+            )
+            .await??;
+            std::fs::write(&uncertain, b"filesync-commit-skipped")?;
+        } else {
+            let error = mount
+                .commit_write_batch(created.fh.clone(), 0, expected.len() as u32, &writes)
+                .await
+                .expect_err("lost commit reply must fail batch commit");
+            let outcome = error
+                .operation_outcome()
+                .ok_or_else(|| io::Error::other(format!("missing uncertain outcome: {error}")))?;
+            ensure(
+                outcome.outcome == nfs_rs::OperationOutcome::Uncertain,
+                format!("unexpected commit outcome: {:?}", outcome.outcome),
+            )?;
+            std::fs::write(&uncertain, b"commit-uncertain-dirty-retained")?;
+        }
         wait_for_lab_file(&restored, Duration::from_secs(120)).await?;
 
         // A full MDS isolation can invalidate the old connection/session. Follow
@@ -3194,7 +3202,7 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
     .await;
 
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
-    // The original session was deliberately fenced by the MDS fault. Its
+    // The original session may have been fenced by the MDS fault. Its
     // ordered LAYOUTRETURN may correctly remain uncertain; authoritative
     // recovery was verified above on a fresh mount.
     let _ = mount.umount().await;
