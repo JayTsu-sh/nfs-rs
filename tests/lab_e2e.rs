@@ -2526,7 +2526,7 @@ async fn write_all_with_chunk_size(
     let mut offset = 0usize;
     while offset < data.len() {
         let end = (offset + chunk_size).min(data.len());
-        let written = nfs_rs::write_all(&*mount, fh.clone(), offset as u64, data.slice(offset..end))
+        let written = nfs_rs::write_all(mount, fh.clone(), offset as u64, data.slice(offset..end))
             .await? as usize;
         ensure(written > 0, format!("zero-byte write at offset {offset}"))?;
         ensure(

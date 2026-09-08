@@ -1456,6 +1456,10 @@ impl Mount41 {
     }
 }
 
+fn wire_commit_range(start: u64, end: u64) -> (u64, u32) {
+    u32::try_from(end - start).map_or((0, 0), |count| (start, count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2042,8 +2046,4 @@ mod tests {
         let _ = batch.await;
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
-}
-
-fn wire_commit_range(start: u64, end: u64) -> (u64, u32) {
-    u32::try_from(end - start).map_or((0, 0), |count| (start, count))
 }
