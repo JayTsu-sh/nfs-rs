@@ -60,6 +60,7 @@ struct Sample {
     pathconf_ms: Option<f64>,
     pathconf_status: String,
     write_ms: f64,
+    batch_commit_ms: f64,
     commit_ms: f64,
     close_ms: f64,
     open_ms: f64,
@@ -200,11 +201,21 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                     writes.push(outcome);
                     offset += written;
                 }
-                let write_ms = millis(started);
+                let raw_write_ms = millis(started);
 
                 let started = Instant::now();
                 mount
                     .commit_write_batch(created.fh.clone(), 0, payload.len() as u32, &writes)
+                    .await?;
+                let batch_commit_ms = millis(started);
+                let write_ms = raw_write_ms + batch_commit_ms;
+
+                // Keep the historical commit_ms metric: an independent COMMIT
+                // RPC latency probe after durable writes, not write settlement.
+                // Production write_all does not issue this extra probe.
+                let started = Instant::now();
+                mount
+                    .commit(created.fh.clone(), 0, payload.len() as u32)
                     .await?;
                 let commit_ms = millis(started);
                 let started = Instant::now();
@@ -274,6 +285,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                     pathconf_ms,
                     pathconf_status,
                     write_ms,
+                    batch_commit_ms,
                     commit_ms,
                     close_ms,
                     open_ms,
@@ -285,7 +297,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                     readdir_ms,
                     remove_ms,
                     rmdir_ms,
-                    write_mib_s: config.payload_mib as f64 / ((write_ms + commit_ms) / 1000.0),
+                    write_mib_s: config.payload_mib as f64 / (write_ms / 1000.0),
                     read_mib_s: config.payload_mib as f64 / (read_ms / 1000.0),
                 })
             }
@@ -352,6 +364,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 "pathconf_ms": sample.pathconf_ms,
                 "pathconf_status": sample.pathconf_status,
                 "write_ms": sample.write_ms,
+                "batch_commit_ms": sample.batch_commit_ms,
                 "commit_ms": sample.commit_ms,
                 "close_ms": sample.close_ms,
                 "open_ms": sample.open_ms,
@@ -376,6 +389,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
         "schema_version": 2,
         "write_semantics": "sequential_unstable_chunks_then_batch_commit",
         "write_throughput_includes_commit": true,
+        "commit_semantics": "standalone_rpc_after_durable_write",
         "environment": config.environment,
         "run_id": config.run_id,
         "window_id": config.window_id,

@@ -66,10 +66,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
-- Storage benchmark measures raw WRITE and batch durability settlement
-  separately. Write throughput includes both phases; all-FILE_SYNC batches
-  skip the extra COMMIT RPC. Recapture performance baselines before comparing
-  these timings with previous versions.
+- Storage benchmark reports durable `write_ms` and its `batch_commit_ms`
+  component. The historical `commit_ms` remains an independent COMMIT RPC
+  latency probe after durable writes, preserving the baseline metric meaning.
+  This diagnostic probe is separate from production batch settlement, which
+  skips extra COMMIT RPCs for all-FILE_SYNC batches.
 
 ### Fixed
 
