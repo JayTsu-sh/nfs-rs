@@ -181,26 +181,30 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 let pathconf_status = pathconf_status(pathconf.available);
 
                 let started = Instant::now();
+                // Measure protocol WRITE separately from batch durability settlement.
+                let mut writes = Vec::new();
                 let mut offset = 0usize;
                 while offset < payload.len() {
                     let end = (offset + max_write as usize).min(payload.len());
-                    let written = mount
-                        .write_stable(
+                    let outcome = mount
+                        .write(
                             created.fh.clone(),
                             offset as u64,
                             payload.slice(offset..end),
                         )
-                        .await? as usize;
+                        .await?;
+                    let written = outcome.count as usize;
                     if written == 0 || written > end - offset {
                         return Err("invalid NFS WRITE count".into());
                     }
+                    writes.push(outcome);
                     offset += written;
                 }
                 let write_ms = millis(started);
 
                 let started = Instant::now();
                 mount
-                    .commit(created.fh.clone(), 0, payload.len() as u32)
+                    .commit_write_batch(created.fh.clone(), 0, payload.len() as u32, &writes)
                     .await?;
                 let commit_ms = millis(started);
                 let started = Instant::now();
@@ -281,7 +285,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                     readdir_ms,
                     remove_ms,
                     rmdir_ms,
-                    write_mib_s: config.payload_mib as f64 / (write_ms / 1000.0),
+                    write_mib_s: config.payload_mib as f64 / ((write_ms + commit_ms) / 1000.0),
                     read_mib_s: config.payload_mib as f64 / (read_ms / 1000.0),
                 })
             }
@@ -370,6 +374,8 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
         "{}",
         serde_json::to_string_pretty(&json!({
         "schema_version": 2,
+        "write_semantics": "sequential_unstable_chunks_then_batch_commit",
+        "write_throughput_includes_commit": true,
         "environment": config.environment,
         "run_id": config.run_id,
         "window_id": config.window_id,

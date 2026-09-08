@@ -60,10 +60,8 @@ async fn main() -> Result<()> {
     .await?;
 
     let created = mount.create_path("hello.txt", Some(0o644)).await?;
-    mount
-        .write_stable(created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
+    nfs_rs::write_all(&*mount, created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
         .await?;
-    mount.commit(created.fh.clone(), 0, 9).await?;
     mount.close(created.fh).await?;
 
     let opened = mount.open_path("hello.txt", OPEN_READ).await?;
@@ -99,19 +97,28 @@ Supported arguments:
 - `mountport=<port>` — MOUNT protocol port for NFSv3.
 - `readdir-buffer=<count>` or `<dircount>,<maxcount>` — response buffer limits
   for directory reads. Both values default to 8192.
-- `rsize=<bytes>` — maximum read request size.
-- `wsize=<bytes>` — maximum write request size.
 - `noresvport=<true|false>` — use an ephemeral source port when true. It
   defaults to false.
-- `readahead=<chunks>` — READ requests kept in flight ahead of a lone
-  sequential reader using `BufferedFile`. The default is 8; `0` disables it.
-- `writeback=<chunks>` — UNSTABLE WRITE requests kept in flight behind a
-  `BufferedFile` writer, with COMMIT on `flush()` and every 16 MiB. The default
-  is 0 (every write is synchronous and FILE_SYNC); when enabled, data is durable
-  only after `flush()`.
 
-`BufferedFile` wraps a file handle from `open`/`create` and applies both
-windows; `Mount::read`/`Mount::write` themselves are unaffected.
+Read and write RPC sizes are determined automatically during mount from server limits, bounded by the client payload ceiling (4 MiB) and negotiated NFSv4.1 session capacities. URL and Python `rsize`/`wsize` options are no longer accepted. Python `io_limits` reports the effective mount limits; pNFS data servers may require smaller chunks.
+
+`BufferedFile` provides bounded concurrent reads of the requested range and per-call durable writes. `write_all`
+and `BufferedFile::write_at` send at most 8 concurrent UNSTABLE chunks sized by
+negotiated `max_write`, complete short writes, then finish a batch commit
+before returning. There is no writeback mode or automatic byte threshold.
+`Mount::write` is the low-level UNSTABLE primitive. Its `WriteOutcome` exposes
+`count`, `committed: WriteCommitted` (`Unstable`, `DataSync`, or `FileSync`),
+and `verifier`. `committed` is the server's response, not the requested level;
+pNFS reports the weakest level across the contributing DS replies. Retain its acknowledgement
+for `Mount::commit_write_batch`, which also routes pNFS commits and completes
+required LAYOUTCOMMITs.
+
+Python `readinto(buffer)` and `readinto_at(buffer, offset)` fill a caller-owned
+writable contiguous buffer using up to 8 concurrent, negotiated-size reads.
+Short responses are continued until the buffer is full or EOF is reached.
+They return the number of bytes filled and leave the tail beyond EOF untouched.
+There is no read-ahead cache or `readahead` option. Each RPC payload is copied
+once into the target, without an intermediate Python `bytes` object.
 
 When `noresvport=false`, the client binds below port 1024 for servers enforcing
 the RFC 1813 secure-port convention. This may require elevated privileges.

@@ -26,6 +26,9 @@ impl Mount41 {
     }
 
     pub(crate) async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
         // Try pNFS parallel read first
         if let Some(result) = self.pnfs_read(&fh, offset, count).await {
             return result;
@@ -57,7 +60,7 @@ impl Mount41 {
         if data.remaining() < 4 {
             return Err(NfsError::Xdr("READ result too short".to_string()));
         }
-        let _eof = data.get_u32(); // bool eof
+        let eof = data.get_u32() != 0;
         // data<>: length-prefixed opaque
         if data.remaining() < 4 {
             return Err(NfsError::Xdr("READ data length missing".to_string()));
@@ -66,7 +69,7 @@ impl Mount41 {
         if data.remaining() < data_len {
             return Err(NfsError::Xdr("READ data truncated".to_string()));
         }
-        Ok(data.slice(..data_len))
+        crate::mount::read_reply(data.slice(..data_len), eof)
     }
 
     pub(crate) async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {

@@ -13,7 +13,7 @@ pub(crate) mod layout;
 pub(crate) mod lease;
 mod lookup;
 pub(crate) mod mount;
-mod pnfs_io;
+pub(crate) mod pnfs_io;
 mod read;
 mod readdir;
 pub(crate) mod session;

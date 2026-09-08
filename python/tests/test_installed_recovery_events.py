@@ -143,7 +143,7 @@ def test_cancelled_file_waiters_settle_owned_work(operation: str) -> None:
 
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        path = "__verifier_change__" if operation == "flush" else "fixture.bin"
+        path = "fixture.bin"
         mode = "rb" if operation == "read" else "w+b"
         file = await client.open(path, mode)
         if operation == "flush":
@@ -176,15 +176,9 @@ def test_cancelled_file_waiters_settle_owned_work(operation: str) -> None:
             assert client.recovery_events() == ()
             await file.close()
         elif operation == "flush":
-            events = client.drain_recovery_events()
-            assert len(events) == 1
-            assert events[0].operation == "commit"
-            with pytest.raises(NfsUncertainOutcomeError):
-                await file.flush()
             assert client.recovery_events() == ()
-            with pytest.raises(NfsFileCloseError) as close_error:
-                await file.close()
-            assert isinstance(close_error.value.errors[0], NfsUncertainOutcomeError)
+            await file.flush()
+            await file.close()
         else:
             assert file.closed
             await file.close()
@@ -193,7 +187,7 @@ def test_cancelled_file_waiters_settle_owned_work(operation: str) -> None:
     asyncio.run(scenario())
 
 
-def test_cancelled_file_close_reports_later_commit_uncertainty() -> None:
+def test_cancelled_write_reports_later_commit_uncertainty() -> None:
     import asyncio
 
     from nfs_rs import AsyncClient, OperationOutcome, _internal
@@ -201,9 +195,8 @@ def test_cancelled_file_close_reports_later_commit_uncertainty() -> None:
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
         file = await client.open("__verifier_change__", "w+b")
-        await file.write(b"dirty")
-        _internal._arm_operation_test_barrier("close")
-        closing = asyncio.create_task(file.close())
+        _internal._arm_operation_test_barrier("write")
+        closing = asyncio.create_task(file.write(b"dirty"))
         await _internal._wait_operation_test_entered()
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -215,6 +208,7 @@ def test_cancelled_file_close_reports_later_commit_uncertainty() -> None:
         assert len(events) == 1
         assert events[0].operation == "commit"
         assert events[0].outcome is OperationOutcome.UNCERTAIN
+        await file.close()
         assert file.closed
         await client.close()
 
@@ -252,6 +246,25 @@ def test_cancelled_path_mutations_report_later_uncertainty(operation: str) -> No
         assert events[0].path == expected_path
         assert events[0].outcome is OperationOutcome.UNCERTAIN
         assert "injected" not in events[0].message
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_async_write_does_not_return_until_its_commit_completes():
+    import asyncio
+    from nfs_rs import AsyncClient, _internal
+
+    async def scenario():
+        client = await AsyncClient.connect("nfs-test://fixture/export")
+        file = await client.open("fixture.bin", "w+b")
+        _internal._arm_operation_test_barrier("commit")
+        writing = asyncio.create_task(file.write(b"durable"))
+        await _internal._wait_operation_test_entered()
+        assert not writing.done()
+        _internal._release_operation_test_barrier()
+        assert await writing == 7
+        await file.close()
         await client.close()
 
     asyncio.run(scenario())

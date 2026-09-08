@@ -78,8 +78,8 @@ def test_async_file_has_relative_and_positional_parity() -> None:
         assert file.tell() == 3
 
         target = bytearray(5)
-        assert await file.readinto_at(target, 10) == 4
-        assert target == b"klmn\0"
+        assert await file.readinto_at(target, 10) == 5
+        assert target == b"klmno"
         await client.close()
         assert file.closed
         for operation in (
@@ -115,4 +115,83 @@ def test_cancelled_open_finishes_registration_under_client_ownership() -> None:
         await client.close()
         assert client.closed
 
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("offset, size, expected", [(0, 26, 26), (3, 40, 23), (26, 12, 0), (0, 0, 0)])
+def test_native_readinto_fills_all_chunks_and_preserves_eof_tail(offset, size, expected):
+    from nfs_rs import Client
+    with Client.connect("nfs-test://fixture/export") as client:
+        with client.open("fixture.bin") as file:
+            target = bytearray(b"!" * size)
+            assert file.readinto_at(target, offset) == expected
+            assert target[:expected] == b"abcdefghijklmnopqrstuvwxyz"[offset:offset + expected]
+            assert target[expected:] == b"!" * (size - expected)
+            assert file.tell() == 0
+            file.seek(offset)
+            assert file.readinto(target) == expected
+            assert file.tell() == offset + expected
+            target.extend(b"released")
+
+
+def test_native_readinto_accepts_typed_and_sliced_writable_buffers():
+    from array import array
+    from nfs_rs import Client
+    with Client.connect("nfs-test://fixture/export") as client:
+        with client.open("fixture.bin") as file:
+            target = array("I", [0] * 4)
+            assert file.readinto(target) == 16
+            assert target.tobytes() == b"abcdefghijklmnop"
+            backing = bytearray(b"!" * 20)
+            with memoryview(backing)[2:18] as view:
+                assert file.readinto_at(view, 0) == 16
+            assert backing == b"!!abcdefghijklmnop!!"
+            for invalid in (b"immutable", memoryview(backing)[::2]):
+                with pytest.raises(TypeError):
+                    file.readinto(invalid)
+
+
+def test_cancelled_readinto_releases_buffer_and_prevents_late_writes():
+    from nfs_rs import AsyncClient, _internal
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            async with await client.open("fixture.bin") as file:
+                target = bytearray(b"!" * 20)
+                _internal._arm_operation_test_barrier("readinto")
+                task = asyncio.create_task(file.readinto(target))
+                try:
+                    await _internal._wait_operation_test_entered()
+                    with pytest.raises(BufferError):
+                        target.extend(b"blocked")
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    target.extend(b"released")
+                    settled = _internal._wait_operation_test_settled()
+                finally:
+                    _internal._release_operation_test_barrier()
+                await settled
+                assert target == b"!" * 20 + b"released"
+                assert file.tell() == 0
+    asyncio.run(scenario())
+
+
+def test_timed_out_readinto_prevents_late_writes():
+    from nfs_rs import AsyncClient, _internal
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export", operation_timeout=0.05) as client:
+            async with await client.open("fixture.bin") as file:
+                target = bytearray(b"!" * 20)
+                _internal._arm_operation_test_barrier("readinto")
+                task = asyncio.create_task(file.readinto_at(target, 0))
+                try:
+                    await _internal._wait_operation_test_entered()
+                    with pytest.raises(TimeoutError):
+                        await task
+                    target.extend(b"released")
+                finally:
+                    _internal._release_operation_test_barrier()
+                # File close waits for the abandoned read to settle.
+                await file.close()
+                assert target == b"!" * 20 + b"released"
     asyncio.run(scenario())

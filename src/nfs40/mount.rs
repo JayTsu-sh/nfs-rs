@@ -129,7 +129,6 @@ struct Mount40 {
     rsize: u32,
     wsize: u32,
     acl_supported: bool,
-    io_options: crate::IoOptions,
 }
 
 #[derive(Clone)]
@@ -236,7 +235,7 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
     let (lease_time, rsize, wsize, acl_supported) =
-        query_mount_parameters(&rpc, &auth, &root_fh, args.rsize, args.wsize).await?;
+        query_mount_parameters(&rpc, &auth, &root_fh).await?;
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
     let issuer = rand::random();
@@ -300,7 +299,6 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         rsize,
         wsize,
         acl_supported,
-        io_options: args.io_options,
     })
 }
 
@@ -308,8 +306,6 @@ async fn query_mount_parameters(
     rpc: &rpc::Client,
     auth: &Auth,
     root_fh: &Bytes,
-    requested_rsize: u32,
-    requested_wsize: u32,
 ) -> Result<(u32, u32, u32, bool)> {
     let response = rpc
         .call(
@@ -348,8 +344,8 @@ async fn query_mount_parameters(
         u64::MAX
     };
     ensure_attr_values_consumed(&values, "mount parameters")?;
-    let rsize = server_maxread.min(u64::from(requested_rsize)) as u32;
-    let wsize = server_maxwrite.min(u64::from(requested_wsize)) as u32;
+    let rsize = crate::mount::negotiated_io_size(server_maxread)?;
+    let wsize = crate::mount::negotiated_io_size(server_maxwrite)?;
     if rsize == 0 || wsize == 0 {
         return Err(NfsError::Xdr(
             "NFSv4.0 MAXREAD and MAXWRITE produced a zero effective I/O size".into(),
@@ -1310,18 +1306,19 @@ impl Mount40 {
         stability: mount::WriteStability,
     ) -> Result<mount::WriteOutcome> {
         let (count, committed, verifier) = self
-            .write_stable_how(fh, offset, data, stability.stable_how())
+            .write_with_stability(fh, offset, data, stability.stable_how())
             .await?;
         Ok(mount::WriteOutcome {
+            pnfs: None,
             count,
-            stable: committed == 2,
+            committed: crate::WriteCommitted::try_from(committed)?,
             verifier: Some(verifier),
         })
     }
 
     /// WRITE with the given `stable_how4`; returns `(count, committed, verifier)`.
-    /// No COMMIT is issued here; `Mount::write_stable` handles a downgraded reply.
-    async fn write_stable_how(
+    /// No COMMIT is issued here; batch commit is performed by the caller.
+    async fn write_with_stability(
         &self,
         fh: Bytes,
         offset: u64,
@@ -1425,9 +1422,6 @@ impl Mount for Mount40 {
     }
     fn get_max_write_size(&self) -> u32 {
         self.wsize
-    }
-    fn io_options(&self) -> crate::IoOptions {
-        self.io_options
     }
     fn version(&self) -> NFSVersion {
         NFSVersion::NFSv4p0
@@ -2124,6 +2118,9 @@ impl Mount for Mount40 {
         self.query_pathconf(fh).await
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {
             let request = CompoundBuilder::new("read")
@@ -2172,12 +2169,7 @@ impl Mount for Mount40 {
         self.write_how(fh, offset, data, mount::WriteStability::Unstable)
             .await
     }
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        let outcome = self
-            .write_how(fh.clone(), offset, data, mount::WriteStability::FileSync)
-            .await?;
-        mount::finish_stable_write(self, fh, offset, outcome).await
-    }
+
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         Box::pin(
             stream::try_unfold(Some((dir_fh, 0, [0; 8])), move |state| async move {
@@ -2404,7 +2396,6 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported,
-            io_options: Default::default(),
         })
     }
 
@@ -2476,7 +2467,6 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
-            io_options: Default::default(),
         })
     }
 
@@ -3060,7 +3050,6 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
-            io_options: Default::default(),
         });
         let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
         let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
@@ -4011,11 +4000,8 @@ mod tests {
             gid: 0,
             dircount: 32 * 1024,
             maxcount: 32 * 1024,
-            rsize: 1_048_576,
-            wsize: 1_048_576,
             noresvport: true,
             retain_delegations: false,
-            io_options: Default::default(),
         };
         let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
         assert_eq!(mount.get_max_read_size(), 65536);
@@ -4075,11 +4061,8 @@ mod tests {
             gid: 0,
             dircount: 32 * 1024,
             maxcount: 32 * 1024,
-            rsize: 0,
-            wsize: 0,
             noresvport: true,
             retain_delegations: true,
-            io_options: Default::default(),
         };
 
         let error = mount_on_addr(addr, &args, Auth::new_null())
@@ -4124,7 +4107,6 @@ mod tests {
             rsize: 1_048_576,
             wsize: 1_048_576,
             acl_supported: false,
-            io_options: Default::default(),
         });
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
@@ -4238,8 +4220,7 @@ mod tests {
         }
         assert_eq!(mount.callback_stats().await.returns_completed, 1);
         assert_eq!(
-            mount
-                .write_stable(opened.fh.clone(), 0, Bytes::from_static(b"data"))
+            crate::write_all(&*mount, opened.fh.clone(), 0, Bytes::from_static(b"data"))
                 .await
                 .unwrap(),
             4
@@ -4484,11 +4465,8 @@ mod tests {
             gid: 0,
             dircount: 32 * 1024,
             maxcount: 32 * 1024,
-            rsize: 0,
-            wsize: 0,
             noresvport: true,
             retain_delegations: false,
-            io_options: Default::default(),
         };
         let task = tokio::spawn(async move { mount_on_addr(addr, &args, Auth::new_null()).await });
         identity_seen_rx.await.unwrap();
@@ -5521,6 +5499,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_write_batches_unstable_chunks_before_one_commit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 65, b"fh").await;
+        let chunk = mount.get_max_write_size() as usize;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut requests = Vec::new();
+            let mut offsets = Vec::new();
+            // All three requests must arrive before any response is sent.
+            // A serial writer times out here; reply order deliberately differs.
+            for _ in 0..3 {
+                let n = chunk;
+                let request =
+                    tokio::time::timeout(Duration::from_secs(2), read_record(&mut stream))
+                        .await??;
+                let padded = (n + 3) & !3;
+                let stable_at = request.len() - padded - 8;
+                assert_eq!(
+                    &request[stable_at..stable_at + 4],
+                    &[0; 4],
+                    "WRITE must request UNSTABLE"
+                );
+                offsets.push(u64::from_be_bytes(
+                    request[stable_at - 8..stable_at].try_into().unwrap(),
+                ));
+                requests.push(request);
+            }
+            offsets.sort_unstable();
+            assert_eq!(offsets, vec![0, chunk as u64, (chunk * 2) as u64]);
+            for request in requests.into_iter().rev() {
+                let n = chunk;
+                let result = [
+                    (n as u32).to_be_bytes().as_slice(),
+                    0u32.to_be_bytes().as_slice(),
+                    [0x71; 8].as_slice(),
+                ]
+                .concat();
+                reply(
+                    &mut stream,
+                    &request,
+                    &compound_result("write", &[(22, &[]), (38, &result)]),
+                )
+                .await?;
+            }
+            let commit = read_record(&mut stream).await?;
+            assert!(commit.windows(6).any(|part| part == b"commit"));
+            reply(
+                &mut stream,
+                &commit,
+                &compound_result("commit", &[(22, &[]), (5, &[0x71; 8])]),
+            )
+            .await
+        });
+        let data = Bytes::from(vec![42; chunk * 3]);
+        assert_eq!(
+            crate::write_all(&*mount, Bytes::from_static(b"fh"), 0, data)
+                .await
+                .unwrap(),
+            (chunk * 3) as u64
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn same_open_file_writes_use_rpc_xids_without_owner_lane_serialization() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
@@ -5554,11 +5597,11 @@ mod tests {
         });
 
         let (first, second) = tokio::join!(
-            mount.write_stable(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
-            mount.write_stable(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
+            mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
+            mount.write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
         );
-        assert_eq!(first.unwrap(), 1);
-        assert_eq!(second.unwrap(), 1);
+        assert_eq!(first.unwrap().count, 1);
+        assert_eq!(second.unwrap().count, 1);
         server.await.unwrap().unwrap();
     }
 
@@ -5692,20 +5735,20 @@ mod tests {
         let first_mount = Arc::clone(&mount);
         let first = tokio::spawn(async move {
             first_mount
-                .write_stable(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
+                .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
                 .await
         });
         let second_mount = Arc::clone(&mount);
         let second = tokio::spawn(async move {
             second_mount
-                .write_stable(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
+                .write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
                 .await
         });
         writes_seen_rx.await.unwrap();
         let close = mount.close(Bytes::from_static(b"fh"));
         let (first, second, close) = tokio::join!(first, second, close);
-        assert_eq!(first.unwrap().unwrap(), 1);
-        assert_eq!(second.unwrap().unwrap(), 1);
+        assert_eq!(first.unwrap().unwrap().count, 1);
+        assert_eq!(second.unwrap().unwrap().count, 1);
         close.unwrap();
         server.await.unwrap().unwrap();
     }

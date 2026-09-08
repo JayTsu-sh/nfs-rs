@@ -29,6 +29,16 @@ class SyncFileInner:
         end = len(DATA) if size < 0 else min(len(DATA), offset + size)
         return DATA[offset:end]
 
+    def readinto(self, target):
+        data = self.read(len(target))
+        target[:len(data)] = data
+        return len(data)
+
+    def readinto_at(self, target, offset):
+        data = self.read_at(offset, len(target))
+        target[:len(data)] = data
+        return len(data)
+
     def seek(self, offset, whence=io.SEEK_SET):
         base = {io.SEEK_SET: 0, io.SEEK_CUR: self.position, io.SEEK_END: len(DATA)}[whence]
         position = base + offset
@@ -51,6 +61,16 @@ class AsyncFileInner(SyncFileInner):
     async def read_at(self, offset, size=-1):
         await asyncio.sleep(0)
         return super().read_at(offset, size)
+
+    async def readinto(self, target):
+        data = await self.read(len(target))
+        target[:len(data)] = data
+        return len(data)
+
+    async def readinto_at(self, target, offset):
+        data = await self.read_at(offset, len(target))
+        target[:len(data)] = data
+        return len(data)
 
     async def seek(self, offset, whence=io.SEEK_SET):
         return super().seek(offset, whence)
@@ -135,17 +155,17 @@ def test_sync_relative_and_positional_reads_keep_separate_positions():
         assert file.tell() == 4
 
 
-def test_sync_readinto_revalidates_target_after_network_work():
+def test_sync_readinto_pins_target_during_network_work():
     file = Client.connect("nfs://server/export").open("file")
     target = bytearray(4)
-    original_read = file._inner.read
+    original_read = file._inner.readinto
 
     def resizing_read(size):
         target.extend(b"x")
         return original_read(size)
 
-    file._inner.read = resizing_read
-    with pytest.raises(BufferError, match="changed size"):
+    file._inner.readinto = resizing_read
+    with pytest.raises(BufferError, match="[Ee]xports"):
         file.readinto(target)
 
 
@@ -176,20 +196,20 @@ def test_async_file_matches_read_seek_and_positional_contract():
     asyncio.run(scenario())
 
 
-def test_async_readinto_detects_resize_during_suspension():
+def test_async_readinto_pins_target_during_suspension():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
         file = await client.open("file")
         target = bytearray(4)
-        original_read = file._inner.read
+        original_read = file._inner.readinto
 
         async def resizing_read(size):
             await asyncio.sleep(0)
             target.extend(b"x")
             return await original_read(size)
 
-        file._inner.read = resizing_read
-        with pytest.raises(BufferError, match="changed size"):
+        file._inner.readinto = resizing_read
+        with pytest.raises(BufferError, match="[Ee]xports"):
             await file.readinto(target)
 
     asyncio.run(scenario())

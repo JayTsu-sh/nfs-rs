@@ -434,3 +434,78 @@ def test_repeated_lifecycle_rss_reaches_a_bounded_plateau() -> None:
     assert max(samples[-3:]) - min(samples[-3:]) <= 8 * 1024 * 1024, (
         f"RSS did not plateau across final batches: {samples}"
     )
+
+
+@pytest.mark.parametrize("cancel_writer", [False, True])
+def test_flush_waits_for_commit_even_after_writer_cancellation(cancel_writer):
+    from nfs_rs import AsyncClient, _internal
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            async with await client.open("fixture.bin", "w+b") as file:
+                _internal._arm_operation_test_barrier("commit")
+                writing = asyncio.create_task(file.write(b"pending data"))
+                flushing = None
+                try:
+                    await asyncio.wait_for(_internal._wait_operation_test_entered(), 2)
+                    if cancel_writer:
+                        writing.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await writing
+                    flushing = asyncio.create_task(file.flush())
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(flushing), 0.05)
+                finally:
+                    _internal._release_operation_test_barrier()
+                    if not cancel_writer:
+                        assert await asyncio.wait_for(writing, 2) == 12
+                    if flushing is not None:
+                        await asyncio.wait_for(flushing, 2)
+    asyncio.run(scenario())
+
+
+def test_sync_flush_waits_for_active_commit():
+    from nfs_rs import Client, _internal
+
+    with Client.connect("nfs-test://fixture/export") as client:
+        with client.open("fixture.bin", "w+b") as file:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                _internal._arm_operation_test_barrier("commit")
+                writing = executor.submit(file.write, b"pending data")
+                flushing = None
+                try:
+                    async def entered():
+                        await asyncio.wait_for(_internal._wait_operation_test_entered(), 2)
+                    asyncio.run(entered())
+                    flushing = executor.submit(file.flush)
+                    with pytest.raises(concurrent.futures.TimeoutError):
+                        flushing.result(timeout=0.05)
+                finally:
+                    _internal._release_operation_test_barrier()
+                    assert writing.result(timeout=2) == 12
+                    if flushing is not None:
+                        flushing.result(timeout=2)
+
+
+def test_flush_waits_for_write_still_settling_after_timeout():
+    from nfs_rs import AsyncClient, NfsTimeoutError, _internal
+
+    async def scenario():
+        async with await AsyncClient.connect(
+            "nfs-test://fixture/export", operation_timeout=0.05
+        ) as client:
+            async with await client.open("fixture.bin", "w+b") as file:
+                _internal._arm_operation_test_barrier("commit")
+                writing = asyncio.create_task(file.write(b"pending data"))
+                try:
+                    await asyncio.wait_for(_internal._wait_operation_test_entered(), 2)
+                    with pytest.raises(NfsTimeoutError):
+                        await writing
+                    # The caller has timed out, but the owned write still holds
+                    # its mutation gate until the blocked commit is settled.
+                    with pytest.raises(NfsTimeoutError):
+                        await file.flush()
+                finally:
+                    _internal._release_operation_test_barrier()
+                await file.flush()
+    asyncio.run(scenario())

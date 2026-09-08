@@ -125,8 +125,6 @@ def test_async_context_preserves_body_exception_when_close_also_fails():
         ({"readdir_buffer": (1, 0)}, "readdir_buffer"),
         ({"readdir_buffer": (1, 2, 3)}, "readdir_buffer"),
         ({"operation_timeout": 0}, "operation_timeout"),
-        ({"readahead": -1}, "readahead"),
-        ({"writeback": 1000}, "writeback"),
     ],
 )
 def test_connection_option_validation_is_shared(options, message):
@@ -142,3 +140,27 @@ def test_python_310_cleanup_fallback_keeps_body_exception_primary():
     cleanup_error = RuntimeError("cleanup failed")
     _record_cleanup_failure(body_error, cleanup_error, "Client")
     assert body_error.__context__ is cleanup_error
+
+
+@pytest.mark.parametrize("value", [0, 8])
+def test_writeback_option_is_removed(value):
+    with pytest.raises(TypeError, match="writeback"):
+        Client.connect("nfs://server/export", writeback=value)
+    with pytest.raises(ValueError, match="writeback"):
+        Client.connect(f"nfs://server/export?writeback={value}")
+
+
+@pytest.mark.parametrize("name", ["rsize", "wsize", "readahead"])
+def test_io_sizes_are_negotiated_and_not_configurable(name):
+    with pytest.raises(TypeError, match=name):
+        Client.connect("nfs://server/export", **{name: 1048576})
+    with pytest.raises(ValueError, match=name):
+        Client.connect(f"nfs://server/export?{name}=1048576")
+
+    async def scenario():
+        with pytest.raises(TypeError, match=name):
+            await AsyncClient.connect("nfs://server/export", **{name: 1048576})
+        with pytest.raises(ValueError, match=name):
+            await AsyncClient.connect(f"nfs://server/export?{name}=1048576")
+
+    asyncio.run(scenario())

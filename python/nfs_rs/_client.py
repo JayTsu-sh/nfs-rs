@@ -190,11 +190,17 @@ class FileInfo:
     used: int
     fsid: int
     fileid: int
-    atime_ns: int
-    mtime_ns: int
-    ctime_ns: int
+    atime: int  # Last access; ns since Unix epoch (UTC).
+    mtime: int  # Last data modification; ns since Unix epoch (UTC).
+    ctime: int  # Last metadata/status change; ns since Unix epoch (UTC).
     owner: str | None
     group: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryRef:
+    path: os.PathLike[str] | str
+    fh: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +208,7 @@ class DirEntry:
     name: str
     path: str
     info: FileInfo
+    fh: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,17 +293,31 @@ def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
         used=values["used"],
         fsid=values["fsid"],
         fileid=values["fileid"],
-        atime_ns=values["atime_ns"],
-        mtime_ns=values["mtime_ns"],
-        ctime_ns=values["ctime_ns"],
+        atime=values["atime_ns"],
+        mtime=values["mtime_ns"],
+        ctime=values["ctime_ns"],
         owner=values.get("owner") or None,
         group=values.get("group") or None,
     )
 
 
+def _scandir_target(target: DirectoryRef | DirEntry | os.PathLike[str] | str) -> tuple[str, bytes | None]:
+    if isinstance(target, (DirectoryRef, DirEntry)):
+        path, fh = target.path, target.fh
+    else:
+        path, fh = target, None
+    normalized = _normalize_path(path)
+    if fh is not None:
+        if not isinstance(fh, bytes):
+            raise TypeError("scandir fh must be bytes or None")
+        if not fh:
+            raise ValueError("scandir fh must not be empty; use None for path lookup")
+    return normalized, fh
+
+
 def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
     path = values["name"] if parent == "." else f"{parent}/{values['name']}"
-    return DirEntry(values["name"], path, _file_info(path, values["info"]))
+    return DirEntry(values["name"], path, _file_info(path, values["info"]), values.get("fh") or None)
 
 
 def _capabilities(values: dict[str, Any]) -> Capabilities:
@@ -368,13 +389,9 @@ def _configured_url(url: str, options: dict[str, Any]) -> str:
         "gid",
         "nfsport",
         "mountport",
-        "rsize",
-        "wsize",
         "readdir-buffer",
         "noresvport",
         "retain-delegations",
-        "readahead",
-        "writeback",
     }
     unknown = sorted({name for name, _ in query_items} - allowed_query_names)
     if unknown:
@@ -385,13 +402,9 @@ def _configured_url(url: str, options: dict[str, Any]) -> str:
         "gid": "gid",
         "nfs_port": "nfsport",
         "mount_port": "mountport",
-        "rsize": "rsize",
-        "wsize": "wsize",
         "readdir_buffer": "readdir-buffer",
         "noresvport": "noresvport",
         "retain_delegations": "retain-delegations",
-        "readahead": "readahead",
-        "writeback": "writeback",
     }
     if "versions" in options:
         query["version"] = ",".join(options["versions"])
@@ -419,13 +432,9 @@ def _options(
     gid: int | None,
     nfs_port: int | None,
     mount_port: int | None,
-    rsize: int | None,
-    wsize: int | None,
     readdir_buffer: int | tuple[int, int] | None,
     noresvport: bool | None,
     retain_delegations: bool | None,
-    readahead: int | None,
-    writeback: int | None,
     connect_timeout: float | None,
     operation_timeout: float | None,
     recovery_event_capacity: int,
@@ -444,12 +453,6 @@ def _options(
             isinstance(port_value, bool) or not 1 <= port_value <= 65535
         ):
             raise ValueError(f"{name} must be between 1 and 65535")
-    for name, size_value in (("rsize", rsize), ("wsize", wsize)):
-        if size_value is not None and (isinstance(size_value, bool) or size_value <= 0):
-            raise ValueError(f"{name} must be positive")
-    for name, window in (("readahead", readahead), ("writeback", writeback)):
-        if window is not None and (isinstance(window, bool) or not 0 <= window <= 256):
-            raise ValueError(f"{name} must be an integer between 0 and 256")
     for name, timeout_value in (
         ("connect_timeout", connect_timeout),
         ("operation_timeout", operation_timeout),
@@ -480,13 +483,9 @@ def _options(
             "gid": gid,
             "nfs_port": nfs_port,
             "mount_port": mount_port,
-            "rsize": rsize,
-            "wsize": wsize,
             "readdir_buffer": readdir_buffer,
             "noresvport": noresvport,
             "retain_delegations": retain_delegations,
-            "readahead": readahead,
-            "writeback": writeback,
             "connect_timeout": connect_timeout,
             "operation_timeout": operation_timeout,
             "recovery_event_capacity": recovery_event_capacity,
@@ -507,13 +506,9 @@ class _ClientOptions:
         gid: int | None = None,
         nfs_port: int | None = None,
         mount_port: int | None = None,
-        rsize: int | None = None,
-        wsize: int | None = None,
         readdir_buffer: int | tuple[int, int] | None = None,
         noresvport: bool | None = None,
         retain_delegations: bool | None = None,
-        readahead: int | None = None,
-        writeback: int | None = None,
         connect_timeout: float | None = None,
         operation_timeout: float | None = None,
         recovery_event_capacity: int = 256,
@@ -587,13 +582,14 @@ class Client(_ClientOptions):
             return False
         return True
 
-    def scandir(self, path: os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
-        normalized = _normalize_path(path)
-        cursor = self._inner.scandir(normalized)
+    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
+        normalized, fh = _scandir_target(path)
+        cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
         def entries() -> Iterator[DirEntry]:
             try:
-                for values in cursor:
-                    yield _directory_entry(normalized, values)
+                for batch in cursor:
+                    for values in batch:
+                        yield _directory_entry(normalized, values)
             except NfsError as error:
                 raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
         return entries()
@@ -823,15 +819,16 @@ class AsyncClient(_ClientOptions):
             return False
         return True
 
-    async def scandir(self, path: os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
+    async def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
         self._check_loop()
-        normalized = _normalize_path(path)
-        cursor = self._inner.scandir(normalized)
+        normalized, fh = _scandir_target(path)
+        cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
         if inspect.isawaitable(cursor):
             cursor = await cursor
         try:
-            async for values in cursor:
-                yield _directory_entry(normalized, values)
+            async for batch in cursor:
+                for values in batch:
+                    yield _directory_entry(normalized, values)
         except NfsError as error:
             raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
 
@@ -1003,28 +1000,14 @@ class AsyncClient(_ClientOptions):
         return f"AsyncClient(version={self.version!s}, closed={self.closed})"
 
 
-def _buffer_length(target: Any) -> int:
+def _writable_byte_view(target: Any) -> memoryview:
     view = memoryview(target)
     try:
         if view.readonly:
             raise TypeError("readinto target must be writable")
         if not view.c_contiguous:
             raise TypeError("readinto target must be C-contiguous")
-        return view.nbytes
-    finally:
-        view.release()
-
-
-def _copy_to_buffer(target: Any, expected_length: int, data: bytes) -> int:
-    view = memoryview(target)
-    try:
-        if view.readonly or not view.c_contiguous:
-            raise TypeError("readinto target must remain writable and C-contiguous")
-        if view.nbytes != expected_length:
-            raise BufferError("readinto target changed size during I/O")
-        bytes_view = view.cast("B")
-        bytes_view[: len(data)] = data
-        return len(data)
+        return view.cast("B")
     finally:
         view.release()
 
@@ -1096,9 +1079,8 @@ class File(io.RawIOBase):
         self._check_closed("readinto")
         if not self.readable():
             raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
-        length = _buffer_length(target)
-        request = min(length, self._inner.max_read_size)
-        return _copy_to_buffer(target, length, self._inner.read(request))
+        with _writable_byte_view(target) as view:
+            return self._inner.readinto(view)
 
     def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_closed("read_at")
@@ -1110,9 +1092,8 @@ class File(io.RawIOBase):
         self._check_closed("readinto_at")
         if not self.readable():
             raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
-        length = _buffer_length(target)
-        request = min(length, self._inner.max_read_size)
-        return _copy_to_buffer(target, length, self._inner.read_at(offset, request))
+        with _writable_byte_view(target) as view:
+            return self._inner.readinto_at(view, offset)
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         self._check_closed("seek")
@@ -1256,10 +1237,8 @@ class AsyncFile:
         self._check_closed("readinto")
         if not self.readable():
             raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
-        length = _buffer_length(target)
-        request = min(length, self._inner.max_read_size)
-        data = await self._inner.read(request)
-        return _copy_to_buffer(target, length, data)
+        with _writable_byte_view(target) as view:
+            return await self._inner.readinto(view)
 
     async def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_loop()
@@ -1273,10 +1252,8 @@ class AsyncFile:
         self._check_closed("readinto_at")
         if not self.readable():
             raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
-        length = _buffer_length(target)
-        request = min(length, self._inner.max_read_size)
-        data = await self._inner.read_at(offset, request)
-        return _copy_to_buffer(target, length, data)
+        with _writable_byte_view(target) as view:
+            return await self._inner.readinto_at(view, offset)
 
     async def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         self._check_loop()

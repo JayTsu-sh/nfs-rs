@@ -4,9 +4,13 @@
 //! has a granted layout, reads and writes are striped across data servers in
 //! parallel. If pNFS is unavailable or fails, callers fall back to MDS I/O.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, info};
@@ -16,7 +20,7 @@ use super::compound::CompoundResponse;
 #[cfg(test)]
 use super::layout::LayoutManager;
 use super::layout::{IoMode, Layout, LayoutContent, LayoutSegment};
-use super::mount::Mount41;
+use super::mount::{Mount41, effective_rsize, effective_wsize};
 use super::state::{AccessMode, StateId};
 use crate::NFSVersion;
 use crate::error::{
@@ -33,10 +37,11 @@ use crate::nfs4::fastxdr::nfsstat4;
 /// ambiguous mutation can never be silently overwritten through the MDS.
 pub(crate) enum PnfsWriteOutcome {
     NotAttempted,
-    Attempted(Result<u32>),
+    Attempted(Result<crate::WriteOutcome>),
 }
 
 struct PlannedDsWrite {
+    file_offset: u64,
     stripe_index: usize,
     ds_fh: Bytes,
     ds_addr: SocketAddr,
@@ -51,45 +56,224 @@ struct DsWriteCompletion<T> {
 }
 
 /// One data server's WRITE reply plus what a follow-up COMMIT needs.
+#[derive(Clone, Debug)]
 struct DsWriteReply {
+    file_offset: u64,
     written: u32,
-    /// `committed == FILE_SYNC4`; otherwise the stripe needs a COMMIT.
-    stable: bool,
+    /// FILE_SYNC needs no further data or layout commit. DATA_SYNC needs
+    /// metadata synchronization; UNSTABLE also needs data COMMIT.
+    committed: crate::WriteCommitted,
+    data: Bytes,
     verifier: [u8; 8],
     ds_addr: SocketAddr,
     ds_fh: Bytes,
     ds_offset: u64,
 }
 
-/// Where the COMMITs for a batch of DS WRITE replies go (RFC 5661 §13.7).
-#[derive(Debug, PartialEq, Eq)]
-enum DsCommitPlan {
-    /// Every reply was FILE_SYNC: nothing to commit.
-    None,
-    /// `NFL4_UFLG_COMMIT_THRU_MDS`: one COMMIT to the MDS whose verifier must
-    /// match every WRITE verifier in the batch.
-    ThroughMds { expected: Vec<[u8; 8]> },
-    /// COMMIT on each data server that downgraded a WRITE (indices into the
-    /// reply batch).
-    PerDataServer { downgraded: Vec<usize> },
+/// Retained by both the caller and layout manager until data and metadata
+/// are committed. Recall/close can finish pending writes before returning a layout.
+#[derive(Debug)]
+pub(crate) struct PendingWrite {
+    fh: Bytes,
+    offset: u64,
+    count: u32,
+    generation: u64,
+    commit_thru_mds: bool,
+    replies: Vec<DsWriteReply>,
+    done: AtomicBool,
+    failed: AtomicBool,
 }
 
-fn plan_ds_commits(commit_thru_mds: bool, replies: &[DsWriteReply]) -> DsCommitPlan {
-    let downgraded: Vec<usize> = replies
-        .iter()
-        .enumerate()
-        .filter(|(_, reply)| !reply.stable)
-        .map(|(index, _)| index)
-        .collect();
-    if downgraded.is_empty() {
-        DsCommitPlan::None
-    } else if commit_thru_mds {
-        DsCommitPlan::ThroughMds {
-            expected: replies.iter().map(|reply| reply.verifier).collect(),
-        }
-    } else {
-        DsCommitPlan::PerDataServer { downgraded }
+impl PendingWrite {
+    fn committed(&self) -> crate::WriteCommitted {
+        self.replies
+            .iter()
+            .map(|reply| reply.committed)
+            .min()
+            .unwrap_or(crate::WriteCommitted::Unstable)
     }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+}
+
+/// A commit is failed only if it exits without settling the retained writes.
+/// Drop also records cancellation, while the caller still holds its I/O gate.
+struct PendingCommitGuard<'a> {
+    pending: &'a [&'a Arc<PendingWrite>],
+}
+
+impl<'a> PendingCommitGuard<'a> {
+    fn new(pending: &'a [&'a Arc<PendingWrite>]) -> Self {
+        Self { pending }
+    }
+}
+
+impl Drop for PendingCommitGuard<'_> {
+    fn drop(&mut self) {
+        for write in self.pending {
+            if !write.is_done() {
+                write.failed.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CommitTarget {
+    offset: u64,
+    count: u32,
+    expected: Vec<[u8; 8]>,
+}
+#[derive(Debug, Default)]
+struct CommitPlan {
+    mds: Option<CommitTarget>,
+    ds: Vec<(SocketAddr, Bytes, CommitTarget)>,
+    layout: Option<(u64, u64)>,
+}
+
+fn plan_commit_batch(pending: &[&Arc<PendingWrite>], replies: &[Vec<DsWriteReply>]) -> CommitPlan {
+    let mut mds_expected = Vec::new();
+    let mut mds_start = u64::MAX;
+    let mut mds_end = 0;
+    let mut ds_groups: BTreeMap<(SocketAddr, Bytes), Vec<&DsWriteReply>> = BTreeMap::new();
+    let mut layout_needed = false;
+    for (write, batch) in pending.iter().zip(replies) {
+        if write.commit_thru_mds {
+            for reply in batch
+                .iter()
+                .filter(|r| r.committed != crate::WriteCommitted::FileSync)
+            {
+                mds_expected.push(reply.verifier);
+            }
+            mds_start = mds_start.min(write.offset);
+            mds_end = mds_end.max(write.offset + u64::from(write.count));
+        } else {
+            layout_needed |= batch
+                .iter()
+                .any(|r| r.committed != crate::WriteCommitted::FileSync);
+            for reply in batch
+                .iter()
+                .filter(|r| r.committed == crate::WriteCommitted::Unstable)
+            {
+                ds_groups
+                    .entry((reply.ds_addr, reply.ds_fh.clone()))
+                    .or_default()
+                    .push(reply);
+            }
+        }
+    }
+    let mds = if mds_expected.is_empty() {
+        None
+    } else {
+        let (offset, count) = wire_commit_range(mds_start, mds_end);
+        Some(CommitTarget {
+            offset,
+            count,
+            expected: mds_expected,
+        })
+    };
+    let ds = ds_groups
+        .into_iter()
+        .map(|((addr, fh), group)| {
+            let start = group.iter().map(|r| r.ds_offset).min().unwrap_or(0);
+            let end = group
+                .iter()
+                .map(|r| r.ds_offset + u64::from(r.written))
+                .max()
+                .unwrap_or(0);
+            let (offset, count) = wire_commit_range(start, end);
+            (
+                addr,
+                fh,
+                CommitTarget {
+                    offset,
+                    count,
+                    expected: group.iter().map(|r| r.verifier).collect(),
+                },
+            )
+        })
+        .collect();
+    let layout = if layout_needed {
+        Some((
+            pending.iter().map(|w| w.offset).min().unwrap_or(0),
+            pending
+                .iter()
+                .map(|w| w.offset + u64::from(w.count))
+                .max()
+                .unwrap_or(0),
+        ))
+    } else {
+        None
+    };
+    CommitPlan { mds, ds, layout }
+}
+
+#[async_trait::async_trait]
+trait CommitIo: Sync {
+    async fn mds_commit(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]>;
+    async fn ds_commit(
+        &self,
+        addr: SocketAddr,
+        fh: &Bytes,
+        generation: u64,
+        offset: u64,
+        count: u32,
+    ) -> Result<[u8; 8]>;
+    async fn layout_commit(&self, fh: &Bytes, generation: u64, start: u64, end: u64) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl CommitIo for Mount41 {
+    async fn mds_commit(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
+        self.commit_with_verifier(fh.clone(), offset, count)
+            .await?
+            .ok_or_else(|| NfsError::Rpc("missing MDS commit verifier".into()))
+    }
+    async fn ds_commit(
+        &self,
+        addr: SocketAddr,
+        fh: &Bytes,
+        generation: u64,
+        offset: u64,
+        count: u32,
+    ) -> Result<[u8; 8]> {
+        self.ds_commit_chunk(addr, fh, generation, offset, count)
+            .await
+    }
+    async fn layout_commit(&self, fh: &Bytes, generation: u64, start: u64, end: u64) -> Result<()> {
+        self.layout_manager
+            .mark_dirty_at(fh, generation, start, end)
+            .await;
+        self.layoutcommit_dirty(fh).await?;
+        Ok(())
+    }
+}
+
+async fn execute_commit_plan(
+    io: &impl CommitIo,
+    fh: &Bytes,
+    generation: u64,
+    plan: &CommitPlan,
+) -> Result<()> {
+    if let Some(target) = &plan.mds {
+        let actual = io.mds_commit(fh, target.offset, target.count).await?;
+        check_commit_verifier(target.expected.iter(), actual)?;
+    }
+    for (addr, ds_fh, target) in &plan.ds {
+        let actual = io
+            .ds_commit(*addr, ds_fh, generation, target.offset, target.count)
+            .await?;
+        check_commit_verifier(target.expected.iter(), actual)?;
+    }
+    if let Some((start, end)) = plan.layout {
+        io.layout_commit(fh, generation, start, end).await?;
+    }
+    Ok(())
 }
 
 /// RFC 5661 §13.7: a COMMIT verifier that differs from any WRITE verifier it
@@ -400,6 +584,10 @@ impl Mount41 {
             .layout_manager
             .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
             .await?;
+        let count = count.min(effective_rsize(
+            u64::from(self.rsize),
+            ds.session.max_response_size(),
+        )?);
         let result = Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
             b.putfh(ds_fh).read(stateid, offset, count)
         })
@@ -412,6 +600,10 @@ impl Mount41 {
                     .layout_manager
                     .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
                     .await?;
+                let count = count.min(effective_rsize(
+                    u64::from(self.rsize),
+                    ds.session.max_response_size(),
+                )?);
                 Mount41::compound_ds(&ds, &self.auth, "ds-read", count as usize, |b| {
                     b.putfh(ds_fh).read(stateid, offset, count)
                 })
@@ -438,7 +630,7 @@ impl Mount41 {
                 .compound_write("ds-write-mds", data, |b| {
                     b.require_generation(generation)
                         .putfh(ds_fh)
-                        .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+                        .write_header(stateid, ds_off, 0 /* UNSTABLE4 */, len)
                 })
                 .await;
         }
@@ -446,9 +638,14 @@ impl Mount41 {
             .layout_manager
             .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
             .await?;
+        let len = data
+            .len()
+            .min(effective_wsize(u64::from(self.wsize), ds.session.max_request_size())? as usize)
+            as u32;
+        let data = data.slice(..len as usize);
         let result = Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data.clone(), |b| {
             b.putfh(ds_fh)
-                .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+                .write_header(stateid, ds_off, 0 /* UNSTABLE4 */, len)
         })
         .await;
         match result {
@@ -458,9 +655,14 @@ impl Mount41 {
                     .layout_manager
                     .get_data_server(ds_addr, &self.auth, &self.client_identity, generation)
                     .await?;
+                let len = data.len().min(effective_wsize(
+                    u64::from(self.wsize),
+                    ds.session.max_request_size(),
+                )? as usize) as u32;
+                let data = data.slice(..len as usize);
                 Mount41::compound_ds_write(&ds, &self.auth, "ds-write", data, |b| {
                     b.putfh(ds_fh)
-                        .write_header(stateid, ds_off, 2 /* FILE_SYNC4 */, len)
+                        .write_header(stateid, ds_off, 0 /* UNSTABLE4 */, len)
                 })
                 .await
             }
@@ -567,34 +769,39 @@ impl Mount41 {
                 async move {
                     let ds_fh = ds_fh_res?;
                     let ds_addr = ds_addr_res?;
-                    let resp = self
-                        .ds_read_chunk(
-                            ds_addr,
-                            &ds_fh,
-                            &io_stateid,
-                            layout.generation,
-                            chunk_ds_offset,
-                            chunk_len,
-                        )
-                        .await?;
-                    // 主 session 复用与独立 DS session 两条路径的 op 布局一致：
-                    // SEQUENCE=0, PUTFH=1, READ=2
-                    resp.op_ok(1)?; // PUTFH
-                    let read_op = resp.op_ok(2)?; // READ
-                    let mut data = read_op.data.clone();
-                    // READ4resok: eof(4) + data<>
-                    if data.remaining() < 4 {
-                        return Err(NfsError::Xdr("DS READ result too short".to_string()));
+                    let mut combined = BytesMut::with_capacity(chunk_len as usize);
+                    while combined.len() < chunk_len as usize {
+                        let remaining = chunk_len as usize - combined.len();
+                        let resp = self
+                            .ds_read_chunk(
+                                ds_addr,
+                                &ds_fh,
+                                &io_stateid,
+                                layout.generation,
+                                chunk_ds_offset + combined.len() as u64,
+                                remaining as u32,
+                            )
+                            .await?;
+                        resp.op_ok(1)?;
+                        let mut data = resp.op_ok(2)?.data.clone();
+                        if data.remaining() < 8 {
+                            return Err(NfsError::Xdr("DS READ result too short".into()));
+                        }
+                        let eof = data.get_u32() != 0;
+                        let data_len = data.get_u32() as usize;
+                        if data_len > remaining || data.remaining() < data_len {
+                            return Err(NfsError::Xdr("invalid DS READ data length".into()));
+                        }
+                        combined.extend_from_slice(&data[..data_len]);
+                        if eof {
+                            break;
+                        }
+                        if data_len == 0 {
+                            return Err(NfsError::Rpc("DS READ made no progress".into()));
+                        }
                     }
-                    let _eof = data.get_u32();
-                    if data.remaining() < 4 {
-                        return Err(NfsError::Xdr("DS READ data length missing".to_string()));
-                    }
-                    let data_len = data.get_u32() as usize;
-                    if data.remaining() < data_len {
-                        return Err(NfsError::Xdr("DS READ data truncated".to_string()));
-                    }
-                    Ok::<Bytes, NfsError>(data.slice(..data_len))
+                    let short = combined.len() < chunk_len as usize;
+                    Ok::<(Bytes, bool), NfsError>((combined.freeze(), short))
                 }
             })
             .collect();
@@ -607,13 +814,16 @@ impl Mount41 {
                     )));
                 }
                 if results.len() == 1 {
-                    Some(Ok(results.into_iter().next().unwrap_or_default()))
+                    Some(Ok(results.into_iter().next().unwrap_or_default().0))
                 } else {
                     // Concatenate stripe results in order
-                    let total_len: usize = results.iter().map(|b| b.len()).sum();
+                    let total_len: usize = results.iter().map(|(b, _)| b.len()).sum();
                     let mut combined = BytesMut::with_capacity(total_len);
-                    for chunk_data in results {
+                    for (chunk_data, short) in results {
                         combined.extend_from_slice(&chunk_data);
+                        if short {
+                            break;
+                        }
                     }
                     Some(Ok(combined.freeze()))
                 }
@@ -704,6 +914,12 @@ impl Mount41 {
             .unwrap_or_else(StateId::anonymous)
             .raw;
 
+        let covered = seg.offset.saturating_add(seg.length).saturating_sub(offset);
+        let data = data.slice(
+            ..data
+                .len()
+                .min(usize::try_from(covered).unwrap_or(usize::MAX)),
+        );
         let num_ds = fh_list.len() as u32;
         let data_len = data.len();
         let chunks = super::layout::split_into_stripes(
@@ -745,6 +961,7 @@ impl Mount41 {
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
                 Ok::<PlannedDsWrite, NfsError>(PlannedDsWrite {
+                    file_offset: chunk.file_offset,
                     stripe_index,
                     ds_fh: ds_fh_res?,
                     ds_addr: ds_addr_res?,
@@ -780,35 +997,8 @@ impl Mount41 {
                 let stripe_index = write.stripe_index;
                 let ds_addr = write.ds_addr;
                 let future = async move {
-                    let resp = self
-                        .ds_write_chunk(
-                            write.ds_addr,
-                            &write.ds_fh,
-                            &io_stateid,
-                            layout.generation,
-                            write.ds_offset,
-                            write.data,
-                        )
-                        .await?;
-                    // SEQUENCE=0, PUTFH=1, WRITE=2（两条路径布局一致）
-                    resp.op_ok(1)?; // PUTFH
-                    let write_op = resp.op_ok(2)?; // WRITE
-                    let mut d = write_op.data.clone();
-                    if d.remaining() < 16 {
-                        return Err(NfsError::Xdr("DS WRITE result too short".to_string()));
-                    }
-                    let written = d.get_u32();
-                    let committed = d.get_u32();
-                    let mut verifier = [0u8; 8];
-                    d.copy_to_slice(&mut verifier);
-                    Ok::<DsWriteReply, NfsError>(DsWriteReply {
-                        written,
-                        stable: committed == 2, // FILE_SYNC4
-                        verifier,
-                        ds_addr: write.ds_addr,
-                        ds_fh: write.ds_fh,
-                        ds_offset: write.ds_offset,
-                    })
+                    self.write_ds_complete(&write, &io_stateid, layout.generation)
+                        .await
                 };
                 (stripe_index, ds_addr, future)
             })
@@ -840,35 +1030,28 @@ impl Mount41 {
                 )));
             }
             let total: u32 = results.iter().map(|reply| reply.written).sum();
-            // RFC 5661 §18.42.3：LAYOUTCOMMIT 不必每次 WRITE 后发，只需在
-            // LAYOUTRETURN/CLOSE 前提交。这里仅累积 dirty 范围，由
-            // flush_layoutcommit 在 close/layoutreturn 时一次性发送，
-            // 避免每个 wsize 块一次串行 MDS RTT。
-            if data_len > 0 {
-                self.layout_manager
-                    .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
-                    .await;
-            }
-            if let Err(error) = self
-                .commit_downgraded_ds_writes(
-                    fh,
-                    offset,
-                    total,
-                    layout.generation,
-                    plan_ds_commits(commit_thru_mds, &results),
-                    &results,
-                )
-                .await
-            {
-                return PnfsWriteOutcome::Attempted(Err(error));
-            }
-            PnfsWriteOutcome::Attempted(Ok(total))
+            let pending = Arc::new(PendingWrite {
+                fh: fh.clone(),
+                offset,
+                count: total,
+                generation: layout.generation,
+                commit_thru_mds,
+                replies: results,
+                done: AtomicBool::new(false),
+                failed: AtomicBool::new(false),
+            });
+            // Register before releasing the file I/O guard, so recall cannot
+            // return a layout while its DS writes are still uncommitted.
+            self.layout_manager
+                .register_write(fh, pending.clone())
+                .await;
+            PnfsWriteOutcome::Attempted(Ok(crate::WriteOutcome {
+                count: total,
+                committed: pending.committed(),
+                verifier: None,
+                pnfs: Some(pending),
+            }))
         } else {
-            if data_len > 0 {
-                self.layout_manager
-                    .mark_dirty_at(fh, layout.generation, offset, offset + data_len as u64)
-                    .await;
-            }
             if completions.iter().any(|completion| {
                 matches!(
                     completion.result,
@@ -877,6 +1060,32 @@ impl Mount41 {
             }) {
                 self.layout_manager.remove_layout(fh).await;
                 self.layout_manager.invalidate_dirty(fh).await;
+            }
+            let known: Vec<_> = completions
+                .iter()
+                .filter_map(|c| c.result.as_ref().ok().cloned())
+                .collect();
+            if !known.is_empty() {
+                self.layout_manager
+                    .register_write(
+                        fh,
+                        Arc::new(PendingWrite {
+                            fh: fh.clone(),
+                            offset,
+                            count: (known
+                                .iter()
+                                .map(|r| r.file_offset + u64::from(r.written))
+                                .max()
+                                .unwrap_or(offset)
+                                - offset) as u32,
+                            generation: layout.generation,
+                            commit_thru_mds,
+                            replies: known,
+                            done: AtomicBool::new(false),
+                            failed: AtomicBool::new(true),
+                        }),
+                    )
+                    .await;
             }
             let diagnostic = ds_batch_diagnostic(&completions);
             // Preserve hot-path performance: aggregate diagnostic context
@@ -898,57 +1107,179 @@ impl Mount41 {
         }
     }
 
-    /// Make DS writes that came back below FILE_SYNC durable and visible
-    /// (RFC 5661 §13.7, §12.5.4). COMMIT is routed per `plan`, each COMMIT
-    /// verifier is checked against the WRITE verifiers it covers, and a
-    /// LAYOUTCOMMIT then synchronises size/mtime to the MDS so the recovered
-    /// data is not left behind a stale layout. A failure anywhere leaves the
-    /// data uncertain, so the error is reported as such rather than dropped.
-    async fn commit_downgraded_ds_writes(
+    /// Finish short writes on one stripe before reporting a contiguous logical
+    /// byte count. Returning the sum of short stripes would conceal holes.
+    async fn write_ds_complete(
+        &self,
+        write: &PlannedDsWrite,
+        stateid: &[u8; 16],
+        generation: u64,
+    ) -> Result<DsWriteReply> {
+        for attempt in 0..3 {
+            match self.write_ds_attempt(write, stateid, generation).await {
+                Err(error)
+                    if attempt < 2
+                        && error
+                            .operation_outcome()
+                            .is_some_and(|o| o.context().operation == "write_verifier") =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last stripe write attempt always returns")
+    }
+
+    async fn write_ds_attempt(
+        &self,
+        write: &PlannedDsWrite,
+        stateid: &[u8; 16],
+        generation: u64,
+    ) -> Result<DsWriteReply> {
+        let mut done = 0usize;
+        let mut level = 2;
+        let mut verifier = None;
+        while done < write.data.len() {
+            let resp = self
+                .ds_write_chunk(
+                    write.ds_addr,
+                    &write.ds_fh,
+                    stateid,
+                    generation,
+                    write.ds_offset + done as u64,
+                    write.data.slice(done..),
+                )
+                .await?;
+            resp.op_ok(1)?;
+            let mut d = resp.op_ok(2)?.data.clone();
+            if d.remaining() < 16 {
+                return Err(NfsError::Xdr("DS WRITE result too short".into()));
+            }
+            let n = d.get_u32() as usize;
+            let committed = d.get_u32();
+            if n == 0 || n > write.data.len() - done || committed > 2 {
+                return Err(NfsError::Rpc("invalid DS WRITE acknowledgement".into()));
+            }
+            let mut current = [0; 8];
+            d.copy_to_slice(&mut current);
+            if verifier.is_some_and(|v| v != current) {
+                return Err(write_verifier_changed(NFSVersion::NFSv4p1));
+            }
+            verifier = Some(current);
+            level = level.min(committed);
+            done += n;
+        }
+        Ok(DsWriteReply {
+            file_offset: write.file_offset,
+            written: done as u32,
+            committed: crate::WriteCommitted::try_from(level)?,
+            verifier: verifier.unwrap_or_default(),
+            ds_addr: write.ds_addr,
+            ds_fh: write.ds_fh.clone(),
+            ds_offset: write.ds_offset,
+            data: write.data.clone(),
+        })
+    }
+
+    /// The caller holds the file I/O gate (shared for ordinary commits,
+    /// exclusive for recall/close). DS identities and offsets come from the
+    /// original WRITE receipts, never from a refreshed stripe mapping.
+    pub(crate) async fn commit_pending_writes(
         &self,
         fh: &Bytes,
-        offset: u64,
-        total: u32,
-        generation: u64,
-        plan: DsCommitPlan,
-        replies: &[DsWriteReply],
+        pending: &[Arc<PendingWrite>],
     ) -> Result<()> {
-        match plan {
-            DsCommitPlan::None => return Ok(()),
-            DsCommitPlan::ThroughMds { expected } => {
-                match self.commit_with_verifier(fh.clone(), offset, total).await {
-                    Ok(Some(committed)) => check_commit_verifier(expected.iter(), committed)?,
-                    Ok(None) => {}
-                    Err(error) => return Err(self.uncertain_after_ds_write(error).await),
-                }
+        let _commit_guard =
+            crate::fileio::file_gate(self as *const Self as usize, fh.clone(), 1).await;
+        let pending: Vec<_> = pending.iter().filter(|w| !w.is_done()).collect();
+        let _attempt = PendingCommitGuard::new(&pending);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for write in &pending {
+            if write.fh != *fh || write.generation != self.layout_manager.generation() {
+                return Err(self
+                    .uncertain_after_ds_write(NfsError::Rpc(
+                        "pNFS commit crossed layout generation".into(),
+                    ))
+                    .await);
             }
-            DsCommitPlan::PerDataServer { downgraded } => {
-                for reply in downgraded.iter().filter_map(|&index| replies.get(index)) {
-                    let committed = match self
-                        .ds_commit_chunk(
-                            reply.ds_addr,
-                            &reply.ds_fh,
-                            generation,
-                            reply.ds_offset,
-                            reply.written,
-                        )
+        }
+        let generation = pending[0].generation;
+        let mut replies: Vec<Vec<DsWriteReply>> =
+            pending.iter().map(|w| w.replies.clone()).collect();
+        for attempt in 0..3 {
+            let result = self
+                .commit_ds_batch(fh, &pending, &replies, generation)
+                .await;
+            match result {
+                Ok(()) => {
+                    if generation != self.layout_manager.generation() {
+                        return Err(self
+                            .uncertain_after_ds_write(NfsError::Rpc(
+                                "pNFS generation changed during commit".into(),
+                            ))
+                            .await);
+                    }
+                    for write in &pending {
+                        write.done.store(true, Ordering::Release);
+                    }
+                    self.layout_manager.prune_completed_writes(fh).await;
+                    return Ok(());
+                }
+                Err(error)
+                    if attempt < 2
+                        && error
+                            .operation_outcome()
+                            .is_some_and(|o| o.context().operation == "write_verifier") =>
+                {
+                    let sid = self
+                        .state
+                        .has_open(fh, AccessMode::Write)
                         .await
-                    {
-                        Ok(verifier) => verifier,
-                        Err(error) => return Err(self.uncertain_after_ds_write(error).await),
-                    };
-                    check_commit_verifier([&reply.verifier], committed)?;
+                        .unwrap_or_else(StateId::anonymous);
+                    for batch in &mut replies {
+                        for reply in batch {
+                            let plan = PlannedDsWrite {
+                                file_offset: reply.file_offset,
+                                stripe_index: 0,
+                                ds_fh: reply.ds_fh.clone(),
+                                ds_addr: reply.ds_addr,
+                                ds_offset: reply.ds_offset,
+                                data: reply.data.clone(),
+                            };
+                            *reply = self
+                                .write_ds_complete(&plan, &sid.raw, generation)
+                                .await
+                                .map_err(|e| {
+                                    uncertain_pnfs_write(
+                                        RequestContext {
+                                            operation: "pnfs_commit".into(),
+                                            protocol: NFSVersion::NFSv4p1,
+                                            request_id: None,
+                                        },
+                                        e,
+                                    )
+                                })?;
+                        }
+                    }
                 }
+                Err(error) => return Err(self.uncertain_after_ds_write(error).await),
             }
         }
-        // RFC 5661 §12.5.4: for file layouts the size attribute is only
-        // synchronised to the MDS by LAYOUTCOMMIT. A concurrent writer may
-        // extend the dirty range while it is in flight; that range stays
-        // pending for the next flush and does not affect this write.
-        if let Err(error) = self.layoutcommit_dirty(fh).await {
-            return Err(self.uncertain_after_ds_write(error).await);
-        }
-        Ok(())
+        unreachable!("bounded commit loop returns on its last attempt")
+    }
+
+    async fn commit_ds_batch(
+        &self,
+        fh: &Bytes,
+        pending: &[&Arc<PendingWrite>],
+        replies: &[Vec<DsWriteReply>],
+        generation: u64,
+    ) -> Result<()> {
+        let plan = plan_commit_batch(pending, replies);
+        execute_commit_plan(self, fh, generation, &plan).await
     }
 
     /// COMMIT one stripe on its data server (COMPOUND: SEQUENCE, PUTFH, COMMIT)
@@ -1007,6 +1338,8 @@ impl Mount41 {
     /// Fails if a concurrent WRITE extended the range meanwhile, because the
     /// caller is about to CLOSE or return the layout.
     pub(crate) async fn flush_layoutcommit(&self, fh: &Bytes) -> Result<()> {
+        let pending = self.layout_manager.pending_writes(fh).await;
+        self.commit_pending_writes(fh, &pending).await?;
         if self.layoutcommit_dirty(fh).await? {
             Ok(())
         } else {
@@ -1233,8 +1566,14 @@ mod tests {
 
     fn reply(stable: bool, verifier: u8) -> DsWriteReply {
         DsWriteReply {
+            file_offset: 0,
             written: 4,
-            stable,
+            committed: if stable {
+                crate::WriteCommitted::FileSync
+            } else {
+                crate::WriteCommitted::Unstable
+            },
+            data: Bytes::from_static(b"data"),
             verifier: [verifier; 8],
             ds_addr: "127.0.0.1:2049".parse().unwrap(),
             ds_fh: Bytes::from_static(b"ds-fh"),
@@ -1242,33 +1581,260 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_sync_replies_need_no_commit_whatever_the_flag() {
-        let replies = [reply(true, 1), reply(true, 1)];
-        assert_eq!(plan_ds_commits(false, &replies), DsCommitPlan::None);
-        assert_eq!(plan_ds_commits(true, &replies), DsCommitPlan::None);
+    #[derive(Default)]
+    struct FakeCommit {
+        calls: std::sync::Mutex<Vec<String>>,
+        mismatch: bool,
+        fail_layout: bool,
+    }
+    #[async_trait::async_trait]
+    impl CommitIo for FakeCommit {
+        async fn mds_commit(&self, _fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("mds:{offset}:{count}"));
+            Ok([if self.mismatch { 99 } else { 1 }; 8])
+        }
+        async fn ds_commit(
+            &self,
+            addr: SocketAddr,
+            fh: &Bytes,
+            _generation: u64,
+            offset: u64,
+            count: u32,
+        ) -> Result<[u8; 8]> {
+            self.calls.lock().unwrap().push(format!(
+                "ds:{}:{}:{offset}:{count}",
+                addr.port(),
+                String::from_utf8_lossy(fh)
+            ));
+            Ok([if self.mismatch {
+                99
+            } else {
+                (addr.port() - 2048) as u8
+            }; 8])
+        }
+        async fn layout_commit(
+            &self,
+            _fh: &Bytes,
+            _generation: u64,
+            start: u64,
+            end: u64,
+        ) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("layout:{start}:{end}"));
+            if self.fail_layout {
+                Err(NfsError::Rpc("layout failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn pending(through_mds: bool, offset: u64, replies: Vec<DsWriteReply>) -> Arc<PendingWrite> {
+        Arc::new(PendingWrite {
+            fh: Bytes::from_static(b"file"),
+            offset,
+            count: replies.iter().map(|r| r.written).sum(),
+            generation: 0,
+            commit_thru_mds: through_mds,
+            replies,
+            done: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        })
+    }
+    fn test_plan(writes: &[Arc<PendingWrite>]) -> CommitPlan {
+        plan_commit_batch(
+            &writes.iter().collect::<Vec<_>>(),
+            &writes.iter().map(|w| w.replies.clone()).collect::<Vec<_>>(),
+        )
     }
 
-    #[test]
-    fn downgraded_reply_with_commit_thru_mds_commits_once_against_all_verifiers() {
-        let replies = [reply(true, 1), reply(false, 2)];
+    #[tokio::test]
+    async fn batch_groups_ds_filehandles_and_commits_metadata_last() {
+        let mut first = reply(false, 1);
+        first.ds_addr.set_port(2049);
+        first.ds_offset = 4;
+        let mut second = first.clone();
+        second.ds_offset = 12;
+        let mut third = reply(false, 2);
+        third.ds_addr.set_port(2050);
+        third.ds_offset = 0;
+        let writes = [
+            pending(false, 0, vec![first]),
+            pending(false, 4, vec![second, third]),
+        ];
+        let io = FakeCommit::default();
+        execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+            .await
+            .unwrap();
         assert_eq!(
-            plan_ds_commits(true, &replies),
-            DsCommitPlan::ThroughMds {
-                expected: vec![[1; 8], [2; 8]]
-            }
+            *io.calls.lock().unwrap(),
+            ["ds:2049:ds-fh:4:12", "ds:2050:ds-fh:0:4", "layout:0:12"]
         );
     }
 
+    #[tokio::test]
+    async fn commit_through_mds_batches_all_chunks_without_ds_commits() {
+        let writes = [
+            pending(true, 0, vec![reply(false, 1)]),
+            pending(true, 4, vec![reply(false, 1)]),
+        ];
+        let io = FakeCommit::default();
+        execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+            .await
+            .unwrap();
+        assert_eq!(*io.calls.lock().unwrap(), ["mds:0:8"]);
+    }
+
     #[test]
-    fn downgraded_reply_without_commit_thru_mds_commits_on_that_data_server() {
-        let replies = [reply(true, 1), reply(false, 2), reply(false, 3)];
-        assert_eq!(
-            plan_ds_commits(false, &replies),
-            DsCommitPlan::PerDataServer {
-                downgraded: vec![1, 2]
-            }
+    fn successful_commit_is_not_reported_as_failure_while_in_progress() {
+        let write = pending(false, 0, vec![reply(false, 1)]);
+        let writes = [&write];
+        {
+            let _attempt = PendingCommitGuard::new(&writes);
+            assert!(
+                !write.failed(),
+                "an in-progress commit is not a failed commit"
+            );
+            write.done.store(true, Ordering::Release);
+        }
+        assert!(write.is_done());
+        assert!(!write.failed());
+    }
+
+    #[tokio::test]
+    async fn cancelled_commit_marks_unsettled_writes_failed() {
+        let write = pending(false, 0, vec![reply(false, 1)]);
+        let copy = write.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let writes = [&copy];
+            let _attempt = PendingCommitGuard::new(&writes);
+            entered.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        assert!(!write.failed());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(write.failed());
+        assert!(!write.is_done());
+    }
+
+    #[tokio::test]
+    async fn incoming_write_waits_for_healthy_recall_commit() {
+        let manager = Arc::new(LayoutManager::new(true));
+        let fh = Bytes::from_static(b"recall-commit");
+        let write = pending(false, 0, vec![reply(false, 1)]);
+        let writes = [&write];
+        let recall_guard = manager.write_file_io(&fh).await;
+        let attempt = PendingCommitGuard::new(&writes);
+        assert!(!write.failed());
+        let reader_manager = manager.clone();
+        let reader_write = write.clone();
+        let mut incoming = tokio::spawn(async move {
+            let _guard = reader_manager.read_file_io(&fh).await;
+            !reader_write.failed() || reader_write.is_done()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut incoming)
+                .await
+                .is_err()
         );
+        write.done.store(true, Ordering::Release);
+        drop(attempt);
+        drop(recall_guard);
+        assert!(incoming.await.unwrap());
+    }
+
+    #[test]
+    fn failed_commit_marks_only_unsettled_writes() {
+        let done = pending(false, 0, vec![reply(false, 1)]);
+        done.done.store(true, Ordering::Release);
+        let unfinished = pending(false, 4, vec![reply(false, 1)]);
+        let writes = [&done, &unfinished];
+        drop(PendingCommitGuard::new(&writes));
+        assert!(!done.failed());
+        assert!(unfinished.failed());
+    }
+
+    #[test]
+    fn outcome_commitment_reports_weakest_ds_reply() {
+        use crate::WriteCommitted::*;
+        for (levels, expected) in [
+            (vec![FileSync, FileSync], FileSync),
+            (vec![FileSync, DataSync], DataSync),
+            (vec![DataSync, Unstable, FileSync], Unstable),
+        ] {
+            let replies = levels
+                .into_iter()
+                .map(|committed| {
+                    let mut r = reply(false, 1);
+                    r.committed = committed;
+                    r
+                })
+                .collect();
+            assert_eq!(pending(false, 0, replies).committed(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn data_sync_requires_only_layout_when_not_committing_through_mds() {
+        let mut r = reply(false, 1);
+        r.committed = crate::WriteCommitted::DataSync;
+        let writes = [pending(false, 10, vec![r])];
+        let io = FakeCommit::default();
+        execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+            .await
+            .unwrap();
+        assert_eq!(*io.calls.lock().unwrap(), ["layout:10:14"]);
+    }
+
+    #[tokio::test]
+    async fn file_sync_replies_need_no_data_or_layout_commit() {
+        for flag in [true, false] {
+            let writes = [pending(flag, 0, vec![reply(true, 1)])];
+            let io = FakeCommit::default();
+            execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+                .await
+                .unwrap();
+            assert!(io.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn verifier_failure_prevents_layout_commit_and_layout_failure_propagates() {
+        let mut r = reply(false, 1);
+        r.ds_addr.set_port(2049);
+        let writes = [pending(false, 0, vec![r])];
+        let io = FakeCommit {
+            mismatch: true,
+            ..Default::default()
+        };
+        assert!(
+            execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+                .await
+                .is_err()
+        );
+        assert_eq!(io.calls.lock().unwrap().len(), 1);
+        let io = FakeCommit {
+            fail_layout: true,
+            ..Default::default()
+        };
+        assert!(
+            execute_commit_plan(&io, &writes[0].fh, 0, &test_plan(&writes))
+                .await
+                .is_err()
+        );
+        assert_eq!(io.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn huge_commit_range_uses_whole_file_without_truncation() {
+        assert_eq!(wire_commit_range(4, u64::from(u32::MAX) + 10), (0, 0));
     }
 
     #[test]
@@ -1476,4 +2042,8 @@ mod tests {
         let _ = batch.await;
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
+}
+
+fn wire_commit_range(start: u64, end: u64) -> (u64, u32) {
+    u32::try_from(end - start).map_or((0, 0), |count| (start, count))
 }

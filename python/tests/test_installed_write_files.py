@@ -59,16 +59,16 @@ def test_native_permissions_are_enforced_even_without_facade() -> None:
     client.close()
 
 
-def test_failed_close_reuses_terminal_flush_error() -> None:
+def test_commit_failure_is_reported_by_write():
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
     file = client.open("__commit_error__", "w+b")
-    assert file.write(b"dirty") == 5
-    with pytest.raises(RuntimeError, match="scripted commit failure"):
-        file.close()
-    with pytest.raises(RuntimeError, match="scripted commit failure"):
-        file.close()
+    with pytest.raises(RuntimeError, match="[Uu]ncertain"):
+        file.write(b"dirty")
+    file.flush()
+    file.close()
+    file.close()
     client.close()
 
 
@@ -79,7 +79,8 @@ def test_partial_and_zero_write_failures_preserve_position_rules() -> None:
     partial = client.open("__partial_write_error__", "w+b")
     with pytest.raises(RuntimeError):
         partial.write(b"abcde")
-    assert partial.tell() == 2
+    with pytest.raises(RuntimeError, match="uncertain"):
+        partial.seek(0, io.SEEK_CUR)
     partial.close()
 
     zero = client.open("__zero_write__", "w+b")
@@ -92,21 +93,15 @@ def test_partial_and_zero_write_failures_preserve_position_rules() -> None:
     client.close()
 
 
-def test_commit_verifier_change_keeps_flush_failed_and_close_terminal() -> None:
+def test_commit_verifier_change_fails_write():
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
     file = client.open("__verifier_change__", "w+b")
-    assert file.write(b"dirty") == 5
-    with pytest.raises(RuntimeError, match="Uncertain") as flush_error:
-        file.flush()
-    with pytest.raises(RuntimeError, match="Uncertain") as first_close_error:
-        file.close()
-    with pytest.raises(RuntimeError, match="Uncertain") as second_close_error:
-        file.close()
-    assert str(first_close_error.value) == str(second_close_error.value)
-    assert str(flush_error.value) == str(first_close_error.value.errors[0])
-    assert str(first_close_error.value.errors[0]) == str(second_close_error.value.errors[0])
+    with pytest.raises(RuntimeError, match="[Uu]ncertain"):
+        file.write(b"dirty")
+    file.flush()
+    file.close()
     client.close()
 
 

@@ -14,649 +14,441 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sequential read-ahead and write-behind on top of a [`Mount`].
-//!
-//! [`BufferedFile`] keeps a window of READ RPCs in flight ahead of a
-//! sequential reader and a window of UNSTABLE WRITE RPCs in flight behind a
-//! writer, so a single caller issuing one chunk at a time saturates the link
-//! the same way a queue depth of `N` would. Data written through the
-//! write-behind window is only durable after [`BufferedFile::flush`]
-//! (RFC 1813 §3.3.7 / RFC 5661 §18.32: UNSTABLE writes need a COMMIT).
+//! Bounded concurrent reads and per-call durable writes on top of a [`Mount`].
+//! Each write sends UNSTABLE chunks and completes one batch commit before
+//! returning. There is no deferred writeback or byte-based commit threshold.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinHandle;
-use tracing::warn;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, stream};
+use tokio::sync::Mutex;
 
 use crate::error::{NfsError, Result};
 use crate::mount::{Mount, WriteOutcome};
 
-/// Tunables for [`BufferedFile`]. Parsed from the `readahead` / `writeback`
-/// URL query parameters and exposed by [`Mount::io_options`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IoOptions {
-    /// Chunks (of the negotiated read size) kept in flight ahead of a
-    /// sequential reader. `0` disables read-ahead.
-    pub readahead: u32,
-    /// UNSTABLE WRITE chunks kept in flight behind a writer. `0` makes every
-    /// write synchronous and FILE_SYNC, which is the historical behaviour.
-    pub writeback: u32,
-    /// Uncommitted bytes after which a COMMIT is issued automatically.
-    pub commit_threshold: u64,
+/// Serialize batches sharing a mount and file, including separate Python
+/// handles. Weak entries do not retain mounts or file handles indefinitely.
+pub(crate) async fn file_gate(
+    identity: usize,
+    fh: Bytes,
+    kind: u8,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    type Gates = std::collections::HashMap<(usize, Bytes, u8), std::sync::Weak<Mutex<()>>>;
+    static GATES: std::sync::OnceLock<std::sync::Mutex<Gates>> = std::sync::OnceLock::new();
+    let gate = {
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = (identity, fh, kind);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            gate
+        } else {
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            let gate = Arc::new(Mutex::new(()));
+            gates.insert(key, Arc::downgrade(&gate));
+            gate
+        }
+    };
+    gate.lock_owned().await
 }
 
-impl Default for IoOptions {
-    fn default() -> Self {
-        Self {
-            readahead: 8,
-            writeback: 0,
-            commit_threshold: 16 * 1024 * 1024,
-        }
+#[async_trait]
+pub(crate) trait WriteIo: Send + Sync {
+    async fn begin_batch(&self, _fh: Bytes) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        None
+    }
+    fn write_chunk_size(&self) -> u32;
+    fn protocol(&self) -> crate::NFSVersion;
+    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
+    async fn commit_batch(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[WriteOutcome],
+    ) -> Result<()>;
+}
+
+#[async_trait]
+pub(crate) trait ReadIo: Send + Sync {
+    fn read_chunk_size(&self) -> u32;
+    async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes>;
+}
+
+#[async_trait]
+pub(crate) trait ChunkIo: WriteIo + ReadIo + 'static {
+    async fn close(&self, fh: Bytes) -> Result<()>;
+}
+
+struct MountWriter<'a, M: Mount + ?Sized>(&'a M);
+#[async_trait]
+impl<M: Mount + ?Sized> WriteIo for MountWriter<'_, M> {
+    async fn begin_batch(&self, fh: Bytes) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Some(file_gate(self.0 as *const M as *const () as usize, fh, 0).await)
+    }
+    fn write_chunk_size(&self) -> u32 {
+        self.0.get_max_write_size().max(1)
+    }
+    fn protocol(&self) -> crate::NFSVersion {
+        self.0.version()
+    }
+    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        self.0.write(fh, offset, data).await
+    }
+    async fn commit_batch(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[WriteOutcome],
+    ) -> Result<()> {
+        self.0.commit_write_batch(fh, offset, count, writes).await
     }
 }
 
-/// The subset of [`Mount`] a [`BufferedFile`] needs. Kept as a separate
-/// trait so the buffering logic can be unit-tested against a fake server.
 #[async_trait]
-pub(crate) trait ChunkIo: Send + Sync + 'static {
-    fn read_chunk_size(&self) -> u32;
-    fn write_chunk_size(&self) -> u32;
-    async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes>;
-    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32>;
-    async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<Option<[u8; 8]>>;
-    async fn close(&self, fh: Bytes) -> Result<()>;
+impl WriteIo for Arc<dyn Mount> {
+    async fn begin_batch(&self, fh: Bytes) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Some(file_gate(Arc::as_ptr(self) as *const () as usize, fh, 0).await)
+    }
+    fn write_chunk_size(&self) -> u32 {
+        self.get_max_write_size().max(1)
+    }
+    fn protocol(&self) -> crate::NFSVersion {
+        self.version()
+    }
+    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        self.write(fh, offset, data).await
+    }
+    async fn commit_batch(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[WriteOutcome],
+    ) -> Result<()> {
+        self.commit_write_batch(fh, offset, count, writes).await
+    }
+}
+
+#[async_trait]
+impl ReadIo for Arc<dyn Mount> {
+    fn read_chunk_size(&self) -> u32 {
+        self.get_max_read_size().max(1)
+    }
+    async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        Mount::read(self.as_ref(), fh, offset, count).await
+    }
 }
 
 #[async_trait]
 impl ChunkIo for Arc<dyn Mount> {
-    fn read_chunk_size(&self) -> u32 {
-        self.get_max_read_size().max(1)
-    }
-
-    fn write_chunk_size(&self) -> u32 {
-        self.get_max_write_size().max(1)
-    }
-
-    async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
-        Mount::read(self.as_ref(), fh, offset, count).await
-    }
-
-    async fn write_unstable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
-        Mount::write(self.as_ref(), fh, offset, data).await
-    }
-
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        Mount::write_stable(self.as_ref(), fh, offset, data).await
-    }
-
-    async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<Option<[u8; 8]>> {
-        Mount::commit_with_verifier(self.as_ref(), fh, offset, count).await
-    }
-
     async fn close(&self, fh: Bytes) -> Result<()> {
         Mount::close(self.as_ref(), fh).await
     }
 }
 
-struct ReadState {
-    /// Offset the next sequential read is expected at.
-    next: u64,
-    /// In-flight read-ahead chunks keyed by file offset. Each covers
-    /// `read_chunk` bytes unless the file ends first. A chunk dropped from
-    /// this map keeps running to completion but still holds its
-    /// `read_permits` slot, so the window bounds READs in flight, not just
-    /// the ones the reader still expects to consume.
-    pending: BTreeMap<u64, JoinHandle<Result<Bytes>>>,
-    /// Known end of file; nothing is prefetched at or beyond it.
-    eof: Option<u64>,
+/// Write all bytes and finish their data/metadata commit before returning.
+/// Uses at most 8 concurrent disjoint chunks, completing short writes before
+/// a single batch commit. Retains the payload for bounded verifier recovery. Calls on the same mount
+/// and file handle are serialized, including calls through separate adapters.
+/// Callers must coordinate overlapping writes made through other mounts.
+/// Cancellation may leave a partially executed write; adapters should settle
+/// this future even if their caller is cancelled.
+pub async fn write_all<M: Mount + ?Sized>(
+    mount: &M,
+    fh: Bytes,
+    offset: u64,
+    data: Bytes,
+) -> Result<u64> {
+    write_all_with(&MountWriter(mount), fh, offset, data).await
 }
 
-struct WriteState {
-    /// In-flight UNSTABLE writes, oldest first. Handles are detached (never
-    /// aborted) so a cancelled caller cannot leave a session slot dangling.
-    inflight: Vec<JoinHandle<Result<WriteOutcome>>>,
-    /// Small contiguous writes waiting to fill a chunk: `(offset, data)`.
-    staging: Option<(u64, BytesMut)>,
-    /// Data sent UNSTABLE since the last successful COMMIT, retained so it
-    /// can be resent if the server's write verifier changes.
-    uncommitted: Vec<(u64, Bytes)>,
-    uncommitted_bytes: u64,
-    /// Write verifier observed on the first UNSTABLE reply since the last COMMIT.
-    verifier: Option<[u8; 8]>,
-    verifier_changed: bool,
-    /// At least one reply since the last COMMIT was not FILE_SYNC.
-    needs_commit: bool,
-    /// First failure of a write-behind task, reported on the next call.
-    failed: Option<NfsError>,
+const WRITE_CONCURRENCY: usize = 8;
+
+/// Complete one disjoint range, retaining every short-write acknowledgement.
+/// Return partial progress along with errors so sibling results can be settled.
+async fn write_chunk_with<I: WriteIo + ?Sized>(
+    io: &I,
+    fh: Bytes,
+    offset: u64,
+    data: Bytes,
+) -> (u64, usize, Vec<WriteOutcome>, Option<NfsError>) {
+    let mut done = 0;
+    let mut receipts = Vec::new();
+    while done < data.len() {
+        let outcome = match io
+            .write_unstable(fh.clone(), offset + done as u64, data.slice(done..))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return (offset, done, receipts, Some(error)),
+        };
+        let n = outcome.count as usize;
+        if n == 0 || n > data.len() - done {
+            let error = write_failure(
+                NfsError::Rpc("server returned an invalid write count".into()),
+                io.protocol(),
+                done as u64,
+                true,
+                false,
+            );
+            return (offset, done, receipts, Some(error));
+        }
+        done += n;
+        receipts.push(outcome);
+    }
+    (offset, done, receipts, None)
 }
 
-/// A file handle with sequential read-ahead and write-behind.
-///
-/// Reads and writes may be issued concurrently from multiple tasks; the file
-/// serialises bookkeeping but never holds a lock across the network.
-///
-/// Data queued by [`BufferedFile::write_at`] is only durable after
-/// [`BufferedFile::flush`] or [`BufferedFile::close`]. `close` owns the
-/// CLOSE: it flushes first, so the file handle must not be closed on the
-/// `Mount` directly. Dropping a `BufferedFile` with queued data discards it
-/// (a warning is logged); there is no implicit flush.
+pub(crate) async fn write_all_with<I: WriteIo + ?Sized>(
+    io: &I,
+    fh: Bytes,
+    offset: u64,
+    data: Bytes,
+) -> Result<u64> {
+    let len = data.len() as u64;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| NfsError::InvalidInput("write range overflows u64".into()))?;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let _batch = io.begin_batch(fh.clone()).await;
+    for attempt in 0..3 {
+        let chunk = io.write_chunk_size().max(1) as usize;
+        let mut ranges = (0..data.len()).step_by(chunk);
+        let mut active = FuturesUnordered::new();
+        let write_range = |start: usize| {
+            let end = data.len().min(start.saturating_add(chunk));
+            write_chunk_with(
+                io,
+                fh.clone(),
+                offset + start as u64,
+                data.slice(start..end),
+            )
+        };
+        for start in ranges.by_ref().take(WRITE_CONCURRENCY) {
+            active.push(write_range(start));
+        }
+        let mut accepted = 0usize;
+        let mut receipts = Vec::new();
+        let mut failure: Option<(u64, NfsError)> = None;
+        let mut uncertain = false;
+        while let Some((start, done, chunk_receipts, error)) = active.next().await {
+            accepted += done;
+            receipts.extend(chunk_receipts);
+            if let Some(error) = error {
+                uncertain |= error
+                    .operation_outcome()
+                    .is_some_and(|outcome| outcome.outcome == crate::OperationOutcome::Uncertain);
+                // Deterministic diagnostics among attempted ranges. Stop
+                // admitting new ranges, but settle every active chunk.
+                if failure.as_ref().is_none_or(|(at, _)| start < *at) {
+                    failure = Some((start, error));
+                }
+            }
+            if failure.is_none()
+                && let Some(start) = ranges.next()
+            {
+                active.push(write_range(start));
+            }
+        }
+        if let Some((_, error)) = failure {
+            return Err(write_failure(
+                error,
+                io.protocol(),
+                accepted as u64,
+                false,
+                uncertain,
+            ));
+        }
+        let (commit_offset, count) = u32::try_from(len).map_or((0, 0), |n| (offset, n));
+        match io
+            .commit_batch(fh.clone(), commit_offset, count, &receipts)
+            .await
+        {
+            Ok(()) => return Ok(len),
+            Err(e)
+                if attempt < 2
+                    && e.operation_outcome()
+                        .is_some_and(|o| o.context().operation == "write_verifier") =>
+            {
+                continue;
+            }
+            Err(e) => return Err(write_failure(e, io.protocol(), len, true, false)),
+        }
+    }
+    unreachable!("last commit attempt always returns")
+}
+
+fn write_failure(
+    error: NfsError,
+    protocol: crate::NFSVersion,
+    accepted: u64,
+    commit: bool,
+    uncertain: bool,
+) -> NfsError {
+    // Concurrent ranges may have holes: completed_bytes is the sum of
+    // acknowledged bytes, not a contiguous resume offset or a durability
+    // guarantee. Once bytes have been accepted, a failure leaves the batch
+    // uncertain even when a later chunk received a definite protocol error.
+    // A sibling can have been transmitted without acknowledging any bytes.
+    // Its uncertainty must survive selection of a different diagnostic error.
+    if accepted == 0 && !commit && !uncertain {
+        return error;
+    }
+    NfsError::OperationOutcome(Box::new(
+        crate::OperationOutcomeError::new(
+            crate::OperationOutcome::Uncertain,
+            crate::OperationClass::ReplaySensitive,
+            crate::RecoveryAction::VerifyThenResume,
+            crate::RequestContext {
+                operation: if commit { "commit" } else { "write" }.into(),
+                protocol,
+                request_id: None,
+            },
+            error,
+        )
+        .with_completed_bytes(accepted),
+    ))
+}
+
+// Bound response memory and RPC pressure independently of the caller's buffer size.
+const READ_CONCURRENCY: usize = 8;
+
+/// Fill only the requested range. Consume responses in offset order so EOF
+/// or an error cannot leave a reported byte count that skips a hole.
+/// Short non-empty responses are continued rather than treated as EOF.
+pub(crate) async fn read_into_with<I, F>(
+    io: &I,
+    fh: Bytes,
+    offset: u64,
+    len: usize,
+    mut fill: F,
+) -> Result<usize>
+where
+    I: ReadIo + ?Sized,
+    F: FnMut(usize, &[u8]) -> Result<()> + Send,
+{
+    offset
+        .checked_add(
+            u64::try_from(len)
+                .map_err(|_| NfsError::InvalidInput("read buffer is too large".into()))?,
+        )
+        .ok_or_else(|| NfsError::InvalidInput("read range overflows u64".into()))?;
+    let chunk = io.read_chunk_size().max(1) as usize;
+    let mut reads = stream::iter((0..len).step_by(chunk))
+        .map(|start| {
+            let fh = fh.clone();
+            async move {
+                let want = chunk.min(len - start);
+                let mut got = 0;
+                let mut pieces = Vec::new();
+                while got < want {
+                    let data = io
+                        .read(
+                            fh.clone(),
+                            offset + start as u64 + got as u64,
+                            (want - got) as u32,
+                        )
+                        .await?;
+                    if data.len() > want - got {
+                        return Err(NfsError::Rpc(
+                            "server returned more READ data than requested".into(),
+                        ));
+                    }
+                    if data.is_empty() {
+                        break;
+                    }
+                    got += data.len();
+                    pieces.push(data);
+                }
+                Ok::<_, NfsError>((start, want, got, pieces))
+            }
+        })
+        .buffered(READ_CONCURRENCY);
+    let mut completed = 0;
+    while let Some(result) = reads.next().await {
+        let (start, want, got, pieces) = result?;
+        let mut at = start;
+        for piece in pieces {
+            fill(at, &piece)?;
+            at += piece.len();
+        }
+        completed += got;
+        if got < want {
+            break;
+        }
+    }
+    Ok(completed)
+}
+
+/// File convenience wrapper. Reads only the requested range, without prefetch
+/// or a retained cache; writes are durable before returning successfully.
 pub struct BufferedFile {
     io: Arc<dyn ChunkIo>,
     fh: Bytes,
-    opts: IoOptions,
-    read_chunk: u32,
-    write_chunk: u32,
-    reads: Mutex<ReadState>,
-    /// `read_at` calls currently in progress; read-ahead only engages for a
-    /// lone reader, callers that are already concurrent supply their own depth.
-    reads_in_flight: AtomicUsize,
-    /// One permit per read-ahead task, released when the READ completes,
-    /// whether or not the reader still wants the result.
-    read_permits: Arc<Semaphore>,
-    writes: Mutex<WriteState>,
-    write_permits: Arc<Semaphore>,
-}
-
-struct InFlightGuard<'a>(&'a AtomicUsize);
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+    writes: tokio::sync::RwLock<()>,
 }
 
 impl std::fmt::Debug for BufferedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferedFile")
-            .field("opts", &self.opts)
-            .field("read_chunk", &self.read_chunk)
-            .field("write_chunk", &self.write_chunk)
-            .finish()
+        f.debug_struct("BufferedFile").finish_non_exhaustive()
     }
 }
 
 impl BufferedFile {
-    /// Wrap `fh` (obtained from `open`/`create` on `mount`) using the mount's
-    /// negotiated transfer sizes and `opts`.
-    pub fn new(mount: Arc<dyn Mount>, fh: Bytes, opts: IoOptions) -> Self {
-        Self::with_io(Arc::new(mount), fh, opts)
+    pub fn new(mount: Arc<dyn Mount>, fh: Bytes) -> Self {
+        Self::with_io(Arc::new(mount), fh)
     }
 
-    pub(crate) fn with_io(io: Arc<dyn ChunkIo>, fh: Bytes, opts: IoOptions) -> Self {
-        let read_chunk = io.read_chunk_size();
-        let write_chunk = io.write_chunk_size();
-        let permits = opts.writeback.max(1) as usize;
+    pub(crate) fn with_io(io: Arc<dyn ChunkIo>, fh: Bytes) -> Self {
         Self {
             io,
             fh,
-            opts,
-            read_chunk,
-            write_chunk,
-            reads: Mutex::new(ReadState {
-                next: 0,
-                pending: BTreeMap::new(),
-                eof: None,
-            }),
-            reads_in_flight: AtomicUsize::new(0),
-            read_permits: Arc::new(Semaphore::new(opts.readahead as usize)),
-            writes: Mutex::new(WriteState {
-                inflight: Vec::new(),
-                staging: None,
-                uncommitted: Vec::new(),
-                uncommitted_bytes: 0,
-                verifier: None,
-                verifier_changed: false,
-                needs_commit: false,
-                failed: None,
-            }),
-            write_permits: Arc::new(Semaphore::new(permits)),
+            writes: tokio::sync::RwLock::new(()),
         }
     }
 
-    pub fn options(&self) -> IoOptions {
-        self.opts
-    }
-
-    /// Read up to `len` bytes at `offset`. Returns fewer bytes only at end of file.
     pub async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes> {
-        if len == 0 {
-            return Ok(Bytes::new());
-        }
-        self.settle_writes().await?;
-        if self.opts.readahead == 0 {
-            return self.read_direct(offset, len).await;
-        }
-        self.reads_in_flight.fetch_add(1, Ordering::AcqRel);
-        let _guard = InFlightGuard(&self.reads_in_flight);
-        let mut pieces: Vec<Bytes> = Vec::new();
-        let mut cur = offset;
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(self.read_chunk);
-            let piece = self.read_chunk_ahead(cur, want).await?;
-            let got = piece.len() as u32;
-            cur = cur.saturating_add(u64::from(got));
-            remaining -= got.min(remaining);
-            pieces.push(piece);
-            if got < want {
-                break;
-            }
-        }
-        Ok(concat(pieces, len as usize))
+        let _guard = self.writes.read().await;
+        let mut data = BytesMut::new();
+        read_into_with(
+            self.io.as_ref(),
+            self.fh.clone(),
+            offset,
+            len as usize,
+            |_, piece| {
+                data.extend_from_slice(piece);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(data.freeze())
     }
 
-    async fn read_direct(&self, offset: u64, len: u32) -> Result<Bytes> {
-        let mut pieces: Vec<Bytes> = Vec::new();
-        let mut cur = offset;
-        let mut remaining = len;
-        while remaining > 0 {
-            let want = remaining.min(self.read_chunk);
-            let piece = self.io.read(self.fh.clone(), cur, want).await?;
-            let got = (piece.len() as u32).min(want);
-            cur = cur.saturating_add(u64::from(got));
-            remaining -= got;
-            let short = got < want;
-            pieces.push(piece.slice(..got as usize));
-            if short {
-                break;
-            }
-        }
-        Ok(concat(pieces, len as usize))
-    }
-
-    /// Serve one chunk at `cur` from the read-ahead window (or directly) and
-    /// keep the window topped up ahead of the furthest reader.
-    ///
-    /// `next` is the frontier (one past the furthest chunk requested so far).
-    /// An access within one window of the frontier counts as sequential; a far
-    /// jump discards the window and starts over. The window is only topped up
-    /// for full-chunk requests from the sole reader in flight: a smaller read
-    /// is either a small file or a caller that does not stream, and
-    /// concurrent readers (QD > 1) interleave in ways a single window cannot
-    /// predict while already keeping the link busy by themselves.
-    async fn read_chunk_ahead(&self, cur: u64, want: u32) -> Result<Bytes> {
-        let window = u64::from(self.read_chunk).saturating_mul(u64::from(self.opts.readahead));
-        let solo = self.reads_in_flight.load(Ordering::Acquire) <= 1 && want == self.read_chunk;
-        let hit = {
-            let mut state = self.reads.lock().await;
-            let hit = state.pending.remove(&cur);
-            let end = cur.saturating_add(u64::from(want));
-            if hit.is_none() && cur.abs_diff(state.next) > window {
-                // Random access: forget the old window. Its tasks finish on
-                // their own and hand back their permits as they do, so a new
-                // window only opens as the old one drains.
-                state.pending.clear();
-                state.next = end;
-            } else {
-                state.next = state.next.max(end);
-                let floor = cur.saturating_sub(window);
-                state.pending.retain(|&key, _| key >= floor);
-                if solo {
-                    self.top_up(&mut state);
-                }
-            }
-            hit
-        };
-        let piece = match hit {
-            Some(handle) => handle.await.map_err(join_error)??,
-            None => self.io.read(self.fh.clone(), cur, want).await?,
-        };
-        let piece = if piece.len() > want as usize {
-            piece.slice(..want as usize)
-        } else {
-            piece
-        };
-        if piece.len() < want as usize {
-            let mut state = self.reads.lock().await;
-            let eof = cur.saturating_add(piece.len() as u64);
-            state.eof = Some(eof);
-            state.pending.retain(|&key, _| key < eof);
-        }
-        Ok(piece)
-    }
-
-    /// Spawn reads from the frontier upward until `readahead` chunks are
-    /// pending or every permit is held by a READ still in flight.
-    fn top_up(&self, state: &mut ReadState) {
-        let chunk = u64::from(self.read_chunk);
-        let mut key = state.next;
-        while state.pending.len() < self.opts.readahead as usize {
-            if state.eof.is_some_and(|eof| key >= eof) {
-                break;
-            }
-            if let Entry::Vacant(slot) = state.pending.entry(key) {
-                let Ok(permit) = Arc::clone(&self.read_permits).try_acquire_owned() else {
-                    break;
-                };
-                let io = Arc::clone(&self.io);
-                let fh = self.fh.clone();
-                let count = self.read_chunk;
-                slot.insert(tokio::spawn(async move {
-                    let _permit = permit;
-                    io.read(fh, key, count).await
-                }));
-            }
-            key = key.saturating_add(chunk);
-        }
-    }
-
-    async fn invalidate_reads(&self) {
-        let mut state = self.reads.lock().await;
-        state.pending.clear();
-        state.eof = None;
-    }
-
-    /// Write `data` at `offset`. With `writeback > 0` this returns once the
-    /// data is queued; durability and errors are reported by [`Self::flush`].
     pub async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.invalidate_reads().await;
-        if self.opts.writeback == 0 {
-            return self.write_all_stable(offset, data).await;
-        }
-        let mut state = self.writes.lock().await;
-        if let Some(error) = state.failed.take() {
-            return Err(error);
-        }
-        reap_finished(&mut state).await;
-        let mut offset = offset;
-        let mut data = data;
-        // Extend a contiguous staging buffer first.
-        let contiguous = state
-            .staging
-            .as_ref()
-            .is_some_and(|(start, buf)| start.saturating_add(buf.len() as u64) == offset);
-        if contiguous {
-            let chunk = self.write_chunk as usize;
-            let full = if let Some((_, buf)) = state.staging.as_mut() {
-                let take = (chunk - buf.len()).min(data.len());
-                buf.extend_from_slice(&data.split_to(take));
-                offset = offset.saturating_add(take as u64);
-                buf.len() == chunk
-            } else {
-                false
-            };
-            if full && let Some((start, buf)) = state.staging.take() {
-                self.emit(&mut state, start, buf.freeze()).await?;
-            }
-        } else if let Some((start, buf)) = state.staging.take() {
-            self.emit(&mut state, start, buf.freeze()).await?;
-        }
-        // Full chunks go out as-is (zero copy); the tail waits in staging.
-        while data.len() >= self.write_chunk as usize {
-            let chunk = data.split_to(self.write_chunk as usize);
-            self.emit(&mut state, offset, chunk).await?;
-            offset = offset.saturating_add(u64::from(self.write_chunk));
-        }
-        if !data.is_empty() {
-            let mut buf = BytesMut::with_capacity(self.write_chunk as usize);
-            buf.extend_from_slice(&data);
-            state.staging = Some((offset, buf));
-        }
-        Ok(())
-    }
-
-    /// Queue one chunk on the write-behind window, blocking while the window is full.
-    async fn emit(&self, state: &mut WriteState, offset: u64, chunk: Bytes) -> Result<()> {
-        let permit = Arc::clone(&self.write_permits)
-            .acquire_owned()
+        let _guard = self.writes.write().await;
+        write_all_with(self.io.as_ref(), self.fh.clone(), offset, data)
             .await
-            .map_err(|_| NfsError::Rpc("write-behind window closed".to_string()))?;
-        reap_finished(state).await;
-        if let Some(error) = state.failed.take() {
-            return Err(error);
-        }
-        let io = Arc::clone(&self.io);
-        let fh = self.fh.clone();
-        let data = chunk.clone();
-        state.inflight.push(tokio::spawn(async move {
-            let _permit = permit;
-            write_all_unstable(io.as_ref(), fh, offset, data).await
-        }));
-        state.uncommitted_bytes = state.uncommitted_bytes.saturating_add(chunk.len() as u64);
-        state.uncommitted.push((offset, chunk));
-        if state.uncommitted_bytes >= self.opts.commit_threshold {
-            self.commit_locked(state).await?;
-        }
-        Ok(())
+            .map(|_| ())
     }
 
-    /// Push staged data out and make everything written so far durable.
     pub async fn flush(&self) -> Result<()> {
-        if self.opts.writeback == 0 {
-            return Ok(());
-        }
-        let mut state = self.writes.lock().await;
-        if let Some(error) = state.failed.take() {
-            return Err(error);
-        }
-        reap_finished(&mut state).await;
-        if let Some((start, buf)) = state.staging.take() {
-            if state.inflight.is_empty() && state.uncommitted.is_empty() {
-                // Lone small write: one FILE_SYNC round trip beats WRITE + COMMIT.
-                return self.write_all_stable(start, buf.freeze()).await;
-            }
-            self.emit(&mut state, start, buf.freeze()).await?;
-        }
-        self.commit_locked(&mut state).await
-    }
-
-    /// Flush queued writes, then CLOSE the file on the mount. The CLOSE is
-    /// sent even when the flush fails, and the flush error is what is
-    /// returned in that case.
-    pub async fn close(self) -> Result<()> {
-        let flushed = self.flush().await;
-        let closed = self.io.close(self.fh.clone()).await;
-        {
-            let mut state = self.writes.lock().await;
-            state.staging = None;
-            state.uncommitted.clear();
-            state.uncommitted_bytes = 0;
-        }
-        flushed.and(closed)
-    }
-
-    /// Make in-flight writes visible to a subsequent read (no COMMIT needed).
-    async fn settle_writes(&self) -> Result<()> {
-        if self.opts.writeback == 0 {
-            return Ok(());
-        }
-        let mut state = self.writes.lock().await;
-        if state.staging.is_none() && state.inflight.is_empty() {
-            return Ok(());
-        }
-        if let Some((start, buf)) = state.staging.take() {
-            self.emit(&mut state, start, buf.freeze()).await?;
-        }
-        drain_inflight(&mut state).await;
-        match state.failed.take() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    async fn commit_locked(&self, state: &mut WriteState) -> Result<()> {
-        drain_inflight(state).await;
-        if let Some(error) = state.failed.take() {
-            state.uncommitted.clear();
-            state.uncommitted_bytes = 0;
-            return Err(error);
-        }
-        if state.uncommitted.is_empty() {
-            return Ok(());
-        }
-        let mut resend = state.verifier_changed;
-        if state.needs_commit {
-            let (offset, count) = commit_range(&state.uncommitted);
-            let verifier = self.io.commit(self.fh.clone(), offset, count).await?;
-            if let (Some(expected), Some(actual)) = (state.verifier, verifier)
-                && expected != actual
-            {
-                resend = true;
-            }
-        }
-        if resend {
-            warn!(
-                bytes = state.uncommitted_bytes,
-                "write verifier changed; resending uncommitted data FILE_SYNC"
-            );
-            for (offset, data) in std::mem::take(&mut state.uncommitted) {
-                self.write_all_stable(offset, data).await?;
-            }
-        }
-        state.uncommitted.clear();
-        state.uncommitted_bytes = 0;
-        state.verifier = None;
-        state.verifier_changed = false;
-        state.needs_commit = false;
+        let _guard = self.writes.write().await;
         Ok(())
     }
 
-    async fn write_all_stable(&self, offset: u64, data: Bytes) -> Result<()> {
-        let mut done = 0usize;
-        while done < data.len() {
-            let n = self
-                .io
-                .write_stable(self.fh.clone(), offset + done as u64, data.slice(done..))
-                .await? as usize;
-            if n == 0 || n > data.len() - done {
-                return Err(NfsError::Rpc(
-                    "server returned an invalid write count".to_string(),
-                ));
-            }
-            done += n;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for BufferedFile {
-    fn drop(&mut self) {
-        if let Ok(state) = self.writes.try_lock()
-            && (state.staging.is_some() || !state.uncommitted.is_empty())
-        {
-            warn!(
-                staged = state.staging.as_ref().map_or(0, |(_, buf)| buf.len()),
-                uncommitted = state.uncommitted_bytes,
-                "BufferedFile dropped with queued writes; call flush() or close() first"
-            );
-        }
-    }
-}
-
-async fn write_all_unstable(
-    io: &dyn ChunkIo,
-    fh: Bytes,
-    offset: u64,
-    data: Bytes,
-) -> Result<WriteOutcome> {
-    let mut done = 0usize;
-    let mut stable = true;
-    let mut verifier = None;
-    while done < data.len() {
-        let out = io
-            .write_unstable(fh.clone(), offset + done as u64, data.slice(done..))
-            .await?;
-        let n = out.count as usize;
-        if n == 0 || n > data.len() - done {
-            return Err(NfsError::Rpc(
-                "server returned an invalid write count".to_string(),
-            ));
-        }
-        done += n;
-        stable &= out.stable;
-        if out.verifier.is_some() {
-            verifier = out.verifier;
-        }
-    }
-    Ok(WriteOutcome {
-        count: done as u32,
-        stable,
-        verifier,
-    })
-}
-
-type TaskResult = std::result::Result<Result<WriteOutcome>, tokio::task::JoinError>;
-
-fn record_outcome(state: &mut WriteState, result: TaskResult) {
-    match result {
-        Ok(Ok(outcome)) => {
-            if !outcome.stable {
-                state.needs_commit = true;
-            }
-            if let Some(verifier) = outcome.verifier {
-                match state.verifier {
-                    None => state.verifier = Some(verifier),
-                    Some(expected) if expected != verifier => state.verifier_changed = true,
-                    Some(_) => {}
-                }
-            }
-        }
-        Ok(Err(error)) => {
-            state.failed.get_or_insert(error);
-        }
-        Err(error) => {
-            state.failed.get_or_insert(join_error(error));
-        }
-    }
-}
-
-/// Collect outcomes of tasks that already finished, without waiting on the rest.
-async fn reap_finished(state: &mut WriteState) {
-    let (done, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut state.inflight)
-        .into_iter()
-        .partition(|handle| handle.is_finished());
-    state.inflight = pending;
-    for handle in done {
-        let result = handle.await;
-        record_outcome(state, result);
-    }
-}
-
-async fn drain_inflight(state: &mut WriteState) {
-    for handle in std::mem::take(&mut state.inflight) {
-        let result = handle.await;
-        record_outcome(state, result);
-    }
-}
-
-fn commit_range(uncommitted: &[(u64, Bytes)]) -> (u64, u32) {
-    let start = uncommitted.iter().map(|(o, _)| *o).min().unwrap_or(0);
-    let end = uncommitted
-        .iter()
-        .map(|(o, d)| o.saturating_add(d.len() as u64))
-        .max()
-        .unwrap_or(0);
-    match u32::try_from(end.saturating_sub(start)) {
-        Ok(count) => (start, count),
-        Err(_) => (0, 0),
-    }
-}
-
-fn join_error(error: tokio::task::JoinError) -> NfsError {
-    NfsError::Rpc(format!("buffered I/O task failed: {error}"))
-}
-
-fn concat(pieces: Vec<Bytes>, capacity: usize) -> Bytes {
-    match pieces.len() {
-        0 => Bytes::new(),
-        1 => pieces.into_iter().next().unwrap_or_default(),
-        _ => {
-            let mut buf = BytesMut::with_capacity(capacity);
-            for piece in pieces {
-                buf.extend_from_slice(&piece);
-            }
-            buf.freeze()
-        }
+    pub async fn close(&self) -> Result<()> {
+        let _guard = self.writes.write().await;
+        self.io.close(self.fh.clone()).await
     }
 }
 
@@ -671,7 +463,6 @@ mod tests {
         data: AsyncMutex<Vec<u8>>,
         reads: AtomicUsize,
         unstable_writes: AtomicUsize,
-        stable_writes: AtomicUsize,
         commits: AtomicUsize,
         closes: AtomicUsize,
         max_concurrent_reads: AtomicUsize,
@@ -680,18 +471,23 @@ mod tests {
         concurrent_writes: AtomicUsize,
         verifier: AtomicU32,
         fail_unstable_at: Option<u64>,
+        fail_write_offset: Option<u64>,
+        write_error: Option<fn(u64) -> NfsError>,
+        write_delay: Option<fn(u64) -> u64>,
         report_stable: bool,
         commit_verifier_bump: bool,
+        change_once: bool,
+        chunk_size: u32,
+        short_write: usize,
+        short_read: usize,
+        fail_read_at: Option<u64>,
         /// Per-offset READ latency in milliseconds (default 5 ms).
         read_delay: Option<fn(u64) -> u64>,
     }
 
     #[async_trait]
-    impl ChunkIo for Fake {
+    impl ReadIo for Fake {
         fn read_chunk_size(&self) -> u32 {
-            4
-        }
-        fn write_chunk_size(&self) -> u32 {
             4
         }
         async fn read(&self, _fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
@@ -700,11 +496,40 @@ mod tests {
             let delay = self.read_delay.map_or(5, |f| f(offset));
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_read_at == Some(offset) {
+                self.concurrent_reads.fetch_sub(1, Ordering::SeqCst);
+                return Err(NfsError::Rpc("scripted read failure".into()));
+            }
+            let count = if self.short_read > 0 {
+                count.min(self.short_read as u32)
+            } else {
+                count
+            };
             let data = self.data.lock().await;
             let start = (offset as usize).min(data.len());
             let end = (start + count as usize).min(data.len());
             self.concurrent_reads.fetch_sub(1, Ordering::SeqCst);
             Ok(Bytes::copy_from_slice(&data[start..end]))
+        }
+    }
+    #[async_trait]
+    impl ChunkIo for Fake {
+        async fn close(&self, _fh: Bytes) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl WriteIo for Fake {
+        fn write_chunk_size(&self) -> u32 {
+            if self.chunk_size == 0 {
+                4
+            } else {
+                self.chunk_size
+            }
+        }
+        fn protocol(&self) -> crate::NFSVersion {
+            crate::NFSVersion::NFSv3
         }
         async fn write_unstable(
             &self,
@@ -715,32 +540,63 @@ mod tests {
             if self.fail_unstable_at.is_some_and(|at| offset >= at) {
                 return Err(NfsError::Rpc("scripted write failure".to_string()));
             }
+            let data = if self.short_write > 0 {
+                data.slice(..data.len().min(self.short_write))
+            } else {
+                data
+            };
             let now = self.concurrent_writes.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_concurrent_writes.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let delay = self.write_delay.map_or(5, |f| f(offset));
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            if let Some(error) = self.write_error {
+                self.concurrent_writes.fetch_sub(1, Ordering::SeqCst);
+                return Err(error(offset));
+            }
+            if self.fail_write_offset == Some(offset) {
+                self.concurrent_writes.fetch_sub(1, Ordering::SeqCst);
+                return Err(NfsError::Rpc("scripted write failure".into()));
+            }
             self.unstable_writes.fetch_add(1, Ordering::SeqCst);
             self.store(offset, &data).await;
             self.concurrent_writes.fetch_sub(1, Ordering::SeqCst);
             let v = self.verifier.load(Ordering::SeqCst);
             Ok(WriteOutcome {
+                pnfs: None,
                 count: data.len() as u32,
-                stable: self.report_stable,
+                committed: if self.report_stable {
+                    crate::WriteCommitted::FileSync
+                } else {
+                    crate::WriteCommitted::Unstable
+                },
                 verifier: Some([v as u8; 8]),
             })
         }
-        async fn write_stable(&self, _fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-            self.stable_writes.fetch_add(1, Ordering::SeqCst);
-            self.store(offset, &data).await;
-            Ok(data.len() as u32)
-        }
-        async fn commit(&self, _fh: Bytes, _offset: u64, _count: u32) -> Result<Option<[u8; 8]>> {
-            self.commits.fetch_add(1, Ordering::SeqCst);
-            let v = self.verifier.load(Ordering::SeqCst) + u32::from(self.commit_verifier_bump);
-            Ok(Some([v as u8; 8]))
-        }
-        async fn close(&self, _fh: Bytes) -> Result<()> {
-            self.closes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        async fn commit_batch(
+            &self,
+            _fh: Bytes,
+            _offset: u64,
+            _count: u32,
+            writes: &[WriteOutcome],
+        ) -> Result<()> {
+            assert_eq!(
+                self.concurrent_writes.load(Ordering::SeqCst),
+                0,
+                "COMMIT raced an active WRITE"
+            );
+            if writes
+                .iter()
+                .all(|w| w.committed == crate::WriteCommitted::FileSync)
+            {
+                return Ok(());
+            }
+            let call = self.commits.fetch_add(1, Ordering::SeqCst);
+            let v = if self.commit_verifier_bump || (self.change_once && call == 0) {
+                self.verifier.fetch_add(1, Ordering::SeqCst) + 1
+            } else {
+                self.verifier.load(Ordering::SeqCst)
+            };
+            crate::mount::verify_write_batch(self.protocol(), writes, Some([v as u8; 8]))
         }
     }
 
@@ -755,125 +611,85 @@ mod tests {
         }
     }
 
-    fn file(fake: Arc<Fake>, readahead: u32, writeback: u32) -> BufferedFile {
-        BufferedFile::with_io(
-            fake,
-            Bytes::from_static(b"fh"),
-            IoOptions {
-                readahead,
-                writeback,
-                commit_threshold: 16,
-            },
-        )
+    fn file(fake: Arc<Fake>) -> BufferedFile {
+        BufferedFile::with_io(fake, Bytes::from_static(b"fh"))
     }
 
     #[tokio::test]
-    async fn sequential_reads_prefetch_and_return_data() {
-        let fake = Arc::new(Fake {
-            data: AsyncMutex::new((0..40u8).collect()),
+    async fn concurrent_reads_fill_requested_range_without_prefetch() {
+        let fake = Fake {
+            data: AsyncMutex::new((0..200u8).collect()),
+            read_delay: Some(|offset| if offset == 0 { 20 } else { 1 }),
             ..Default::default()
-        });
-        let f = file(fake.clone(), 3, 0);
-        let mut got = Vec::new();
-        let mut off = 0;
-        loop {
-            let piece = f.read_at(off, 4).await.unwrap();
-            if piece.is_empty() {
-                break;
-            }
-            got.extend_from_slice(&piece);
-            off += piece.len() as u64;
-        }
-        assert_eq!(got, (0..40u8).collect::<Vec<_>>());
-        assert!(fake.max_concurrent_reads.load(Ordering::SeqCst) >= 2);
-        // 10 data chunks plus at most `readahead` empty probes past the end.
-        assert!(fake.reads.load(Ordering::SeqCst) <= 14);
-    }
-
-    #[tokio::test]
-    async fn random_reads_do_not_prefetch() {
-        let fake = Arc::new(Fake {
-            data: AsyncMutex::new((0..80u8).collect()),
-            ..Default::default()
-        });
-        // chunk 4 × readahead 3 = 12-byte window; every jump below is wider.
-        let f = file(fake.clone(), 3, 0);
-        assert_eq!(&f.read_at(40, 4).await.unwrap()[..], &[40, 41, 42, 43]);
-        assert_eq!(&f.read_at(4, 4).await.unwrap()[..], &[4, 5, 6, 7]);
-        assert_eq!(&f.read_at(64, 2).await.unwrap()[..], &[64, 65]);
-        // Let any stray prefetch tasks finish before counting.
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert_eq!(fake.reads.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn concurrent_readers_do_not_thrash_the_window() {
-        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
-        let fake = Arc::new(Fake {
-            data: AsyncMutex::new(data.clone()),
-            ..Default::default()
-        });
-        let f = Arc::new(file(fake.clone(), 8, 0));
-        let mut tasks = Vec::new();
-        for k in 0..8u64 {
-            let f = Arc::clone(&f);
-            tasks.push(tokio::spawn(async move {
-                let mut got = Vec::new();
-                for i in (k..1024).step_by(8) {
-                    // Jitter so the eight readers arrive out of order.
-                    tokio::time::sleep(std::time::Duration::from_micros((i * 7) % 300)).await;
-                    got.push((i * 4, f.read_at(i * 4, 4).await.unwrap()));
-                }
-                got
-            }));
-        }
-        let mut all: Vec<(u64, Bytes)> = Vec::new();
-        for task in tasks {
-            all.extend(task.await.unwrap());
-        }
-        all.sort_by_key(|(offset, _)| *offset);
-        let joined: Vec<u8> = all.iter().flat_map(|(_, b)| b.iter().copied()).collect();
-        assert_eq!(joined, data);
-        // 1024 chunks; concurrent readers must not trigger extra refetching.
-        assert!(fake.reads.load(Ordering::SeqCst) < 1024 + 64);
-        assert!(fake.max_concurrent_reads.load(Ordering::SeqCst) >= 4);
-    }
-
-    #[tokio::test]
-    async fn discarded_windows_stay_within_the_readahead_bound() {
-        // A full-chunk read after a far jump opens a window; the next far jump
-        // discards it while its READs are still on the wire. Prefetch targets
-        // answer slowly so dropped windows pile up unless in-flight READs are
-        // bounded globally: the total must stay at readahead + the reader's
-        // own chunk no matter how many windows were dropped.
-        fn prefetch_targets_are_slow(offset: u64) -> u64 {
-            if offset % 400 >= 8 { 300 } else { 5 }
-        }
-        let fake = Arc::new(Fake {
-            data: AsyncMutex::new((0..=255u8).cycle().take(4096).collect()),
-            read_delay: Some(prefetch_targets_are_slow),
-            ..Default::default()
-        });
-        let f = file(fake.clone(), 3, 0);
-        for jump in 0..6u64 {
-            let offset = jump * 400;
-            assert_eq!(f.read_at(offset, 4).await.unwrap().len(), 4);
-            assert_eq!(f.read_at(offset + 4, 4).await.unwrap().len(), 4);
-        }
+        };
+        let mut target = [255; 100];
+        let n = read_into_with(&fake, Bytes::new(), 0, target.len(), |at, data| {
+            target[at..at + data.len()].copy_from_slice(data);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(target.as_slice(), &(0..100u8).collect::<Vec<_>>());
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 25);
         let peak = fake.max_concurrent_reads.load(Ordering::SeqCst);
-        assert!(peak <= 4, "in-flight READs escaped the window: {peak}");
+        assert!(peak > 1 && peak <= READ_CONCURRENCY);
     }
 
     #[tokio::test]
-    async fn small_reads_do_not_prefetch() {
-        let fake = Arc::new(Fake {
-            data: AsyncMutex::new((0..40u8).collect()),
+    async fn short_reads_are_completed_and_eof_leaves_buffer_tail_untouched() {
+        let fake = Fake {
+            data: AsyncMutex::new((0..25u8).collect()),
+            short_read: 2,
             ..Default::default()
-        });
-        let f = file(fake.clone(), 3, 0);
-        assert_eq!(&f.read_at(0, 2).await.unwrap()[..], &[0, 1]);
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
+        };
+        let mut target = [255; 32];
+        let n = read_into_with(&fake, Bytes::new(), 3, target.len(), |at, data| {
+            target[at..at + data.len()].copy_from_slice(data);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(n, 22);
+        assert_eq!(&target[..n], &(3..25u8).collect::<Vec<_>>());
+        assert_eq!(&target[n..], &[255; 10]);
+    }
+
+    #[tokio::test]
+    async fn read_error_never_copies_data_beyond_a_hole() {
+        let fake = Fake {
+            data: AsyncMutex::new((0..40u8).collect()),
+            fail_read_at: Some(4),
+            ..Default::default()
+        };
+        let mut target = [255; 20];
+        assert!(
+            read_into_with(&fake, Bytes::new(), 0, target.len(), |at, data| {
+                target[at..at + data.len()].copy_from_slice(data);
+                Ok(())
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(&target[..4], &[0, 1, 2, 3]);
+        assert_eq!(&target[4..], &[255; 16]);
+    }
+
+    #[tokio::test]
+    async fn empty_and_overflow_reads_send_no_requests() {
+        let fake = Fake::default();
+        assert_eq!(
+            read_into_with(&fake, Bytes::new(), 0, 0, |_, _| panic!("no data"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            read_into_with(&fake, Bytes::new(), u64::MAX, 1, |_, _| panic!("no data"))
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -882,46 +698,131 @@ mod tests {
             data: AsyncMutex::new((0..10u8).collect()),
             ..Default::default()
         });
-        let f = file(fake, 2, 0);
+        let f = file(fake);
         let all = f.read_at(0, 64).await.unwrap();
         assert_eq!(&all[..], &(0..10u8).collect::<Vec<_>>()[..]);
         assert!(f.read_at(10, 4).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn small_writes_coalesce_into_one_stable_write() {
+    async fn writes_use_at_most_eight_chunks_and_commit_after_all_short_writes() {
+        let fake = Fake {
+            short_write: 2,
+            write_delay: Some(|offset| if offset == 7 { 20 } else { 2 }),
+            ..Default::default()
+        };
+        let payload = Bytes::from((0..200u8).collect::<Vec<_>>());
+        assert_eq!(
+            write_all_with(&fake, Bytes::new(), 7, payload.clone())
+                .await
+                .unwrap(),
+            200
+        );
+        assert_eq!(&fake.data.lock().await[7..], payload.as_ref());
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 100);
+        assert_eq!(
+            fake.max_concurrent_writes.load(Ordering::SeqCst),
+            WRITE_CONCURRENCY
+        );
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_uncertainty_survives_lowest_offset_definite_error_without_acknowledgements() {
+        for delay in [
+            (|offset| if offset == 0 { 1 } else { 10 }) as fn(u64) -> u64,
+            (|offset| if offset == 0 { 10 } else { 1 }) as fn(u64) -> u64,
+        ] {
+            let fake = Fake {
+                write_delay: Some(delay),
+                write_error: Some(|offset| {
+                    if offset == 0 {
+                        return NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOSPC);
+                    }
+                    NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
+                        crate::OperationOutcome::Uncertain,
+                        crate::OperationClass::ReplaySensitive,
+                        crate::RecoveryAction::VerifyThenResume,
+                        crate::RequestContext {
+                            operation: "write".into(),
+                            protocol: crate::NFSVersion::NFSv3,
+                            request_id: None,
+                        },
+                        NfsError::Rpc("reply lost after transmission".into()),
+                    )))
+                }),
+                ..Default::default()
+            };
+            let error = write_all_with(&fake, Bytes::new(), 0, Bytes::from(vec![9; 32]))
+                .await
+                .unwrap_err();
+            let outcome = error
+                .operation_outcome()
+                .expect("sibling may have modified the file");
+            assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+            assert_eq!(outcome.completed_bytes, Some(0));
+            assert!(matches!(
+                *outcome.source,
+                NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOSPC)
+            ));
+            assert_eq!(fake.concurrent_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.commits.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_stops_admission_settles_siblings_and_skips_commit() {
+        let fake = Fake {
+            fail_write_offset: Some(0),
+            write_delay: Some(|offset| if offset == 0 { 1 } else { 20 }),
+            ..Default::default()
+        };
+        let error = write_all_with(&fake, Bytes::new(), 0, Bytes::from(vec![9; 200]))
+            .await
+            .unwrap_err();
+        assert_eq!(fake.concurrent_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.unstable_writes.load(Ordering::SeqCst),
+            WRITE_CONCURRENCY - 1
+        );
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 0);
+        let outcome = error.operation_outcome().unwrap();
+        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+        assert_eq!(
+            outcome.completed_bytes,
+            Some(((WRITE_CONCURRENCY - 1) * 4) as u64)
+        );
+        let data = fake.data.lock().await;
+        assert_eq!(&data[..4], &[0; 4]);
+        assert_eq!(&data[4..], &[9; (WRITE_CONCURRENCY - 1) * 4]);
+    }
+
+    #[tokio::test]
+    async fn small_writes_each_commit_before_return() {
         let fake = Arc::new(Fake::default());
-        let f = file(fake.clone(), 0, 4);
+        let f = file(fake.clone());
         f.write_at(0, Bytes::from_static(b"a")).await.unwrap();
         f.write_at(1, Bytes::from_static(b"b")).await.unwrap();
         f.write_at(2, Bytes::from_static(b"c")).await.unwrap();
         f.flush().await.unwrap();
-        assert_eq!(fake.stable_writes.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(fake.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 3);
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 3);
         assert_eq!(&fake.data.lock().await[..], b"abc");
     }
 
     #[tokio::test]
-    async fn chunked_writes_pipeline_and_commit_on_flush() {
+    async fn each_write_commits_before_return_and_flush_does_not_repeat() {
         let fake = Arc::new(Fake::default());
-        let f = file(fake.clone(), 0, 4);
-        let payload: Vec<u8> = (0..32u8).collect();
-        for i in 0..8 {
-            f.write_at(
-                i * 4,
-                Bytes::copy_from_slice(&payload[i as usize * 4..][..4]),
-            )
-            .await
-            .unwrap();
-        }
-        f.flush().await.unwrap();
-        assert_eq!(&fake.data.lock().await[..], &payload[..]);
+        let f = file(fake.clone());
+        f.write_at(0, Bytes::from(vec![42; 32])).await.unwrap();
         assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 8);
-        assert!(fake.max_concurrent_writes.load(Ordering::SeqCst) >= 2);
-        // 32 bytes with a 16-byte threshold: one automatic COMMIT plus the flush.
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+        f.write_at(32, Bytes::from_static(b"tail")).await.unwrap();
         assert_eq!(fake.commits.load(Ordering::SeqCst), 2);
-        assert_eq!(fake.stable_writes.load(Ordering::SeqCst), 0);
+        f.flush().await.unwrap();
+        f.close().await.unwrap();
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -930,103 +831,108 @@ mod tests {
             report_stable: true,
             ..Default::default()
         });
-        let f = file(fake.clone(), 0, 2);
-        f.write_at(0, Bytes::from_static(b"abcdefgh"))
+        file(fake.clone())
+            .write_at(0, Bytes::from_static(b"abcdefgh"))
             .await
             .unwrap();
-        f.flush().await.unwrap();
         assert_eq!(fake.commits.load(Ordering::SeqCst), 0);
-        assert_eq!(&fake.data.lock().await[..], b"abcdefgh");
     }
 
     #[tokio::test]
-    async fn verifier_change_resends_uncommitted_data_stable() {
+    async fn verifier_recovery_is_bounded_and_never_uses_file_sync() {
         let fake = Arc::new(Fake {
-            commit_verifier_bump: true, // COMMIT reports a different verifier: "server rebooted"
+            commit_verifier_bump: true,
             ..Default::default()
         });
-        let f = file(fake.clone(), 0, 4);
-        f.write_at(0, Bytes::from_static(b"abcdefgh"))
-            .await
-            .unwrap();
-        f.flush().await.unwrap();
-        assert_eq!(fake.stable_writes.load(Ordering::SeqCst), 2);
-        assert_eq!(&fake.data.lock().await[..], b"abcdefgh");
+        assert!(
+            file(fake.clone())
+                .write_at(0, Bytes::from_static(b"abcdefgh"))
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 3);
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 6);
     }
 
     #[tokio::test]
-    async fn close_commits_queued_writes_before_closing() {
-        // One full chunk in flight UNSTABLE plus a staged tail: close must
-        // push the tail, COMMIT, and only then CLOSE.
-        let fake = Arc::new(Fake::default());
-        let f = file(fake.clone(), 0, 2);
-        f.write_at(0, Bytes::from_static(b"abcde")).await.unwrap();
-        assert_eq!(fake.closes.load(Ordering::SeqCst), 0);
-        f.close().await.unwrap();
-        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
-        assert_eq!(fake.data.lock().await.as_slice(), b"abcde");
-    }
-
-    #[tokio::test]
-    async fn close_reports_the_flush_error_and_still_closes() {
-        let fake = Arc::new(Fake {
-            fail_unstable_at: Some(0),
-            ..Default::default()
-        });
-        let f = file(fake.clone(), 0, 2);
-        f.write_at(0, Bytes::from_static(b"abcdefgh"))
-            .await
-            .unwrap();
-        assert!(f.close().await.is_err());
-        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn write_failure_is_reported_on_flush() {
+    async fn partial_failure_is_reported_by_write_as_uncertain() {
         let fake = Arc::new(Fake {
             fail_unstable_at: Some(4),
             ..Default::default()
         });
-        let f = file(fake, 0, 4);
-        f.write_at(0, Bytes::from_static(b"abcdefgh"))
+        let error = file(fake.clone())
+            .write_at(0, Bytes::from_static(b"abcdefgh"))
             .await
-            .unwrap();
-        assert!(matches!(f.flush().await, Err(NfsError::Rpc(_))));
-        assert!(f.flush().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn read_after_write_sees_queued_data() {
-        let fake = Arc::new(Fake::default());
-        let f = file(fake.clone(), 2, 4);
-        f.write_at(0, Bytes::from_static(b"abcdefghij"))
-            .await
-            .unwrap();
-        assert_eq!(&f.read_at(4, 6).await.unwrap()[..], b"efghij");
-        f.flush().await.unwrap();
-        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn writeback_zero_is_synchronous_and_stable() {
-        let fake = Arc::new(Fake::default());
-        let f = file(fake.clone(), 0, 0);
-        f.write_at(0, Bytes::from_static(b"abcdefgh"))
-            .await
-            .unwrap();
-        assert_eq!(fake.stable_writes.load(Ordering::SeqCst), 1);
-        f.flush().await.unwrap();
+            .unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            crate::OperationOutcome::Uncertain
+        );
         assert_eq!(fake.commits.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn commit_range_covers_all_chunks() {
-        let chunks = vec![
-            (8, Bytes::from_static(b"abcd")),
-            (0, Bytes::from_static(b"ab")),
-        ];
-        assert_eq!(commit_range(&chunks), (0, 12));
-        assert_eq!(commit_range(&[]), (0, 0));
+    #[tokio::test]
+    async fn reads_after_write_observe_new_data() {
+        let fake = Arc::new(Fake {
+            data: AsyncMutex::new(vec![0; 16]),
+            ..Default::default()
+        });
+        let f = file(fake.clone());
+        f.read_at(0, 4).await.unwrap();
+        f.write_at(4, Bytes::from_static(b"changed!"))
+            .await
+            .unwrap();
+        assert_eq!(&f.read_at(4, 8).await.unwrap()[..], b"changed!");
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn large_call_has_one_commit_and_short_writes_are_completed() {
+        let fake = Arc::new(Fake {
+            chunk_size: 1024 * 1024,
+            ..Default::default()
+        });
+        let data = Bytes::from(vec![7; 17 * 1024 * 1024]);
+        file(fake.clone()).write_at(0, data.clone()).await.unwrap();
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 17);
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.data.lock().await.as_slice(), data.as_ref());
+
+        let fake = Arc::new(Fake {
+            short_write: 2,
+            ..Default::default()
+        });
+        file(fake.clone())
+            .write_at(0, Bytes::from_static(b"abcdefghij"))
+            .await
+            .unwrap();
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 5);
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.data.lock().await.as_slice(), b"abcdefghij");
+    }
+
+    #[tokio::test]
+    async fn verifier_change_rewrites_retained_data_and_recommits() {
+        let fake = Arc::new(Fake {
+            change_once: true,
+            ..Default::default()
+        });
+        file(fake.clone())
+            .write_at(0, Bytes::from_static(b"abcdefgh"))
+            .await
+            .unwrap();
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.commits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn overflow_is_rejected_before_any_write() {
+        let fake = Arc::new(Fake::default());
+        assert!(
+            file(fake.clone())
+                .write_at(u64::MAX, Bytes::from_static(b"a"))
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 0);
     }
 }

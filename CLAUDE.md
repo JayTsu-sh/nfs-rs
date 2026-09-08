@@ -43,7 +43,7 @@ Pure Rust NFS client library (NetApp), built as a native Rust library.
 
 `parse_url_and_mount(url, max_retries)` in `src/lib.rs` parses a `nfs://host/export[?params]` URL and returns a `Box<dyn Mount>`. It calls `nfs3::mount()` for NFSv3 (the only real implementation).
 
-URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`, `rsize`, `wsize`.
+URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`. Read/write sizes are negotiated automatically; see `src/mount.rs::negotiated_io_size` and the version-specific mount code.
 
 ### Public Interface: `Mount` Trait (`src/mount.rs`)
 
@@ -72,7 +72,7 @@ Each NFSv3 procedure (access, read, write, lookup, etc.) has its own file in `sr
 3. MOUNT NULL (ping)
 4. MOUNT MNT → get root file handle
 5. NFS NULL (ping)
-6. FSINFO → clamp `rsize`/`wsize` to server limits (min 8 KiB, max 4 MiB)
+6. FSINFO → derive read/write sizes from `rtmax`/`wtmax`, bounded by the client payload ceiling; reject zero limits
 
 ### XDR Types
 

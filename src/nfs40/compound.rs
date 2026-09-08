@@ -899,8 +899,8 @@ pub(crate) fn decode_read_response(buf: Bytes) -> Result<Bytes> {
     }
     expect_op(&mut buf, OP_PUTFH, "PUTFH")?;
     expect_op(&mut buf, OP_READ, "READ")?;
-    let _eof = take_u32(&mut buf, "READ eof")?;
-    take_opaque(&mut buf, "READ data")
+    let eof = take_u32(&mut buf, "READ eof")? != 0;
+    crate::mount::read_reply(take_opaque(&mut buf, "READ data")?, eof)
 }
 
 pub(crate) fn decode_write_response(buf: Bytes) -> Result<(u32, u32, [u8; 8])> {

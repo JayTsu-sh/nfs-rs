@@ -8,7 +8,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt};
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple, PyType};
@@ -26,7 +27,10 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
-type DirectoryItem = std::result::Result<Py<PyDict>, NfsError>;
+// Keep protocol work independent of the GIL and bound queued directory memory.
+const DIRECTORY_BATCH_SIZE: usize = 128;
+type DirectoryEntry = (String, Attr, Bytes);
+type DirectoryItem = Result<Vec<DirectoryEntry>>;
 
 fn deadline_exceeded(operation: &str) -> NfsError {
     NfsError::Io(std::io::Error::new(
@@ -260,8 +264,6 @@ enum FileBackend {
         file_handle: Bytes,
         max_read: u32,
         max_write: u32,
-        /// Read-ahead / write-behind window; `None` when both are disabled.
-        buffered: Option<Box<crate::BufferedFile>>,
     },
     #[cfg(feature = "python-test-support")]
     Test {
@@ -332,7 +334,7 @@ struct FileResource {
     position_uncertain: AtomicBool,
     open_state_lost: AtomicBool,
     recovery_generation: u64,
-    dirty_state: tokio::sync::Mutex<DirtyState>,
+    mutation_gate: RwLock<()>,
     close_state: Mutex<FileCloseState>,
     close_started: Notify,
     close_notify: Notify,
@@ -344,12 +346,6 @@ struct FileResource {
     test_commit_calls: AtomicU64,
     #[cfg(feature = "python-test-support")]
     test_verifier_change: bool,
-}
-
-#[derive(Debug, Default)]
-struct DirtyState {
-    ranges: Vec<(u64, u64)>,
-    verifier: Option<[u8; 8]>,
 }
 
 #[derive(Debug, Default)]
@@ -422,36 +418,142 @@ fn with_confirmed_bytes(mut error: NfsError, confirmed: u64, protocol: NFSVersio
     ))
 }
 
-fn write_uncertain_error(message: &str, protocol: NFSVersion, confirmed: u64) -> NfsError {
-    with_confirmed_bytes(
-        NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
-            crate::OperationOutcome::Uncertain,
-            crate::OperationClass::ReplaySensitive,
-            crate::RecoveryAction::VerifyThenResume,
-            crate::RequestContext {
-                operation: "write".to_string(),
-                protocol,
-                request_id: None,
-            },
-            NfsError::Rpc(message.to_string()),
-        ))),
-        confirmed,
-        protocol,
-    )
+#[async_trait::async_trait]
+impl crate::fileio::WriteIo for FileResource {
+    async fn begin_batch(&self, _fh: Bytes) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match &self.backend {
+            FileBackend::Mount {
+                mount, file_handle, ..
+            } => Some(
+                crate::fileio::file_gate(
+                    Arc::as_ptr(mount) as *const () as usize,
+                    file_handle.clone(),
+                    0,
+                )
+                .await,
+            ),
+            #[cfg(feature = "python-test-support")]
+            _ => None,
+        }
+    }
+    fn write_chunk_size(&self) -> u32 {
+        self.max_write().max(1)
+    }
+    fn protocol(&self) -> NFSVersion {
+        self.protocol_version()
+    }
+    async fn write_unstable(
+        &self,
+        _fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::WriteOutcome> {
+        self.write_chunk(offset, data).await
+    }
+    async fn commit_batch(
+        &self,
+        _fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[crate::WriteOutcome],
+    ) -> Result<()> {
+        wait_at_operation_test_barrier("commit").await;
+        if let Some(error) = injected_fault("commit", "before-send").await {
+            return Err(error);
+        }
+        match &self.backend {
+            FileBackend::Mount {
+                mount, file_handle, ..
+            } => {
+                mount
+                    .commit_write_batch(file_handle.clone(), offset, count, writes)
+                    .await?;
+            }
+            #[cfg(feature = "python-test-support")]
+            FileBackend::Test { .. } => {
+                if writes
+                    .iter()
+                    .any(|w| w.committed != crate::WriteCommitted::FileSync)
+                {
+                    self.test_commit_calls.fetch_add(1, Ordering::Relaxed);
+                    if self.test_fail_commit {
+                        return Err(NfsError::Rpc("scripted commit failure".into()));
+                    }
+                    crate::mount::verify_write_batch(
+                        self.protocol_version(),
+                        writes,
+                        self.test_verifier_change.then_some([2; 8]),
+                    )?;
+                }
+            }
+        }
+        if let Some(error) = injected_fault("commit", "after-send-before-response").await {
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
-fn commit_uncertain_error(message: &str, protocol: NFSVersion) -> NfsError {
-    NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
-        crate::OperationOutcome::Uncertain,
-        crate::OperationClass::ReplaySensitive,
-        crate::RecoveryAction::VerifyThenResume,
-        crate::RequestContext {
-            operation: "commit".to_string(),
-            protocol,
-            request_id: None,
-        },
-        NfsError::Rpc(message.to_string()),
-    )))
+/// The Python facade holds an exported writable memoryview for the operation.
+/// It releases that view on success, error, timeout, or cancellation. Acquire a
+/// temporary buffer only while attached to Python, so a released view prevents
+/// abandoned work from writing to a caller's buffer after the call has ended.
+struct ReadTarget {
+    view: Py<PyAny>,
+    len: usize,
+}
+
+impl ReadTarget {
+    fn new(view: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let buffer = PyBuffer::<u8>::get(view)?;
+        if buffer.readonly() || !buffer.is_c_contiguous() {
+            return Err(PyValueError::new_err(
+                "readinto requires a writable contiguous byte buffer",
+            ));
+        }
+        Ok(Self {
+            view: view.clone().unbind(),
+            len: buffer.len_bytes(),
+        })
+    }
+
+    fn fill(&self, offset: usize, data: &[u8]) -> Result<()> {
+        Python::attach(|py| {
+            let buffer = PyBuffer::<u8>::get(self.view.bind(py))
+                .map_err(|_| NfsError::InvalidInput("readinto target has been released".into()))?;
+            let end = offset
+                .checked_add(data.len())
+                .filter(|end| *end <= buffer.len_bytes())
+                .ok_or_else(|| NfsError::InvalidInput("readinto buffer range is invalid".into()))?;
+            if buffer.readonly() || !buffer.is_c_contiguous() {
+                return Err(NfsError::InvalidInput(
+                    "readinto target is not writable and contiguous".into(),
+                ));
+            }
+            // SAFETY: the exported buffer pins the allocation; the range is
+            // checked above, and this copy holds the GIL. No Rust reference to
+            // Python-owned memory escapes this call. RPC Bytes have separate
+            // storage. Callers must not concurrently mutate their target.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buffer.buf_ptr().cast::<u8>().add(offset),
+                    end - offset,
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
+#[async_trait]
+impl crate::fileio::ReadIo for FileResource {
+    fn read_chunk_size(&self) -> u32 {
+        self.max_read()
+    }
+    async fn read(&self, _fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        self.read_chunk(offset, count).await
+    }
 }
 
 impl FileResource {
@@ -466,14 +568,6 @@ impl FileResource {
         let max_write = mount.get_max_write_size().max(1);
         let file_handle = file.file_handle();
         let recovery_generation = mount.health().generation;
-        let io_options = mount.io_options();
-        let buffered = (io_options.readahead > 0 || io_options.writeback > 0).then(|| {
-            Box::new(crate::BufferedFile::new(
-                mount.clone(),
-                file_handle.clone(),
-                io_options,
-            ))
-        });
         Arc::new(Self {
             safe_path,
             backend: FileBackend::Mount {
@@ -481,7 +575,6 @@ impl FileResource {
                 file_handle,
                 max_read,
                 max_write,
-                buffered,
             },
             mode,
             operation_gate: Arc::new(RwLock::new(())),
@@ -491,7 +584,7 @@ impl FileResource {
             position_uncertain: AtomicBool::new(false),
             open_state_lost: AtomicBool::new(false),
             recovery_generation,
-            dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
+            mutation_gate: RwLock::new(()),
             close_state: Mutex::new(FileCloseState {
                 started: false,
                 file: Some(file),
@@ -544,7 +637,7 @@ impl FileResource {
             position_uncertain: AtomicBool::new(false),
             open_state_lost: AtomicBool::new(false),
             recovery_generation: 0,
-            dirty_state: tokio::sync::Mutex::new(DirtyState::default()),
+            mutation_gate: RwLock::new(()),
             close_state: Mutex::new(FileCloseState::default()),
             close_started: Notify::new(),
             close_notify: Notify::new(),
@@ -669,9 +762,6 @@ impl FileResource {
                 ),
             )));
         }
-        if let Some(buffered) = self.readahead() {
-            return buffered.read_at(offset, count).await;
-        }
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
@@ -688,26 +778,6 @@ impl FileResource {
         }
     }
 
-    fn readahead(&self) -> Option<&crate::BufferedFile> {
-        match &self.backend {
-            FileBackend::Mount {
-                buffered: Some(buffered),
-                ..
-            } if buffered.options().readahead > 0 => Some(buffered.as_ref()),
-            _ => None,
-        }
-    }
-
-    fn writeback(&self) -> Option<&crate::BufferedFile> {
-        match &self.backend {
-            FileBackend::Mount {
-                buffered: Some(buffered),
-                ..
-            } if buffered.options().writeback > 0 => Some(buffered.as_ref()),
-            _ => None,
-        }
-    }
-
     fn max_read(&self) -> u32 {
         match &self.backend {
             FileBackend::Mount { max_read, .. } => *max_read,
@@ -717,6 +787,7 @@ impl FileResource {
     }
 
     async fn read_at(&self, offset: u64, size: i64) -> Result<Vec<u8>> {
+        let _mutation = self.mutation_gate.read().await;
         if !self.mode.readable {
             return Err(NfsError::ModeViolation("file is not readable".to_string()));
         }
@@ -738,11 +809,34 @@ impl FileResource {
             current = current.saturating_add(chunk.len() as u64);
             remaining = remaining.saturating_sub(chunk.len() as u64);
             result.extend_from_slice(&chunk);
-            if chunk.len() < count as usize {
-                break;
-            }
         }
         Ok(result)
+    }
+
+    async fn read_into_at(&self, target: &ReadTarget, offset: u64) -> Result<usize> {
+        if !self.mode.readable {
+            return Err(NfsError::ModeViolation("file is not readable".into()));
+        }
+        let _mutation = self.mutation_gate.read().await;
+        wait_at_operation_test_barrier("readinto").await;
+        crate::fileio::read_into_with(self, Bytes::new(), offset, target.len, |at, piece| {
+            target.fill(at, piece)
+        })
+        .await
+    }
+
+    async fn read_into(&self, target: &ReadTarget) -> Result<usize> {
+        let _guard = self.relative_gate.lock().await;
+        if self.position_uncertain.load(Ordering::Acquire) {
+            return Err(NfsError::PositionUncertain(
+                "file position is uncertain; seek to an absolute offset".into(),
+            ));
+        }
+        let position = self.position.load(Ordering::Acquire);
+        let count = self.read_into_at(target, position).await?;
+        self.position
+            .store(position + count as u64, Ordering::Release);
+        Ok(count)
     }
 
     async fn read(&self, size: i64) -> Result<Vec<u8>> {
@@ -782,16 +876,7 @@ impl FileResource {
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
-            } => {
-                let count = mount
-                    .write_stable(file_handle.clone(), offset, data)
-                    .await?;
-                Ok(crate::WriteOutcome {
-                    count,
-                    stable: true,
-                    verifier: None,
-                })
-            }
+            } => mount.write(file_handle.clone(), offset, data).await,
             #[cfg(feature = "python-test-support")]
             FileBackend::Test {
                 data: target,
@@ -803,8 +888,9 @@ impl FileResource {
                 }
                 if matches!(write_fault, Some(TestWriteFault::ZeroAt(at)) if offset >= *at) {
                     return Ok(crate::WriteOutcome {
+                        pnfs: None,
                         count: 0,
-                        stable: false,
+                        committed: crate::WriteCommitted::Unstable,
                         verifier: None,
                     });
                 }
@@ -832,112 +918,33 @@ impl FileResource {
                 }
                 target[start..end].copy_from_slice(&data[..written]);
                 Ok(crate::WriteOutcome {
+                    pnfs: None,
                     count: written as u32,
-                    stable: false,
+                    committed: crate::WriteCommitted::Unstable,
                     verifier: self.test_verifier_change.then_some([1; 8]),
                 })
             }
         }
     }
 
-    fn merge_dirty_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
-        ranges.push((start, end));
-        ranges.sort_unstable_by_key(|range| range.0);
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-        for range in ranges.drain(..) {
-            if let Some(last) = merged.last_mut()
-                && range.0 <= last.1
-            {
-                last.1 = last.1.max(range.1);
-            } else {
-                merged.push(range);
-            }
-        }
-        *ranges = merged;
-    }
-
-    async fn record_write(&self, start: u64, end: u64, outcome: crate::WriteOutcome) -> bool {
-        let mut dirty = self.dirty_state.lock().await;
-        let verifier_changed = outcome
-            .verifier
-            .is_some_and(|verifier| dirty.verifier.is_some_and(|expected| expected != verifier));
-        if !outcome.stable || verifier_changed {
-            Self::merge_dirty_range(&mut dirty.ranges, start, end);
-        }
-        if !outcome.stable
-            && !verifier_changed
-            && let Some(verifier) = outcome.verifier
-        {
-            dirty.verifier = Some(verifier);
-        }
-        verifier_changed
-    }
-
     async fn write_complete_at(&self, offset: u64, data: Bytes) -> Result<u64> {
         if !self.mode.writable {
-            return Err(NfsError::ModeViolation("file is not writable".to_string()));
+            return Err(NfsError::ModeViolation("file is not writable".into()));
         }
+        let _mutation = self.mutation_gate.write().await;
         if let Some(error) = injected_fault("write", "before-send").await {
             return Err(error);
         }
-        if let Some(buffered) = self.writeback() {
-            // Write-behind: the data is queued; durability and deferred
-            // failures surface on flush()/close().
-            let queued = data.len() as u64;
-            buffered
-                .write_at(offset, data)
-                .await
-                .map_err(|error| with_confirmed_bytes(error, 0, self.protocol_version()))?;
-            if let Some(error) = injected_fault("write", "after-send-before-response").await {
-                return Err(with_confirmed_bytes(error, queued, self.protocol_version()));
-            }
-            return Ok(queued);
-        }
-        let mut current = offset;
-        let mut confirmed = 0_u64;
-        while confirmed < data.len() as u64 {
-            let remaining = &data[confirmed as usize..];
-            let count = remaining.len().min(self.max_write() as usize);
-            let chunk = Bytes::copy_from_slice(&remaining[..count]);
-            let outcome = match self.write_chunk(current, chunk).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return Err(with_confirmed_bytes(
-                        error,
-                        confirmed,
-                        self.protocol_version(),
-                    ));
-                }
-            };
-            let written = u64::from(outcome.count);
-            if written == 0 || written > count as u64 {
-                return Err(write_uncertain_error(
-                    "server returned an invalid write count",
-                    self.protocol_version(),
-                    confirmed,
-                ));
-            }
-            if self
-                .record_write(current, current.saturating_add(written), outcome)
-                .await
-            {
-                return Err(write_uncertain_error(
-                    "write verifier changed before commit",
-                    self.protocol_version(),
-                    confirmed.saturating_add(written),
-                ));
-            }
-            current = current.saturating_add(written);
-            confirmed = confirmed.saturating_add(written);
-        }
+        let result = crate::fileio::write_all_with(self, Bytes::new(), offset, data).await;
+        let written = result?;
         if let Some(error) = injected_fault("write", "after-send-before-response").await {
             return Err(with_confirmed_bytes(
                 error,
-                confirmed,
+                written,
                 self.protocol_version(),
             ));
         }
-        Ok(confirmed)
+        Ok(written)
     }
 
     async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
@@ -958,9 +965,6 @@ impl FileResource {
             ));
         }
         let position = if self.mode.append {
-            if let Some(buffered) = self.writeback() {
-                buffered.flush().await?;
-            }
             self.current_size().await?
         } else {
             self.position.load(Ordering::Acquire)
@@ -992,10 +996,9 @@ impl FileResource {
         if let Some(error) = injected_fault("truncate", "before-send").await {
             return Err(error);
         }
+        let _mutation = self.mutation_gate.write().await;
+        let _batch = crate::fileio::WriteIo::begin_batch(self, Bytes::new()).await;
         let size = size.unwrap_or_else(|| self.position.load(Ordering::Acquire));
-        if let Some(buffered) = self.writeback() {
-            buffered.flush().await?;
-        }
         match &self.backend {
             FileBackend::Mount {
                 mount, file_handle, ..
@@ -1021,14 +1024,6 @@ impl FileResource {
                 data.lock().await.resize(size, 0);
             }
         }
-        let mut dirty = self.dirty_state.lock().await;
-        for range in dirty.ranges.iter_mut() {
-            range.1 = range.1.min(size);
-        }
-        dirty.ranges.retain(|range| range.0 < range.1);
-        if dirty.ranges.is_empty() {
-            dirty.verifier = None;
-        }
         if let Some(error) = injected_fault("truncate", "after-send-before-response").await {
             return Err(error);
         }
@@ -1037,61 +1032,9 @@ impl FileResource {
 
     async fn flush_inner(&self) -> Result<()> {
         wait_at_operation_test_barrier("flush").await;
-        if !self.mode.writable {
-            return Ok(());
-        }
-        if let Some(error) = injected_fault("commit", "before-send").await {
-            return Err(error);
-        }
-        if let Some(buffered) = self.writeback() {
-            buffered.flush().await?;
-        }
-        let mut dirty = self.dirty_state.lock().await;
-        let expected_verifier = dirty.verifier;
-        for &(start, end) in dirty.ranges.iter() {
-            let mut offset = start;
-            while offset < end {
-                let count = (end - offset).min(u64::from(u32::MAX)) as u32;
-                match &self.backend {
-                    FileBackend::Mount {
-                        mount, file_handle, ..
-                    } => {
-                        let verifier = mount
-                            .commit_with_verifier(file_handle.clone(), offset, count)
-                            .await?;
-                        if let (Some(expected), Some(actual)) = (expected_verifier, verifier)
-                            && expected != actual
-                        {
-                            return Err(commit_uncertain_error(
-                                "commit verifier changed; dirty data may have been lost",
-                                mount.version(),
-                            ));
-                        }
-                    }
-                    #[cfg(feature = "python-test-support")]
-                    FileBackend::Test { .. } => {
-                        self.test_commit_calls.fetch_add(1, Ordering::Relaxed);
-                        if self.test_fail_commit {
-                            return Err(NfsError::Rpc("scripted commit failure".to_string()));
-                        }
-                        if self.test_verifier_change
-                            && expected_verifier.is_some_and(|expected| expected != [2; 8])
-                        {
-                            return Err(commit_uncertain_error(
-                                "commit verifier changed; dirty data may have been lost",
-                                NFSVersion::NFSv3,
-                            ));
-                        }
-                    }
-                }
-                offset = offset.saturating_add(u64::from(count));
-            }
-        }
-        if let Some(error) = injected_fault("commit", "after-send-before-response").await {
-            return Err(error);
-        }
-        dirty.ranges.clear();
-        dirty.verifier = None;
+        // Owned writes retain this gate through COMMIT, including after their
+        // Python caller has timed out or cancelled its wait.
+        let _mutation = self.mutation_gate.write().await;
         Ok(())
     }
 
@@ -1943,13 +1886,20 @@ fn fs_stat_dict<'py>(py: Python<'py>, info: crate::FSStat) -> PyResult<Bound<'py
     Ok(values)
 }
 
-fn entry_dict(name: String, attr: Attr) -> PyResult<Py<PyDict>> {
-    Python::attach(|py| {
-        let values = PyDict::new(py);
-        values.set_item("name", name)?;
-        values.set_item("info", attr_dict(py, &attr)?)?;
-        Ok(values.unbind())
-    })
+fn directory_batch_dicts(
+    py: Python<'_>,
+    entries: Vec<DirectoryEntry>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    entries
+        .into_iter()
+        .map(|(name, attr, fh)| {
+            let values = PyDict::new(py);
+            values.set_item("name", name)?;
+            values.set_item("fh", (!fh.is_empty()).then(|| PyBytes::new(py, &fh)))?;
+            values.set_item("info", attr_dict(py, &attr)?)?;
+            Ok(values.unbind())
+        })
+        .collect()
 }
 
 #[cfg(feature = "python-test-support")]
@@ -2515,22 +2465,27 @@ async fn xattr_remove(
 
 #[cfg(feature = "python-test-support")]
 fn test_directory_entries(path: &str) -> Option<Vec<(String, Attr)>> {
-    (path == "." || path == "folder" || path == "large").then(|| {
+    if path == "batched" || path == "large" {
+        return Some(
+            (0..DIRECTORY_BATCH_SIZE * 4 + 7)
+                .map(|i| {
+                    let attr = Attr {
+                        fileid: i as u64,
+                        type_: 1,
+                        ..Attr::default()
+                    };
+                    (format!("entry-{i}"), attr)
+                })
+                .collect(),
+        );
+    }
+    (path == "." || path == "folder").then(|| {
         let first = test_attr("first")
             .and_then(std::result::Result::ok)
             .unwrap_or_default();
         let mut second = first.clone();
         second.fileid = 10;
-        let mut entries = vec![
-            ("first".to_string(), first),
-            ("second".to_string(), second.clone()),
-        ];
-        if path == "large" {
-            let mut third = second;
-            third.fileid = 11;
-            entries.push(("third".to_string(), third));
-        }
-        entries
+        vec![("first".to_string(), first), ("second".to_string(), second)]
     })
 }
 
@@ -2559,10 +2514,61 @@ fn test_directory_fails(_path: &str) -> bool {
     false
 }
 
+/// A supplied handle is authoritative; path lookup is evaluated only when absent.
+async fn directory_handle(
+    fh: Option<Bytes>,
+    lookup: impl Future<Output = Result<Bytes>>,
+) -> Result<Bytes> {
+    match fh {
+        Some(fh) if fh.is_empty() => Err(NfsError::InvalidInput(
+            "scandir fh must not be empty".into(),
+        )),
+        Some(fh) => Ok(fh),
+        None => lookup.await,
+    }
+}
+
+/// Flush ready entries before waiting for another protocol page. Errors follow
+/// already received entries; a slow next page never holds a partial batch hostage.
+async fn stream_directory_batches(
+    entries: impl Stream<Item = Result<DirectoryEntry>> + Unpin,
+    sender: mpsc::Sender<DirectoryItem>,
+    core: &ClientCore,
+) {
+    let mut batches = entries.ready_chunks(DIRECTORY_BATCH_SIZE);
+    loop {
+        let batch = tokio::select! {
+            batch = batches.next() => batch,
+            () = sender.closed() => return,
+            () = core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => return,
+        };
+        let Some(batch) = batch else { return };
+        let mut ready = Vec::with_capacity(batch.len());
+        let mut failure = None;
+        for entry in batch {
+            match entry {
+                Ok(entry) => ready.push(entry),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if !ready.is_empty() && !send_directory_item(&sender, Ok(ready), core).await {
+            return;
+        }
+        if let Some(error) = failure {
+            let _ = send_directory_item(&sender, Err(error), core).await;
+            return;
+        }
+    }
+}
+
 async fn directory_receiver(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     path: String,
+    fh: Option<Bytes>,
 ) -> Result<mpsc::Receiver<DirectoryItem>> {
     let operation = core.begin_operation()?;
     let (sender, receiver) = mpsc::channel(1);
@@ -2582,12 +2588,11 @@ async fn directory_receiver(
             let first = test_attr("first")
                 .and_then(std::result::Result::ok)
                 .unwrap_or_default();
-            let first = entry_dict("first".to_string(), first)
-                .map_err(|error| NfsError::Rpc(error.to_string()));
-            if send_directory_item(&sender, first, &closing).await {
-                let error = NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM);
-                let _ = send_directory_item(&sender, Err(error), &closing).await;
-            }
+            let entries = futures::stream::iter([
+                Ok(("first".to_string(), first, Bytes::new())),
+                Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM)),
+            ]);
+            stream_directory_batches(entries, sender, &closing).await;
         });
         return Ok(receiver);
     }
@@ -2595,12 +2600,11 @@ async fn directory_receiver(
         let closing = core.clone();
         tokio::spawn(async move {
             let _operation = operation;
-            for (name, attr) in entries {
-                let item = entry_dict(name, attr).map_err(|error| NfsError::Rpc(error.to_string()));
-                if !send_directory_item(&sender, item, &closing).await {
-                    break;
-                }
-            }
+            let entries = futures::stream::iter(entries.into_iter().map(|(name, attr)| {
+                let fh = attr.filehandle.clone();
+                Ok((name, attr, fh))
+            }));
+            stream_directory_batches(entries, sender, &closing).await;
         });
         return Ok(receiver);
     }
@@ -2611,37 +2615,32 @@ async fn directory_receiver(
     tokio::spawn(async move {
         let _operation = operation;
         let stream = tokio::select! {
-            result = mount.readdirplus_path(&path) => Some(result),
+            result = async {
+                let handle = directory_handle(fh, async { Ok(mount.lookup_path(&path).await?.fh) }).await?;
+                Ok::<_, NfsError>(mount.readdirplus(handle).await)
+            } => Some(result),
             () = closing.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => None,
+            () = sender.closed() => None,
         };
         let Some(stream) = stream else {
             return;
         };
         match stream {
-            Ok(mut entries) => loop {
-                let next = tokio::select! {
-                    result = entries.try_next() => Some(result),
-                    () = closing.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => None,
-                };
-                let Some(next) = next else {
-                    break;
-                };
-                let item = match next {
-                    Ok(Some(entry)) => match entry.attr {
-                        Some(attr) => entry_dict(entry.file_name, attr)
-                            .map_err(|error| NfsError::Rpc(error.to_string())),
-                        None => Err(NfsError::Rpc(
-                            "directory entry did not include attributes".to_string(),
-                        )),
-                    },
-                    Ok(None) => break,
-                    Err(error) => Err(error),
-                };
-                let stop = item.is_err();
-                if !send_directory_item(&sender, item, &closing).await || stop {
-                    break;
-                }
-            },
+            Ok(entries) => {
+                let entries = entries.map(|entry| {
+                    let entry = entry?;
+                    let attr = entry.attr.ok_or_else(|| {
+                        NfsError::Rpc("directory entry did not include attributes".to_string())
+                    })?;
+                    let fh = if entry.handle.is_empty() {
+                        attr.filehandle.clone()
+                    } else {
+                        entry.handle
+                    };
+                    Ok((entry.file_name, attr, fh))
+                });
+                stream_directory_batches(entries, sender, &closing).await;
+            }
             Err(error) => {
                 let _ = send_directory_item(&sender, Err(error), &closing).await;
             }
@@ -2663,8 +2662,8 @@ impl SyncDirectoryCursor {
         slf
     }
 
-    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        py.detach(|| {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Vec<Py<PyDict>>>> {
+        let batch = py.detach(|| {
             let mut receiver = self
                 .receiver
                 .lock()
@@ -2674,12 +2673,11 @@ impl SyncDirectoryCursor {
                 "scandir",
                 async { Ok(receiver.recv().await) },
             ));
-            match item.map_err(nfs_error)? {
-                Some(Ok(values)) => Ok(Some(values)),
-                Some(Err(error)) => Err(nfs_error(error)),
-                None => Ok(None),
-            }
-        })
+            item.map_err(nfs_error)?.transpose().map_err(nfs_error)
+        })?;
+        batch
+            .map(|entries| directory_batch_dicts(py, entries))
+            .transpose()
     }
 }
 
@@ -2705,7 +2703,7 @@ impl AsyncDirectoryCursor {
             .await
             .map_err(nfs_error)?;
             match item {
-                Some(Ok(values)) => Ok(values),
+                Some(Ok(entries)) => Python::attach(|py| directory_batch_dicts(py, entries)),
                 Some(Err(error)) => Err(nfs_error(error)),
                 None => Err(PyStopAsyncIteration::new_err(())),
             }
@@ -3513,6 +3511,29 @@ impl SyncFile {
         Ok(PyBytes::new(py, &data).unbind())
     }
 
+    fn readinto(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let target = ReadTarget::new(target)?;
+        let resource = self.resource.clone();
+        self.run_operation(py, "readinto", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.read_into(&target).await
+        })
+    }
+
+    fn readinto_at(
+        &self,
+        py: Python<'_>,
+        target: &Bound<'_, PyAny>,
+        offset: u64,
+    ) -> PyResult<usize> {
+        let target = ReadTarget::new(target)?;
+        let resource = self.resource.clone();
+        self.run_operation(py, "readinto_at", async move {
+            let _file_operation = resource.begin_operation().await?;
+            resource.read_into_at(&target, offset).await
+        })
+    }
+
     #[pyo3(signature = (offset, whence = 0))]
     fn seek(&self, py: Python<'_>, offset: i64, whence: i32) -> PyResult<u64> {
         let resource = self.resource.clone();
@@ -3643,6 +3664,47 @@ impl AsyncFile {
                 .await
                 .map_err(nfs_error)?;
             Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
+        })
+    }
+
+    fn readinto<'py>(
+        &self,
+        py: Python<'py>,
+        target: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = ReadTarget::new(target)?;
+        let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
+        let timeout = self.operation_timeout;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            cancellation_safe_file_operation(core, resource, "readinto", timeout, async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.read_into(&target).await
+            })
+            .await
+            .map_err(nfs_error)
+        })
+    }
+
+    fn readinto_at<'py>(
+        &self,
+        py: Python<'py>,
+        target: &Bound<'_, PyAny>,
+        offset: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = ReadTarget::new(target)?;
+        let resource = self.resource.clone();
+        let work_resource = resource.clone();
+        let core = self.core.clone();
+        let timeout = self.operation_timeout;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            cancellation_safe_file_operation(core, resource, "readinto_at", timeout, async move {
+                let _file_operation = work_resource.begin_operation().await?;
+                work_resource.read_into_at(&target, offset).await
+            })
+            .await
+            .map_err(nfs_error)
         })
     }
 
@@ -4333,12 +4395,23 @@ impl SyncClient {
         fs_stat_dict(py, info)
     }
 
-    fn scandir(&self, py: Python<'_>, path: String) -> PyResult<SyncDirectoryCursor> {
+    #[pyo3(signature = (path, fh = None))]
+    fn scandir(
+        &self,
+        py: Python<'_>,
+        path: String,
+        fh: Option<Vec<u8>>,
+    ) -> PyResult<SyncDirectoryCursor> {
         let receiver = self.run_operation(
             py,
             "scandir",
             Some(path.clone()),
-            directory_receiver(self.core.clone(), self.health_source.clone(), path),
+            directory_receiver(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                fh.map(Bytes::from),
+            ),
         )?;
         Ok(SyncDirectoryCursor {
             runtime: self.runtime.clone(),
@@ -4896,15 +4969,24 @@ impl AsyncClient {
         })
     }
 
-    fn scandir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (path, fh = None))]
+    fn scandir<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        fh: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let receiver =
-                with_operation_timeout(timeout, "scandir", directory_receiver(core, mount, path))
-                    .await
-                    .map_err(nfs_error)?;
+            let receiver = with_operation_timeout(
+                timeout,
+                "scandir",
+                directory_receiver(core, mount, path, fh.map(Bytes::from)),
+            )
+            .await
+            .map_err(nfs_error)?;
             Ok(AsyncDirectoryCursor {
                 receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 operation_timeout: timeout,
@@ -4971,14 +5053,17 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "python-test-support"))]
+#[cfg(test)]
+#[cfg(feature = "python-test-support")]
 mod read_only_file_tests {
     use super::{FileMode, FileResource, TestWriteFault, nfs_access_mask, with_confirmed_bytes};
     use crate::error::{
         OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction, RequestContext,
     };
     use crate::{NFSVersion, NfsError};
+    use bytes::Bytes;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn python_access_bits_map_to_nfs_access_semantics() {
@@ -5091,7 +5176,7 @@ mod read_only_file_tests {
     }
 
     #[tokio::test]
-    async fn complete_write_hides_partial_backend_writes_and_flushes_dirty_ranges() {
+    async fn complete_write_hides_short_writes_and_commits_before_return() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = test_file(mode).await;
         let data = bytes::Bytes::from_static(b"abcdefghij");
@@ -5101,9 +5186,9 @@ mod read_only_file_tests {
             file.read_at(0, -1).await.ok().as_deref(),
             Some(&b"abcdefghij"[..])
         );
-        assert!(!file.dirty_state.lock().await.ranges.is_empty());
+        assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 1);
         assert!(file.flush_inner().await.is_ok());
-        assert!(file.dirty_state.lock().await.ranges.is_empty());
+        assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5129,10 +5214,10 @@ mod read_only_file_tests {
     }
 
     #[tokio::test]
-    async fn failed_flush_preserves_dirty_state_and_close_reuses_terminal_result() {
-        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+    async fn commit_failure_is_reported_by_write_and_close_does_not_repeat_it() {
+        let mode = FileMode::parse("w+b").unwrap();
         let file = FileResource::test(
-            "fixture.bin".to_string(),
+            "fixture.bin".into(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             true,
@@ -5141,20 +5226,16 @@ mod read_only_file_tests {
             false,
         )
         .await;
+        let error = file.write(Bytes::from_static(b"dirty")).await.unwrap_err();
         assert_eq!(
-            file.write(bytes::Bytes::from_static(b"dirty")).await.ok(),
-            Some(5)
+            error.operation_outcome().unwrap().outcome,
+            OperationOutcome::Uncertain
         );
-        let first = file.close().await;
-        let second = file.close().await;
-        assert!(first.is_err());
-        assert!(second.is_err());
-        assert_eq!(
-            file.test_commit_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert!(!file.dirty_state.lock().await.ranges.is_empty());
+        assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 1);
+        file.flush_inner().await.unwrap();
+        file.close().await.unwrap();
+        file.close().await.unwrap();
+        assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -5180,7 +5261,7 @@ mod read_only_file_tests {
     }
 
     #[tokio::test]
-    async fn definite_partial_write_advances_position_to_confirmed_boundary() {
+    async fn partial_uncommitted_write_makes_position_uncertain() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
             "fixture.bin".to_string(),
@@ -5202,7 +5283,7 @@ mod read_only_file_tests {
                 .and_then(|outcome| outcome.completed_bytes),
             Some(2)
         );
-        assert_eq!(file.tell().ok(), Some(2));
+        assert!(file.position_uncertain.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -5225,42 +5306,10 @@ mod read_only_file_tests {
     }
 
     #[tokio::test]
-    async fn verifier_change_preserves_dirty_ranges() {
-        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
-        let file = test_file(mode).await;
-        assert!(
-            !file
-                .record_write(
-                    0,
-                    2,
-                    crate::WriteOutcome {
-                        count: 2,
-                        stable: false,
-                        verifier: Some([1; 8]),
-                    },
-                )
-                .await
-        );
-        assert!(
-            file.record_write(
-                2,
-                4,
-                crate::WriteOutcome {
-                    count: 2,
-                    stable: false,
-                    verifier: Some([2; 8]),
-                },
-            )
-            .await
-        );
-        assert_eq!(file.dirty_state.lock().await.ranges, vec![(0, 4)]);
-    }
-
-    #[tokio::test]
-    async fn commit_verifier_change_fails_flush_without_clearing_dirty_state() {
-        let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
+    async fn persistent_verifier_change_fails_write_after_bounded_retries() {
+        let mode = FileMode::parse("w+b").unwrap();
         let file = FileResource::test(
-            "fixture.bin".to_string(),
+            "fixture.bin".into(),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
@@ -5269,18 +5318,135 @@ mod read_only_file_tests {
             true,
         )
         .await;
+        let error = file.write(Bytes::from_static(b"data")).await.unwrap_err();
         assert_eq!(
-            file.write(bytes::Bytes::from_static(b"data")).await.ok(),
-            Some(4)
+            error.operation_outcome().unwrap().outcome,
+            OperationOutcome::Uncertain
         );
-        let error = file.flush_inner().await;
+        assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 3);
+    }
+}
+
+#[cfg(test)]
+mod directory_handle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn supplied_handle_skips_lookup_and_missing_handle_resolves_path() {
+        let handle = Bytes::from_static(b"directory-fh");
+        assert_eq!(
+            directory_handle(Some(handle.clone()), async {
+                panic!("lookup must not run")
+            })
+            .await
+            .unwrap(),
+            handle
+        );
+        assert_eq!(
+            directory_handle(None, async { Ok(handle.clone()) })
+                .await
+                .unwrap(),
+            handle
+        );
         assert!(
-            error
-                .as_ref()
-                .err()
-                .and_then(NfsError::operation_outcome)
-                .is_some_and(|outcome| outcome.outcome == OperationOutcome::Uncertain)
+            directory_handle(None, async {
+                Err(NfsError::InvalidInput("missing directory".into()))
+            })
+            .await
+            .is_err()
         );
-        assert!(!file.dirty_state.lock().await.ranges.is_empty());
+        assert!(
+            directory_handle(Some(Bytes::new()), async {
+                panic!("empty supplied fh must not trigger lookup")
+            })
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod directory_batch_tests {
+    use super::*;
+
+    fn core() -> Arc<ClientCore> {
+        ClientCore::new(Arc::new(MountDriver {
+            mount: tokio::sync::Mutex::new(None),
+            resources: Arc::new(AdapterResources::default()),
+        }))
+    }
+
+    fn entry(i: usize) -> Result<DirectoryEntry> {
+        Ok((i.to_string(), Attr::default(), Bytes::new()))
+    }
+
+    #[tokio::test]
+    async fn bounded_batches_preserve_order_and_prefix_before_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let count = DIRECTORY_BATCH_SIZE * 2 + 7;
+        let entries = futures::stream::iter(
+            (0..count)
+                .map(entry)
+                .chain([Err(NfsError::InvalidInput("stop".into())), entry(count)]),
+        );
+        let producer = tokio::spawn(async move {
+            stream_directory_batches(entries, tx, &core()).await;
+        });
+        let mut names = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            match batch {
+                Ok(batch) => {
+                    assert!(!batch.is_empty() && batch.len() <= DIRECTORY_BATCH_SIZE);
+                    names.extend(batch.into_iter().map(|entry| entry.0));
+                }
+                Err(error) => {
+                    assert!(matches!(error, NfsError::InvalidInput(_)));
+                    assert_eq!(names, (0..count).map(|i| i.to_string()).collect::<Vec<_>>());
+                    assert!(rx.recv().await.is_none());
+                    producer.await.unwrap();
+                    return;
+                }
+            }
+        }
+        panic!("expected stream error after valid prefix");
+    }
+
+    #[tokio::test]
+    async fn partial_batch_is_delivered_before_pending_page_and_drop_stops_producer() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let entries = futures::stream::iter([entry(0)]).chain(futures::stream::pending());
+        let producer = tokio::spawn(async move {
+            stream_directory_batches(entries, tx, &core()).await;
+        });
+        let batch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch[0].0, "0");
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_full_batch_queue() {
+        let (tx, _rx) = mpsc::channel(1);
+        let core = core();
+        let closing = core.clone();
+        let producer = tokio::spawn(async move {
+            let _operation = core.begin_operation().unwrap();
+            stream_directory_batches(futures::stream::iter((0..1024).map(entry)), tx, &core).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), closing.close())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

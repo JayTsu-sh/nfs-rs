@@ -27,7 +27,9 @@ def test_installed_sync_paths_metadata_and_streaming_directory():
     assert info.owner is None
     assert info.group is None
     assert info.fileid == 9
-    assert info.mtime_ns == 3_000_000_004
+    assert info.atime == 1_000_000_002
+    assert info.mtime == 3_000_000_004
+    assert info.ctime == 5_000_000_006
     assert not client.exists("missing")
     with pytest.raises(PermissionError):
         client.exists("denied")
@@ -41,7 +43,7 @@ def test_installed_sync_paths_metadata_and_streaming_directory():
 def test_client_close_cancels_unconsumed_directory_producer_without_hanging():
     client = Client.connect("nfs-test://fixture/export")
     entries = client.scandir("large")
-    assert next(entries).name == "first"
+    assert next(entries).name == "entry-0"
     client.close()
     assert client.closed
 
@@ -122,3 +124,37 @@ def test_installed_invalid_paths_never_reach_native_adapter(path):
     with pytest.raises((TypeError, ValueError)):
         client.stat(path)
     client.close()
+
+
+def test_scandir_reference_crosses_native_boundary_in_sync_and_async():
+    from nfs_rs import AsyncClient, Client, DirectoryRef
+
+    with Client.connect("nfs-test://fixture/export") as client:
+        for fh in (None, b"opaque\x00directory-handle"):
+            entries = list(client.scandir(DirectoryRef("folder", fh)))
+            assert [entry.path for entry in entries] == ["folder/first", "folder/second"]
+            assert all(entry.fh is None for entry in entries)  # fixture omits handles
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            for fh in (None, b"opaque\x00directory-handle"):
+                entries = [entry async for entry in client.scandir(DirectoryRef("folder", fh))]
+                assert [entry.path for entry in entries] == ["folder/first", "folder/second"]
+                assert all(entry.fh is None for entry in entries)
+
+    asyncio.run(scenario())
+
+
+def test_batched_scandir_preserves_all_entries_in_sync_and_async():
+    expected = [f"entry-{i}" for i in range(519)]
+    with Client.connect("nfs-test://fixture/export") as client:
+        entries = list(client.scandir("batched"))
+        assert [entry.name for entry in entries] == expected
+        assert [entry.info.fileid for entry in entries] == list(range(519))
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            entries = [entry async for entry in client.scandir("batched")]
+            assert [entry.name for entry in entries] == expected
+            assert [entry.info.fileid for entry in entries] == list(range(519))
+    asyncio.run(scenario())

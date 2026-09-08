@@ -12,18 +12,31 @@ use crate::mount::{WriteOutcome, WriteStability};
 use crate::nfs4::attrs::{decode_getattr_response, encode_setattr, standard_getattr_bitmap};
 
 impl Mount41 {
-    /// Try a FILE_SYNC write through pNFS data servers. `None` means no DS
+    /// Try an UNSTABLE write through pNFS data servers. `None` means no DS
     /// mutation was attempted and the caller must write through the MDS.
-    pub(crate) async fn write_stable_pnfs(
+    pub(crate) async fn write_pnfs(
         &self,
         fh: &Bytes,
         offset: u64,
         data: Bytes,
-    ) -> Option<Result<u32>> {
+    ) -> Option<Result<mount::WriteOutcome>> {
         if let Err(error) = self.refresh_layout_for_write(fh, offset).await {
             return Some(Err(error));
         }
         let _io_guard = self.layout_manager.read_file_io(fh).await;
+        // Recall/refresh commits hold the exclusive I/O gate. Inspect failure
+        // only after settlement, while the layout is protected from replacement.
+        if self
+            .layout_manager
+            .pending_writes(fh)
+            .await
+            .iter()
+            .any(|w| w.failed() && !w.is_done())
+        {
+            return Some(Err(crate::NfsError::Rpc(
+                "previous pNFS write failed; close and recover before writing again".into(),
+            )));
+        }
         match self.pnfs_write(fh, offset, data).await {
             PnfsWriteOutcome::NotAttempted => None,
             PnfsWriteOutcome::Attempted(result) => Some(result),
@@ -67,8 +80,9 @@ impl Mount41 {
         let mut verifier = [0u8; 8];
         d.copy_to_slice(&mut verifier);
         Ok(WriteOutcome {
+            pnfs: None,
             count,
-            stable: committed == 2, // FILE_SYNC4
+            committed: crate::WriteCommitted::try_from(committed)?,
             verifier: Some(verifier),
         })
     }

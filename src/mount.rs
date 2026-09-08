@@ -22,6 +22,27 @@ use futures::TryStreamExt;
 use futures::stream::Stream;
 use std::pin::Pin;
 
+// Implementation payload ceiling; server and session limits may be smaller.
+pub(crate) const MAX_IO_SIZE: u32 = 4 * 1024 * 1024;
+
+pub(crate) fn negotiated_io_size(server_max: u64) -> Result<u32> {
+    let size = server_max.min(u64::from(MAX_IO_SIZE)) as u32;
+    if size == 0 {
+        return Err(NfsError::Xdr(
+            "server reported a zero maximum I/O size".into(),
+        ));
+    }
+    Ok(size)
+}
+
+/// An empty READ without EOF must not silently terminate a buffer fill.
+pub(crate) fn read_reply(data: Bytes, eof: bool) -> Result<Bytes> {
+    if data.is_empty() && !eof {
+        return Err(NfsError::Rpc("READ made no progress without EOF".into()));
+    }
+    Ok(data)
+}
+
 pub(crate) fn block_on_compat<F: std::future::Future>(f: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -40,29 +61,72 @@ pub const OPEN_READ: u32 = 1;
 pub const OPEN_WRITE: u32 = 2;
 pub const OPEN_BOTH: u32 = 3;
 
+/// Server-reported WRITE commitment (RFC 1813 §3.3.7, RFC 7530 §16.38,
+/// RFC 5661 §18.32). This describes the response, not the requested stability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u32)]
+pub enum WriteCommitted {
+    /// Data may be volatile; data and metadata still require synchronization.
+    Unstable = 0,
+    /// Data and metadata needed to recover it are durable; other metadata may not be.
+    DataSync = 1,
+    /// File data and metadata are durable.
+    FileSync = 2,
+}
+
+impl TryFrom<u32> for WriteCommitted {
+    type Error = NfsError;
+
+    fn try_from(value: u32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Unstable),
+            1 => Ok(Self::DataSync),
+            2 => Ok(Self::FileSync),
+            _ => Err(NfsError::Xdr(format!(
+                "invalid WRITE committed value: {value}"
+            ))),
+        }
+    }
+}
+
 /// Protocol write acknowledgement used by higher-level durability adapters.
 /// Result of one WRITE as reported by the server.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct WriteOutcome {
     /// Bytes the server accepted (may be fewer than requested).
     pub count: u32,
-    /// `true` when the server committed the data to stable storage
-    /// (`FILE_SYNC`); `false` means a COMMIT is still required.
-    pub stable: bool,
-    /// Server write verifier; a change between WRITE and COMMIT means the
-    /// server lost uncommitted data and it must be rewritten.
+    /// Actual server response. For pNFS, the lowest level across all DS
+    /// replies (including short-write retries) contributing to `count`.
+    /// Preserve the outcome for `commit_write_batch`, which also handles
+    /// required pNFS layout synchronization.
+    pub committed: WriteCommitted,
+    /// Single-server write verifier. pNFS verifiers are held in the opaque
+    /// receipt and checked by `commit_write_batch`. A changed verifier means
+    /// uncommitted data may have been lost and must be rewritten.
     pub verifier: Option<[u8; 8]>,
+    /// Opaque routing information retained until batch commit completes.
+    pub(crate) pnfs: Option<std::sync::Arc<crate::nfs41::pnfs_io::PendingWrite>>,
+}
+
+impl WriteOutcome {
+    /// Construct an acknowledgement for a write to a single NFS server.
+    pub fn new(count: u32, committed: WriteCommitted, verifier: Option<[u8; 8]>) -> Self {
+        Self {
+            count,
+            committed,
+            verifier,
+            pnfs: None,
+        }
+    }
 }
 
 /// Stability level requested for a WRITE (`stable_how` in RFC 1813 §3.3.7,
 /// `stable_how4` in RFC 5661 §18.32). Internal: the public API exposes
-/// [`Mount::write`] (UNSTABLE) and [`Mount::write_stable`] (FILE_SYNC).
+/// [`Mount::write`] (UNSTABLE).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WriteStability {
     /// The server may buffer the data; COMMIT before relying on it.
     Unstable,
-    /// Data and metadata are stable when the reply arrives.
-    FileSync,
 }
 
 impl WriteStability {
@@ -70,30 +134,8 @@ impl WriteStability {
     pub(crate) fn stable_how(self) -> u32 {
         match self {
             WriteStability::Unstable => 0,
-            WriteStability::FileSync => 2,
         }
     }
-}
-
-/// Finish a FILE_SYNC write: if the server downgraded the stability level,
-/// COMMIT and check that the write verifier is unchanged.
-pub(crate) async fn finish_stable_write<M: Mount + ?Sized>(
-    mount: &M,
-    fh: Bytes,
-    offset: u64,
-    outcome: WriteOutcome,
-) -> Result<u32> {
-    if !outcome.stable {
-        let verifier = mount
-            .commit_with_verifier(fh, offset, outcome.count)
-            .await?;
-        if let (Some(expected), Some(actual)) = (outcome.verifier, verifier)
-            && expected != actual
-        {
-            return Err(write_verifier_changed(mount.version()));
-        }
-    }
-    Ok(outcome.count)
 }
 
 /// Error for a write verifier that changed between WRITE and COMMIT: the
@@ -296,19 +338,13 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn write_chunk(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes, offset: u64, data: &[u8], size: u32) -> nfs_rs::Result<u32> {
+    /// async fn write_chunk(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes, offset: u64, data: &[u8], size: u32) -> nfs_rs::Result<u64> {
     ///     let chunk_size = mount.get_max_write_size().min(size) as usize;
     ///     let data = data[0..chunk_size].to_vec();
-    ///     mount.write_stable(fh, offset, bytes::Bytes::from(data)).await
+    ///     nfs_rs::write_all(mount, fh, offset, bytes::Bytes::from(data)).await
     /// }
     /// ```
     fn get_max_write_size(&self) -> u32;
-
-    /// Read-ahead / write-behind tunables for [`crate::BufferedFile`], taken
-    /// from the `readahead` and `writeback` URL parameters.
-    fn io_options(&self) -> crate::IoOptions {
-        crate::IoOptions::default()
-    }
 
     /// Return NFSv4.1 fore-channel limits, or `None` for other protocol versions.
     async fn nfs41_channel_limits(&self) -> Option<Nfs41ChannelLimits> {
@@ -419,10 +455,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     /// async fn write_and_flush(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes, offset: u64, data: &[u8]) -> nfs_rs::Result<()> {
     ///     let outcome = mount.write(fh.clone(), offset, bytes::Bytes::copy_from_slice(data)).await?;
-    ///     if outcome.stable {
-    ///         return Ok(()); // server committed it anyway
-    ///     }
-    ///     mount.commit(fh, offset, outcome.count).await
+    ///     mount.commit_write_batch(fh, offset, outcome.count, &[outcome]).await
     /// }
     /// ```
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()>;
@@ -438,6 +471,28 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Ok(None)
     }
 
+    /// Complete a batch of WRITE acknowledgements, checking all verifiers.
+    /// pNFS implementations route COMMIT to the appropriate servers and
+    /// complete required LAYOUTCOMMITs. Retain the data until this succeeds.
+    /// The range must cover every acknowledgement; `(0, 0)` covers the file.
+    /// Pass only acknowledgements from writes on this mount and file handle.
+    async fn commit_write_batch(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[WriteOutcome],
+    ) -> Result<()> {
+        if writes
+            .iter()
+            .all(|w| w.committed == crate::WriteCommitted::FileSync)
+        {
+            return Ok(());
+        }
+        let actual = self.commit_with_verifier(fh, offset, count).await?;
+        verify_write_batch(self.version(), writes, actual)
+    }
+
     /// Same as [`Mount::commit`] but instead of taking in a file handle, takes in a path for which file handle is
     /// obtained by performing one or more LOOKUP procedures.
     ///
@@ -445,11 +500,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///
     /// ```
     /// async fn write_to_path_and_flush(mount: &dyn nfs_rs::Mount, path: &str, offset: u64, data: &[u8]) -> nfs_rs::Result<()> {
-    ///     let outcome = mount.write_path(path, offset, bytes::Bytes::copy_from_slice(data)).await?;
-    ///     if outcome.stable {
-    ///         return Ok(());
-    ///     }
-    ///     mount.commit_path(path, offset, outcome.count).await
+    ///     let obj = mount.lookup_path(path).await?;
+    ///     nfs_rs::write_all(mount, obj.fh, offset, bytes::Bytes::copy_from_slice(data)).await?;
+    ///     Ok(())
     /// }
     /// ```
     async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
@@ -1087,83 +1140,18 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Procedure WRITE with `stable = UNSTABLE`: the server may keep the
-    /// data in volatile memory, so the caller must [`Mount::commit`] before
+    /// data in volatile memory, so the caller must [`Mount::commit_write_batch`] before
     /// relying on it (RFC 1813 §3.3.7 / RFC 5661 §18.32). No COMMIT is issued
     /// here; the returned [`WriteOutcome`] says how many bytes the server
-    /// took, whether it committed them anyway, and the write verifier to
-    /// compare against the COMMIT reply. Use [`Mount::write_stable`] for a
-    /// write that is durable when it returns, or [`crate::BufferedFile`] for
-    /// pipelined writes with batched COMMITs.
+    /// took, the server's full [`WriteCommitted`] level, and the write verifier to
+    /// pass to [`Mount::commit_write_batch`]. Use [`crate::write_all`] for a
+    /// complete write that is durable when it returns.
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
 
     /// Same as [`Mount::write`] but takes a path resolved via LOOKUP.
     async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<WriteOutcome> {
         let res = self.lookup_path(path).await?;
         self.write(res.fh, offset, data).await
-    }
-
-    /// Writes data to a file and returns once it is on stable storage:
-    /// `FILE_SYNC` is requested and, if the server downgrades it, a COMMIT
-    /// follows and the write verifier is checked.
-    ///
-    /// On NFSv4.1 with a pNFS file layout the data is stable on the data
-    /// servers when this returns. The size and mtime the metadata server
-    /// reports are synchronised by LAYOUTCOMMIT (RFC 5661 §12.5.4), which is
-    /// sent at [`Mount::close`] and after a downgraded data-server write; in
-    /// between, a GETATTR from another client may still show the old size.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// async fn write_all(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes, mut offset: u64, data: bytes::Bytes) -> nfs_rs::Result<()> {
-    ///     let mut remaining = data;
-    ///     loop {
-    ///         if remaining.is_empty() {
-    ///             return Ok(());
-    ///         }
-    ///         let chunk_size = mount.get_max_write_size() as usize;
-    ///         let chunk = if remaining.len() > chunk_size {
-    ///             remaining.split_to(chunk_size)
-    ///         } else {
-    ///             let chunk = remaining;
-    ///             remaining = bytes::Bytes::new();
-    ///             chunk
-    ///         };
-    ///         let written_bytes = mount.write_stable(fh.clone(), offset, chunk).await? as usize;
-    ///         offset += written_bytes as u64;
-    ///     }
-    /// }
-    /// ```
-    async fn write_stable(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32>;
-
-    /// Same as [`Mount::write_stable`] but instead of taking in a file handle, takes in a path for which file handle is
-    /// obtained by performing one or more LOOKUP procedures.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// async fn write_all_to_path(mount: &dyn nfs_rs::Mount, path: &str, mut offset: u64, data: bytes::Bytes) -> nfs_rs::Result<()> {
-    ///     let mut remaining = data;
-    ///     loop {
-    ///         if remaining.is_empty() {
-    ///             return Ok(());
-    ///         }
-    ///         let chunk_size = mount.get_max_write_size() as usize;
-    ///         let chunk = if remaining.len() > chunk_size {
-    ///             remaining.split_to(chunk_size)
-    ///         } else {
-    ///             let chunk = remaining;
-    ///             remaining = bytes::Bytes::new();
-    ///             chunk
-    ///         };
-    ///         let written_bytes = mount.write_stable_path(path, offset, chunk).await? as usize;
-    ///         offset += written_bytes as u64;
-    ///     }
-    /// }
-    /// ```
-    async fn write_stable_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        let res = self.lookup_path(path).await?;
-        self.write_stable(res.fh, offset, data).await
     }
 
     /// Procedure READDIR retrieves a variable number of entries, in sequence, from a directory and returns the name
@@ -1596,14 +1584,14 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         block_on_compat(self.read_path(path, offset, count))
     }
 
-    /// Blocking version of [`Mount::write_stable`]
-    fn sync_write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<u32> {
-        block_on_compat(self.write_stable(fh, offset, data))
+    /// Blocking version of [`Mount::write`]
+    fn sync_write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        block_on_compat(self.write(fh, offset, data))
     }
 
-    /// Blocking version of [`Mount::write_stable_path`]
-    fn sync_write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<u32> {
-        block_on_compat(self.write_stable_path(path, offset, data))
+    /// Blocking version of [`Mount::write_path`]
+    fn sync_write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+        block_on_compat(self.write_path(path, offset, data))
     }
 
     /// Blocking version of [`Mount::readdir`]
@@ -1970,4 +1958,73 @@ pub struct ReaddirplusEntry {
     pub file_name: String,
     pub attr: Option<Attr>,
     pub handle: Bytes,
+}
+
+/// Validate only acknowledgements that still require stable storage.
+pub(crate) fn verify_write_batch(
+    protocol: NFSVersion,
+    writes: &[WriteOutcome],
+    actual: Option<[u8; 8]>,
+) -> Result<()> {
+    for write in writes
+        .iter()
+        .filter(|w| w.committed != crate::WriteCommitted::FileSync)
+    {
+        if let Some(expected) = write.verifier
+            && actual != Some(expected)
+        {
+            return Err(write_verifier_changed(protocol));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod negotiated_size_tests {
+    use super::*;
+
+    #[test]
+    fn empty_read_requires_eof() {
+        assert!(read_reply(Bytes::new(), false).is_err());
+        assert!(read_reply(Bytes::new(), true).unwrap().is_empty());
+        assert_eq!(
+            read_reply(Bytes::from_static(b"short"), false).unwrap(),
+            b"short"[..]
+        );
+    }
+
+    #[test]
+    fn automatic_sizes_respect_server_and_client_limits() {
+        assert_eq!(negotiated_io_size(4096).unwrap(), 4096);
+        assert_eq!(
+            negotiated_io_size(2 * 1024 * 1024).unwrap(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(negotiated_io_size(u64::MAX).unwrap(), MAX_IO_SIZE);
+        assert!(negotiated_io_size(0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod write_committed_tests {
+    use super::*;
+
+    #[test]
+    fn response_levels_are_distinct_and_invalid_wire_values_fail() {
+        for (wire, expected) in [
+            (0, WriteCommitted::Unstable),
+            (1, WriteCommitted::DataSync),
+            (2, WriteCommitted::FileSync),
+        ] {
+            let outcome =
+                WriteOutcome::new(7, WriteCommitted::try_from(wire).unwrap(), Some([9; 8]));
+            assert_eq!(outcome.committed, expected);
+            assert_eq!(outcome.count, 7);
+            assert_eq!(outcome.verifier, Some([9; 8]));
+            let verified = verify_write_batch(NFSVersion::NFSv3, &[outcome], Some([8; 8]));
+            assert_eq!(verified.is_ok(), expected == WriteCommitted::FileSync);
+        }
+        assert!(WriteCommitted::try_from(3).is_err());
+        assert!(WriteCommitted::try_from(u32::MAX).is_err());
+    }
 }
