@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-09
+
+- Remove Python `Client.read_bytes` and `Client.write_bytes`, including async variants. Use `client.open()` and File methods instead.
+- Preserve all four Python File read methods. `read` and `read_at` now use negotiated chunks with up to eight concurrent requests, complete short reads, and stop at EOF.
+- Assemble returned Python bytes directly from owned response buffers, eliminating the intermediate payload copy. `readinto` continues filling caller-owned buffers.
+- Update API stubs, examples, real-protocol validation scripts, and regression coverage.
+
 ## [0.7.1] - 2026-09-09
 
 ### Documentation

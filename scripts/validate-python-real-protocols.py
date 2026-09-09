@@ -172,9 +172,11 @@ def sync_scenario(url: str, version: str, require_pnfs: bool, payload: bytes) ->
         tracemalloc.start()
         try:
             started = time.perf_counter()
-            written, write_rss_growth = monitor_rss(
-                lambda: client.write_bytes(payload_path, payload)
-            )
+            def write_payload():
+                with client.open(payload_path, "wb") as file:
+                    return file.write(payload)
+
+            written, write_rss_growth = monitor_rss(write_payload)
             write_seconds = time.perf_counter() - started
             _, peak = tracemalloc.get_traced_memory()
         finally:
@@ -202,7 +204,8 @@ def sync_scenario(url: str, version: str, require_pnfs: bool, payload: bytes) ->
             # Set the boundary only after the RSS sampler is running and
             # immediately before entering the native blocking operation.
             heartbeat_before_read = heartbeat
-            result = client.read_bytes(payload_path)
+            with client.open(payload_path, "rb") as file:
+                result = file.read()
             heartbeat_after_read = heartbeat
             return result
 
@@ -254,8 +257,10 @@ async def async_scenario(url: str, version: str, payload: bytes) -> dict[str, fl
     task = asyncio.create_task(beat())
     try:
         assert client.version.value == version
-        await client.write_bytes(payload_path, payload)
-        assert await client.read_bytes(payload_path) == payload
+        async with await client.open(payload_path, "wb") as file:
+            await file.write(payload)
+        async with await client.open(payload_path, "rb") as file:
+            assert await file.read() == payload
         await verified_remove_async(client, payload_path)
     finally:
         stop = True

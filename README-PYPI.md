@@ -61,7 +61,8 @@ url = "nfs://server.example.com/export?version=4.1&noresvport=true"
 
 with Client.connect(url, connect_timeout=10, operation_timeout=30) as client:
     client.mkdir("incoming", parents=True, exist_ok=True)
-    written = client.write_bytes("incoming/hello.txt", b"hello NFS")
+    with client.open("incoming/hello.txt", "wb") as file:
+        written = file.write(b"hello NFS")
     assert written == 9
 
     info = client.stat("incoming/hello.txt")
@@ -116,6 +117,18 @@ with the client that returned them; an invalid or stale handle is reported as
 an error rather than silently replaced through path lookup.
 
 ## Read and write with a large buffer
+
+`File.read(size=-1)` and `File.read_at(offset, size=-1)` return `bytes` and
+use the same negotiated chunk size and maximum of 8 concurrent reads as
+`readinto` and `readinto_at`. Non-empty short responses are completed until
+the requested range is filled or EOF is reached. Omitting `size` reads to EOF
+in bounded batches. `read` advances the position; `read_at` leaves it unchanged.
+Response buffers are retained without copying their payload, then copied once
+into the final Python `bytes`. Use `readinto` with a reusable buffer to avoid
+allocating a new result for every call.
+
+`Client.read_bytes` and `Client.write_bytes` (including their async variants)
+have been removed. Open a file with `client.open()` and use its read/write methods.
 
 `readinto()` fills a writable buffer and returns the number of bytes read. It
 continues short server responses until the buffer is full or EOF is reached;
@@ -230,7 +243,8 @@ from nfs_rs import Client, NfsNotFoundError, NfsUncertainOutcomeError
 
 with Client.connect("nfs://server/export?version=4.1") as client:
     try:
-        data = client.read_bytes("missing.bin")
+        with client.open("missing.bin", "rb") as file:
+            data = file.read()
     except NfsNotFoundError:
         data = b""
 

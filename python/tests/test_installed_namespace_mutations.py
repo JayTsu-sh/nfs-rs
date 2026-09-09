@@ -21,8 +21,10 @@ def test_sync_namespace_and_whole_file_conveniences() -> None:
     client.link("new", "hard")
     client.symlink("../raw/target", "sym")
     assert client.readlink("sym") == "../target"
-    assert client.write_bytes("whole.bin", b"contents") == 8
-    assert client.read_bytes("whole.bin") == b"contents"
+    with client.open("whole.bin", "wb") as file:
+        assert file.write(b"contents") == 8
+    with client.open("whole.bin", "rb") as file:
+        assert file.read() == b"contents"
     client.touch("empty.bin")
     client.remove("whole.bin")
     client.rmdir("parent/child")
@@ -57,8 +59,10 @@ def test_async_namespace_twins() -> None:
         await client.link("to", "hard")
         await client.symlink("../../target", "sym")
         assert await client.readlink("sym") == "../target"
-        assert await client.write_bytes("async.bin", b"value") == 5
-        assert await client.read_bytes("async.bin") == b"value"
+        async with await client.open("async.bin", "wb") as file:
+            assert await file.write(b"value") == 5
+        async with await client.open("async.bin", "rb") as file:
+            assert await file.read() == b"value"
         await client.remove("async.bin")
         await client.rmdir("async/child")
         await client.close()

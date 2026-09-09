@@ -321,7 +321,7 @@ fn write_failure(
 }
 
 // Bound response memory and RPC pressure independently of the caller's buffer size.
-const READ_CONCURRENCY: usize = 8;
+pub(crate) const READ_CONCURRENCY: usize = 8;
 
 /// Fill only the requested range. Consume responses in offset order so EOF
 /// or an error cannot leave a reported byte count that skips a hole.
@@ -336,6 +336,21 @@ pub(crate) async fn read_into_with<I, F>(
 where
     I: ReadIo + ?Sized,
     F: FnMut(usize, &[u8]) -> Result<()> + Send,
+{
+    read_chunks_with(io, fh, offset, len, |at, piece| fill(at, &piece)).await
+}
+
+/// Deliver owned response buffers in offset order without copying their payload.
+pub(crate) async fn read_chunks_with<I, F>(
+    io: &I,
+    fh: Bytes,
+    offset: u64,
+    len: usize,
+    mut fill: F,
+) -> Result<usize>
+where
+    I: ReadIo + ?Sized,
+    F: FnMut(usize, Bytes) -> Result<()> + Send,
 {
     offset
         .checked_add(
@@ -379,8 +394,9 @@ where
         let (start, want, got, pieces) = result?;
         let mut at = start;
         for piece in pieces {
-            fill(at, &piece)?;
-            at += piece.len();
+            let len = piece.len();
+            fill(at, piece)?;
+            at += len;
         }
         completed += got;
         if got < want {
@@ -634,6 +650,34 @@ mod tests {
         assert_eq!(fake.reads.load(Ordering::SeqCst), 25);
         let peak = fake.max_concurrent_reads.load(Ordering::SeqCst);
         assert!(peak > 1 && peak <= READ_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn owned_read_chunks_are_ordered_with_actual_concurrency() {
+        for (len, expected_peak) in [(3, 1), (12, 3), (40, 8)] {
+            let fake = Fake {
+                data: AsyncMutex::new((0..40u8).collect()),
+                read_delay: Some(|offset| if offset == 0 { 20 } else { 1 }),
+                short_read: 2,
+                ..Default::default()
+            };
+            let mut pieces = Vec::new();
+            let mut next = 0;
+            let count = read_chunks_with(&fake, Bytes::new(), 0, len, |at, piece| {
+                assert_eq!(at, next);
+                next += piece.len();
+                pieces.push(piece);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(count, len);
+            assert_eq!(pieces.concat(), (0..len as u8).collect::<Vec<_>>());
+            assert_eq!(
+                fake.max_concurrent_reads.load(Ordering::SeqCst),
+                expected_peak
+            );
+        }
     }
 
     #[tokio::test]

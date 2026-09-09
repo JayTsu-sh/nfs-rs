@@ -707,14 +707,6 @@ class Client(_ClientOptions):
         now = time.time_ns()
         self.utime(normalized, ns=(now, now))
 
-    def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
-        with self.open(path, "rb") as file:
-            return file.read()
-
-    def write_bytes(self, path: os.PathLike[str] | str, data: Any) -> int:
-        with self.open(path, "wb") as file:
-            return file.write(data)
-
     def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
         """Open a binary file.
 
@@ -967,14 +959,6 @@ class AsyncClient(_ClientOptions):
         await file.close()
         now = time.time_ns()
         await self.utime(normalized, ns=(now, now))
-
-    async def read_bytes(self, path: os.PathLike[str] | str) -> bytes:
-        async with await self.open(path, "rb") as file:
-            return await file.read()
-
-    async def write_bytes(self, path: os.PathLike[str] | str, data: Any) -> int:
-        async with await self.open(path, "wb") as file:
-            return await file.write(data)
 
     async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
         """Open a binary file with the same non-transactional effects as Client.open()."""

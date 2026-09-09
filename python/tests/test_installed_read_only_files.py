@@ -195,3 +195,44 @@ def test_timed_out_readinto_prevents_late_writes():
                 await file.close()
                 assert target == b"!" * 20 + b"released"
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [0, 3, 4, 5, 32, 40, 4096, -1])
+def test_bytes_reads_across_chunks_and_eof(size: int) -> None:
+    from nfs_rs import Client
+
+    payload = bytes(range(251)) * 3  # Test server negotiates four-byte chunks.
+    with Client.connect("nfs-test://fixture/export") as client:
+        assert not hasattr(client, "read_bytes")
+        assert not hasattr(client, "write_bytes")
+        with client.open("read-chunks.bin", "w+b") as file:
+            file.write(payload)
+            file.seek(2)
+            expected = payload[2:] if size == -1 else payload[2:2 + size]
+            assert file.read_at(2, size) == expected
+            assert file.tell() == 2
+            assert file.read(size) == expected
+            assert file.tell() == 2 + len(expected)
+            assert file.read_at(len(payload), size) == b""
+
+
+@pytest.mark.parametrize("size", [0, 3, 4, 5, 32, 40, 4096, -1])
+def test_async_bytes_reads_across_chunks_and_eof(size: int) -> None:
+    from nfs_rs import AsyncClient
+
+    async def scenario() -> None:
+        payload = bytes(range(251)) * 3
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            assert not hasattr(client, "read_bytes")
+            assert not hasattr(client, "write_bytes")
+            async with await client.open("async-read-chunks.bin", "w+b") as file:
+                await file.write(payload)
+                await file.seek(2)
+                expected = payload[2:] if size == -1 else payload[2:2 + size]
+                assert await file.read_at(2, size) == expected
+                assert file.tell() == 2
+                assert await file.read(size) == expected
+                assert file.tell() == 2 + len(expected)
+                assert await file.read_at(len(payload), size) == b""
+
+    asyncio.run(scenario())

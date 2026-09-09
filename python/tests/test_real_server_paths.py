@@ -37,7 +37,8 @@ def test_real_server_metadata_xattrs_and_filesystem_information():
     path = f"python-ticket08-{os.getpid()}-{time.time_ns()}"
     with Client.connect(REAL_URL) as client:
         try:
-            assert client.write_bytes(path, b"metadata") == 8
+            with client.open(path, "wb") as file:
+                assert file.write(b"metadata") == 8
             client.chmod(path, 0o600)
             before = client.stat(path)
             client.chown(path, -1, -1)
