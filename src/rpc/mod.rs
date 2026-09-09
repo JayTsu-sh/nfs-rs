@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -177,7 +177,16 @@ async fn portmap_calls(
             METADATA_TIMEOUT,
         )
         .await?;
-    Ok(BigEndian::read_u32(&res[..4]) as u16)
+    let bytes: [u8; 4] = res
+        .as_ref()
+        .try_into()
+        .map_err(|_| NfsError::Xdr("GETPORT result must contain exactly 4 bytes".into()))?;
+    let port = u16::try_from(u32::from_be_bytes(bytes))
+        .map_err(|_| NfsError::Xdr("GETPORT port exceeds 65535".into()))?;
+    if port == 0 {
+        return Err(NfsError::Rpc("GETPORT service is not registered".into()));
+    }
+    Ok(port)
 }
 
 #[derive(Debug, PartialEq)]
@@ -264,6 +273,35 @@ impl Drop for RebindPublicationGuard<'_> {
 /// is established (see `enable_backchannel`); read by the reader loop on each CALL.
 type BackchannelSlot = Arc<std::sync::Mutex<Option<BackchannelHandler>>>;
 
+/// A partially written record cannot be followed by another RPC record.
+/// Synchronous socket shutdown in Drop also covers task cancellation and timeout.
+struct FrameWriteGuard<'a> {
+    writer: TokioMutexGuard<'a, OwnedWriteHalf>,
+    complete: bool,
+}
+
+impl Drop for FrameWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = socket2::SockRef::from(self.writer.as_ref()).shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+async fn connect_stream(addr: SocketAddr, noresvport: bool) -> Result<tokio::net::TcpStream> {
+    tokio::time::timeout(
+        METADATA_TIMEOUT,
+        crate::connect_to_target(&addr, noresvport),
+    )
+    .await
+    .map_err(|_| {
+        NfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "RPC connect timeout",
+        ))
+    })?
+}
+
 pub(crate) struct StreamMux {
     /// Wrapped in an `Arc` so the reader loop can also write backchannel replies
     /// onto the same connection (NFSv4.1 backchannel rides the fore-channel TCP).
@@ -284,7 +322,7 @@ pub(crate) struct StreamMux {
 
 impl StreamMux {
     pub(crate) async fn connect(addr: SocketAddr, noresvport: bool) -> Result<Arc<Self>> {
-        let stream = crate::connect_to_target(&addr, noresvport).await?;
+        let stream = connect_stream(addr, noresvport).await?;
         let (reader, writer) = stream.into_split();
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let writer = Arc::new(TokioMutex::new(writer));
@@ -365,67 +403,85 @@ impl StreamMux {
         timeout: std::time::Duration,
         bypass_readiness: bool,
     ) -> Result<Bytes> {
-        if !bypass_readiness {
-            self.wait_until_ready()
-                .await
-                .map_err(|error| NfsError::transport(crate::RequestTransmission::NotSent, error))?;
-        }
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|_| {
-                NfsError::transport(
-                    crate::RequestTransmission::NotSent,
-                    NfsError::Rpc("pending map lock poisoned".to_string()),
-                )
-            })?
-            .insert(xid, tx);
-        let _pending_guard = PendingRequestGuard {
-            pending: Arc::clone(&self.pending),
-            xid,
-        };
+        let mut transmission = crate::RequestTransmission::NotSent;
+        let attempt = async {
+            if !bypass_readiness {
+                self.wait_until_ready().await.map_err(|error| {
+                    NfsError::transport(crate::RequestTransmission::NotSent, error)
+                })?;
+            }
+            let (tx, rx) = oneshot::channel();
+            self.pending
+                .lock()
+                .map_err(|_| {
+                    NfsError::transport(
+                        crate::RequestTransmission::NotSent,
+                        NfsError::Rpc("pending map lock poisoned".to_string()),
+                    )
+                })?
+                .insert(xid, tx);
+            let _pending_guard = PendingRequestGuard {
+                pending: Arc::clone(&self.pending),
+                xid,
+            };
 
-        // Write request under the writer lock — released before awaiting the response.
-        // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
-        let write_result = {
-            let mut writer = self.writer.lock().await;
-            async {
-                writer.write_all(header).await?;
-                if !data.is_empty() {
-                    writer.write_all(data).await?;
-                    if data_pad > 0 {
-                        writer.write_all(&[0u8; 4][..data_pad]).await?;
+            // Write request under the writer lock — released before awaiting the response.
+            // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
+            let write_result = {
+                let writer = self.writer.lock().await;
+                let mut frame = FrameWriteGuard {
+                    writer,
+                    complete: false,
+                };
+                transmission = crate::RequestTransmission::Sent;
+                async {
+                    frame.writer.write_all(header).await?;
+                    if !data.is_empty() {
+                        frame.writer.write_all(data).await?;
+                        if data_pad > 0 {
+                            frame.writer.write_all(&[0u8; 4][..data_pad]).await?;
+                        }
                     }
+                    frame.complete = true;
+                    Ok::<(), NfsError>(())
                 }
-                Ok::<(), NfsError>(())
-            }
-            .await
-        };
+                .await
+            };
 
-        write_result
-            .map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))?;
+            write_result
+                .map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))?;
 
-        // Wait for response from the reader task with timeout.
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Err(error @ NfsError::Io(_)))) => {
-                Err(NfsError::transport(crate::RequestTransmission::Sent, error))
-            }
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NfsError::transport(
-                crate::RequestTransmission::Sent,
-                NfsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "reader task terminated",
+            // Wait for response from the reader task with timeout.
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(Err(error @ NfsError::Io(_)))) => {
+                    Err(NfsError::transport(crate::RequestTransmission::Sent, error))
+                }
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(NfsError::transport(
+                    crate::RequestTransmission::Sent,
+                    NfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "reader task terminated",
+                    )),
                 )),
-            )),
-            Err(_) => Err(NfsError::transport(
-                crate::RequestTransmission::Sent,
+                Err(_) => Err(NfsError::transport(
+                    crate::RequestTransmission::Sent,
+                    NfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RPC response timeout",
+                    )),
+                )),
+            }
+        };
+        tokio::time::timeout(timeout, attempt).await.map_err(|_| {
+            NfsError::transport(
+                transmission,
                 NfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "RPC response timeout",
+                    "RPC attempt timeout",
                 )),
-            )),
-        }
+            )
+        })?
     }
 
     async fn reconnect(self: &Arc<Self>, failed_gen: u64) -> Result<()> {
@@ -446,7 +502,7 @@ impl StreamMux {
         }
         // Establish new TCP connection OUTSIDE the writer lock so that
         // concurrent send_and_receive() calls are not blocked during connect.
-        let stream = crate::connect_to_target(&self.addr, self.noresvport).await?;
+        let stream = connect_stream(self.addr, self.noresvport).await?;
         let (reader, new_writer) = stream.into_split();
         let reader = BufReader::with_capacity(1_048_576, reader);
 
@@ -663,9 +719,18 @@ async fn dispatch_backchannel_call(
     let mut out = Vec::with_capacity(4 + reply.len());
     out.extend_from_slice(&mark.to_be_bytes());
     out.extend_from_slice(&reply);
-    let mut w = writer.lock().await;
-    if let Err(e) = w.write_all(&out).await {
-        warn!(xid, error = %e, "failed to write backchannel reply");
+    let result = tokio::time::timeout(METADATA_TIMEOUT, async {
+        let mut frame = FrameWriteGuard {
+            writer: writer.lock().await,
+            complete: false,
+        };
+        frame.writer.write_all(&out).await?;
+        frame.complete = true;
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        warn!(xid, "failed to write backchannel reply before deadline");
     }
 }
 
@@ -832,6 +897,7 @@ impl Client {
         // Total replay budget: 3x the per-attempt timeout, so we fail fast instead
         // of accumulating max_attempts * timeout worth of delay.
         let max_total = timeout.saturating_mul(3);
+        let deadline = start + max_total;
 
         // Determine mux from the program field in msg_body (offset 4, big-endian u32).
         let program = if msg_body.len() >= 8 {
@@ -854,7 +920,7 @@ impl Client {
 
         while attempt < max_attempts {
             // Bail out if total elapsed time exceeds the budget.
-            if start.elapsed() > max_total {
+            if tokio::time::Instant::now() >= deadline {
                 break;
             }
 
@@ -872,7 +938,14 @@ impl Client {
             );
             let r#gen = mux.generation();
             let res = mux
-                .send_and_receive_inner(xid, &msg_body, &data, data_pad, timeout, bypass_readiness)
+                .send_and_receive_inner(
+                    xid,
+                    &msg_body,
+                    &data,
+                    data_pad,
+                    timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    bypass_readiness,
+                )
                 .await;
 
             match res {
@@ -913,9 +986,25 @@ impl Client {
                         );
                         let jitter = rand::random_range(0..50u64);
                         let backoff = std::cmp::min(100u64 << (attempt - 1), 2000) + jitter;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
-                        if let Err(reconn_err) = mux.reconnect(r#gen).await {
-                            warn!(error = %reconn_err, "reconnect failed, will retry");
+                        let reconnect = async {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                            mux.reconnect(r#gen).await
+                        };
+                        match tokio::time::timeout_at(deadline, reconnect).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(reconn_err)) => {
+                                warn!(error = %reconn_err, "reconnect failed, will retry")
+                            }
+                            Err(_) => {
+                                last_error = Some(NfsError::transport(
+                                    logical_transmission,
+                                    NfsError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "RPC total attempt budget exhausted during reconnect",
+                                    )),
+                                ));
+                                break;
+                            }
                         }
                         last_error = Some(e);
                         continue;
@@ -1646,6 +1735,170 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+        client.shutdown().await;
+    }
+    fn nfs_test_body() -> Vec<u8> {
+        [RPC_VERSION, NFS_PROG, 4, 1]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_includes_waiting_for_writer() {
+        let client = Client::new_dummy().await;
+        let writer = client.nfs_mux.writer.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("RPC deadline must include lock admission")
+        .unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            result.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        drop(writer);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn portmap_rejects_short_and_out_of_range_results() {
+        for payload in [
+            vec![],
+            vec![0; 3],
+            65536u32.to_be_bytes().to_vec(),
+            0u32.to_be_bytes().to_vec(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for data in [vec![], payload] {
+                    let record = read_test_record(&mut stream).await.unwrap();
+                    let xid = BigEndian::read_u32(&record[..4]);
+                    write_test_rpc_reply(&mut stream, xid, &data).await.unwrap();
+                }
+            });
+            let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
+            assert!(
+                portmap_calls(&client, NFS_PROG, 3, &Auth::new_null(), 2)
+                    .await
+                    .is_err()
+            );
+            client.shutdown().await;
+            server.await.unwrap();
+        }
+    }
+
+    async fn unfinished_frame_is_discarded(cancel: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (drain_tx, drain_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let marker = stream.read_u32().await.unwrap();
+            started_tx.send(()).unwrap();
+            drain_rx.await.unwrap();
+            let mut received = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut received),
+            )
+            .await
+            .expect("cancelled partial frame must close its socket")
+            .unwrap();
+            assert!(received.len() < (marker & 0x7fffffff) as usize);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let record = read_test_record(&mut stream).await.unwrap();
+            assert_eq!(&record[8..], &nfs_test_body());
+            write_test_rpc_reply(&mut stream, BigEndian::read_u32(&record[..4]), b"ok")
+                .await
+                .unwrap();
+        });
+        let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
+        {
+            let writer = client.nfs_mux.writer.lock().await;
+            socket2::SockRef::from(writer.as_ref())
+                .set_send_buffer_size(1024)
+                .unwrap();
+        }
+        let task_client = client.clone();
+        let call = tokio::spawn(async move {
+            task_client
+                .call_with_data(
+                    nfs_test_body(),
+                    Bytes::from(vec![1; 16 * 1024 * 1024]),
+                    ReplayPolicy::ONE_ATTEMPT,
+                    if cancel {
+                        std::time::Duration::from_secs(10)
+                    } else {
+                        std::time::Duration::from_millis(20)
+                    },
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        if cancel {
+            call.abort();
+            let _ = call.await;
+        } else {
+            let error = call.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(
+                error.request_transmission(),
+                Some(crate::RequestTransmission::Sent)
+            );
+        }
+        drain_tx.send(()).unwrap();
+        let result = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap(), Bytes::from_static(b"ok"));
+        client.shutdown().await;
+    }
+    #[tokio::test]
+    async fn cancelling_partial_frame_closes_stream_and_next_call_reconnects() {
+        unfinished_frame_is_discarded(true).await;
+    }
+
+    #[tokio::test]
+    async fn sending_deadline_discards_partial_frame() {
+        unfinished_frame_is_discarded(false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_includes_readiness() {
+        let client = Client::new_dummy().await;
+        client
+            .nfs_mux
+            .readiness
+            .store(CONNECTION_REBINDING, Ordering::Release);
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
         client.shutdown().await;
     }
 }

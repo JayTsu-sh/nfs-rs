@@ -327,6 +327,24 @@ impl Drop for AcquiredSlot<'_> {
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn for_test(marker: u8) -> Session {
+        Session {
+            generation: 0,
+            session_id: [marker; 16],
+            client_id: marker as u64,
+            slot_table: SlotTable::new(1),
+            max_request_size: 4096,
+            max_response_size: 4096,
+            max_cached_response_size: 512,
+            max_operations: 16,
+            backchannel_max_requests: 1,
+            backchannel_max_request_size: 4096,
+            backchannel_max_operations: 2,
+            pnfs_mds: false,
+        }
+    }
+
     /// Session ID (16 bytes).
     pub fn id(&self) -> &[u8; 16] {
         &self.session_id
@@ -897,20 +915,7 @@ mod tests {
     use super::*;
 
     fn test_session(marker: u8) -> Session {
-        Session {
-            generation: 0,
-            session_id: [marker; 16],
-            client_id: marker as u64,
-            slot_table: SlotTable::new(1),
-            max_request_size: 4096,
-            max_response_size: 4096,
-            max_cached_response_size: 512,
-            max_operations: 16,
-            backchannel_max_requests: 1,
-            backchannel_max_request_size: 4096,
-            backchannel_max_operations: 2,
-            pnfs_mds: false,
-        }
+        Session::for_test(marker)
     }
 
     #[tokio::test]

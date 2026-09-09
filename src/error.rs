@@ -245,7 +245,7 @@ pub enum NfsError {
 /// One ordered phase failure from a terminal file close.
 #[derive(Debug)]
 pub struct FileCloseFailure {
-    /// Stable operation name (`commit` or `close`).
+    /// Stable operation name (`write`, `commit` or `close`).
     pub operation: &'static str,
     /// The original structured failure.
     pub error: std::sync::Arc<NfsError>,

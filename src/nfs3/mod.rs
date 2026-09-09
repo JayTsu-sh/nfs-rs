@@ -94,51 +94,55 @@ pub(crate) use fastxdr::{
 /// cookie and entry count, then once (destructive) via `from_fn` to yield entries.
 macro_rules! paged_dir_stream {
     ($self:expr_2021, $dir_fh:expr_2021, $fetch_page:ident, $convert:expr_2021, $label:literal) => {{
-        use futures::stream::TryStreamExt as _;
         let this = $self;
-        futures::stream::try_unfold(Some(($dir_fh, 0u64, [0u8; 8])), move |state| async move {
-            let Some((fh, cookie, verifier)) = state else {
-                return Ok::<_, crate::error::NfsError>(None);
-            };
-            let res = this.$fetch_page(fh.clone(), cookie, verifier).await?;
-            let new_verifier: [u8; 8] = res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
-            let eof = res.reply.eof;
-            // Walk linked list (read-only) for last cookie and count.
-            let (new_cookie, entry_count, entries_head) = match res.reply.entries {
-                Some(entry) => {
-                    let mut count = 0usize;
-                    let mut last_cookie = cookie;
-                    let mut e = &*entry;
-                    loop {
-                        count += 1;
-                        last_cookie = e.cookie.0;
-                        match &e.nextentry {
-                            Some(next) => e = next,
-                            None => break,
-                        }
+        futures::stream::try_unfold(
+            Some(($dir_fh, crate::mount::DirectoryCursor::default())),
+            move |state| async move {
+                let Some((fh, mut cursor)) = state else {
+                    return Ok::<_, crate::error::NfsError>(None);
+                };
+                let cookie = cursor.cookie;
+                let res = this
+                    .$fetch_page(fh.clone(), cookie, cursor.verifier)
+                    .await?;
+                let new_verifier: [u8; 8] =
+                    res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
+                let eof = res.reply.eof;
+                // Walk linked list (read-only) for last cookie and count.
+                let (new_cookie, entry_count, entries_head) = match res.reply.entries {
+                    Some(entry) => {
+                        let mut count = 0usize;
+                        let mut e = &*entry;
+                        let last_cookie = loop {
+                            count += 1;
+                            match &e.nextentry {
+                                Some(next) => e = next,
+                                None => break e.cookie.0,
+                            }
+                        };
+                        (last_cookie, count, Some(entry))
                     }
-                    (last_cookie, count, Some(entry))
-                }
-                None => (cookie, 0, None),
-            };
-            tracing::debug!(cookie = new_cookie, eof, entry_count, $label);
-            let next = if eof || entry_count == 0 {
-                None
-            } else {
-                Some((fh, new_cookie, new_verifier))
-            };
-            // Yield entries directly from the linked list — no intermediate Vec.
-            let convert = $convert;
-            let entry_iter = {
-                let mut current = entries_head;
-                std::iter::from_fn(move || {
-                    let mut node = current.take()?;
-                    current = node.nextentry.take();
-                    Some(Ok(convert(node)))
-                })
-            };
-            Ok(Some((futures::stream::iter(entry_iter), next)))
-        })
+                    None => (cookie, 0, None),
+                };
+                tracing::debug!(cookie = new_cookie, eof, entry_count, $label);
+                let next = if cursor.advance(new_cookie, new_verifier, entry_count, eof)? {
+                    Some((fh, cursor))
+                } else {
+                    None
+                };
+                // Yield entries directly from the linked list — no intermediate Vec.
+                let convert = $convert;
+                let entry_iter = {
+                    let mut current = entries_head;
+                    std::iter::from_fn(move || {
+                        let mut node = current.take()?;
+                        current = node.nextentry.take();
+                        Some(Ok(convert(node)))
+                    })
+                };
+                Ok(Some((futures::stream::iter(entry_iter), next)))
+            },
+        )
         .try_flatten()
     }};
 }

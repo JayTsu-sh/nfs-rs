@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use syn::visit::{self, Visit};
+use syn::{Attribute, Item};
 
 const MANIFEST: &str = "tests/nfs41-reliability-coverage.json";
 
@@ -59,6 +61,18 @@ fn coverage_manifest_is_complete() {
             "{id} silently skips required nightly coverage"
         );
         assert_eq!(entry["required"], true, "{id} must remain required");
+        let status = entry["ci_status"]
+            .as_str()
+            .expect("explicit CI mapping status");
+        assert!(["mapped", "partial", "unmapped"].contains(&status));
+        let concrete = entry["ci_tests"]
+            .as_array()
+            .expect("concrete CI test names");
+        assert_eq!(
+            concrete.is_empty(),
+            status == "unmapped",
+            "{id} has inconsistent mapping status"
+        );
     }
     for number in 1..=25 {
         assert!(
@@ -85,24 +99,90 @@ fn production_code_has_no_unwrap_or_expect() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("Rust source must be UTF-8");
-            let production = source
-                .split("#[cfg(test)]")
-                .next()
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim_start();
-                    !trimmed.starts_with("///") && !trimmed.starts_with("//!")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let tree = syn::parse_file(&source).expect("Rust source must parse");
+            let mut calls = ProductionPanics::default();
+            calls.visit_file(&tree);
             assert!(
-                !production.contains(".unwrap()") && !production.contains(".expect("),
-                "production unwrap/expect found in {}",
+                calls.methods.is_empty(),
+                "production panic helpers {:?} found in {}",
+                calls.methods,
                 path.display()
             );
         }
     }
+}
+
+#[derive(Default)]
+struct ProductionPanics {
+    methods: Vec<String>,
+}
+
+fn test_only(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Path>()
+                .is_ok_and(|path| path.is_ident("test"))
+    })
+}
+
+impl<'ast> Visit<'ast> for ProductionPanics {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if !test_only(&file.attrs) {
+            visit::visit_file(self, file);
+        }
+    }
+    fn visit_item(&mut self, item: &'ast Item) {
+        let attributes = match item {
+            Item::Const(i) => &i.attrs,
+            Item::Enum(i) => &i.attrs,
+            Item::ExternCrate(i) => &i.attrs,
+            Item::Fn(i) => &i.attrs,
+            Item::ForeignMod(i) => &i.attrs,
+            Item::Impl(i) => &i.attrs,
+            Item::Macro(i) => &i.attrs,
+            Item::Mod(i) => &i.attrs,
+            Item::Static(i) => &i.attrs,
+            Item::Struct(i) => &i.attrs,
+            Item::Trait(i) => &i.attrs,
+            Item::TraitAlias(i) => &i.attrs,
+            Item::Type(i) => &i.attrs,
+            Item::Union(i) => &i.attrs,
+            Item::Use(i) => &i.attrs,
+            _ => &[][..],
+        };
+        if !test_only(attributes) {
+            visit::visit_item(self, item);
+        }
+    }
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if !test_only(&item.attrs) {
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "unwrap" || call.method == "expect" {
+            self.methods.push(call.method.to_string());
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+#[test]
+fn panic_scan_continues_after_test_only_imports_and_modules() {
+    let source = r#"
+        #[cfg(test)] use std::sync::atomic::AtomicUsize;
+        fn production() { Some(1).unwrap(); }
+        #[cfg(test)] mod tests { fn test() { Some(1).unwrap(); } }
+        fn later() { Some(2).expect("needed"); }
+        impl Thing {
+            #[cfg(test)] fn fixture() { Some(3).unwrap(); }
+            fn production_method() { Some(4).unwrap(); }
+        }
+    "#;
+    let mut calls = ProductionPanics::default();
+    calls.visit_file(&syn::parse_file(source).unwrap());
+    assert_eq!(calls.methods, ["unwrap", "expect", "unwrap"]);
 }
 
 #[test]

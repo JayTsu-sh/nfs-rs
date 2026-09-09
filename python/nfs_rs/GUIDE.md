@@ -61,7 +61,7 @@ Common options:
 | `version=4.1,4.0,3` | Try an explicit fallback order |
 | `uid=`, `gid=` | AUTH_SYS numeric identity |
 | `nfsport=`, `mountport=` | Override service ports |
-| `readdir-buffer=` | Directory response limit, or `dircount,maxcount` |
+| `readdir-buffer=` | Directory response limit, or `dircount,maxcount`; honored by v3/v4.0/v4.1, additionally bounded by v4.1 session capacity |
 | `noresvport=true` | Use an unprivileged source port |
 | `retain-delegations=true` | Retain delegations when supported |
 
@@ -319,6 +319,17 @@ Pass `-1` to one side of `chown` when that identity should remain unchanged.
 
 ### Extended attributes and ACL capability
 
+Named attributes use the optional NFSv4.1 OPENATTR file interface, not the
+NFSv4.2 GETXATTR/SETXATTR extension or a portable mapping of Linux POSIX xattrs.
+There is no fixed client limit on the complete value size; server and file system
+limits still apply. Negotiated read/write sizes limit individual requests.
+`getxattr` continues short reads to EOF and buffers the complete value in memory.
+`setxattr` replaces the entire value, including truncating old contents when
+setting a shorter or empty value, and completes short writes before closing.
+Replacement is not atomic across clients: an error after truncation can leave a
+partial value. Inspect the uncertain outcome and verify the value before retrying;
+write and cleanup failures remain available in the error source chain.
+
 Extended attributes are optional and server dependent. Check the negotiated
 capability before using them:
 
@@ -436,6 +447,12 @@ confirmed prefix, resume offset, or durability guarantee.
 State-loss errors may require reopening a file or remounting. A
 `NfsPositionUncertainError` means the sequential file cursor cannot be trusted;
 prefer verification and positional I/O during recovery.
+
+RPC timeouts cover admission, sending and response waiting. A Python
+`operation_timeout` limits how long the caller waits; an admitted modifying
+operation may continue settling after that timeout. It is not a rollback or
+proof that the server did nothing. Close the client to drain owned operations,
+and inspect recovery events before retrying uncertain mutations.
 
 ## Cancellation and recovery events
 

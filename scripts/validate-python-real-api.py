@@ -338,6 +338,9 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
             capability_call(lambda: client.removexattr(data, xattr), "Client.removexattr", checks)
         else:
             check(client.getxattr(data, xattr) == b"value", "Client.getxattr", checks)
+            for replacement in (b"xy", b""):
+                client.setxattr(data, xattr, replacement)
+                check(client.getxattr(data, xattr) == replacement, "Client.setxattr:replace-exact", checks)
             check(xattr in client.listxattr(data), "Client.listxattr", checks)
             client.removexattr(data, xattr)
             checks.extend(("Client.setxattr", "Client.removexattr"))
@@ -522,6 +525,9 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             await capability_call_async(lambda: client.removexattr(data, xattr), "AsyncClient.removexattr", checks)
         else:
             check(await client.getxattr(data, xattr) == b"value", "AsyncClient.getxattr", checks)
+            for replacement in (b"xy", b""):
+                await client.setxattr(data, xattr, replacement)
+                check(await client.getxattr(data, xattr) == replacement, "AsyncClient.setxattr:replace-exact", checks)
             check(xattr in await client.listxattr(data), "AsyncClient.listxattr", checks)
             await client.removexattr(data, xattr)
             checks.extend(("AsyncClient.setxattr", "AsyncClient.removexattr"))

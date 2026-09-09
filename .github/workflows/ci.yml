@@ -20,7 +20,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets --no-fail-fast
+      - run: |
+          mkdir -p target
+          cargo test --all-targets --no-fail-fast | tee target/rust-test-results.txt
+        shell: bash
+      - run: python3 scripts/check-reliability-test-results.py --results target/rust-test-results.txt
+      - run: cargo test --doc
 
   python:
     strategy:
@@ -36,6 +41,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: Swatinem/rust-cache@v2
       - run: python -m pip install "maturin>=1,<2" mypy pytest
+      - run: cargo test --locked --features python-bindings --lib
       - run: cargo check --locked --features python-extension
       - run: maturin build --locked --features python-test-support --out target/wheels
       - run: python -m pip install --force-reinstall target/wheels/nfs_rs-*.whl

@@ -1,10 +1,29 @@
 # NFSv4.1 Migration Reliability — P0/P1 Specification
 
-Status: Draft  
+Status: Implementation tracked; validation evidence remains incomplete
+
 Created: 2026-07-31  
 Target library: `nfs-rs`  
 Primary consumer: long-running file migration tools  
 Normative protocol: RFC 5661 (NFSv4.1), RFC 5531 (ONC RPC), RFC 4506 (XDR)
+
+## Current implementation and evidence (2026-09-09)
+
+Section 2 records the original problem statement, not an assertion that every
+listed defect still exists. The implementation now includes explicit replay
+classes, slot fencing, validated renewal replies, session-generation checks,
+connection rebind and callback replay handling. Remaining coverage must be read
+from [the coverage manifest](../tests/nfs41-reliability-coverage.json).
+
+The manifest separates historical descriptions from concrete `ci_tests` names
+and `ci_status` (`mapped`, `partial`, `unmapped`). CI compares those names with
+actual successful test execution. A mapped test demonstrates only its asserted
+behavior; it does not prove all requirements or substitute for real-server
+fault evidence. Planned and blocked-capability nightly items remain outstanding.
+
+The September review corrections and their deterministic regression cases are
+recorded in [the review validation notes](validation/review-fixes-2026-09-09.md).
+These notes do not claim new physical-lab evidence.
 
 ## 1. Goal
 

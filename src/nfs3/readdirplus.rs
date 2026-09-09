@@ -19,6 +19,7 @@ use super::{
     paged_dir_stream, post_op_fh3,
 };
 use bytes::Bytes;
+use futures::TryStreamExt as _;
 use futures::stream::Stream;
 
 #[derive(Debug)]

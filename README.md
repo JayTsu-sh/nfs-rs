@@ -29,7 +29,7 @@ The public API is still evolving while the crate is below version 1.0.
 
 ```toml
 [dependencies]
-nfs-rs = "0.5"
+nfs-rs = "0.8.1"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -96,7 +96,8 @@ Supported arguments:
 - `nfsport=<port>` — NFS service port. This bypasses portmapper discovery.
 - `mountport=<port>` — MOUNT protocol port for NFSv3.
 - `readdir-buffer=<count>` or `<dircount>,<maxcount>` — response buffer limits
-  for directory reads. Both values default to 8192.
+  for directory reads. Both values default to 8192. All three implemented
+  versions honor this option; v4.1 further bounds the reply by session capacity.
 - `noresvport=<true|false>` — use an ephemeral source port when true. It
   defaults to false.
 
@@ -112,6 +113,20 @@ and `verifier`. `committed` is the server's response, not the requested level;
 pNFS reports the weakest level across the contributing DS replies. Retain its acknowledgement
 for `Mount::commit_write_batch`, which also routes pNFS commits and completes
 required LAYOUTCOMMITs.
+
+Each Rust `BufferedFile` owns one OPEN reference; separately constructed wrappers
+need separate opens even when their file handles are equal. Successful `close`
+is idempotent and subsequent reads, writes and flushes return `ClosedResource`.
+A failed or cancelled close keeps the wrapper unusable; release remaining protocol
+state with `Mount::umount` before discarding the mount.
+
+RPC deadlines include waiting for readiness, the writer lock, socket transmission
+and the reply. Dropping a Rust future during a partial send shuts down that TCP
+connection; later retryable calls can reconnect. Cancellation still does not undo
+remote mutations. Settle a modifying future to obtain its outcome, or verify the
+remote file before resuming. Python owns and settles admitted operations as described
+in its API guide. Directory scans report non-EOF pages that make no progress as
+errors instead of silently reporting a complete listing.
 
 Python `readinto(buffer)` and `readinto_at(buffer, offset)` fill a caller-owned
 writable contiguous buffer using up to 8 concurrent, negotiated-size reads.
@@ -143,6 +158,7 @@ trait for supported filesystem operations.
 
 ## Testing
 
+Run `cargo test --all-targets --no-fail-fast` and `cargo test --doc`.
 Normal unit and integration tests run without access to an NFS server. The
 ignored physical-lab test exercises NFSv3 and NFSv4.1 against dedicated exports;
 its setup is documented in the source repository and is not part of the

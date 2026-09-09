@@ -20,7 +20,45 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use futures::stream::Stream;
+use std::collections::HashSet;
 use std::pin::Pin;
+
+/// Tracks page boundaries without assuming cookies are ordered offsets.
+/// An empty non-EOF page or a repeated boundary must not masquerade as EOF.
+pub(crate) struct DirectoryCursor {
+    pub cookie: u64,
+    pub verifier: [u8; 8],
+    seen: HashSet<u64>,
+}
+
+impl Default for DirectoryCursor {
+    fn default() -> Self {
+        Self {
+            cookie: 0,
+            verifier: [0; 8],
+            seen: HashSet::from([0]),
+        }
+    }
+}
+
+impl DirectoryCursor {
+    pub fn advance(
+        &mut self,
+        cookie: u64,
+        verifier: [u8; 8],
+        entries: usize,
+        eof: bool,
+    ) -> Result<bool> {
+        if (!eof && entries == 0) || (entries > 0 && !self.seen.insert(cookie)) {
+            return Err(NfsError::Xdr(
+                "READDIR page made no progress or repeated a cookie".into(),
+            ));
+        }
+        self.cookie = cookie;
+        self.verifier = verifier;
+        Ok(!eof)
+    }
+}
 
 // Implementation payload ceiling; server and session limits may be smaller.
 pub(crate) const MAX_IO_SIZE: u32 = 4 * 1024 * 1024;
@@ -735,6 +773,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Get a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
+    /// NFSv4.1 reads to EOF, completing short reads, with a 1 MiB complete-value
+    /// ceiling. Oversized values return an error, never a truncated success.
     async fn getxattr(&self, _fh: Bytes, _name: &str) -> Result<Bytes> {
         Err(NfsError::Unsupported(
             "Named attributes require NFSv4".to_string(),
@@ -748,6 +788,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Set a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
+    /// NFSv4.1 replaces the complete value (at most 1 MiB), including truncating
+    /// shorter/empty replacements. This is not atomic across clients; errors after
+    /// truncation carry an uncertain outcome and require verification.
     async fn setxattr(&self, _fh: Bytes, _name: &str, _value: Bytes) -> Result<()> {
         Err(NfsError::Unsupported(
             "Named attributes require NFSv4".to_string(),
