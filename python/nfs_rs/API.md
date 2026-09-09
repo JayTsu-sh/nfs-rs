@@ -306,7 +306,7 @@ Frozen health snapshot. Values describe local state rather than a fresh server p
 |---|---|---|
 | `Health.lifecycle` | `Lifecycle` | Lifecycle enum for local state. |
 | `Health.generation` | `int` | Recovery-generation counter. |
-| `Health.lease_healthy` | `bool &#124; None` | Lease-health flag, or None when not applicable/available. |
+| `Health.lease_healthy` | `bool \| None` | Lease-health flag, or None when not applicable/available. |
 
 ### RecoveryEvent
 
@@ -315,11 +315,11 @@ Frozen diagnostic event retained in a bounded client queue. Read it with recover
 | Member | Type / value | Meaning |
 |---|---|---|
 | `RecoveryEvent.operation` | `str` | Operation name, or None when no operation context is available. |
-| `RecoveryEvent.path` | `str &#124; None` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `RecoveryEvent.path` | `str \| None` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
 | `RecoveryEvent.protocol` | `str` | Protocol identifier, or None on an error without protocol context. |
 | `RecoveryEvent.outcome` | `OperationOutcome` | OperationOutcome failure classification; optional on generic NfsError. |
 | `RecoveryEvent.recovery_action` | `RecoveryAction` | RecoveryAction to consider next; optional on generic NfsError. |
-| `RecoveryEvent.completed_bytes` | `int &#124; None` | Acknowledged write bytes, or None when unknown/not applicable. May cover non-contiguous ranges; not a resume offset or proof of durability. |
+| `RecoveryEvent.completed_bytes` | `int \| None` | Acknowledged write bytes, or None when unknown/not applicable. May cover non-contiguous ranges; not a resume offset or proof of durability. |
 | `RecoveryEvent.message` | `str` | Human-readable diagnostic message. |
 
 ### FileInfo
@@ -341,8 +341,8 @@ Frozen file metadata. Counts are integers; atime, mtime and ctime retain their n
 | `FileInfo.atime` | `int` | Last access time, integer nanoseconds since Unix epoch (UTC). |
 | `FileInfo.mtime` | `int` | Last data modification time, integer nanoseconds since Unix epoch (UTC). |
 | `FileInfo.ctime` | `int` | Last metadata/status change time, integer nanoseconds since Unix epoch (UTC); not creation time. |
-| `FileInfo.owner` | `str &#124; None` | Server owner name, or None when unavailable. |
-| `FileInfo.group` | `str &#124; None` | Server group name, or None when unavailable. |
+| `FileInfo.owner` | `str \| None` | Server owner name, or None when unavailable. |
+| `FileInfo.group` | `str \| None` | Server group name, or None when unavailable. |
 
 ### DirectoryRef
 
@@ -350,8 +350,8 @@ Frozen scan input. path is used for returned entry paths and diagnostics. When f
 
 | Member | Type / value | Meaning |
 |---|---|---|
-| `DirectoryRef.path` | `os.PathLike[str] &#124; str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
-| `DirectoryRef.fh` | `bytes &#124; None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
+| `DirectoryRef.path` | `os.PathLike[str] \| str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `DirectoryRef.fh` | `bytes \| None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
 
 ### DirEntry
 
@@ -362,7 +362,7 @@ Frozen directory entry with eager metadata and an optional opaque file handle. I
 | `DirEntry.name` | `str` | Entry basename. |
 | `DirEntry.path` | `str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
 | `DirEntry.info` | `FileInfo` | Eager FileInfo metadata for the entry. |
-| `DirEntry.fh` | `bytes &#124; None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
+| `DirEntry.fh` | `bytes \| None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
 
 ### ExportEntry
 
@@ -437,16 +437,16 @@ Immutable structured base for all library NFS failures. Subclasses also preserve
 | Member | Type / value | Meaning |
 |---|---|---|
 | `NfsError.message` | `str` | Human-readable diagnostic message. |
-| `NfsError.operation` | `str &#124; None` | Operation name, or None when no operation context is available. |
-| `NfsError.protocol` | `str &#124; None` | Protocol identifier, or None on an error without protocol context. |
-| `NfsError.code` | `int &#124; None` | Numeric protocol status, or None. |
-| `NfsError.code_name` | `str &#124; None` | Symbolic protocol status, or None. |
-| `NfsError.recovery_action` | `RecoveryAction &#124; None` | RecoveryAction to consider next; optional on generic NfsError. |
-| `NfsError.outcome` | `OperationOutcome &#124; None` | OperationOutcome failure classification; optional on generic NfsError. |
-| `NfsError.operation_class` | `OperationClass &#124; None` | OperationClass request classification, or None. |
-| `NfsError.completed_bytes` | `int &#124; None` | Acknowledged write bytes, or None when unknown/not applicable. May cover non-contiguous ranges; not a resume offset or proof of durability. |
-| `NfsError.errno` | `int &#124; None` | Mapped OS error number, or None. |
-| `NfsError.filename` | `str &#124; None` | Path context, or None. |
+| `NfsError.operation` | `str \| None` | Operation name, or None when no operation context is available. |
+| `NfsError.protocol` | `str \| None` | Protocol identifier, or None on an error without protocol context. |
+| `NfsError.code` | `int \| None` | Numeric protocol status, or None. |
+| `NfsError.code_name` | `str \| None` | Symbolic protocol status, or None. |
+| `NfsError.recovery_action` | `RecoveryAction \| None` | RecoveryAction to consider next; optional on generic NfsError. |
+| `NfsError.outcome` | `OperationOutcome \| None` | OperationOutcome failure classification; optional on generic NfsError. |
+| `NfsError.operation_class` | `OperationClass \| None` | OperationClass request classification, or None. |
+| `NfsError.completed_bytes` | `int \| None` | Acknowledged write bytes, or None when unknown/not applicable. May cover non-contiguous ranges; not a resume offset or proof of durability. |
+| `NfsError.errno` | `int \| None` | Mapped OS error number, or None. |
+| `NfsError.filename` | `str \| None` | Path context, or None. |
 | `NfsError.errors` | `tuple[NfsError, ...]` | Tuple of child NfsError values, especially for cleanup aggregation. |
 
 #### NfsError.__init__
