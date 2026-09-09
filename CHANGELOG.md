@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-09
+
+- Ship the complete Python API reference and user guide inside both the wheel and source distribution, with links from the PyPI description.
+- Check documentation coverage against every exported Python symbol, method, property, data field, and enum member; validate packaged documentation bytes.
+- Include the concurrent read and API cleanup changes from 0.8.0, whose registry publication was cancelled to include documentation in this release.
+
 ## [0.8.0] - 2026-09-09
 
 - Remove Python `Client.read_bytes` and `Client.write_bytes`, including async variants. Use `client.open()` and File methods instead.
