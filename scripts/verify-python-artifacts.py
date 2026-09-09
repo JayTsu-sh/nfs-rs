@@ -41,6 +41,11 @@ def verify_wheel(root: Path, wheel: Path) -> None:
         names = set(archive.namelist())
         for required in ("nfs_rs/__init__.pyi", "nfs_rs/py.typed", "nfs_rs/_client.py"):
             assert required in names, f"wheel is missing {required}"
+        for document in ("API.md", "GUIDE.md"):
+            packaged = f"nfs_rs/{document}"
+            assert packaged in names, f"wheel is missing {packaged}"
+            assert archive.read(packaged) == (root / "python" / packaged).read_bytes(), \
+                f"wheel documentation differs from source: {packaged}"
         assert not any(name.endswith("_internal.pyi") for name in names)
         extension = next(name for name in names if name.startswith("nfs_rs/_internal") and name.endswith(".so"))
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
@@ -63,6 +68,12 @@ def verify_sdist(root: Path, sdist: Path) -> None:
     assert sdist.name == f"nfs_rs-{version}.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         names = archive.getnames()
+        for document in ("API.md", "GUIDE.md"):
+            packaged = f"nfs_rs-{version}/python/nfs_rs/{document}"
+            content = archive.extractfile(packaged)
+            assert content is not None, f"sdist is missing {packaged}"
+            assert content.read() == (root / "python/nfs_rs" / document).read_bytes(), \
+                f"sdist documentation differs from source: {packaged}"
     prefix = f"nfs_rs-{version}/"
     required = {
         "Cargo.toml",

@@ -14,6 +14,22 @@ exports directly from Python without a kernel mount or a C NFS library.
 
 Authentication uses AUTH_SYS. Kerberos and RPCSEC_GSS are not implemented.
 
+## Complete API documentation
+
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.1/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.1/python/nfs_rs/GUIDE.md)
+
+Both complete documents are included in the PyPI wheel and source distribution,
+including signatures, defaults, return values, timestamp units, error types,
+synchronous/asynchronous usage and protocol limitations. Read them offline:
+
+```python
+from importlib.resources import files
+
+print(files("nfs_rs").joinpath("API.md").read_text(encoding="utf-8"))
+print(files("nfs_rs").joinpath("GUIDE.md").read_text(encoding="utf-8"))
+```
+
 ## Select a protocol version
 
 The Python API accepts exactly `"3"`, `"4.0"`, and `"4.1"`. Select one in the
