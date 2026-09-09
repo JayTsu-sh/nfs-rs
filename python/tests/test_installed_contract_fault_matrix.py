@@ -54,8 +54,6 @@ CLIENT_CASES = {
     "symlink": Call("symlink", ("target", "link")),
     "readlink": Call("readlink", ("link",)),
     "touch": Call("touch", ("file",)),
-    "read_bytes": Call("read_bytes", ("fixture.bin",)),
-    "write_bytes": Call("write_bytes", ("file", b"value")),
     "open": Call("open", ("fixture.bin", "rb")),
 }
 

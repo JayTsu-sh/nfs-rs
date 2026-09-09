@@ -494,6 +494,28 @@ impl crate::fileio::WriteIo for FileResource {
     }
 }
 
+/// Keep RPC buffers owned until constructing the final immutable Python bytes.
+/// This avoids an intermediate contiguous allocation and a second payload copy.
+#[derive(Default)]
+struct ReadResult {
+    pieces: Vec<Bytes>,
+    len: usize,
+}
+
+impl ReadResult {
+    fn into_pybytes(self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        PyBytes::new_with(py, self.len, |target| {
+            let mut at = 0;
+            for piece in self.pieces {
+                target[at..at + piece.len()].copy_from_slice(&piece);
+                at += piece.len();
+            }
+            Ok(())
+        })
+        .map(Bound::unbind)
+    }
+}
+
 /// The Python facade holds an exported writable memoryview for the operation.
 /// It releases that view on success, error, timeout, or cancellation. Acquire a
 /// temporary buffer only while attached to Python, so a released view prevents
@@ -786,7 +808,7 @@ impl FileResource {
         }
     }
 
-    async fn read_at(&self, offset: u64, size: i64) -> Result<Vec<u8>> {
+    async fn read_at(&self, offset: u64, size: i64) -> Result<ReadResult> {
         let _mutation = self.mutation_gate.read().await;
         if !self.mode.readable {
             return Err(NfsError::ModeViolation("file is not readable".to_string()));
@@ -796,19 +818,36 @@ impl FileResource {
                 "read size must be -1 or non-negative".to_string(),
             ));
         }
-        let requested = if size == -1 { u64::MAX } else { size as u64 };
-        let mut result = Vec::new();
+        let mut result = ReadResult::default();
         let mut current = offset;
-        let mut remaining = requested;
-        while remaining != 0 {
-            let count = remaining.min(u64::from(self.max_read())) as u32;
-            let chunk = self.read_chunk(current, count).await?;
-            if chunk.is_empty() {
+        // Unknown-length reads advance in bounded windows until EOF. Sized
+        // reads use the same rolling concurrency limit as readinto.
+        loop {
+            let len = if size == -1 {
+                (u64::from(self.max_read()) * crate::fileio::READ_CONCURRENCY as u64)
+                    .min(u64::MAX - current)
+                    .min(usize::MAX as u64) as usize
+            } else {
+                usize::try_from(size)
+                    .map_err(|_| NfsError::InvalidInput("read size is too large".into()))?
+            };
+            if len == 0 {
                 break;
             }
-            current = current.saturating_add(chunk.len() as u64);
-            remaining = remaining.saturating_sub(chunk.len() as u64);
-            result.extend_from_slice(&chunk);
+            let count =
+                crate::fileio::read_chunks_with(self, Bytes::new(), current, len, |_, piece| {
+                    result.pieces.push(piece);
+                    Ok(())
+                })
+                .await?;
+            result.len = result
+                .len
+                .checked_add(count)
+                .ok_or_else(|| NfsError::InvalidInput("read result is too large".into()))?;
+            if size != -1 || count < len {
+                break;
+            }
+            current += count as u64;
         }
         Ok(result)
     }
@@ -839,7 +878,7 @@ impl FileResource {
         Ok(count)
     }
 
-    async fn read(&self, size: i64) -> Result<Vec<u8>> {
+    async fn read(&self, size: i64) -> Result<ReadResult> {
         wait_at_operation_test_barrier("read").await;
         let _guard = self.relative_gate.lock().await;
         if self.position_uncertain.load(Ordering::Acquire) {
@@ -849,10 +888,8 @@ impl FileResource {
         }
         let position = self.position.load(Ordering::Acquire);
         let data = self.read_at(position, size).await?;
-        self.position.store(
-            position.saturating_add(data.len() as u64),
-            Ordering::Release,
-        );
+        self.position
+            .store(position.saturating_add(data.len as u64), Ordering::Release);
         Ok(data)
     }
 
@@ -3498,7 +3535,7 @@ impl SyncFile {
             let _file_operation = resource.begin_operation().await?;
             resource.read(size).await
         })?;
-        Ok(PyBytes::new(py, &data).unbind())
+        data.into_pybytes(py)
     }
 
     #[pyo3(signature = (offset, size = -1))]
@@ -3508,7 +3545,7 @@ impl SyncFile {
             let _file_operation = resource.begin_operation().await?;
             resource.read_at(offset, size).await
         })?;
-        Ok(PyBytes::new(py, &data).unbind())
+        data.into_pybytes(py)
     }
 
     fn readinto(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -3645,7 +3682,7 @@ impl AsyncFile {
                 })
                 .await
                 .map_err(nfs_error)?;
-            Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
+            Python::attach(|py| data.into_pybytes(py))
         })
     }
 
@@ -3663,7 +3700,7 @@ impl AsyncFile {
                 })
                 .await
                 .map_err(nfs_error)?;
-            Python::attach(|py| Ok(PyBytes::new(py, &data).unbind()))
+            Python::attach(|py| data.into_pybytes(py))
         })
     }
 
@@ -5136,7 +5173,7 @@ mod read_only_file_tests {
         let Ok(data) = file.read_at(2, 11).await else {
             panic!("fixture read should succeed");
         };
-        assert_eq!(data, b"cdefghijklm");
+        assert_eq!(data.pieces.concat(), b"cdefghijklm");
     }
 
     #[tokio::test]
@@ -5145,13 +5182,13 @@ mod read_only_file_tests {
         let Ok(initial) = file.read(3).await else {
             panic!("fixture read should succeed");
         };
-        assert_eq!(initial, b"abc");
+        assert_eq!(initial.pieces.concat(), b"abc");
         let (left, right) = tokio::join!(file.read_at(4, 4), file.read_at(8, 4));
         let (Ok(left), Ok(right)) = (left, right) else {
             panic!("positional fixture reads should succeed");
         };
-        assert_eq!(left, b"efgh");
-        assert_eq!(right, b"ijkl");
+        assert_eq!(left.pieces.concat(), b"efgh");
+        assert_eq!(right.pieces.concat(), b"ijkl");
         assert_eq!(file.tell().ok(), Some(3));
     }
 
@@ -5183,7 +5220,11 @@ mod read_only_file_tests {
         assert_eq!(file.write(data).await.ok(), Some(10));
         assert_eq!(file.tell().ok(), Some(10));
         assert_eq!(
-            file.read_at(0, -1).await.ok().as_deref(),
+            file.read_at(0, -1)
+                .await
+                .ok()
+                .map(|data| data.pieces.concat())
+                .as_deref(),
             Some(&b"abcdefghij"[..])
         );
         assert_eq!(file.test_commit_calls.load(Ordering::Relaxed), 1);
@@ -5208,7 +5249,11 @@ mod read_only_file_tests {
         );
         assert_eq!(file.tell().ok(), Some(27));
         assert_eq!(
-            file.read_at(24, -1).await.ok().as_deref(),
+            file.read_at(24, -1)
+                .await
+                .ok()
+                .map(|data| data.pieces.concat())
+                .as_deref(),
             Some(&b"yz!"[..])
         );
     }

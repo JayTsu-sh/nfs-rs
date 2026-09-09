@@ -43,9 +43,12 @@ def test_documented_client_methods_exist_in_public_stub() -> None:
     }
     expected = {
         "Client": {"connect", "stat", "scandir", "mkdir", "open", "setxattr", "drain_recovery_events"},
-        "AsyncClient": {"connect", "scandir", "mkdir", "open", "write_bytes", "drain_recovery_events"},
-        "File": {"read", "read_at", "write", "write_at", "flush"},
-        "AsyncFile": {"read", "read_at", "write", "write_at", "flush"},
+        "AsyncClient": {"connect", "scandir", "mkdir", "open", "drain_recovery_events"},
+        "File": {"read", "read_at", "readinto", "readinto_at", "write", "write_at", "flush"},
+        "AsyncFile": {"read", "read_at", "readinto", "readinto_at", "write", "write_at", "flush"},
     }
     for class_name, methods in expected.items():
         assert methods <= classes[class_name]
+
+    for class_name in ("Client", "AsyncClient"):
+        assert not {"read_bytes", "write_bytes"} & classes[class_name]

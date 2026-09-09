@@ -205,19 +205,21 @@ Namespace operations include `mkdir`, `touch`, `remove`/`unlink`, `rmdir`,
 `rename`, hard `link`, `symlink`, and `readlink`. `remove` and `unlink` are
 equivalent file-removal operations.
 
-### Small-file convenience methods
+### Reading and writing whole files
 
 ```python
 from nfs_rs import Client
 
 with Client.connect("nfs://server/export?version=4.1") as client:
-    count = client.write_bytes("message.bin", b"hello")
+    with client.open("message.bin", "wb") as file:
+        count = file.write(b"hello")
     assert count == 5
-    assert client.read_bytes("message.bin") == b"hello"
+    with client.open("message.bin", "rb") as file:
+        assert file.read() == b"hello"
 ```
 
-These helpers hold the complete value in memory. Use the file API for large
-objects.
+`read()` holds the complete file in memory. For large files, reuse a buffer with
+`readinto()` instead.
 
 ### File objects and large transfers
 
@@ -244,6 +246,18 @@ with Client.connect("nfs://server/export?version=4.1") as client:
 `tell`, `write`, `truncate`, and `flush`. It has no operating-system file
 descriptor, so `fileno()` is unsupported. `read_at`/`readinto_at` and `write_at`
 perform positional I/O without changing the file position.
+
+`File.read(size=-1)` and `File.read_at(offset, size=-1)` return `bytes` and
+use the same negotiated chunk size and maximum of 8 concurrent reads as
+`readinto` and `readinto_at`. Non-empty short responses are completed until
+the requested range is filled or EOF is reached. Omitting `size` reads to EOF
+in bounded batches. `read` advances the position; `read_at` leaves it unchanged.
+Response buffers are retained without copying their payload, then copied once
+into the final Python `bytes`. Use `readinto` with a reusable buffer to avoid
+allocating a new result for every call.
+
+`Client.read_bytes` and `Client.write_bytes` (including their async variants)
+have been removed. Open a file with `client.open()` and use its read/write methods.
 
 `readinto(buffer)` and `readinto_at(buffer, offset)` accept writable,
 C-contiguous buffer objects, including `bytearray`, writable `memoryview`, and
@@ -340,7 +354,8 @@ async def process() -> None:
         operation_timeout=30,
     ) as client:
         await client.mkdir("results", exist_ok=True)
-        await client.write_bytes("results/one.bin", b"one")
+        async with await client.open("results/one.bin", "wb") as file:
+            await file.write(b"one")
 
         async with await client.open("results/one.bin", "r+b") as file:
             await file.write_at(b"ONE", 0)

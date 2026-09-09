@@ -95,8 +95,10 @@ def test_sync_namespace_paths_targets_and_conveniences():
     client.symlink("../raw/./target", "links/sym")
     assert ("symlink", "../raw/./target", "links/sym") in client._inner.calls
     assert client.readlink("links/./sym") == "../raw-target"
-    assert client.write_bytes("data", bytearray(b"value")) == 5
-    assert client.read_bytes("data") == b"value"
+    with client.open("data", "wb") as file:
+        assert file.write(bytearray(b"value")) == 5
+    with client.open("data", "rb") as file:
+        assert file.read() == b"value"
     client.touch("created")
     assert ("open", "created", "ab") in client._inner.calls
 
@@ -127,8 +129,10 @@ def test_async_surface_matches_sync():
         await client.link("b", "hard")
         await client.symlink("../target", "sym")
         assert await client.readlink("sym") == "../raw-target"
-        assert await client.write_bytes("data", memoryview(b"async")) == 5
-        assert await client.read_bytes("data") == b"async"
+        async with await client.open("data", "wb") as file:
+            assert await file.write(memoryview(b"async")) == 5
+        async with await client.open("data", "rb") as file:
+            assert await file.read() == b"async"
         await client.remove("data")
         await client.rmdir("a/b")
     asyncio.run(scenario())

@@ -20,18 +20,18 @@ PUBLIC_API_COVERAGE = {
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
-        "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
+        "mkdir", "open", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "setdacl", "setsacl", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__enter__",
+        "touch", "truncate", "unlink", "utime", "version", "__enter__",
         "__exit__",
     ),
     "AsyncClient": (
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
-        "mkdir", "open", "read_bytes", "readlink", "recovery_events", "remove",
+        "mkdir", "open", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "setdacl", "setsacl", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "write_bytes", "__aenter__",
+        "touch", "truncate", "unlink", "utime", "version", "__aenter__",
         "__aexit__",
     ),
     "File": (
@@ -243,8 +243,10 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         client.mkdir(f"{nested}/child", parents=True)
         client.mkdir(nested, exist_ok=True)
         check(client.exists(f"{nested}/child"), "Client.mkdir/exists", checks)
-        check(client.write_bytes(data, b"payload") == 7, "Client.write_bytes", checks)
-        check(client.read_bytes(data) == b"payload", "Client.read_bytes", checks)
+        with client.open(data, "wb") as file:
+            check(file.write(b"payload") == 7, "File.write", checks)
+        with client.open(data, "rb") as file:
+            check(file.read() == b"payload", "File.read", checks)
         info = client.stat(data)
         check(info.size == 7 and info.type == nfs_rs.FileType.FILE, "Client.stat", checks)
         names = client.listdir(root)
@@ -343,7 +345,8 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         client.rename(data, renamed)
         check(not client.exists(data) and client.exists(renamed), "Client.rename", checks)
         client.link(renamed, hard_link)
-        check(client.read_bytes(hard_link) == b"payl", "Client.link", checks)
+        with client.open(hard_link, "rb") as file:
+            check(file.read() == b"payl", "Client.link", checks)
         client.symlink("renamed.bin", symbolic_link)
         check(client.readlink(symbolic_link) == "renamed.bin", "Client.symlink/readlink", checks)
         client.touch(touched)
@@ -353,7 +356,8 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         client.unlink(touched)
         check(not client.exists(touched), "Client.unlink", checks)
         remove_path = f"{root}/remove-me.bin"
-        client.write_bytes(remove_path, b"remove")
+        with client.open(remove_path, "wb") as file:
+            file.write(b"remove")
         client.remove(remove_path)
         check(not client.exists(remove_path), "Client.remove", checks)
         client.rmdir(f"{nested}/child")
@@ -424,8 +428,10 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         await client.mkdir(f"{nested}/child", parents=True)
         await client.mkdir(nested, exist_ok=True)
         check(await client.exists(f"{nested}/child"), "AsyncClient.mkdir/exists", checks)
-        check(await client.write_bytes(data, b"payload") == 7, "AsyncClient.write_bytes", checks)
-        check(await client.read_bytes(data) == b"payload", "AsyncClient.read_bytes", checks)
+        async with await client.open(data, "wb") as file:
+            check(await file.write(b"payload") == 7, "AsyncFile.write", checks)
+        async with await client.open(data, "rb") as file:
+            check(await file.read() == b"payload", "AsyncFile.read", checks)
         info = await client.stat(data)
         check(info.size == 7, "AsyncClient.stat", checks)
         check("async-data.bin" in await client.listdir(root), "AsyncClient.listdir", checks)
@@ -523,7 +529,8 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         await client.rename(data, renamed)
         check(not await client.exists(data) and await client.exists(renamed), "AsyncClient.rename", checks)
         await client.link(renamed, hard_link)
-        check(await client.read_bytes(hard_link) == b"payl", "AsyncClient.link", checks)
+        async with await client.open(hard_link, "rb") as file:
+            check(await file.read() == b"payl", "AsyncClient.link", checks)
         await client.symlink("async-renamed.bin", symbolic_link)
         check(await client.readlink(symbolic_link) == "async-renamed.bin", "AsyncClient.symlink/readlink", checks)
         await client.touch(touched)
@@ -533,7 +540,8 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         await client.unlink(touched)
         check(not await client.exists(touched), "AsyncClient.unlink", checks)
         remove_path = f"{root}/async-remove-me.bin"
-        await client.write_bytes(remove_path, b"remove")
+        async with await client.open(remove_path, "wb") as file:
+            await file.write(b"remove")
         await client.remove(remove_path)
         check(not await client.exists(remove_path), "AsyncClient.remove", checks)
         await client.rmdir(f"{nested}/child")
