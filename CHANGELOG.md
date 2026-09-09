@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-09
+
 ### Fixed
 
 - NFSv4.1 named attributes replace shorter/empty values correctly, complete short
