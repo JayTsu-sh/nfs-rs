@@ -19,6 +19,8 @@ mod readdir;
 pub(crate) mod session;
 mod setattr;
 pub(crate) mod state;
+#[cfg(test)]
+mod test_support;
 mod write;
 mod xattr;
 

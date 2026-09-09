@@ -3,34 +3,343 @@
   "spec": "docs/nfs41-migration-reliability-spec.md",
   "tracking_issue": 10,
   "requirements": [
-    "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9",
-    "R10", "R11", "R12", "R13", "R14", "R15", "R16", "R17", "R18"
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "R8",
+    "R9",
+    "R10",
+    "R11",
+    "R12",
+    "R13",
+    "R14",
+    "R15",
+    "R16",
+    "R17",
+    "R18"
   ],
   "tests": [
-    {"id":"T01","ci":"nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound","nightly":"existing-v41-modifying-compound-e2e","required":true},
-    {"id":"T02","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"blocked-capability:retry-uncached-injection","required":true},
-    {"id":"T03","ci":"error::tests::replay_protocol_errors_have_operation_aware_outcomes","nightly":"blocked-capability:seq-false-retry-injection","required":true},
-    {"id":"T04","ci":"nfs41::lease::tests::non_ok_sequence_status_matrix_is_rejected","nightly":"blocked-capability:renewal-session-fault","required":true},
-    {"id":"T05","ci":"nfs41::session::tests::concurrent_replacements_publish_once","nightly":"lab_e2e::nfs_v41_session_fault_reopen_resume_checksum:64-active-writers","required":true},
-    {"id":"T06","ci":"nfs41::state::tests::transition_rejects_late_open_from_old_generation+nfs41::layout::tests::transition_rejects_late_layout_from_old_generation+nfs41::layout::tests::transition_rejects_late_device_and_dirty_updates","nightly":"lab_e2e::nfs_v41_session_fault_reopen_resume_checksum:remount-reopen-restart-checksum","required":true},
-    {"id":"T07","ci":"rpc::tests::concurrent_reconnect_observers_run_one_effective_rebind+rpc::tests::failed_rebind_marks_replacement_connection_unready+rpc::tests::cancelled_rebind_marks_replacement_connection_unready+nfs41::mount::tests::bind_validation_requires_matching_session_and_backchannel","nightly":"lab_e2e::nfs_v41_tcp_reset_rebind_checksum:two-generations","required":true},
-    {"id":"T08","ci":"nfs41::callback::tests::scripted_callback_reply_loss_replays_cached_body_and_executes_recall_once+nfs41::callback::tests::false_retry_misorder_session_and_slot_errors_have_no_side_effect+nfs41::callback::tests::concurrent_duplicates_have_one_recall_side_effect+nfs41::compound::tests::open_delegation_preferences_match_linux_wire_values","nightly":"lab_e2e::nfs_v41_real_callback_reply_loss_checksum:knfsd-recall+drop-once+proxy-retransmit+checksum","required":true},
-    {"id":"T09","ci":"nfs41::callback::tests::opaque_tag_is_echoed_and_operation_error_sets_compound_status+nfs41::callback::tests::malformed_and_wrong_rpc_fields_return_deterministic_errors+nfs41::callback::tests::zero_ops_minor_version_excessive_ops_and_sequence_position_are_validated","nightly":"scripted:callback-golden-wire;blocked-capability:real-server-layout-recall","required":true},
-    {"id":"T10","ci":"channel attrs+encoded sizes+operations+identity+dynamic slot shrink-growth boundaries","nightly":"ontap-negotiated-effective-limits+bounded-concurrency","required":true},
-    {"id":"T11","ci":"pnfs two-phase DS preflight before zero-copy WRITE batch","nightly":"ontap-pre-write-ds-isolate zero-ds-connection mds-fallback checksum","required":true},
-    {"id":"T12","ci":"pnfs attempted-write error requires verify-then-resume","nightly":"ontap-ds-isolate uncertain-no-fallback restart-resume-checksum","required":true},
-    {"id":"T13","ci":"versioned dirty snapshot survives failure/cancellation/concurrent write and clears only on matching acknowledgement","nightly":"ontap-layoutcommit mds-isolate uncertain dirty-retained reopen-verify restore checksum","required":true},
-    {"id":"T14","ci":"per-file shared WRITE exclusive recall-close gate+ordered atomic layoutcommit-layoutreturn+cross-file concurrency","nightly":"ontap-real-cb-layoutrecall during active write ordered return close full checksum","required":true},
-    {"id":"T15","ci":"partial:pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write;blocked-capability:real-multi-ds-stripe-plan","nightly":"blocked-capability:ontap-single-ds-isolation-while-sibling-ds-remains-reachable;additional-evidence:lab_e2e::nfs_v41_pnfs_multifile_active_layout_refresh","required":true},
-    {"id":"T16","ci":"planned:pnfs-disable","nightly":"planned:mds-only","required":true},
-    {"id":"T17","ci":"coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired","nightly":"lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:netapp-file-layout-capability-artifact","required":true},
-    {"id":"T18","ci":"planned:fault-cleanup-shell","nightly":"planned:fault-restore-smoke","required":true},
-    {"id":"T19","ci":"error::tests::outcome_error_preserves_source_without_payload_context","nightly":"planned:artifact-redaction","required":true},
-    {"id":"T20","ci":"existing-all-targets","nightly":"existing-v3-v41-e2e+netapp-v41-compatibility-e2e","required":true},
-    {"id":"T21","ci":"nfs41::lease::tests::echoed_identity_mismatch_matrix_is_rejected","nightly":"blocked-capability:three-lease-intervals","required":true},
-    {"id":"T22","ci":"nfs41::session::tests::cancellation_keeps_armed_slot_fenced","nightly":"existing-workflow-cleanup","required":true},
-    {"id":"T23","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:zero-copy-stripes+full-checksum","required":true},
-    {"id":"T24","ci":"production_code_has_no_unwrap_or_expect","nightly":"planned:fault-no-process-panic","required":true},
-    {"id":"T25","ci":"rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload","nightly":"planned:before-after-performance","required":true}
+    {
+      "id": "T01",
+      "ci": "nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound",
+      "nightly": "existing-v41-modifying-compound-e2e",
+      "required": true,
+      "ci_tests": [
+        "nfs41::compound::tests::cache_policy_is_true_for_mixed_modifying_compound"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T02",
+      "ci": "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload",
+      "nightly": "blocked-capability:retry-uncached-injection",
+      "required": true,
+      "ci_tests": [
+        "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T03",
+      "ci": "error::tests::replay_protocol_errors_have_operation_aware_outcomes",
+      "nightly": "blocked-capability:seq-false-retry-injection",
+      "required": true,
+      "ci_tests": [
+        "error::tests::replay_protocol_errors_have_operation_aware_outcomes"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T04",
+      "ci": "nfs41::lease::tests::non_ok_sequence_status_matrix_is_rejected",
+      "nightly": "blocked-capability:renewal-session-fault",
+      "required": true,
+      "ci_tests": [
+        "nfs41::lease::tests::non_ok_sequence_status_matrix_is_rejected"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T05",
+      "ci": "nfs41::session::tests::concurrent_replacements_publish_once",
+      "nightly": "lab_e2e::nfs_v41_session_fault_reopen_resume_checksum:64-active-writers",
+      "required": true,
+      "ci_tests": [
+        "nfs41::session::tests::concurrent_replacements_publish_once"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T06",
+      "ci": "nfs41::state::tests::transition_rejects_late_open_from_old_generation+nfs41::layout::tests::transition_rejects_late_layout_from_old_generation+nfs41::layout::tests::transition_rejects_late_device_and_dirty_updates",
+      "nightly": "lab_e2e::nfs_v41_session_fault_reopen_resume_checksum:remount-reopen-restart-checksum",
+      "required": true,
+      "ci_tests": [
+        "nfs41::state::tests::transition_rejects_late_open_from_old_generation",
+        "nfs41::layout::tests::transition_rejects_late_layout_from_old_generation",
+        "nfs41::layout::tests::transition_rejects_late_device_and_dirty_updates"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T07",
+      "ci": "rpc::tests::concurrent_reconnect_observers_run_one_effective_rebind+rpc::tests::failed_rebind_marks_replacement_connection_unready+rpc::tests::cancelled_rebind_marks_replacement_connection_unready+nfs41::mount::tests::bind_validation_requires_matching_session_and_backchannel",
+      "nightly": "lab_e2e::nfs_v41_tcp_reset_rebind_checksum:two-generations",
+      "required": true,
+      "ci_tests": [
+        "rpc::tests::concurrent_reconnect_observers_run_one_effective_rebind",
+        "rpc::tests::failed_rebind_marks_replacement_connection_unready",
+        "rpc::tests::cancelled_rebind_marks_replacement_connection_unready",
+        "nfs41::mount::tests::bind_validation_requires_matching_session_and_backchannel"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T08",
+      "ci": "nfs41::callback::tests::scripted_callback_reply_loss_replays_cached_body_and_executes_recall_once+nfs41::callback::tests::false_retry_misorder_session_and_slot_errors_have_no_side_effect+nfs41::callback::tests::concurrent_duplicates_have_one_recall_side_effect+nfs41::compound::tests::open_delegation_preferences_match_linux_wire_values",
+      "nightly": "lab_e2e::nfs_v41_real_callback_reply_loss_checksum:knfsd-recall+drop-once+proxy-retransmit+checksum",
+      "required": true,
+      "ci_tests": [
+        "nfs41::callback::tests::scripted_callback_reply_loss_replays_cached_body_and_executes_recall_once",
+        "nfs41::callback::tests::false_retry_misorder_session_and_slot_errors_have_no_side_effect",
+        "nfs41::callback::tests::concurrent_duplicates_have_one_recall_side_effect",
+        "nfs41::compound::tests::open_delegation_preferences_match_linux_wire_values"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T09",
+      "ci": "nfs41::callback::tests::opaque_tag_is_echoed_and_operation_error_sets_compound_status+nfs41::callback::tests::malformed_and_wrong_rpc_fields_return_deterministic_errors+nfs41::callback::tests::zero_ops_minor_version_excessive_ops_and_sequence_position_are_validated",
+      "nightly": "scripted:callback-golden-wire;blocked-capability:real-server-layout-recall",
+      "required": true,
+      "ci_tests": [
+        "nfs41::callback::tests::opaque_tag_is_echoed_and_operation_error_sets_compound_status",
+        "nfs41::callback::tests::malformed_and_wrong_rpc_fields_return_deterministic_errors",
+        "nfs41::callback::tests::zero_ops_minor_version_excessive_ops_and_sequence_position_are_validated"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T10",
+      "ci": "channel attrs+encoded sizes+operations+identity+dynamic slot shrink-growth boundaries",
+      "nightly": "ontap-negotiated-effective-limits+bounded-concurrency",
+      "required": true,
+      "ci_tests": [
+        "nfs41::session::tests::channel_limits_reject_zero_and_above_offer",
+        "nfs41::mount::tests::negotiated_encoded_size_limits_accept_exact_boundary_only",
+        "nfs41::session::tests::sequence_identity_and_target_are_validated_before_advance",
+        "nfs41::session::tests::target_shrink_preserves_in_flight_slots_and_growth_wakes_waiter"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T11",
+      "ci": "pnfs two-phase DS preflight before zero-copy WRITE batch",
+      "nightly": "ontap-pre-write-ds-isolate zero-ds-connection mds-fallback checksum",
+      "required": true,
+      "ci_tests": [],
+      "ci_status": "unmapped"
+    },
+    {
+      "id": "T12",
+      "ci": "pnfs attempted-write error requires verify-then-resume",
+      "nightly": "ontap-ds-isolate uncertain-no-fallback restart-resume-checksum",
+      "required": true,
+      "ci_tests": [
+        "nfs41::pnfs_io::tests::attempted_ds_error_is_uncertain_and_requires_verification"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T13",
+      "ci": "versioned dirty snapshot survives failure/cancellation/concurrent write and clears only on matching acknowledgement",
+      "nightly": "ontap-layoutcommit mds-isolate uncertain dirty-retained reopen-verify restore checksum",
+      "required": true,
+      "ci_tests": [
+        "nfs41::layout::tests::dirty_snapshot_survives_unacknowledged_commit",
+        "nfs41::layout::tests::dirty_acknowledgement_preserves_concurrent_write",
+        "nfs41::layout::tests::dirty_acknowledgement_clears_only_matching_snapshot",
+        "nfs41::pnfs_io::tests::cancelled_commit_marks_unsettled_writes_failed"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T14",
+      "ci": "per-file shared WRITE exclusive recall-close gate+ordered atomic layoutcommit-layoutreturn+cross-file concurrency",
+      "nightly": "ontap-real-cb-layoutrecall during active write ordered return close full checksum",
+      "required": true,
+      "ci_tests": [
+        "nfs41::layout::tests::file_io_gate_allows_parallel_writes_and_serializes_recall",
+        "nfs41::layout::tests::file_io_gate_does_not_serialize_different_files"
+      ],
+      "ci_status": "partial"
+    },
+    {
+      "id": "T15",
+      "ci": "partial:pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write;blocked-capability:real-multi-ds-stripe-plan",
+      "nightly": "blocked-capability:ontap-single-ds-isolation-while-sibling-ds-remains-reachable;additional-evidence:lab_e2e::nfs_v41_pnfs_multifile_active_layout_refresh",
+      "required": true,
+      "ci_tests": [
+        "nfs41::pnfs_io::tests::ds_batch_waits_for_success_when_failure_completes_first",
+        "nfs41::pnfs_io::tests::ds_batch_waits_for_failure_when_success_completes_first",
+        "nfs41::pnfs_io::tests::cancelling_ds_batch_drops_every_pending_write"
+      ],
+      "ci_status": "partial"
+    },
+    {
+      "id": "T16",
+      "ci": "planned:pnfs-disable",
+      "nightly": "planned:mds-only",
+      "required": true,
+      "ci_tests": [],
+      "ci_status": "unmapped"
+    },
+    {
+      "id": "T17",
+      "ci": "coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired",
+      "nightly": "lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:netapp-file-layout-capability-artifact",
+      "required": true,
+      "ci_tests": [
+        "coverage_manifest_is_complete",
+        "netapp_pnfs_lab_contract_is_wired"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T18",
+      "ci": "planned:fault-cleanup-shell",
+      "nightly": "planned:fault-restore-smoke",
+      "required": true,
+      "ci_tests": [
+        "nfs_fault_helper_is_allow_listed_and_run_scoped"
+      ],
+      "ci_status": "partial"
+    },
+    {
+      "id": "T19",
+      "ci": "error::tests::outcome_error_preserves_source_without_payload_context",
+      "nightly": "planned:artifact-redaction",
+      "required": true,
+      "ci_tests": [
+        "error::tests::outcome_error_preserves_source_without_payload_context"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T20",
+      "ci": "existing-all-targets",
+      "nightly": "existing-v3-v41-e2e+netapp-v41-compatibility-e2e",
+      "required": true,
+      "ci_tests": [],
+      "ci_status": "unmapped"
+    },
+    {
+      "id": "T21",
+      "ci": "nfs41::lease::tests::echoed_identity_mismatch_matrix_is_rejected",
+      "nightly": "blocked-capability:three-lease-intervals",
+      "required": true,
+      "ci_tests": [
+        "nfs41::lease::tests::echoed_identity_mismatch_matrix_is_rejected"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T22",
+      "ci": "nfs41::session::tests::cancellation_keeps_armed_slot_fenced",
+      "nightly": "existing-workflow-cleanup",
+      "required": true,
+      "ci_tests": [
+        "nfs41::session::tests::cancellation_keeps_armed_slot_fenced"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T23",
+      "ci": "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload",
+      "nightly": "lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:zero-copy-stripes+full-checksum",
+      "required": true,
+      "ci_tests": [
+        "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T24",
+      "ci": "production_code_has_no_unwrap_or_expect",
+      "nightly": "planned:fault-no-process-panic",
+      "required": true,
+      "ci_tests": [
+        "production_code_has_no_unwrap_or_expect",
+        "panic_scan_continues_after_test_only_imports_and_modules"
+      ],
+      "ci_status": "mapped"
+    },
+    {
+      "id": "T25",
+      "ci": "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload",
+      "nightly": "planned:before-after-performance",
+      "required": true,
+      "ci_tests": [
+        "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload"
+      ],
+      "ci_status": "mapped"
+    }
+  ],
+  "review_regressions": [
+    {
+      "id": "review-xattr",
+      "ci_status": "mapped",
+      "ci": "2026-09-09 review regression suite",
+      "ci_tests": [
+        "nfs41::xattr::tests::xattr_short_io_and_replacement_preserve_exact_value",
+        "nfs41::xattr::tests::xattr_get_continues_short_non_eof_reads",
+        "nfs41::xattr::tests::xattr_close_failure_is_returned",
+        "nfs41::xattr::tests::xattr_open_progress_preserves_uncertainty_without_retry",
+        "nfs41::xattr::tests::xattr_values_above_one_mib_roundtrip_with_short_io",
+        "nfs41::xattr::tests::xattr_listing_handles_noent_and_preserves_page_verifier",
+        "nfs41::xattr::tests::xattr_zero_progress_preserves_write_and_close_errors"
+      ],
+      "nightly": "pending: physical-lab verification; xattr replacement added to validate-python-real-api.py"
+    },
+    {
+      "id": "review-rpc",
+      "ci_status": "mapped",
+      "ci": "2026-09-09 review regression suite",
+      "ci_tests": [
+        "rpc::tests::rpc_timeout_includes_waiting_for_writer",
+        "rpc::tests::rpc_timeout_includes_readiness",
+        "rpc::tests::portmap_rejects_short_and_out_of_range_results",
+        "rpc::tests::cancelling_partial_frame_closes_stream_and_next_call_reconnects",
+        "rpc::tests::sending_deadline_discards_partial_frame"
+      ],
+      "nightly": "pending: physical-lab verification; xattr replacement added to validate-python-real-api.py"
+    },
+    {
+      "id": "review-directory",
+      "ci_status": "mapped",
+      "ci": "2026-09-09 review regression suite",
+      "ci_tests": [
+        "nfs41::readdir::tests::directory_empty_non_eof_is_an_error",
+        "nfs41::readdir::tests::directory_repeated_cookie_is_an_error",
+        "nfs41::readdir::tests::directory_pagination_echoes_verifier_and_configuration",
+        "nfs3::readdir::tests::directory_paging_rejects_no_progress_and_preserves_verifiers"
+      ],
+      "nightly": "pending: physical-lab verification; xattr replacement added to validate-python-real-api.py"
+    },
+    {
+      "id": "review-lifecycle",
+      "ci_status": "mapped",
+      "ci": "2026-09-09 review regression suite",
+      "ci_tests": [
+        "fileio::tests::close_is_idempotent_and_rejects_later_io",
+        "fileio::tests::failed_or_cancelled_close_never_releases_a_second_reference",
+        "nfs41::mount::tests::mount_failure_preserves_connection_error"
+      ],
+      "nightly": "pending: physical-lab verification; xattr replacement added to validate-python-real-api.py"
+    }
   ]
 }

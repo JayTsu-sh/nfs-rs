@@ -30,6 +30,17 @@ print(files("nfs_rs").joinpath("API.md").read_text(encoding="utf-8"))
 print(files("nfs_rs").joinpath("GUIDE.md").read_text(encoding="utf-8"))
 ```
 
+Named attributes use the optional NFSv4.1 OPENATTR file interface, not the
+NFSv4.2 GETXATTR/SETXATTR extension or a portable mapping of Linux POSIX xattrs.
+There is no fixed client limit on the complete value size; server and file system
+limits still apply. Negotiated read/write sizes limit individual requests.
+`getxattr` continues short reads to EOF and buffers the complete value in memory.
+`setxattr` replaces the entire value, including truncating old contents when
+setting a shorter or empty value, and completes short writes before closing.
+Replacement is not atomic across clients: an error after truncation can leave a
+partial value. Inspect the uncertain outcome and verify the value before retrying;
+write and cleanup failures remain available in the error source chain.
+
 ## Select a protocol version
 
 The Python API accepts exactly `"3"`, `"4.0"`, and `"4.1"`. Select one in the

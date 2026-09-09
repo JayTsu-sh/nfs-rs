@@ -244,6 +244,8 @@ pub(crate) struct Mount41 {
     /// 时阻塞其它 client 对同一文件的访问。
     pub(crate) recall_tx: tokio::sync::mpsc::Sender<RecallNotification>,
     pub(crate) retain_delegations: bool,
+    pub(crate) dircount: u32,
+    pub(crate) maxcount: u32,
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
     pub(crate) acl_supported: bool,
@@ -369,8 +371,27 @@ impl Mount41 {
         tag: &str,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, METADATA_TIMEOUT, None, &build_ops)
+        self.compound_inner(tag, METADATA_TIMEOUT, None, None, &build_ops)
             .await
+    }
+
+    /// Preserve a partial response after the specified operation has succeeded.
+    /// The index includes SEQUENCE. Callers must check all subsequent results.
+    /// This prevents retrying a mutation when a later operation returns DELAY/GRACE.
+    pub(crate) async fn compound_preserving_progress(
+        &self,
+        tag: &str,
+        progress_index: usize,
+        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+    ) -> Result<CompoundResponse> {
+        self.compound_inner(
+            tag,
+            METADATA_TIMEOUT,
+            None,
+            Some(progress_index),
+            &build_ops,
+        )
+        .await
     }
 
     /// Send a COMPOUND with SEQUENCE (data-transfer timeout scaled by payload size).
@@ -380,7 +401,7 @@ impl Mount41 {
         data_size: usize,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, data_timeout(data_size), None, &build_ops)
+        self.compound_inner(tag, data_timeout(data_size), None, None, &build_ops)
             .await
     }
 
@@ -392,7 +413,7 @@ impl Mount41 {
         data: bytes::Bytes,
         build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        self.compound_inner(tag, data_timeout(data.len()), Some(data), &build_ops)
+        self.compound_inner(tag, data_timeout(data.len()), Some(data), None, &build_ops)
             .await
     }
 
@@ -403,6 +424,7 @@ impl Mount41 {
         tag: &str,
         timeout: std::time::Duration,
         write_data: Option<bytes::Bytes>,
+        progress_index: Option<usize>,
         build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
     ) -> Result<CompoundResponse> {
         for attempt in 0..=DELAY_RETRY_MAX {
@@ -485,6 +507,14 @@ impl Mount41 {
             } else {
                 None
             };
+            if let Some(index) = progress_index
+                && resp.op_ok(index).is_ok()
+                && let Some(sequence) = sequence_result
+            {
+                self.handle_seq_status(sequence.status_flags).await;
+                slot.resolve();
+                return Ok(resp);
+            }
             match resp.check_status() {
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
                     let delay_ms = delay_with_jitter_ms(attempt);
@@ -783,18 +813,17 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
 
     let auth = Auth::new_unix("nfs-rs", args.uid, args.gid);
 
+    let mut last_error = None;
     for addr in &addrs {
         match mount_on_addr(addr, args, &auth).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "NFSv4.1 mount attempt failed");
-                continue;
+                last_error = Some(e);
             }
         }
     }
-    Err(NfsError::Rpc(
-        "NFSv4.1 mount failed on all addresses".to_string(),
-    ))
+    Err(last_error.unwrap_or_else(|| NfsError::Rpc("NFSv4.1 resolved no addresses".into())))
 }
 
 async fn mount_on_addr(
@@ -907,6 +936,8 @@ async fn mount_on_addr(
         recall_handle,
         recall_tx,
         retain_delegations: args.retain_delegations,
+        dircount: args.dircount,
+        maxcount: args.maxcount,
         rsize,
         wsize,
         acl_supported,
@@ -2258,6 +2289,39 @@ pub(super) fn extract_open_delegation(data: &mut Bytes) -> Option<[u8; 16]> {
 }
 
 #[cfg(test)]
+pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mount41 {
+    let session_holder = Arc::new(SessionHolder::new(Session::for_test(1)));
+    let auth = Auth::new_null();
+    let (recall_tx, _) = tokio::sync::mpsc::channel(32);
+    Mount41 {
+        lease_renewal: LeaseRenewal::start(
+            client.clone(),
+            auth.clone(),
+            session_holder.clone(),
+            std::time::Duration::from_secs(3600),
+        ),
+        rpc: client,
+        auth,
+        root_fh: Bytes::from_static(b"root"),
+        session_holder,
+        callback_state: CallbackState::new_negotiated([1; 16], 1, 1, 4096, 2),
+        recovery_lock: tokio::sync::Mutex::new(()),
+        client_identity: ClientIdentity::new(),
+        state: StateManager::new(),
+        layout_manager: Arc::new(LayoutManager::new(true)),
+        server_addr: addr,
+        recall_handle: None,
+        recall_tx,
+        retain_delegations: false,
+        dircount: 8192,
+        maxcount: 8192,
+        rsize: 4,
+        wsize: 4,
+        acl_supported: false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2420,5 +2484,17 @@ mod tests {
         // 整体截断
         let mut short = Bytes::from_static(&[0u8; 10]);
         assert_eq!(extract_open_delegation(&mut short), None);
+    }
+    #[tokio::test]
+    async fn mount_failure_preserves_connection_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let args = crate::parse_url(&format!(
+            "nfs://127.0.0.1/export?version=4.1&nfsport={port}&noresvport=true"
+        ))
+        .unwrap();
+        let error = mount(&args).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 }

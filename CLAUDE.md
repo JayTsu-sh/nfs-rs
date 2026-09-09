@@ -41,9 +41,9 @@ Pure Rust NFS client library (NetApp), built as a native Rust library.
 
 ### Entry Point
 
-`parse_url_and_mount(url, max_retries)` in `src/lib.rs` parses a `nfs://host/export[?params]` URL and returns a `Box<dyn Mount>`. It calls `nfs3::mount()` for NFSv3 (the only real implementation).
+`parse_url_and_mount(url)` in `src/lib.rs` parses a `nfs://host/export[?params]` URL and returns a `Box<dyn Mount>`. It dispatches to NFSv3, experimental NFSv4.0, or NFSv4.1 in the requested preference order. Exact `4.0` is required; `4.2` is not implemented.
 
-URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`. Read/write sizes are negotiated automatically; see `src/mount.rs::negotiated_io_size` and the version-specific mount code.
+URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`, `noresvport`, `retain-delegations`. Read/write sizes are negotiated automatically; see `src/mount.rs::negotiated_io_size` and the version-specific mount code.
 
 ### Public Interface: `Mount` Trait (`src/mount.rs`)
 
@@ -74,23 +74,33 @@ Each NFSv3 procedure (access, read, write, lookup, etc.) has its own file in `sr
 5. NFS NULL (ping)
 6. FSINFO → derive read/write sizes from `rtmax`/`wtmax`, bounded by the client payload ceiling; reject zero limits
 
+### NFSv4 and adapters
+
+- `src/nfs40/`: v4.0 client identity, OPEN/LOCK state, lease/reclaim and separate callback listener.
+- `src/nfs41/`: COMPOUND, SEQUENCE slots and replay, session generations, backchannel callbacks and pNFS file layouts.
+- `src/nfs4/`: shared XDR, attribute, ACL and stateid primitives.
+- `src/fileio.rs`: bounded concurrent reads and per-call durable writes; `BufferedFile` owns one OPEN reference.
+- `src/client_core.rs`, `src/python_adapter.rs`, `python/nfs_rs/`: resource lifecycle, owned operation settlement and Python APIs. When changing cancellation or close, read `docs/python-api.md` and run installed-wheel tests.
+
 ### XDR Types
 
-`src/nfs3/nfs3xdr.rs` and `src/nfs3/mount3xdr.rs` are **generated code** from XDR spec files by `xdrgen`. **Do not edit directly.**
+`build.rs` generates response types from `src/nfs3/xdr/` and `src/nfs4/xdr/` using fastxdr into `OUT_DIR`. Do not edit generated output. `src/nfs3/nfs3xdr.rs` and `mount3xdr.rs` contain maintained request encoders; update them when request encoding changes.
 
 ### RPC Layer (`src/rpc/`)
 
-**`rpc::Client`** holds two stream IDs: `nfs_stream_id` (always used) and optional `mount_stream_id` (used only for MOUNT program calls when MOUNT runs on a different port than NFS).
+`rpc::Client` owns an NFS `Arc<StreamMux>` and an optional separate MOUNT mux. Each mux has one TCP reader task, a mutex-protected writer and a pending-XID map. There is no global stream-ID registry.
 
-`Client::call()` implements retry-with-reconnect: on `BrokenPipe`/`ConnectionAborted`/`ConnectionReset`, sleeps `num_retries * 100ms` and reconnects, up to `max_retries` (default 10) attempts.
+Protocol engines choose `ReplayPolicy`; only explicitly replayable logical requests may be retransmitted. Retries use fresh transport XIDs, unchanged request bodies and jittered backoff. Each attempt bounds readiness, writer admission, transmission and response waiting. The overall RPC replay budget is three attempt timeouts, including reconnect; TCP connect itself is bounded to five seconds. These are RPC bounds, not a whole multi-RPC operation deadline.
 
-**TCP stream management** (`src/lib.rs`): Global `LazyLock<HashMap<u32, Arc<RwLock<TcpStream>>>>` keyed by random `u32` IDs. Source port is bound to 500–999 range (random, retried up to 100 times).
+A cancelled or failed partial frame shuts down its socket before the writer lock is released. Do not reuse a partially transmitted record stream. NFSv4.1 reconnect must complete session binding before normal requests resume.
 
-**Auth** (`src/rpc/auth.rs`): Only `AUTH_NULL` and `AUTH_UNIX` are used. `AUTH_UNIX` encodes uid/gid from the URL (or system `getuid()`/`getgid()` on Unix, 65534 on Windows).
+`src/lib.rs::connect_to_target` uses an ephemeral source port with `noresvport=true`; otherwise it chooses a privileged port below 1024, excluding well-known services. Authentication is AUTH_NULL or AUTH_SYS, with UID/GID from the URL or process defaults. RPCSEC_GSS/Kerberos is unavailable.
 
-### Known Limitations
+### Recovery and validation boundaries
 
-**Stale file handles after server reboot**: TCP reconnection (`StreamMux::reconnect`) restores the network connection but does **not** re-mount. If the NFS server reboots, all previously obtained file handles become stale (`NFS3ERR_STALE`). The `_path` methods will also fail because intermediate lookup handles are stale. Callers should catch `NfsError::Nfs3` with `NFS3ERR_STALE` and re-mount (`parse_url_and_mount`) to obtain fresh handles. This is consistent with how libnfs and other NFS client libraries handle this scenario.
+TCP reconnect does not make stale file handles valid. If the server reports stale handles, remount and reopen as directed by the structured error. Whether handles survive a reboot depends on the server; do not assume all handles become stale. For uncertain modifying outcomes, preserve transmission evidence and recovery guidance rather than treating the operation as definitely unexecuted.
+
+For reliability changes, consult `docs/nfs41-migration-reliability-spec.md` and `tests/nfs41-reliability-coverage.json`. `ci_status` records concrete mapping quality; nightly capability gaps remain explicit. A mapping is not evidence until its named tests actually pass. CI validates those names against test execution output.
 
 ### Code Style
 
@@ -167,8 +177,7 @@ let val = some_option.unwrap_or_default();
 验证命令（提交前检查）：
 
 ```bash
-grep -rn '\.unwrap()\|\.expect(' --include="*.rs" \
-  $(find . -name "*.rs" -not -path "*/tests/*" -not -path "*_test.rs")
+cargo test --test reliability_coverage production_code_has_no_unwrap_or_expect
 ```
 
 ***
@@ -200,7 +209,7 @@ pub type Result<T> = std::result::Result<T, NfsError>;
 
 **不得**用 `.to_string()` 丢失类型信息后再包进 `String` 变种。
 
-> 注：当前代码仍使用 `std::io::Error` + `ErrorKind::Other` 包装所有错误。上述是目标方向，迁移可渐进完成。
+> 当前公共边界使用 `NfsError`；传输状态和不确定结果通过结构化 source 链保留。不要把底层错误转成字符串后丢弃类型。
 
 
 ## 工作原则（强制）

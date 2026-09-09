@@ -7,6 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- NFSv4.1 named attributes replace shorter/empty values correctly, complete short
+  reads and writes without a fixed complete-value size cap, and preserve
+  write/CLOSE failures. A successful truncating OPEN followed by GETFH failure
+  now reports an uncertain outcome with verification guidance, without replaying
+  the truncation on a later DELAY/GRACE response.
+  Attribute listings now handle NOENT and echo directory cookie verifiers.
+- RPC deadlines include admission and sending; interrupted partial frames close
+  their connection. GETPORT validates payload length and port range without panic.
+- NFSv3/v4.1 directory scans reject non-EOF empty pages and repeated page cookies.
+  NFSv4.1 honors `readdir-buffer` within session capacity and preserves mount errors.
+- Rust `BufferedFile` makes successful close idempotent and fences subsequent I/O.
+- Reliability mappings are checked against executed tests; the production panic
+  helper scan parses Rust syntax instead of truncating at a test-only import.
+  CI now executes Rust documentation tests.
+
 ## [0.8.1] - 2026-09-09
 
 - Ship the complete Python API reference and user guide inside both the wheel and source distribution, with links from the PyPI description.

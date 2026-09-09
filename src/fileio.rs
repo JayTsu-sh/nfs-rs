@@ -411,7 +411,26 @@ where
 pub struct BufferedFile {
     io: Arc<dyn ChunkIo>,
     fh: Bytes,
-    writes: tokio::sync::RwLock<()>,
+    writes: tokio::sync::RwLock<FileState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    Open,
+    Closing,
+    Closed,
+}
+
+impl FileState {
+    fn require_open(self) -> Result<()> {
+        if self == Self::Open {
+            Ok(())
+        } else {
+            Err(NfsError::ClosedResource(
+                "BufferedFile is closing or closed".into(),
+            ))
+        }
+    }
 }
 
 impl std::fmt::Debug for BufferedFile {
@@ -421,6 +440,8 @@ impl std::fmt::Debug for BufferedFile {
 }
 
 impl BufferedFile {
+    /// Own one OPEN reference for `fh`; every separately constructed wrapper
+    /// must receive its own reference obtained via `Mount::open`/`create`.
     pub fn new(mount: Arc<dyn Mount>, fh: Bytes) -> Self {
         Self::with_io(Arc::new(mount), fh)
     }
@@ -429,12 +450,13 @@ impl BufferedFile {
         Self {
             io,
             fh,
-            writes: tokio::sync::RwLock::new(()),
+            writes: tokio::sync::RwLock::new(FileState::Open),
         }
     }
 
     pub async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes> {
-        let _guard = self.writes.read().await;
+        let guard = self.writes.read().await;
+        guard.require_open()?;
         let mut data = BytesMut::new();
         read_into_with(
             self.io.as_ref(),
@@ -451,20 +473,37 @@ impl BufferedFile {
     }
 
     pub async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
-        let _guard = self.writes.write().await;
+        let guard = self.writes.write().await;
+        guard.require_open()?;
         write_all_with(self.io.as_ref(), self.fh.clone(), offset, data)
             .await
             .map(|_| ())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let _guard = self.writes.write().await;
+        let guard = self.writes.write().await;
+        guard.require_open()?;
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
-        let _guard = self.writes.write().await;
-        self.io.close(self.fh.clone()).await
+        let mut state = self.writes.write().await;
+        match *state {
+            FileState::Closed => return Ok(()),
+            FileState::Closing => {
+                return Err(NfsError::ClosedResource(
+                    "BufferedFile close did not settle successfully; clean up the mount".into(),
+                ));
+            }
+            FileState::Open => {}
+        }
+        // Consume this wrapper's reference once. A failed or cancelled CLOSE
+        // must not release a reference belonging to a later OPEN of the same fh.
+        // The mount retains pending protocol state for umount cleanup.
+        *state = FileState::Closing;
+        self.io.close(self.fh.clone()).await?;
+        *state = FileState::Closed;
+        Ok(())
     }
 }
 
@@ -497,6 +536,8 @@ mod tests {
         short_write: usize,
         short_read: usize,
         fail_read_at: Option<u64>,
+        fail_close: bool,
+        close_delay: Option<std::time::Duration>,
         /// Per-offset READ latency in milliseconds (default 5 ms).
         read_delay: Option<fn(u64) -> u64>,
     }
@@ -532,6 +573,12 @@ mod tests {
     impl ChunkIo for Fake {
         async fn close(&self, _fh: Bytes) -> Result<()> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if let Some(delay) = self.close_delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.fail_close {
+                return Err(NfsError::Rpc("scripted close failure".into()));
+            }
             Ok(())
         }
     }
@@ -978,5 +1025,58 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.unstable_writes.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn close_is_idempotent_and_rejects_later_io() {
+        let fake = Arc::new(Fake::default());
+        let first = file(fake.clone());
+        let second = file(fake.clone());
+        first.close().await.unwrap();
+        first.close().await.unwrap();
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            first.read_at(0, 1).await,
+            Err(NfsError::ClosedResource(_))
+        ));
+        assert!(matches!(
+            first.write_at(0, Bytes::from_static(b"x")).await,
+            Err(NfsError::ClosedResource(_))
+        ));
+        assert!(matches!(
+            first.flush().await,
+            Err(NfsError::ClosedResource(_))
+        ));
+        second.write_at(0, Bytes::from_static(b"y")).await.unwrap();
+        second.close().await.unwrap();
+        assert_eq!(fake.closes.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn failed_or_cancelled_close_never_releases_a_second_reference() {
+        for cancel in [false, true] {
+            let fake = Arc::new(Fake {
+                fail_close: !cancel,
+                close_delay: cancel.then_some(std::time::Duration::from_secs(60)),
+                ..Default::default()
+            });
+            let file = file(fake.clone());
+            if cancel {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(10), file.close())
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(file.close().await.is_err());
+            }
+            assert!(matches!(
+                file.read_at(0, 1).await,
+                Err(NfsError::ClosedResource(_))
+            ));
+            assert!(matches!(
+                file.close().await,
+                Err(NfsError::ClosedResource(_))
+            ));
+            assert_eq!(fake.closes.load(Ordering::SeqCst), 1);
+        }
     }
 }
