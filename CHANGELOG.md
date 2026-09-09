@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-09
+
+### Documentation
+
+- Update the PyPI README with file-handle directory scanning, reusable 40 MiB
+  read buffers, durable writes, async examples, negotiated chunk limits, and
+  nanosecond timestamp fields. Clarify that write input is snapshotted and that
+  acknowledged byte counts are not safe resume offsets.
+- No runtime or public API changes from 0.7.0.
+
 ## [0.7.0] - 2026-09-08
 
 ### Fixed
@@ -278,7 +288,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.5.8...v0.6.0
