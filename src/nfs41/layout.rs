@@ -27,8 +27,8 @@ use crate::rpc::auth::Auth;
 /// DS 控制操作（DESTROY_SESSION/DESTROY_CLIENTID）的超时。
 const DS_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// DS 连接 + 会话建立的整体超时（不可达地址快速失败并拉黑）。
-const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// DS 连接 + 会话建立的整体超时；1 秒内未完成则标记不可达，允许写前回退。
+const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 type DataServerInitKey = (u64, SocketAddr);
 type DataServerInitGate = Mutex<()>;
@@ -1323,6 +1323,58 @@ mod tests {
         };
         sort_multipath_by_affinity(&mut info, &mds);
         assert_eq!(info.ds_addrs[0][0], v4);
+    }
+
+    #[tokio::test]
+    async fn unresponsive_ds_handshake_times_out_within_two_seconds_and_is_cached() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (received, observed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).await.unwrap();
+            received.send(()).unwrap();
+            // Accept EXCHANGE_ID but never reply, reproducing a stalled DS handshake.
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let manager = LayoutManager::new(true);
+        let auth = Auth::new_unix("ds-timeout-test", 0, 0);
+        let identity = ClientIdentity::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.get_data_server(address, &auth, &identity, manager.generation()),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            observed.await.is_ok(),
+            "the peer must receive the handshake"
+        );
+        let error = result
+            .expect("stalled DS initialization exceeded two seconds")
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("connect timed out"));
+        assert!(manager.is_ds_unreachable(&address).await);
+
+        let cached = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.get_data_server(address, &auth, &identity, manager.generation()),
+        )
+        .await
+        .expect("cached DS failure should not wait for another handshake");
+        assert!(
+            cached
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("marked unreachable")
+        );
     }
 
     #[tokio::test]
