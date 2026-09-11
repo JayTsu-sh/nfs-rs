@@ -16,8 +16,8 @@ Authentication uses AUTH_SYS. Kerberos and RPCSEC_GSS are not implemented.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.2/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.2/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.4/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.4/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,

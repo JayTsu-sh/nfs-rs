@@ -23,8 +23,8 @@ classifiers = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.2/python/nfs_rs/API.md"
-"User Guide" = "https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.2/python/nfs_rs/GUIDE.md"
+Documentation = "https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.4/python/nfs_rs/API.md"
+"User Guide" = "https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.4/python/nfs_rs/GUIDE.md"
 Repository = "https://github.com/JayTsu-sh/nfs-rs"
 Issues = "https://github.com/JayTsu-sh/nfs-rs/issues"
 
