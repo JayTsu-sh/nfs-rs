@@ -84,6 +84,7 @@ mod tests {
 
     struct Pages {
         cookies: Vec<Option<u64>>,
+        names: Vec<&'static [u8]>,
         eof: bool,
         next: AtomicUsize,
     }
@@ -105,7 +106,10 @@ mod tests {
             xdr_u32(&mut data, u32::from(entry.is_some()));
             if let Some(cookie) = entry {
                 data.extend(42u64.to_be_bytes());
-                xdr_opaque(&mut data, b"entry");
+                xdr_opaque(
+                    &mut data,
+                    self.names.get(index).copied().unwrap_or(b"entry"),
+                );
                 data.extend(cookie.to_be_bytes());
                 if plus {
                     data.extend([0; 8]);
@@ -142,6 +146,7 @@ mod tests {
         ] {
             let pages = Pages {
                 cookies,
+                names: Vec::new(),
                 eof,
                 next: AtomicUsize::new(0),
             };
@@ -165,5 +170,35 @@ mod tests {
             let result: Result<Vec<_>> = entries.try_collect().await;
             assert_eq!(result.is_ok(), valid);
         }
+    }
+
+    #[tokio::test]
+    async fn directory_streams_filter_dot_entries_without_stalling_pagination() {
+        let pages = Pages {
+            cookies: vec![Some(1), Some(2), Some(3)],
+            names: vec![b".", b"..", b"visible"],
+            eof: true,
+            next: AtomicUsize::new(0),
+        };
+        let entries = paged_dir_stream!(
+            &pages,
+            Bytes::new(),
+            read,
+            |entry: Box<crate::nfs3::entry3>| bytes_to_string(entry.name.0),
+            "test filtered readdir page"
+        );
+        let result: Result<Vec<_>> = entries.try_collect().await;
+        assert_eq!(result.unwrap(), ["visible"]);
+
+        pages.next.store(0, Ordering::SeqCst);
+        let entries = paged_dir_stream!(
+            &pages,
+            Bytes::new(),
+            plus,
+            |entry: Box<crate::nfs3::entryplus3>| bytes_to_string(entry.name.0),
+            "test filtered readdirplus page"
+        );
+        let result: Result<Vec<_>> = entries.try_collect().await;
+        assert_eq!(result.unwrap(), ["visible"]);
     }
 }

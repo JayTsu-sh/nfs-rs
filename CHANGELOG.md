@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- NFSv3 `READDIR` and `READDIRPLUS` omit the server-provided `.` and `..`
+  entries while preserving cookie-based pagination.
+
 ## [0.8.3] - 2026-09-11
 
 ### Fixed
