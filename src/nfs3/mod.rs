@@ -88,7 +88,11 @@ pub(crate) use fastxdr::{
 ///
 /// Generates a `try_unfold + try_flatten` stream that fetches directory pages
 /// via `$fetch_page`, then yields entries directly from the XDR linked list
-/// without an intermediate `Vec` — each entry node is converted by `$convert`.
+/// without an intermediate `Vec` — each non-special entry node is converted by
+/// `$convert`. NFSv3 servers may include `.` and `..`; those names are omitted
+/// from the public stream while their cookies still count as page progress.
+/// RFC 1813 sections 3.3.16 and 3.3.17 define the raw `READDIR` and
+/// `READDIRPLUS` entry streams normalized here.
 ///
 /// The linked list is walked twice per page: once (read-only) to find the last
 /// cookie and entry count, then once (destructive) via `from_fn` to yield entries.
@@ -130,14 +134,19 @@ macro_rules! paged_dir_stream {
                 } else {
                     None
                 };
-                // Yield entries directly from the linked list — no intermediate Vec.
+                // Yield non-special entries directly — no intermediate Vec.
                 let convert = $convert;
                 let entry_iter = {
                     let mut current = entries_head;
                     std::iter::from_fn(move || {
-                        let mut node = current.take()?;
-                        current = node.nextentry.take();
-                        Some(Ok(convert(node)))
+                        loop {
+                            let mut node = current.take()?;
+                            current = node.nextentry.take();
+                            let name = node.name.0.as_ref();
+                            if name != b"." && name != b".." {
+                                return Some(Ok(convert(node)));
+                            }
+                        }
                     })
                 };
                 Ok(Some((futures::stream::iter(entry_iter), next)))
