@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-11
+
 ### Fixed
 
 - NFSv3 `READDIR` and `READDIRPLUS` omit the server-provided `.` and `..`
@@ -334,7 +336,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.2...v0.8.3
 [0.7.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.6.1...v0.7.0
