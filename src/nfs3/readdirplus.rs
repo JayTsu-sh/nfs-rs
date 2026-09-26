@@ -185,15 +185,10 @@ mod tests {
         assert!(dots.entries.is_empty());
         assert_eq!(dots.next.cookie, 2);
 
+        // An empty EOF page keeps the requested cookie with its own verifier.
         let empty_eof = into_page(reply([8; 8], &[], true), expected).unwrap();
         assert!(empty_eof.entries.is_empty() && empty_eof.eof);
-        assert_eq!(
-            empty_eof.next,
-            DirectoryCookie {
-                cookie: 4,
-                verifier: [8; 8]
-            }
-        );
+        assert_eq!(empty_eof.next, expected);
     }
 
     #[test]
@@ -202,8 +197,13 @@ mod tests {
             cookie: 4,
             verifier: [7; 8],
         };
-        assert!(into_page(reply([7; 8], &[], false), position).is_err());
-        assert!(into_page(reply([7; 8], &[(4, b"x")], false), position).is_err());
-        assert!(into_page(reply([7; 8], &[(0, b"x")], true), position).is_err());
+        for reply in [
+            reply([7; 8], &[], false),
+            reply([7; 8], &[(4, b"x")], false),
+            reply([7; 8], &[(0, b"x")], true),
+        ] {
+            let error = into_page(reply, position).unwrap_err();
+            assert!(error.to_string().contains("made no progress"), "{error}");
+        }
     }
 }

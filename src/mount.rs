@@ -55,6 +55,10 @@ impl DirectoryCursor {
     /// Validates one page fetched from this cursor's position and returns the
     /// position that continues after it. `entries` counts every entry the server
     /// returned, including entries the public listing omits.
+    ///
+    /// A page without entries (only valid at EOF) returns the requested position
+    /// unchanged: a cookie must travel with the verifier of the reply that
+    /// produced it (RFC 1813 §3.3.16, RFC 7530 §16.24.4, RFC 5661 §18.23.3).
     pub fn page(
         mut self,
         last_cookie: u64,
@@ -62,7 +66,14 @@ impl DirectoryCursor {
         entries: usize,
         eof: bool,
     ) -> Result<DirectoryCookie> {
+        let requested = DirectoryCookie {
+            cookie: self.cookie,
+            verifier: self.verifier,
+        };
         self.advance(last_cookie, verifier, entries, eof)?;
+        if entries == 0 {
+            return Ok(requested);
+        }
         Ok(DirectoryCookie {
             cookie: self.cookie,
             verifier: self.verifier,
@@ -139,9 +150,9 @@ pub struct ReaddirplusPage {
     /// [`Mount::readdirplus`], so a non-EOF page may be empty only when the
     /// server returned nothing but those two names.
     pub entries: Vec<ReaddirplusEntry>,
-    /// Position after the last entry of this page (the requested cookie when the
-    /// page has no entries) with the verifier the server returned; pass it to the
-    /// next call.
+    /// Position after the last entry of this page with the verifier of this
+    /// reply; pass it to the next call. A page without entries (an EOF page)
+    /// returns the requested position unchanged.
     pub next: DirectoryCookie,
     /// The server reported the end of the directory.
     pub eof: bool,
@@ -1359,8 +1370,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// one, until [`ReaddirplusPage::eof`].
     ///
     /// A page that makes no progress (non-EOF without entries, or ending at the
-    /// requested cookie) is an error. Detecting a cookie repeated across pages is
-    /// the caller's responsibility. When the server rejects the cookie or its
+    /// requested cookie) fails with [`NfsError::Xdr`], the same variant as a
+    /// malformed reply. Detecting a cookie repeated across pages is the caller's
+    /// responsibility: a server whose cookies cycle would otherwise page forever,
+    /// so the example below keeps the cookies it has seen. When the server
+    /// rejects the cookie or its
     /// verifier, the error satisfies [`NfsError::is_bad_directory_cookie`] and the
     /// listing can only restart from [`DirectoryCookie::default`].
     ///
@@ -1374,12 +1388,16 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     /// async fn count_entries(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes) -> nfs_rs::Result<usize> {
     ///     let mut position = nfs_rs::DirectoryCookie::default();
+    ///     let mut seen = std::collections::HashSet::new();
     ///     let mut count = 0;
     ///     loop {
     ///         let page = mount.readdirplus_page(dir_fh.clone(), position).await?;
     ///         count += page.entries.len();
     ///         if page.eof {
     ///             return Ok(count);
+    ///         }
+    ///         if !seen.insert(page.next.cookie) {
+    ///             return Err(nfs_rs::NfsError::Xdr("directory cookie repeated".into()));
     ///         }
     ///         position = page.next; // persist this to resume after a failure
     ///     }

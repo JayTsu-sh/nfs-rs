@@ -1457,7 +1457,8 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_EXPIRED
         | NFS4ERR_ADMIN_REVOKED
         | NFS4ERR_DELEG_REVOKED => ("NfsStateLostError", None, Some("reopen")),
-        // NFS4ERR_NOT_SAME is also VERIFY's mismatch, which this client never sends.
+        // Besides READDIR's verifier rejection, NFS4ERR_NOT_SAME comes from VERIFY,
+        // EXCHANGE_ID updates and GETDEVICELIST, none of which this client sends.
         NFS4ERR_BAD_COOKIE | NFS4ERR_NOT_SAME => ("NfsBadCookieError", None, None),
         NFS4ERR_DELAY
         | NFS4ERR_GRACE
@@ -2559,19 +2560,29 @@ fn test_directory_fails(_path: &str) -> bool {
 }
 
 /// Test-support directory "paged": seven entries served three per page. Cookie
-/// of entry `i` is `i + 1`; any position other than a page boundary with the
-/// fixture verifier (zero at the start) is a stale cookie.
+/// of entry `i` is `i + 1`; any position other than a page boundary or the end
+/// with the fixture verifier (zero at the start) is a stale cookie. Directory
+/// "stalled" answers every page without entries and without EOF.
 #[cfg(feature = "python-test-support")]
 fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<DirectoryPage>> {
     const TOTAL: u64 = 7;
     const PAGE: u64 = 3;
     const VERIFIER: [u8; 8] = *b"fixture1";
+    if path == "stalled" {
+        let cursor = crate::mount::DirectoryCursor::resume(position);
+        return Some(
+            cursor
+                .page(position.cookie, VERIFIER, 0, false)
+                .map(|next| (Vec::new(), next, false)),
+        );
+    }
     if path != "paged" {
         return None;
     }
     let start = position.cookie;
     let expected = if start == 0 { [0; 8] } else { VERIFIER };
-    if !start.is_multiple_of(PAGE) || start >= TOTAL || position.verifier != expected {
+    let boundary = start.is_multiple_of(PAGE) || start == TOTAL;
+    if !boundary || start > TOTAL || position.verifier != expected {
         return Some(Err(NfsError::Nfs3(
             crate::nfs3::ErrorCode::NFS3ERR_BAD_COOKIE,
         )));

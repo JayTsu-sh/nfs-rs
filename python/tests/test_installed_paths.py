@@ -172,6 +172,11 @@ def test_scandir_page_resumes_from_saved_position_in_a_new_client():
         expected[0:3], expected[3:6], expected[6:7]
     ]
     assert [page.next.cookie for page in pages] == [3, 6, 7]
+    with Client.connect("nfs-test://fixture/export") as client:
+        # A caller that keeps going after EOF gets an empty EOF page at the same position.
+        after_end = client.scandir_page("paged", pages[-1].next)
+    assert not after_end.entries and after_end.eof
+    assert after_end.next == pages[-1].next
     assert all(page.next.verifier == b"fixture1" for page in pages)
     assert pages[0].entries[0].path == "paged/page-entry-0"
     assert pages[0].entries[0].info.fileid == 1
@@ -217,3 +222,14 @@ def test_async_scandir_page_resumes_and_types_stale_cookies():
             assert caught.value.operation == "scandir_page"
 
     asyncio.run(scenario())
+
+
+def test_scandir_page_without_progress_raises_encoding_error():
+    from nfs_rs import NfsEncodingError, NfsProtocolError
+
+    with Client.connect("nfs-test://fixture/export") as client:
+        with pytest.raises(NfsEncodingError) as caught:
+            client.scandir_page("stalled")
+    assert not isinstance(caught.value, NfsProtocolError)
+    assert caught.value.operation == "scandir_page"
+    assert "no progress" in str(caught.value)

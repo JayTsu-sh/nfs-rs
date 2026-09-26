@@ -4650,7 +4650,52 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(!error.is_bad_directory_cookie());
+        assert!(
+            error.to_string().contains("did not advance cookie"),
+            "{error}"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    fn empty_readdir_result(verifier: [u8; 8], eof: bool) -> Vec<u8> {
+        let mut page = verifier.to_vec();
+        page.extend_from_slice(&0u32.to_be_bytes());
+        page.extend_from_slice(&u32::from(eof).to_be_bytes());
+        compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_rejects_empty_page_before_eof_and_keeps_position_at_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            for eof in [false, true] {
+                let request = read_record(&mut stream).await?;
+                reply(
+                    &mut stream,
+                    &request,
+                    &empty_readdir_result(*b"newverif", eof),
+                )
+                .await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let position = mount::DirectoryCookie {
+            cookie: 7,
+            verifier: *b"firstver",
+        };
+        let error = mount
+            .readdirplus_page(Bytes::from_static(b"root"), position)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("made no progress"), "{error}");
+        let page = mount
+            .readdirplus_page(Bytes::from_static(b"root"), position)
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty() && page.eof);
+        assert_eq!(page.next, position);
         server.await.unwrap().unwrap();
     }
 

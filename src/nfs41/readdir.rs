@@ -369,7 +369,7 @@ mod tests {
                 .readdirplus_page_from(Bytes::new(), position)
                 .await
                 .unwrap_err();
-            assert!(!error.is_bad_directory_cookie());
+            assert!(error.to_string().contains("made no progress"), "{error}");
         }
         mount.rpc.shutdown().await;
         server.await.unwrap();

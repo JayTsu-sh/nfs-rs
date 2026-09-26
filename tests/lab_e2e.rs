@@ -2194,11 +2194,15 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
             .collect::<BTreeSet<_>>();
         let started = Instant::now();
         let checked = async {
+            // Wait for every create, even after a failure, so no request is still
+            // in flight when cleanup removes its name.
             futures::stream::iter(&names)
                 .map(|name| mount.create(dir.clone(), name, Some(0o644)))
                 .buffer_unordered(64)
-                .try_for_each(|_| async { Ok(()) })
-                .await?;
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
             println!("{url}: created {files} files in {:?}", started.elapsed());
             check_paged_listing(url, mount.as_ref(), dir.clone(), &names).await
         }
@@ -2214,8 +2218,10 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
                 }
             })
             .buffer_unordered(64)
-            .try_for_each(|()| async { Ok(()) })
-            .await;
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<(), _>>();
         let removed_dir = mount.rmdir(parent_fh, &case).await;
         mount.umount().await?;
         checked?;

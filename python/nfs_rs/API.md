@@ -609,7 +609,7 @@ Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
 
 ### NfsBadCookieError
 
-The server rejected a scandir_page position: the cookie is stale or invalid (NFS3ERR_BAD_COOKIE, NFS4ERR_BAD_COOKIE) or its verifier no longer matches the directory (NFS4ERR_NOT_SAME). The listing cannot continue from that position; restart it from DirectoryCookie().
+The server rejected a directory position: the cookie is stale or invalid (NFS3ERR_BAD_COOKIE, NFS4ERR_BAD_COOKIE) or its verifier no longer matches the directory (NFS4ERR_NOT_SAME). scandir_page raises it for a saved position; scandir and listdir raise it when the directory changes while a listing is in progress. The listing cannot continue from that position; restart it from DirectoryCookie() (or call scandir again).
 
 Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
 
@@ -811,7 +811,7 @@ def scandir_page(
 ) -> DirectoryPage: ...
 ```
 
-Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress raises NfsProtocolError; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. Detecting a cookie repeated across pages is the caller's responsibility.
+Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress (no entries before eof, or ending at the requested cookie) raises NfsEncodingError, like a malformed reply; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. A page without entries at eof returns position unchanged as next. Detecting a cookie repeated across pages is the caller's responsibility: keep the cookies already received and stop when next repeats one, or a server whose cookies cycle pages forever.
 
 #### Client.listdir
 
