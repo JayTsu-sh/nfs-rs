@@ -140,6 +140,7 @@ class NfsInvalidInputError(ValueError, NfsError): __init__ = _structured_init
 class NfsProtocolError(NfsError): pass
 class NfsStateLostError(NfsProtocolError): pass
 class NfsRetryableError(NfsProtocolError): pass
+class NfsBadCookieError(NfsProtocolError): pass
 class NfsOperationOutcomeError(NfsError): pass
 class NfsUncertainOutcomeError(NfsOperationOutcomeError): pass
 class NfsPositionUncertainError(NfsError): pass

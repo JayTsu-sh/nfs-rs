@@ -158,3 +158,62 @@ def test_batched_scandir_preserves_all_entries_in_sync_and_async():
             assert [entry.name for entry in entries] == expected
             assert [entry.info.fileid for entry in entries] == list(range(519))
     asyncio.run(scenario())
+
+
+def test_scandir_page_resumes_from_saved_position_in_a_new_client():
+    from nfs_rs import DirectoryCookie, NfsBadCookieError
+
+    expected = [f"page-entry-{index}" for index in range(7)]
+    with Client.connect("nfs-test://fixture/export") as client:
+        pages = [client.scandir_page("paged")]
+        while not pages[-1].eof:
+            pages.append(client.scandir_page("paged", pages[-1].next))
+    assert [[entry.name for entry in page.entries] for page in pages] == [
+        expected[0:3], expected[3:6], expected[6:7]
+    ]
+    assert [page.next.cookie for page in pages] == [3, 6, 7]
+    assert all(page.next.verifier == b"fixture1" for page in pages)
+    assert pages[0].entries[0].path == "paged/page-entry-0"
+    assert pages[0].entries[0].info.fileid == 1
+
+    saved = DirectoryCookie(pages[0].next.cookie, pages[0].next.verifier)
+    with Client.connect("nfs-test://fixture/export") as client:
+        resumed = []
+        position = saved
+        while True:
+            page = client.scandir_page("paged", position)
+            resumed += [entry.name for entry in page.entries]
+            if page.eof:
+                break
+            position = page.next
+        assert resumed == expected[3:]
+
+        for stale in (DirectoryCookie(4, b"fixture1"), DirectoryCookie(3, b"otherver")):
+            with pytest.raises(NfsBadCookieError) as caught:
+                client.scandir_page("paged", stale)
+            error = caught.value
+            assert error.code == 10003
+            assert error.code_name == "NFS3ERR_BAD_COOKIE"
+            assert error.operation == "scandir_page"
+            assert error.filename == "paged"
+            assert error.protocol == "3"
+
+
+def test_async_scandir_page_resumes_and_types_stale_cookies():
+    from nfs_rs import DirectoryCookie, NfsBadCookieError, NfsProtocolError
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            first = await client.scandir_page("paged")
+            assert [entry.name for entry in first.entries] == [
+                "page-entry-0", "page-entry-1", "page-entry-2"
+            ]
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            second = await client.scandir_page("paged", first.next)
+            assert second.entries[0].name == "page-entry-3"
+            with pytest.raises(NfsBadCookieError) as caught:
+                await client.scandir_page("paged", DirectoryCookie(5, first.next.verifier))
+            assert isinstance(caught.value, NfsProtocolError)
+            assert caught.value.operation == "scandir_page"
+
+    asyncio.run(scenario())

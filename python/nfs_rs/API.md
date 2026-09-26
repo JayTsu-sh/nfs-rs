@@ -364,6 +364,25 @@ Frozen directory entry with eager metadata and an optional opaque file handle. I
 | `DirEntry.info` | `FileInfo` | Eager FileInfo metadata for the entry. |
 | `DirEntry.fh` | `bytes \| None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
 
+### DirectoryCookie
+
+Frozen, caller-held position in a directory listing: the cookie of the last entry already received and the cookie verifier the server returned with it. The default value is the start of the directory. Persist it to resume a listing with scandir_page after a failure, on the same or a new client of the same server; the server may still reject it once the directory changed or the server restarted.
+
+| Member | Type / value | Meaning |
+|---|---|---|
+| `DirectoryCookie.cookie` | `int = 0` | Unsigned 64-bit server cookie; 0 starts at the beginning. Opaque: do not compute or compare it as an offset. |
+| `DirectoryCookie.verifier` | `bytes = bytes(8)` | Exactly 8 opaque bytes returned with the cookie; all zero with cookie 0. |
+
+### DirectoryPage
+
+Frozen result of one scandir_page call.
+
+| Member | Type / value | Meaning |
+|---|---|---|
+| `DirectoryPage.entries` | `tuple[DirEntry, ...]` | Entries of this page in server order, with the same metadata and handles as scandir. May be empty before EOF only when the server returned nothing but NFSv3 dot entries. |
+| `DirectoryPage.next` | `DirectoryCookie` | Position after the last entry of this page; pass it to the next scandir_page call. |
+| `DirectoryPage.eof` | `bool` | True when the server reported the end of the directory. |
+
 ### ExportEntry
 
 Frozen MOUNT export-list entry. This is export discovery information, not proof that the caller can mount or access the export.
@@ -588,6 +607,12 @@ A protocol failure classified as retryable; consult recovery_action and outcome.
 
 Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
 
+### NfsBadCookieError
+
+The server rejected a scandir_page position: the cookie is stale or invalid (NFS3ERR_BAD_COOKIE, NFS4ERR_BAD_COOKIE) or its verifier no longer matches the directory (NFS4ERR_NOT_SAME). The listing cannot continue from that position; restart it from DirectoryCookie().
+
+Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
+
 ### NfsOperationOutcomeError
 
 Failure carrying explicit outcome and recovery information.
@@ -775,6 +800,18 @@ def scandir(
 ```
 
 Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup; otherwise the path is resolved first. No recursive traversal or handle fallback is performed. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
+
+#### Client.scandir_page
+
+```python
+def scandir_page(
+    self,
+    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    position: DirectoryCookie | None = None,
+) -> DirectoryPage: ...
+```
+
+Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress raises NfsProtocolError; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. Detecting a cookie repeated across pages is the caller's responsibility.
 
 #### Client.listdir
 
@@ -1140,6 +1177,18 @@ def scandir(
 ```
 
 Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup; otherwise the path is resolved first. No recursive traversal or handle fallback is performed. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
+
+#### AsyncClient.scandir_page
+
+```python
+async def scandir_page(
+    self,
+    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    position: DirectoryCookie | None = None,
+) -> DirectoryPage: ...
+```
+
+Await one directory page starting after position; the semantics, errors and resume rules are those of Client.scandir_page. Unlike scandir, it is awaited and returns a DirectoryPage.
 
 #### AsyncClient.listdir
 

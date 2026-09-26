@@ -315,7 +315,7 @@ def test_every_public_exception_has_stable_installed_shape_and_mro() -> None:
         "NfsConnectionError", "NfsOSError", "NfsMountError", "NfsRpcError",
         "NfsEncodingError", "NfsDirectoryEntryError", "NfsUnsupportedError",
         "NfsInvalidInputError", "NfsProtocolError", "NfsStateLostError",
-        "NfsRetryableError", "NfsOperationOutcomeError", "NfsUncertainOutcomeError",
+        "NfsRetryableError", "NfsBadCookieError", "NfsOperationOutcomeError", "NfsUncertainOutcomeError",
         "NfsPositionUncertainError", "NfsLostOpenStateError", "NfsClosedResourceError",
         "NfsClientClosedError", "NfsModeError", "NfsFileCloseError", "NfsClientCloseError",
     }

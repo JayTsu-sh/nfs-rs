@@ -20,6 +20,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `NfsError::is_bad_directory_cookie` identifies a rejected listing position
   (`NFS3ERR_BAD_COOKIE`, `NFS4ERR_BAD_COOKIE`, `NFS4ERR_NOT_SAME`), after which
   only a restart from the beginning is possible.
+- Python `Client.scandir_page` and `AsyncClient.scandir_page` expose the page
+  interface with the `DirectoryCookie` and `DirectoryPage` types.
+
+### Changed
+
+- Python raises the new `NfsBadCookieError` for `NFS3ERR_BAD_COOKIE`,
+  `NFS4ERR_BAD_COOKIE` and `NFS4ERR_NOT_SAME`. It subclasses
+  `NfsProtocolError`, which these statuses raised before.
 
 ## [0.8.4] - 2026-09-11
 

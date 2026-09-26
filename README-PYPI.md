@@ -143,6 +143,29 @@ Otherwise, it resolves `path` first. The loop above implements recursion;
 with the client that returned them; an invalid or stale handle is reported as
 an error rather than silently replaced through path lookup.
 
+## Resume a directory listing
+
+`scandir_page()` returns one page and the position after it, so a long listing
+can continue after a failure instead of starting over:
+
+```python
+from nfs_rs import Client, DirectoryCookie, NfsBadCookieError
+
+with Client.connect("nfs://server.example.com/export?version=4.1") as client:
+    position = DirectoryCookie()  # or a position saved by an earlier run
+    while True:
+        try:
+            page = client.scandir_page("incoming", position)
+        except NfsBadCookieError:
+            position = DirectoryCookie()  # the server rejected it: restart
+            continue
+        for entry in page.entries:
+            print(entry.path)
+        if page.eof:
+            break
+        position = page.next
+```
+
 ## Read and write with a large buffer
 
 `File.read(size=-1)` and `File.read_at(offset, size=-1)` return `bytes` and

@@ -3,8 +3,8 @@ use crate::client_core::{
 };
 use crate::nfs4::Nfs4ErrorCode::*;
 use crate::{
-    AceFlags, AceMask, AceType, Acl41Flags, Attr, Mount, MountHealth, NFSVersion, NfsAce, NfsAcl41,
-    NfsError, OpenFile, Result, parse_url_and_mount,
+    AceFlags, AceMask, AceType, Acl41Flags, Attr, DirectoryCookie, Mount, MountHealth, NFSVersion,
+    NfsAce, NfsAcl41, NfsError, OpenFile, ReaddirplusEntry, Result, parse_url_and_mount,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,6 +31,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 const DIRECTORY_BATCH_SIZE: usize = 128;
 type DirectoryEntry = (String, Attr, Bytes);
 type DirectoryItem = Result<Vec<DirectoryEntry>>;
+type DirectoryPage = (Vec<DirectoryEntry>, DirectoryCookie, bool);
 
 fn deadline_exceeded(operation: &str) -> NfsError {
     NfsError::Io(std::io::Error::new(
@@ -1405,7 +1406,7 @@ mod nfs3_python_mapping {
             S::NFS3ERR_REMOTE => ("NfsProtocolError", None, None, 71),
             S::NFS3ERR_BADHANDLE => ("NfsStateLostError", None, Some("remount"), 10001),
             S::NFS3ERR_NOT_SYNC => ("NfsProtocolError", None, None, 10002),
-            S::NFS3ERR_BAD_COOKIE => ("NfsProtocolError", None, None, 10003),
+            S::NFS3ERR_BAD_COOKIE => ("NfsBadCookieError", None, None, 10003),
             S::NFS3ERR_NOTSUPP => ("NfsUnsupportedError", Some(nix::libc::ENOTSUP), None, 10004),
             S::NFS3ERR_TOOSMALL => ("NfsProtocolError", None, None, 10005),
             S::NFS3ERR_SERVERFAULT => ("NfsProtocolError", None, None, 10006),
@@ -1456,6 +1457,8 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_EXPIRED
         | NFS4ERR_ADMIN_REVOKED
         | NFS4ERR_DELEG_REVOKED => ("NfsStateLostError", None, Some("reopen")),
+        // NFS4ERR_NOT_SAME is also VERIFY's mismatch, which this client never sends.
+        NFS4ERR_BAD_COOKIE | NFS4ERR_NOT_SAME => ("NfsBadCookieError", None, None),
         NFS4ERR_DELAY
         | NFS4ERR_GRACE
         | NFS4ERR_RETRY_UNCACHED_REP
@@ -1483,7 +1486,6 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_NOFILEHANDLE
         | NFS4ERR_MINOR_VERS_MISMATCH
         | NFS4ERR_BAD_SEQID
-        | NFS4ERR_NOT_SAME
         | NFS4ERR_LOCK_RANGE
         | NFS4ERR_SYMLINK
         | NFS4ERR_RESTOREFH
@@ -1517,7 +1519,6 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_BADSLOT
         | NFS4ERR_BAD_SESSION_DIGEST
         | NFS4ERR_SEQUENCE_POS
-        | NFS4ERR_BAD_COOKIE
         | NFS4ERR_REQ_TOO_BIG
         | NFS4ERR_REP_TOO_BIG
         | NFS4ERR_REP_TOO_BIG_TO_CACHE
@@ -1959,6 +1960,12 @@ fn test_attr(path: &str) -> Option<Result<Attr>> {
             return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTSUPP)));
         }
         "__xdev__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_XDEV))),
+        "__bad_cookie__" => {
+            return Some(Err(NfsError::Nfs3(
+                crate::nfs3::ErrorCode::NFS3ERR_BAD_COOKIE,
+            )));
+        }
+        "__not_same__" => return Some(Err(NfsError::Nfs4(NFS4ERR_NOT_SAME))),
         _ => 9,
     };
     Some(Ok(Attr {
@@ -2551,6 +2558,105 @@ fn test_directory_fails(_path: &str) -> bool {
     false
 }
 
+/// Test-support directory "paged": seven entries served three per page. Cookie
+/// of entry `i` is `i + 1`; any position other than a page boundary with the
+/// fixture verifier (zero at the start) is a stale cookie.
+#[cfg(feature = "python-test-support")]
+fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<DirectoryPage>> {
+    const TOTAL: u64 = 7;
+    const PAGE: u64 = 3;
+    const VERIFIER: [u8; 8] = *b"fixture1";
+    if path != "paged" {
+        return None;
+    }
+    let start = position.cookie;
+    let expected = if start == 0 { [0; 8] } else { VERIFIER };
+    if !start.is_multiple_of(PAGE) || start >= TOTAL || position.verifier != expected {
+        return Some(Err(NfsError::Nfs3(
+            crate::nfs3::ErrorCode::NFS3ERR_BAD_COOKIE,
+        )));
+    }
+    let end = (start + PAGE).min(TOTAL);
+    let entries = (start..end)
+        .map(|index| {
+            let attr = Attr {
+                fileid: index + 1,
+                type_: 1,
+                ..Attr::default()
+            };
+            (format!("page-entry-{index}"), attr, Bytes::new())
+        })
+        .collect();
+    let next = DirectoryCookie {
+        cookie: end,
+        verifier: VERIFIER,
+    };
+    Some(Ok((entries, next, end == TOTAL)))
+}
+
+#[cfg(not(feature = "python-test-support"))]
+fn test_directory_page(_path: &str, _position: DirectoryCookie) -> Option<Result<DirectoryPage>> {
+    None
+}
+
+/// Directory entries crossing into Python always carry attributes.
+fn directory_entry(entry: ReaddirplusEntry) -> Result<DirectoryEntry> {
+    let attr = entry
+        .attr
+        .ok_or_else(|| NfsError::Rpc("directory entry did not include attributes".to_string()))?;
+    let fh = if entry.handle.is_empty() {
+        attr.filehandle.clone()
+    } else {
+        entry.handle
+    };
+    Ok((entry.file_name, attr, fh))
+}
+
+fn directory_position(cookie: u64, verifier: Option<Vec<u8>>) -> Result<DirectoryCookie> {
+    let verifier = match verifier {
+        None => [0; 8],
+        Some(bytes) => bytes.try_into().map_err(|_| {
+            NfsError::InvalidInput("scandir_page verifier must be exactly 8 bytes".into())
+        })?,
+    };
+    Ok(DirectoryCookie { cookie, verifier })
+}
+
+/// One READDIRPLUS page from a caller-held position; see `Mount::readdirplus_page`.
+async fn directory_page(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+    fh: Option<Bytes>,
+    position: DirectoryCookie,
+) -> Result<DirectoryPage> {
+    let _operation = core.begin_operation()?;
+    if let Some(result) = test_directory_page(&path, position) {
+        return result;
+    }
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("scandir_page requires a connected protocol engine".to_string())
+    })?;
+    let handle = directory_handle(fh, async { Ok(mount.lookup_path(&path).await?.fh) }).await?;
+    let page = mount.readdirplus_page(handle, position).await?;
+    let entries = page
+        .entries
+        .into_iter()
+        .map(directory_entry)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((entries, page.next, page.eof))
+}
+
+fn directory_page_dict<'py>(py: Python<'py>, page: DirectoryPage) -> PyResult<Bound<'py, PyDict>> {
+    let (entries, next, eof) = page;
+    let result = PyDict::new(py);
+    result.set_item("entries", directory_batch_dicts(py, entries)?)?;
+    result.set_item("cookie", next.cookie)?;
+    result.set_item("verifier", PyBytes::new(py, &next.verifier))?;
+    result.set_item("eof", eof)?;
+    Ok(result)
+}
+
 /// A supplied handle is authoritative; path lookup is evaluated only when absent.
 async fn directory_handle(
     fh: Option<Bytes>,
@@ -2664,18 +2770,7 @@ async fn directory_receiver(
         };
         match stream {
             Ok(entries) => {
-                let entries = entries.map(|entry| {
-                    let entry = entry?;
-                    let attr = entry.attr.ok_or_else(|| {
-                        NfsError::Rpc("directory entry did not include attributes".to_string())
-                    })?;
-                    let fh = if entry.handle.is_empty() {
-                        attr.filehandle.clone()
-                    } else {
-                        entry.handle
-                    };
-                    Ok((entry.file_name, attr, fh))
-                });
+                let entries = entries.map(|entry| directory_entry(entry?));
                 stream_directory_batches(entries, sender, &closing).await;
             }
             Err(error) => {
@@ -4457,6 +4552,31 @@ impl SyncClient {
         })
     }
 
+    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None))]
+    fn scandir_page<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        fh: Option<Vec<u8>>,
+        cookie: u64,
+        verifier: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let position = directory_position(cookie, verifier).map_err(nfs_error)?;
+        let page = self.run_operation(
+            py,
+            "scandir_page",
+            Some(path.clone()),
+            directory_page(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                fh.map(Bytes::from),
+                position,
+            ),
+        )?;
+        directory_page_dict(py, page)
+    }
+
     #[pyo3(signature = (path, mode = "rb"))]
     fn open(&self, py: Python<'_>, path: String, mode: &str) -> PyResult<SyncFile> {
         validate_file_mode(mode)?;
@@ -5028,6 +5148,31 @@ impl AsyncClient {
                 receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
                 operation_timeout: timeout,
             })
+        })
+    }
+
+    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None))]
+    fn scandir_page<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        fh: Option<Vec<u8>>,
+        cookie: u64,
+        verifier: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let position = directory_position(cookie, verifier).map_err(nfs_error)?;
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let page = with_operation_timeout(
+                timeout,
+                "scandir_page",
+                directory_page(core, mount, path, fh.map(Bytes::from), position),
+            )
+            .await
+            .map_err(nfs_error)?;
+            Python::attach(|py| directory_page_dict(py, page).map(Bound::unbind))
         })
     }
 

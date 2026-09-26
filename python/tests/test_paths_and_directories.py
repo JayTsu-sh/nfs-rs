@@ -48,6 +48,15 @@ class SyncInner:
             raise PermissionError(_path)
         yield [{"name": "second", "info": {**INFO, "fileid": 10}}]
 
+    def scandir_page(self, path, fh, cookie, verifier):
+        self.last_page = (path, fh, cookie, verifier)
+        return {
+            "entries": [{"name": f"entry-{cookie}", "info": dict(INFO), "fh": b"child-fh\0"}],
+            "cookie": cookie + 1,
+            "verifier": b"verifier",
+            "eof": cookie >= 1,
+        }
+
 
 class AsyncInner(SyncInner):
     @classmethod
@@ -59,6 +68,9 @@ class AsyncInner(SyncInner):
 
     async def stat(self, path):
         return super().stat(path)
+
+    async def scandir_page(self, path, fh, cookie, verifier):
+        return super().scandir_page(path, fh, cookie, verifier)
 
     async def scandir(self, _path, fh=None):
         self.last_scan = (_path, fh)
@@ -202,3 +214,50 @@ def test_scandir_rejects_invalid_handles(fh, error):
         with pytest.raises(error, match="fh"):
             _ = [entry async for entry in client.scandir(DirectoryRef("folder", fh))]
     asyncio.run(scenario())
+
+
+def test_scandir_page_passes_position_and_returns_resumable_pages():
+    from nfs_rs import DirectoryCookie, DirectoryPage, DirectoryRef
+
+    client = Client.connect("nfs://server/export")
+    first = client.scandir_page("a/./b")
+    assert client._inner.last_page == ("a/b", None, 0, bytes(8))
+    assert isinstance(first, DirectoryPage)
+    assert [entry.path for entry in first.entries] == ["a/b/entry-0"]
+    assert first.entries[0].fh == b"child-fh\0"
+    assert first.next == DirectoryCookie(1, b"verifier")
+    assert not first.eof
+    last = client.scandir_page(DirectoryRef("a/b", b"dir-fh"), first.next)
+    assert client._inner.last_page == ("a/b", b"dir-fh", 1, b"verifier")
+    assert last.eof
+
+    async def scenario():
+        client = await AsyncClient.connect("nfs://server/export")
+        page = await client.scandir_page("a/b", DirectoryCookie(1, b"verifier"))
+        assert client._inner.last_page == ("a/b", None, 1, b"verifier")
+        assert page.eof and page.next == DirectoryCookie(2, b"verifier")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "position, error",
+    [
+        ((1, b"verifier"), TypeError),
+        ("cookie", TypeError),
+        ({"cookie": -1}, ValueError),
+        ({"cookie": 2**64}, ValueError),
+        ({"cookie": True}, ValueError),
+        ({"verifier": b"short"}, ValueError),
+        ({"verifier": "8 chars!"}, ValueError),
+    ],
+)
+def test_scandir_page_rejects_invalid_positions_before_adapter(position, error):
+    from nfs_rs import DirectoryCookie
+
+    if isinstance(position, dict):
+        position = DirectoryCookie(**position)
+    client = Client.connect("nfs://server/export")
+    with pytest.raises(error):
+        client.scandir_page("folder", position)
+    assert not hasattr(client._inner, "last_page")

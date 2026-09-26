@@ -205,6 +205,39 @@ error are yielded before that error is raised.
 `scandir()` streams entries and avoids constructing a complete list. Consume or
 close the client before discarding a partially consumed iterator.
 
+### Resumable directory pages
+
+`scandir_page()` reads one directory page at a time and returns a
+`DirectoryPage` with `entries`, `next` and `eof`. The caller holds the position
+(`DirectoryCookie`: the server cookie and its 8-byte verifier), so a listing
+interrupted by a timeout or reconnect continues from the last page received,
+even on a new client of the same server, instead of starting over. Persist
+`page.next` only after the page's entries have been processed.
+
+```python
+from nfs_rs import Client, DirectoryCookie, NfsBadCookieError
+
+def list_resumably(client: Client, path: str, position: DirectoryCookie) -> None:
+    while True:
+        try:
+            page = client.scandir_page(path, position)
+        except NfsBadCookieError:
+            # The server no longer accepts this position; only a full restart is safe.
+            position = DirectoryCookie()
+            continue
+        for entry in page.entries:
+            print(entry.name, entry.info.size)
+        if page.eof:
+            return
+        position = page.next  # save this to resume after a failure
+```
+
+`AsyncClient.scandir_page()` is awaited and returns the same page. A server may
+reject a saved position after the directory changed or the server restarted;
+that raises `NfsBadCookieError` (NFS3ERR_BAD_COOKIE, NFS4ERR_BAD_COOKIE or
+NFS4ERR_NOT_SAME). Some servers accept any cookie and simply return fewer
+entries, so a restarted listing can repeat entries already processed.
+
 Namespace operations include `mkdir`, `touch`, `remove`/`unlink`, `rmdir`,
 `rename`, hard `link`, `symlink`, and `readlink`. `remove` and `unlink` are
 equivalent file-removal operations.
