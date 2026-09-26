@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `Mount::readdirplus_page` reads one READDIRPLUS (NFSv3) or READDIR (NFSv4.0,
+  NFSv4.1) page from a caller-held `DirectoryCookie` (cookie and cookie
+  verifier) and returns a `ReaddirplusPage` with the entries, the position
+  after them and the EOF flag. A listing interrupted by a transient failure can
+  continue from the last page received, also on a new mount, instead of
+  restarting. Pages that make no progress are rejected. The existing
+  `readdirplus` streams are unchanged; implementations of `Mount` outside this
+  crate inherit a default that returns `NfsError::Unsupported`.
+- `NfsError::is_bad_directory_cookie` identifies a rejected listing position
+  (`NFS3ERR_BAD_COOKIE`, `NFS4ERR_BAD_COOKIE`, `NFS4ERR_NOT_SAME`), after which
+  only a restart from the beginning is possible.
+
 ## [0.8.4] - 2026-09-11
 
 ### Fixed

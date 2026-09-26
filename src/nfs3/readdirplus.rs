@@ -18,6 +18,7 @@ use super::{
     Mount, READDIRPLUS3args, READDIRPLUS3resok, Result, bytes_to_string, entryplus3, nfs_fh3,
     paged_dir_stream, post_op_fh3,
 };
+use crate::mount::{DirectoryCookie, DirectoryCursor, ReaddirplusPage};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use futures::stream::Stream;
@@ -59,17 +60,21 @@ impl Mount {
             self,
             dir_fh,
             readdirplus_at,
-            |entry: Box<entryplus3>| ReaddirplusEntry {
-                fileid: entry.fileid.0,
-                file_name: bytes_to_string(entry.name.0),
-                attr: entry.name_attributes.into(),
-                handle: match entry.name_handle {
-                    post_op_fh3::TRUE(h) => h.0,
-                    _ => Bytes::new(),
-                },
-            },
+            |entry: Box<entryplus3>| convert_entry(*entry),
             "readdirplus page received"
         )
+    }
+
+    /// One READDIRPLUS page from a caller-held position (RFC 1813 §3.3.17).
+    pub async fn readdirplus_page(
+        &self,
+        dir_fh: Bytes,
+        position: DirectoryCookie,
+    ) -> Result<ReaddirplusPage> {
+        let res = self
+            .readdirplus_at(dir_fh, position.cookie, position.verifier)
+            .await?;
+        into_page(res, position)
     }
 
     pub async fn readdirplus_at(
@@ -86,5 +91,119 @@ impl Mount {
             maxcount: self.maxcount,
         };
         self._readdirplus(args).await
+    }
+}
+
+fn convert_entry(entry: entryplus3) -> ReaddirplusEntry {
+    ReaddirplusEntry {
+        fileid: entry.fileid.0,
+        file_name: bytes_to_string(entry.name.0),
+        attr: entry.name_attributes.into(),
+        handle: match entry.name_handle {
+            post_op_fh3::TRUE(h) => h.0,
+            _ => Bytes::new(),
+        },
+    }
+}
+
+/// Converts one reply into a public page. `.` and `..` count toward progress
+/// but are omitted, as in the stream.
+fn into_page(res: READDIRPLUS3resok, position: DirectoryCookie) -> Result<ReaddirplusPage> {
+    let verifier: [u8; 8] = res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
+    let mut last_cookie = position.cookie;
+    let mut received = 0usize;
+    let mut entries = Vec::new();
+    let mut current = res.reply.entries;
+    while let Some(mut node) = current {
+        current = node.nextentry.take();
+        received += 1;
+        last_cookie = node.cookie.0;
+        let name = node.name.0.as_ref();
+        if name != b"." && name != b".." {
+            entries.push(convert_entry(*node).into());
+        }
+    }
+    let eof = res.reply.eof;
+    let next = DirectoryCursor::resume(position).page(last_cookie, verifier, received, eof)?;
+    Ok(ReaddirplusPage { entries, next, eof })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfs4::compound::{xdr_opaque, xdr_u32};
+
+    fn reply(verifier: [u8; 8], entries: &[(u64, &[u8])], eof: bool) -> READDIRPLUS3resok {
+        let mut data = vec![0; 4]; // no directory post-op attrs
+        data.extend(verifier);
+        for (cookie, name) in entries {
+            xdr_u32(&mut data, 1);
+            data.extend(42u64.to_be_bytes());
+            xdr_opaque(&mut data, name);
+            data.extend(cookie.to_be_bytes());
+            data.extend([0; 8]); // no attrs / fh
+        }
+        xdr_u32(&mut data, 0);
+        xdr_u32(&mut data, u32::from(eof));
+        READDIRPLUS3resok::try_from(&mut Bytes::from(data)).unwrap()
+    }
+
+    fn names(page: &ReaddirplusPage) -> Vec<&str> {
+        page.entries
+            .iter()
+            .map(|entry| entry.file_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn page_omits_dot_entries_and_resumes_after_last_cookie() {
+        let first = reply(
+            [7; 8],
+            &[(1, b"."), (2, b".."), (3, b"a"), (4, b"b")],
+            false,
+        );
+        let page = into_page(first, DirectoryCookie::default()).unwrap();
+        assert_eq!(names(&page), ["a", "b"]);
+        assert!(!page.eof);
+        let expected = DirectoryCookie {
+            cookie: 4,
+            verifier: [7; 8],
+        };
+        assert_eq!(page.next, expected);
+
+        let last = into_page(reply([7; 8], &[(5, b"c")], true), page.next).unwrap();
+        assert_eq!(names(&last), ["c"]);
+        assert!(last.eof);
+        assert_eq!(last.next.cookie, 5);
+
+        // A page holding only `.` and `..` still makes progress.
+        let dots = into_page(
+            reply([7; 8], &[(1, b"."), (2, b"..")], false),
+            DirectoryCookie::default(),
+        )
+        .unwrap();
+        assert!(dots.entries.is_empty());
+        assert_eq!(dots.next.cookie, 2);
+
+        let empty_eof = into_page(reply([8; 8], &[], true), expected).unwrap();
+        assert!(empty_eof.entries.is_empty() && empty_eof.eof);
+        assert_eq!(
+            empty_eof.next,
+            DirectoryCookie {
+                cookie: 4,
+                verifier: [8; 8]
+            }
+        );
+    }
+
+    #[test]
+    fn page_without_progress_is_an_error() {
+        let position = DirectoryCookie {
+            cookie: 4,
+            verifier: [7; 8],
+        };
+        assert!(into_page(reply([7; 8], &[], false), position).is_err());
+        assert!(into_page(reply([7; 8], &[(4, b"x")], false), position).is_err());
+        assert!(into_page(reply([7; 8], &[(0, b"x")], true), position).is_err());
     }
 }

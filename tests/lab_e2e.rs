@@ -3,14 +3,14 @@ use std::env;
 use std::io;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
-    AceFlags, AceMask, AceType, Acl, Acl41Flags, Mount, MountLifecycleState, NFSVersion, NfsAce,
-    NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time, parse_url_and_mount,
+    AceFlags, AceMask, AceType, Acl, Acl41Flags, DirectoryCookie, Mount, MountLifecycleState,
+    NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time, parse_url_and_mount,
 };
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
@@ -23,6 +23,9 @@ const LAB_ACL_LINUX_V40_URL_ENV: &str = "NFS_RS_LAB_ACL_LINUX_V40_URL";
 const LAB_ACL_LINUX_V41_URL_ENV: &str = "NFS_RS_LAB_ACL_LINUX_V41_URL";
 const LAB_ACL_FAS2750_V40_URL_ENV: &str = "NFS_RS_LAB_ACL_FAS2750_V40_URL";
 const LAB_ACL_FAS2750_V41_URL_ENV: &str = "NFS_RS_LAB_ACL_FAS2750_V41_URL";
+const LAB_READDIR_URLS_ENV: &str = "NFS_RS_LAB_READDIR_URLS";
+const LAB_READDIR_PARENT_ENV: &str = "NFS_RS_LAB_READDIR_PARENT";
+const LAB_READDIR_FILES_ENV: &str = "NFS_RS_LAB_READDIR_FILES";
 const CASE_DIR: &str = "nfs-rs-e2e";
 const ORIGINAL_FILE: &str = "nfs-rs-e2e/payload.bin";
 const RENAMED_FILE: &str = "nfs-rs-e2e/renamed.bin";
@@ -2161,6 +2164,185 @@ async fn nfs_v40_destination_partition_respects_lease_generation() -> TestResult
     }
     mount.umount().await?;
     Ok(())
+}
+
+/// Creates a large directory under `NFS_RS_LAB_READDIR_PARENT` (default: the
+/// export root) of every URL in `NFS_RS_LAB_READDIR_URLS`, lists it page by page,
+/// resumes from a middle page on a new mount, probes a garbage cookie and
+/// verifier, then removes everything it created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires writable NFS exports for a large paged directory"]
+async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResult {
+    let files = match env::var(LAB_READDIR_FILES_ENV) {
+        Ok(value) => value.parse::<usize>()?,
+        Err(_) => 20_000,
+    };
+    let parent = env::var(LAB_READDIR_PARENT_ENV).unwrap_or_default();
+    let urls = env::var(LAB_READDIR_URLS_ENV)?;
+    for url in urls.split(',').filter(|url| !url.is_empty()) {
+        let mount = parse_url_and_mount(url).await?;
+        let parent_fh = if parent.is_empty() {
+            mount.getfh().await
+        } else {
+            mount.lookup_path(&parent).await?.fh
+        };
+        let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let case = format!("nfs-rs-readdir-page-{}-{millis}", std::process::id());
+        let dir = mount.mkdir(parent_fh.clone(), &case, 0o755).await?.fh;
+        let names = (0..files)
+            .map(|index| format!("entry-{index:06}"))
+            .collect::<BTreeSet<_>>();
+        let started = Instant::now();
+        let checked = async {
+            futures::stream::iter(&names)
+                .map(|name| mount.create(dir.clone(), name, Some(0o644)))
+                .buffer_unordered(64)
+                .try_for_each(|_| async { Ok(()) })
+                .await?;
+            println!("{url}: created {files} files in {:?}", started.elapsed());
+            check_paged_listing(url, mount.as_ref(), dir.clone(), &names).await
+        }
+        .await;
+        let removed = futures::stream::iter(&names)
+            .map(|name| {
+                let (mount, dir) = (&mount, dir.clone());
+                async move {
+                    match mount.remove(dir, name).await {
+                        Err(error) if error.is_not_found() => Ok(()),
+                        other => other,
+                    }
+                }
+            })
+            .buffer_unordered(64)
+            .try_for_each(|()| async { Ok(()) })
+            .await;
+        let removed_dir = mount.rmdir(parent_fh, &case).await;
+        mount.umount().await?;
+        checked?;
+        removed?;
+        removed_dir?;
+    }
+    Ok(())
+}
+
+async fn check_paged_listing(
+    url: &str,
+    mount: &dyn Mount,
+    dir: Bytes,
+    expected: &BTreeSet<String>,
+) -> TestResult {
+    let pages = read_pages(mount, dir.clone(), DirectoryCookie::default()).await?;
+    let listed = pages
+        .iter()
+        .flat_map(|(_, names)| names.clone())
+        .collect::<Vec<_>>();
+    ensure(
+        listed.len() == expected.len()
+            && listed.iter().cloned().collect::<BTreeSet<_>>() == *expected,
+        format!("{url}: paged listing returned {} entries", listed.len()),
+    )?;
+    ensure(
+        pages.len() > 2,
+        format!("{url}: only {} pages", pages.len()),
+    )?;
+    let streamed = mount
+        .readdirplus(dir.clone())
+        .await
+        .map_ok(|entry| entry.file_name)
+        .try_collect::<Vec<_>>()
+        .await?;
+    ensure(
+        streamed == listed,
+        format!("{url}: stream order differs from pages"),
+    )?;
+
+    let middle = pages.len() / 2;
+    let resume_from = pages[middle].0;
+    let skipped = pages[..middle]
+        .iter()
+        .map(|(_, names)| names.len())
+        .sum::<usize>();
+    let fresh = parse_url_and_mount(url).await?;
+    let resumed = read_pages(fresh.as_ref(), dir.clone(), resume_from).await;
+    let garbage_cookie = DirectoryCookie {
+        cookie: 0x5eed_0000_dead_beef,
+        verifier: resume_from.verifier,
+    };
+    let cookie_probe = probe_position(fresh.as_ref(), dir.clone(), garbage_cookie).await;
+    let mut verifier = resume_from.verifier;
+    verifier.iter_mut().for_each(|byte| *byte ^= 0xa5);
+    let garbage_verifier = DirectoryCookie {
+        cookie: resume_from.cookie,
+        verifier,
+    };
+    let verifier_probe = probe_position(fresh.as_ref(), dir, garbage_verifier).await;
+    fresh.umount().await?;
+    let resumed = resumed?
+        .into_iter()
+        .flat_map(|(_, names)| names)
+        .collect::<Vec<_>>();
+    ensure(
+        resumed == listed[skipped..],
+        format!("{url}: resumed listing differs from the remaining entries"),
+    )?;
+    println!(
+        "{url}: {} pages, {} entries; resumed page {middle} (cookie {:#x}, verifier {:02x?}) \
+         on a new mount: {} remaining entries match; garbage cookie: {}; garbage verifier: {}",
+        pages.len(),
+        listed.len(),
+        resume_from.cookie,
+        resume_from.verifier,
+        resumed.len(),
+        cookie_probe?,
+        verifier_probe?,
+    );
+    Ok(())
+}
+
+type Pages = Vec<(DirectoryCookie, Vec<String>)>;
+
+async fn read_pages(
+    mount: &dyn Mount,
+    dir: Bytes,
+    mut position: DirectoryCookie,
+) -> TestResult<Pages> {
+    let mut pages = Vec::new();
+    loop {
+        let page = mount.readdirplus_page(dir.clone(), position).await?;
+        ensure(
+            page.entries
+                .iter()
+                .all(|entry| entry.attr.is_some() && !entry.handle.is_empty()),
+            "page entry lacks attributes or a file handle",
+        )?;
+        let names = page
+            .entries
+            .into_iter()
+            .map(|entry| entry.file_name)
+            .collect();
+        pages.push((position, names));
+        if page.eof {
+            return Ok(pages);
+        }
+        position = page.next;
+    }
+}
+
+/// A rejected position must carry the typed error; a server may also accept it.
+async fn probe_position(
+    mount: &dyn Mount,
+    dir: Bytes,
+    position: DirectoryCookie,
+) -> TestResult<String> {
+    match mount.readdirplus_page(dir, position).await {
+        Ok(page) => Ok(format!(
+            "accepted ({} entries, eof={})",
+            page.entries.len(),
+            page.eof
+        )),
+        Err(error) if error.is_bad_directory_cookie() => Ok(format!("rejected: {error}")),
+        Err(error) => Err(format!("untyped rejection: {error:?}").into()),
+    }
 }
 
 fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
