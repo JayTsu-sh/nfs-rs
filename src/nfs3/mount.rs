@@ -181,6 +181,14 @@ impl crate::Mount for Mount3 {
         Box::pin(self.m.readdirplus(dir_fh).await.map_ok(Into::into))
     }
 
+    async fn readdirplus_page(
+        &self,
+        dir_fh: Bytes,
+        position: crate::DirectoryCookie,
+    ) -> Result<crate::ReaddirplusPage> {
+        self.m.readdirplus_page(dir_fh, position).await
+    }
+
     async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
         self.m.mkdir(dir_fh, dirname, mode).await
     }

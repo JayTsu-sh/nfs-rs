@@ -42,6 +42,44 @@ impl Default for DirectoryCursor {
 }
 
 impl DirectoryCursor {
+    /// Starts a cursor at a caller-held position. The starting cookie counts as
+    /// seen, so a page whose last entry repeats it is rejected as no progress.
+    pub fn resume(position: DirectoryCookie) -> Self {
+        Self {
+            cookie: position.cookie,
+            verifier: position.verifier,
+            seen: HashSet::from([0, position.cookie]),
+        }
+    }
+
+    /// Validates one page fetched from this cursor's position and returns the
+    /// position that continues after it. `entries` counts every entry the server
+    /// returned, including entries the public listing omits.
+    ///
+    /// A page without entries (only valid at EOF) returns the requested position
+    /// unchanged: a cookie must travel with the verifier of the reply that
+    /// produced it (RFC 1813 §3.3.16, RFC 7530 §16.24.4, RFC 5661 §18.23.3).
+    pub fn page(
+        mut self,
+        last_cookie: u64,
+        verifier: [u8; 8],
+        entries: usize,
+        eof: bool,
+    ) -> Result<DirectoryCookie> {
+        let requested = DirectoryCookie {
+            cookie: self.cookie,
+            verifier: self.verifier,
+        };
+        self.advance(last_cookie, verifier, entries, eof)?;
+        if entries == 0 {
+            return Ok(requested);
+        }
+        Ok(DirectoryCookie {
+            cookie: self.cookie,
+            verifier: self.verifier,
+        })
+    }
+
     pub fn advance(
         &mut self,
         cookie: u64,
@@ -88,6 +126,37 @@ pub(crate) fn block_on_compat<F: std::future::Future>(f: F) -> F::Output {
         }
         _ => futures::executor::block_on(f),
     }
+}
+
+/// A resumable position in a directory listing: the cookie of the last entry
+/// already received and the cookie verifier returned with it (RFC 1813 §3.3.16,
+/// RFC 7530 §16.24, RFC 5661 §18.23).
+///
+/// [`DirectoryCookie::default`] is the start of the directory (cookie 0,
+/// verifier 0). A position stays usable in a later request sequence on the same
+/// mount or on a new mount of the same server, but the server may reject it once
+/// the directory changed or the server restarted; see
+/// [`NfsError::is_bad_directory_cookie`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct DirectoryCookie {
+    pub cookie: u64,
+    pub verifier: [u8; 8],
+}
+
+/// One page of [`Mount::readdirplus_page`].
+#[derive(Debug)]
+pub struct ReaddirplusPage {
+    /// Entries in server order. NFSv3 `.` and `..` are omitted, as in
+    /// [`Mount::readdirplus`], so a non-EOF page may be empty only when the
+    /// server returned nothing but those two names.
+    pub entries: Vec<ReaddirplusEntry>,
+    /// Position after the last entry of this page with the verifier of this
+    /// reply; pass it to the next call. When the server returned no entries at
+    /// all (only valid at EOF), this is the requested position unchanged; an
+    /// NFSv3 page holding only `.` and `..` still advances past them.
+    pub next: DirectoryCookie,
+    /// The server reported the end of the directory.
+    pub eof: bool,
 }
 
 pub type ReaddirStream<'a> = Pin<Box<dyn Stream<Item = Result<ReaddirEntry>> + Send + 'a>>;
@@ -1289,6 +1358,62 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn readdirplus_path(&self, dir_path: &str) -> Result<ReaddirplusStream<'_>> {
         let res = self.lookup_path(dir_path).await?;
         Ok(self.readdirplus(res.fh).await)
+    }
+
+    /// Reads one READDIRPLUS page (NFSv3) or one READDIR page with the
+    /// [`Mount::readdirplus`] attribute set (NFSv4.x) starting after `position`,
+    /// using the mount's configured `readdir-buffer` sizes.
+    ///
+    /// Unlike [`Mount::readdirplus`], the caller holds the position, so a listing
+    /// interrupted by a transient failure can continue from the last page it
+    /// received instead of restarting. Pass [`DirectoryCookie::default`] for the
+    /// first page and each page's [`ReaddirplusPage::next`] for the following
+    /// one, until [`ReaddirplusPage::eof`].
+    ///
+    /// A page that makes no progress (non-EOF without entries, or ending at the
+    /// requested cookie) fails with [`NfsError::Xdr`], the same variant as a
+    /// malformed reply. Detecting a cookie repeated across pages is the caller's
+    /// responsibility: a server whose cookies cycle would otherwise page forever,
+    /// so the example below keeps the cookies it has seen, checking EOF first
+    /// because an EOF page without entries repeats the requested cookie. When
+    /// the server rejects the cookie or its verifier, the error satisfies
+    /// [`NfsError::is_bad_directory_cookie`] and the listing can only restart
+    /// from [`DirectoryCookie::default`].
+    ///
+    /// Entries whose NFSv4.1 attributes cannot be decoded are returned without
+    /// attributes, as in [`Mount::readdirplus`]; on NFSv4.0 a malformed entry fails
+    /// the whole page. Implementations outside this crate return
+    /// [`NfsError::Unsupported`] unless they override this method.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// async fn count_entries(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes) -> nfs_rs::Result<usize> {
+    ///     let mut position = nfs_rs::DirectoryCookie::default();
+    ///     let mut seen = std::collections::HashSet::new();
+    ///     let mut count = 0;
+    ///     loop {
+    ///         let page = mount.readdirplus_page(dir_fh.clone(), position).await?;
+    ///         count += page.entries.len();
+    ///         if page.eof {
+    ///             return Ok(count);
+    ///         }
+    ///         if !seen.insert(page.next.cookie) {
+    ///             return Err(nfs_rs::NfsError::Xdr("directory cookie repeated".into()));
+    ///         }
+    ///         position = page.next; // persist this to resume after a failure
+    ///     }
+    /// }
+    /// ```
+    async fn readdirplus_page(
+        &self,
+        dir_fh: Bytes,
+        position: DirectoryCookie,
+    ) -> Result<ReaddirplusPage> {
+        let _ = (dir_fh, position);
+        Err(NfsError::Unsupported(
+            "readdirplus_page is not implemented by this Mount".into(),
+        ))
     }
 
     /// Procedure MKDIR creates a new subdirectory.

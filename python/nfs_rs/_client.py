@@ -212,6 +212,19 @@ class DirEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectoryCookie:
+    cookie: int = 0
+    verifier: bytes = bytes(8)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryPage:
+    entries: tuple[DirEntry, ...]
+    next: DirectoryCookie
+    eof: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ExportEntry:
     path: str
     groups: tuple[str, ...]
@@ -313,6 +326,27 @@ def _scandir_target(target: DirectoryRef | DirEntry | os.PathLike[str] | str) ->
         if not fh:
             raise ValueError("scandir fh must not be empty; use None for path lookup")
     return normalized, fh
+
+
+def _directory_position(position: DirectoryCookie | None) -> tuple[int, bytes]:
+    if position is None:
+        return 0, bytes(8)
+    if not isinstance(position, DirectoryCookie):
+        raise TypeError("scandir_page position must be a DirectoryCookie or None")
+    cookie, verifier = position.cookie, position.verifier
+    if not isinstance(cookie, int) or isinstance(cookie, bool) or not 0 <= cookie < 2**64:
+        raise ValueError("scandir_page cookie must be an unsigned 64-bit integer")
+    if not isinstance(verifier, bytes) or len(verifier) != 8:
+        raise ValueError("scandir_page verifier must be exactly 8 bytes")
+    return cookie, verifier
+
+
+def _directory_page(parent: str, values: dict[str, Any]) -> DirectoryPage:
+    return DirectoryPage(
+        tuple(_directory_entry(parent, entry) for entry in values["entries"]),
+        DirectoryCookie(values["cookie"], bytes(values["verifier"])),
+        values["eof"],
+    )
 
 
 def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
@@ -594,6 +628,15 @@ class Client(_ClientOptions):
                 raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
         return entries()
 
+    def scandir_page(
+        self,
+        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        position: DirectoryCookie | None = None,
+    ) -> DirectoryPage:
+        normalized, fh = _scandir_target(path)
+        cookie, verifier = _directory_position(position)
+        return _directory_page(normalized, self._inner.scandir_page(normalized, fh, cookie, verifier))
+
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name for entry in self.scandir(path)]
 
@@ -823,6 +866,16 @@ class AsyncClient(_ClientOptions):
                     yield _directory_entry(normalized, values)
         except NfsError as error:
             raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
+
+    async def scandir_page(
+        self,
+        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        position: DirectoryCookie | None = None,
+    ) -> DirectoryPage:
+        self._check_loop()
+        normalized, fh = _scandir_target(path)
+        cookie, verifier = _directory_position(position)
+        return _directory_page(normalized, await self._inner.scandir_page(normalized, fh, cookie, verifier))
 
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
         return [entry.name async for entry in self.scandir(path)]

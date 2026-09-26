@@ -1666,6 +1666,13 @@ impl crate::Mount for Mount41Wrapper {
     async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
         self.m.readdirplus_path(dir_path).await
     }
+    async fn readdirplus_page(
+        &self,
+        dir_fh: Bytes,
+        position: mount::DirectoryCookie,
+    ) -> Result<mount::ReaddirplusPage> {
+        self.m.readdirplus_page_from(dir_fh, position).await
+    }
     async fn write(
         &self,
         fh: Bytes,

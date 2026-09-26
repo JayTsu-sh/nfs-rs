@@ -85,6 +85,24 @@ impl Mount41 {
         Ok(self.readdirplus(obj.fh).await)
     }
 
+    /// One READDIR page from a caller-held position (RFC 5661 §18.23).
+    pub(crate) async fn readdirplus_page_from(
+        &self,
+        dir_fh: Bytes,
+        position: mount::DirectoryCookie,
+    ) -> Result<mount::ReaddirplusPage> {
+        let (entries, last_cookie, verifier, eof) = self
+            .readdirplus_page(&dir_fh, position.cookie, &position.verifier)
+            .await?;
+        let next = mount::DirectoryCursor::resume(position).page(
+            last_cookie,
+            verifier,
+            entries.len(),
+            eof,
+        )?;
+        Ok(mount::ReaddirplusPage { entries, next, eof })
+    }
+
     async fn readdir_page(
         &self,
         fh: &Bytes,
@@ -247,7 +265,7 @@ fn decode_entry_fattr4(data: &mut Bytes) -> Result<mount::Attr> {
 mod tests {
     use super::*;
     use crate::nfs41::test_support::directory_page as page;
-    use crate::nfs41::test_support::{ok, putfh, serve};
+    use crate::nfs41::test_support::{Reply, ok, putfh, serve};
 
     #[tokio::test]
     async fn directory_empty_non_eof_is_an_error() {
@@ -276,6 +294,101 @@ mod tests {
         assert!(entries.try_next().await.unwrap().is_some());
         assert!(entries.try_next().await.is_err());
         drop(entries);
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_resumes_from_caller_position_and_types_stale_cookies() {
+        let mut calls = 0;
+        let (mount, server) = serve(move |_, mut args| {
+            calls += 1;
+            if calls > 1 {
+                let status = if calls == 2 { 10003 } else { 10027 };
+                return vec![
+                    ok(22, vec![]),
+                    Reply {
+                        opcode: 26,
+                        status,
+                        data: vec![],
+                    },
+                ];
+            }
+            putfh(&mut args);
+            assert_eq!(args.get_u32(), 26);
+            assert_eq!(args.get_u64(), 5);
+            assert_eq!(&args.split_to(8)[..], &[9; 8]);
+            vec![ok(22, vec![]), ok(26, page(Some(8), false, [3; 8]))]
+        })
+        .await;
+        let position = mount::DirectoryCookie {
+            cookie: 5,
+            verifier: [9; 8],
+        };
+        let page = mount
+            .readdirplus_page_from(Bytes::new(), position)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].fileid, 42);
+        assert!(!page.eof);
+        assert_eq!(
+            page.next,
+            mount::DirectoryCookie {
+                cookie: 8,
+                verifier: [3; 8]
+            }
+        );
+        for _ in 0..2 {
+            let error = mount
+                .readdirplus_page_from(Bytes::new(), page.next)
+                .await
+                .unwrap_err();
+            assert!(error.is_bad_directory_cookie(), "{error:?}");
+        }
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_keeps_position_on_empty_eof_page() {
+        let (mount, server) =
+            serve(move |_, _| vec![ok(22, vec![]), ok(26, page(None, true, [2; 8]))]).await;
+        let position = mount::DirectoryCookie {
+            cookie: 5,
+            verifier: [1; 8],
+        };
+        let page = mount
+            .readdirplus_page_from(Bytes::new(), position)
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty() && page.eof);
+        assert_eq!(page.next, position);
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_rejects_no_progress() {
+        let mut calls = 0;
+        let (mount, server) = serve(move |_, _| {
+            calls += 1;
+            // An empty non-EOF page, then a page ending at the requested cookie.
+            let cookie = (calls == 2).then_some(5);
+            vec![ok(22, vec![]), ok(26, page(cookie, false, [1; 8]))]
+        })
+        .await;
+        let position = mount::DirectoryCookie {
+            cookie: 5,
+            verifier: [1; 8],
+        };
+        for _ in 0..2 {
+            let error = mount
+                .readdirplus_page_from(Bytes::new(), position)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("made no progress"), "{error}");
+        }
         mount.rpc.shutdown().await;
         server.await.unwrap();
     }

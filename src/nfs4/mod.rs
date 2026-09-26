@@ -55,7 +55,7 @@ impl std::fmt::Display for Nfs4ErrorCode {
             Nfs4ErrorCode::NFS4ERR_OLD_STATEID => write!(f, "old state ID"),
             Nfs4ErrorCode::NFS4ERR_BAD_STATEID => write!(f, "bad state ID"),
             Nfs4ErrorCode::NFS4ERR_BAD_SEQID => write!(f, "bad sequence ID"),
-            Nfs4ErrorCode::NFS4ERR_NOT_SAME => write!(f, "verify/nverify mismatch"),
+            Nfs4ErrorCode::NFS4ERR_NOT_SAME => write!(f, "verifier or attribute mismatch"),
             Nfs4ErrorCode::NFS4ERR_LOCK_RANGE => write!(f, "lock range not supported"),
             Nfs4ErrorCode::NFS4ERR_SYMLINK => write!(f, "symlink encountered"),
             Nfs4ErrorCode::NFS4ERR_RESTOREFH => write!(f, "no saved filehandle"),

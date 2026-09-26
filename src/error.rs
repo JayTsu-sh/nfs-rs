@@ -321,6 +321,21 @@ impl NfsError {
         )
     }
 
+    /// The server rejected a directory listing position: the cookie is stale or
+    /// invalid (NFS3ERR_BAD_COOKIE, RFC 1813 §3.3.16; NFS4ERR_BAD_COOKIE) or its
+    /// verifier is no longer valid for the directory (NFS4ERR_NOT_SAME, RFC 7530
+    /// §16.24.4, RFC 5661 §18.23.3). The listing can only restart from the
+    /// beginning. Meaningful for READDIR / READDIRPLUS results only: VERIFY also
+    /// reports NFS4ERR_NOT_SAME.
+    pub fn is_bad_directory_cookie(&self) -> bool {
+        matches!(
+            self,
+            NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_BAD_COOKIE)
+                | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_COOKIE)
+                | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOT_SAME)
+        )
+    }
+
     /// Returns the corresponding `std::io::ErrorKind` for backward compatibility
     /// with code that matches on error kinds.
     pub fn kind(&self) -> std::io::ErrorKind {
@@ -462,6 +477,27 @@ impl From<NfsError> for std::io::Error {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn bad_directory_cookie_covers_cookie_and_verifier_rejections() {
+        use crate::nfs3::ErrorCode as V3;
+        use crate::nfs4::Nfs4ErrorCode as V4;
+        for error in [
+            NfsError::Nfs3(V3::NFS3ERR_BAD_COOKIE),
+            NfsError::Nfs4(V4::NFS4ERR_BAD_COOKIE),
+            NfsError::Nfs4(V4::NFS4ERR_NOT_SAME),
+        ] {
+            assert!(error.is_bad_directory_cookie(), "{error:?}");
+        }
+        for error in [
+            NfsError::Nfs3(V3::NFS3ERR_NOT_SYNC),
+            NfsError::Nfs3(V3::NFS3ERR_STALE),
+            NfsError::Nfs4(V4::NFS4ERR_STALE),
+            NfsError::Xdr("READDIR page made no progress".into()),
+        ] {
+            assert!(!error.is_bad_directory_cookie(), "{error:?}");
+        }
+    }
 
     #[test]
     fn nfs3_error_display() {

@@ -35,6 +35,15 @@ def test_protocol_statuses_have_structured_python_semantics() -> None:
         assert error.code == code
         assert error.code_name == code_name
         assert error.filename == path
+    from nfs_rs import NfsBadCookieError
+    for path, code, code_name in (
+        ("__bad_cookie__", 10003, "NFS3ERR_BAD_COOKIE"),
+        ("__not_same__", 10027, "NFS4ERR_NOT_SAME"),
+    ):
+        with pytest.raises(NfsBadCookieError) as bad_cookie:
+            client.stat(path)
+        assert bad_cookie.value.code == code
+        assert bad_cookie.value.code_name == code_name
     with pytest.raises(NfsOSError) as not_empty:
         client.stat("__notempty__")
     assert not_empty.value.errno == errno.ENOTEMPTY

@@ -1009,7 +1009,7 @@ impl Mount40 {
         ))
     }
 
-    async fn readdirplus_page(
+    async fn fetch_readdirplus_page(
         &self,
         fh: &Bytes,
         cookie: u64,
@@ -2194,7 +2194,7 @@ impl Mount for Mount40 {
                     return Ok(None);
                 };
                 let (entries, last_cookie, verifier, eof) =
-                    self.readdirplus_page(&fh, cookie, &verifier).await?;
+                    self.fetch_readdirplus_page(&fh, cookie, &verifier).await?;
                 if entries.is_empty() && !eof && last_cookie == cookie {
                     return Err(NfsError::Xdr("READDIRPLUS page made no progress".into()));
                 }
@@ -2203,6 +2203,20 @@ impl Mount for Mount40 {
             })
             .try_flatten(),
         )
+    }
+    async fn readdirplus_page(
+        &self,
+        dir_fh: Bytes,
+        position: mount::DirectoryCookie,
+    ) -> Result<mount::ReaddirplusPage> {
+        let (entries, last_cookie, verifier, eof) = self
+            .fetch_readdirplus_page(&dir_fh, position.cookie, &position.verifier)
+            .await?;
+        let received = entries.len();
+        let entries = entries.into_iter().collect::<Result<Vec<_>>>()?;
+        let next =
+            mount::DirectoryCursor::resume(position).page(last_cookie, verifier, received, eof)?;
+        Ok(mount::ReaddirplusPage { entries, next, eof })
     }
     async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
         let bitmap = standard_getattr_bitmap();
@@ -4550,6 +4564,138 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["one", "two"]
         );
+        server.await.unwrap().unwrap();
+    }
+
+    fn failed_readdir_result(status: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&status.to_be_bytes());
+        xdr_opaque(&mut result, b"readdir");
+        result.extend_from_slice(&2u32.to_be_bytes());
+        for (opcode, op_status) in [(22u32, 0u32), (26, status)] {
+            result.extend_from_slice(&opcode.to_be_bytes());
+            result.extend_from_slice(&op_status.to_be_bytes());
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_resumes_from_caller_position_and_types_stale_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let position = [7u64.to_be_bytes().as_slice(), b"firstver"].concat();
+            assert!(request.windows(position.len()).any(|wire| wire == position));
+            reply(
+                &mut stream,
+                &request,
+                &readdir_result(*b"secondve", 11, b"two", false),
+            )
+            .await?;
+            for status in [10003u32, 10027] {
+                let request = read_record(&mut stream).await?;
+                reply(&mut stream, &request, &failed_readdir_result(status)).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let position = mount::DirectoryCookie {
+            cookie: 7,
+            verifier: *b"firstver",
+        };
+        let page = mount
+            .readdirplus_page(Bytes::from_static(b"root"), position)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].file_name, "two");
+        assert_eq!(page.entries[0].fileid, 111);
+        assert!(!page.eof);
+        assert_eq!(
+            page.next,
+            mount::DirectoryCookie {
+                cookie: 11,
+                verifier: *b"secondve"
+            }
+        );
+        for _ in 0..2 {
+            let error = mount
+                .readdirplus_page(Bytes::from_static(b"root"), page.next)
+                .await
+                .unwrap_err();
+            assert!(error.is_bad_directory_cookie(), "{error:?}");
+        }
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_rejects_page_ending_at_requested_cookie() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &request,
+                &readdir_result(*b"verifier", 0, b"zero", false),
+            )
+            .await
+        });
+        let error = mount
+            .readdirplus_page(
+                Bytes::from_static(b"root"),
+                mount::DirectoryCookie::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("did not advance cookie"),
+            "{error}"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    fn empty_readdir_result(verifier: [u8; 8], eof: bool) -> Vec<u8> {
+        let mut page = verifier.to_vec();
+        page.extend_from_slice(&0u32.to_be_bytes());
+        page.extend_from_slice(&u32::from(eof).to_be_bytes());
+        compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
+    }
+
+    #[tokio::test]
+    async fn readdirplus_page_rejects_empty_page_before_eof_and_keeps_position_at_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            for eof in [false, true] {
+                let request = read_record(&mut stream).await?;
+                reply(
+                    &mut stream,
+                    &request,
+                    &empty_readdir_result(*b"newverif", eof),
+                )
+                .await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let position = mount::DirectoryCookie {
+            cookie: 7,
+            verifier: *b"firstver",
+        };
+        let error = mount
+            .readdirplus_page(Bytes::from_static(b"root"), position)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("made no progress"), "{error}");
+        let page = mount
+            .readdirplus_page(Bytes::from_static(b"root"), position)
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty() && page.eof);
+        assert_eq!(page.next, position);
         server.await.unwrap().unwrap();
     }
 
