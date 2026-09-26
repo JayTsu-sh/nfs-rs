@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.1/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.5/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 

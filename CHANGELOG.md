@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-27
+
 ### Added
 
 - `Mount::readdirplus_page` reads one READDIRPLUS (NFSv3) or READDIR (NFSv4.0,
@@ -21,13 +23,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   (`NFS3ERR_BAD_COOKIE`, `NFS4ERR_BAD_COOKIE`, `NFS4ERR_NOT_SAME`), after which
   only a restart from the beginning is possible.
 - Python `Client.scandir_page` and `AsyncClient.scandir_page` expose the page
-  interface with the `DirectoryCookie` and `DirectoryPage` types.
+  interface with the `DirectoryCookie` and `DirectoryPage` types. A page that
+  makes no progress raises `NfsEncodingError`.
 
 ### Changed
 
 - Python raises the new `NfsBadCookieError` for `NFS3ERR_BAD_COOKIE`,
   `NFS4ERR_BAD_COOKIE` and `NFS4ERR_NOT_SAME`. It subclasses
   `NfsProtocolError`, which these statuses raised before.
+- The `NFS4ERR_NOT_SAME` error text is now "verifier or attribute mismatch"
+  (previously "verify/nverify mismatch"), since READDIR also returns it.
+- The user guide links to the API reference of this release.
+
+### Known limitations
+
+- Detecting a cookie repeated across pages is the caller's responsibility.
+- Stale positions are only reported when the server checks them. NetApp ONTAP
+  (NFSv3, NFSv4.0, NFSv4.1) rejects a garbage cookie verifier with
+  `BAD_COOKIE`; the DXN-2 NFS server (NFSv3, NFSv4.0) accepts both a garbage
+  cookie and a garbage verifier, and both servers answer an unknown cookie
+  with an empty EOF page instead of an error. A resumed listing on such
+  servers can silently miss or repeat entries if the directory changed.
 
 ## [0.8.4] - 2026-09-11
 
@@ -358,7 +374,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.2...v0.8.3
 [0.7.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.7.0...v0.7.1
