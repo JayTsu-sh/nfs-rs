@@ -31,6 +31,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Python raises the new `NfsBadCookieError` for `NFS3ERR_BAD_COOKIE`,
   `NFS4ERR_BAD_COOKIE` and `NFS4ERR_NOT_SAME`. It subclasses
   `NfsProtocolError`, which these statuses raised before.
+- The `NFS4ERR_NOT_SAME` error text is now "verifier or attribute mismatch"
+  (previously "verify/nverify mismatch"), since READDIR also returns it.
+- The user guide links to the API reference of this release.
 
 ### Known limitations
 
