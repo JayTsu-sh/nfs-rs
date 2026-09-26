@@ -351,6 +351,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readdirplus_page_keeps_position_on_empty_eof_page() {
+        let (mount, server) =
+            serve(move |_, _| vec![ok(22, vec![]), ok(26, page(None, true, [2; 8]))]).await;
+        let position = mount::DirectoryCookie {
+            cookie: 5,
+            verifier: [1; 8],
+        };
+        let page = mount
+            .readdirplus_page_from(Bytes::new(), position)
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty() && page.eof);
+        assert_eq!(page.next, position);
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn readdirplus_page_rejects_no_progress() {
         let mut calls = 0;
         let (mount, server) = serve(move |_, _| {

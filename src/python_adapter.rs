@@ -2588,7 +2588,7 @@ fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<D
         )));
     }
     let end = (start + PAGE).min(TOTAL);
-    let entries = (start..end)
+    let entries: Vec<_> = (start..end)
         .map(|index| {
             let attr = Attr {
                 fileid: index + 1,
@@ -2598,11 +2598,13 @@ fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<D
             (format!("page-entry-{index}"), attr, Bytes::new())
         })
         .collect();
-    let next = DirectoryCookie {
-        cookie: end,
-        verifier: VERIFIER,
-    };
-    Some(Ok((entries, next, end == TOTAL)))
+    let next = crate::mount::DirectoryCursor::resume(position).page(
+        end,
+        VERIFIER,
+        entries.len(),
+        end == TOTAL,
+    );
+    Some(next.map(|next| (entries, next, end == TOTAL)))
 }
 
 #[cfg(not(feature = "python-test-support"))]

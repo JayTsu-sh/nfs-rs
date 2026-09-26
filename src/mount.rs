@@ -151,8 +151,9 @@ pub struct ReaddirplusPage {
     /// server returned nothing but those two names.
     pub entries: Vec<ReaddirplusEntry>,
     /// Position after the last entry of this page with the verifier of this
-    /// reply; pass it to the next call. A page without entries (an EOF page)
-    /// returns the requested position unchanged.
+    /// reply; pass it to the next call. When the server returned no entries at
+    /// all (only valid at EOF), this is the requested position unchanged; an
+    /// NFSv3 page holding only `.` and `..` still advances past them.
     pub next: DirectoryCookie,
     /// The server reported the end of the directory.
     pub eof: bool,
@@ -1373,10 +1374,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// requested cookie) fails with [`NfsError::Xdr`], the same variant as a
     /// malformed reply. Detecting a cookie repeated across pages is the caller's
     /// responsibility: a server whose cookies cycle would otherwise page forever,
-    /// so the example below keeps the cookies it has seen. When the server
-    /// rejects the cookie or its
-    /// verifier, the error satisfies [`NfsError::is_bad_directory_cookie`] and the
-    /// listing can only restart from [`DirectoryCookie::default`].
+    /// so the example below keeps the cookies it has seen, checking EOF first
+    /// because an EOF page without entries repeats the requested cookie. When
+    /// the server rejects the cookie or its verifier, the error satisfies
+    /// [`NfsError::is_bad_directory_cookie`] and the listing can only restart
+    /// from [`DirectoryCookie::default`].
     ///
     /// Entries whose NFSv4.1 attributes cannot be decoded are returned without
     /// attributes, as in [`Mount::readdirplus`]; on NFSv4.0 a malformed entry fails

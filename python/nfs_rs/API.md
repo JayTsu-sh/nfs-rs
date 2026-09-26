@@ -567,7 +567,7 @@ Bases: `NfsError`. Inherits all documented NfsError fields and methods.
 
 ### NfsEncodingError
 
-A name/value could not be represented using the API encoding rules.
+A name/value could not be represented using the API encoding rules, or the server's reply was malformed or violated the protocol (for example a directory page that makes no progress).
 
 Bases: `NfsError`. Inherits all documented NfsError fields and methods.
 
@@ -811,7 +811,7 @@ def scandir_page(
 ) -> DirectoryPage: ...
 ```
 
-Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress (no entries before eof, or ending at the requested cookie) raises NfsEncodingError, like a malformed reply; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. A page without entries at eof returns position unchanged as next. Detecting a cookie repeated across pages is the caller's responsibility: keep the cookies already received and stop when next repeats one, or a server whose cookies cycle pages forever.
+Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress (no entries from the server before eof, or ending at the requested cookie) raises NfsEncodingError, like a malformed reply; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. When the server returned no entries at all (only valid at eof), next is position unchanged. Detecting a cookie repeated across pages is the caller's responsibility: check eof first, then keep the cookies already received and stop when next repeats one; otherwise a server whose cookies cycle can page forever.
 
 #### Client.listdir
 

@@ -238,8 +238,10 @@ that raises `NfsBadCookieError` (NFS3ERR_BAD_COOKIE, NFS4ERR_BAD_COOKIE or
 NFS4ERR_NOT_SAME). Some servers accept any cookie and simply return fewer
 entries, so a restarted listing can repeat entries already processed. A page
 that makes no progress raises `NfsEncodingError`. Repeated cookies across pages
-are not detected for you: keep the cookies already received and stop when
-`page.next.cookie` repeats one, or a server whose cookies cycle pages forever.
+are not detected for you: check `page.eof` first (an EOF page without entries
+repeats the requested cookie), then keep the cookies already received and stop
+when `page.next.cookie` repeats one; otherwise a server whose cookies cycle can
+page forever.
 
 Namespace operations include `mkdir`, `touch`, `remove`/`unlink`, `rmdir`,
 `rename`, hard `link`, `symlink`, and `readlink`. `remove` and `unlink` are
