@@ -60,7 +60,7 @@ impl Mount {
             self,
             dir_fh,
             readdirplus_at,
-            |entry: Box<entryplus3>| convert_entry(*entry),
+            convert_entry,
             "readdirplus page received"
         )
     }
@@ -99,8 +99,10 @@ fn convert_entry(entry: entryplus3) -> ReaddirplusEntry {
         fileid: entry.fileid.0,
         file_name: bytes_to_string(entry.name.0),
         attr: entry.name_attributes.into(),
+        // A copy: a slice would keep the whole reply (up to the read limit) alive for as long
+        // as the caller keeps the handle.
         handle: match entry.name_handle {
-            post_op_fh3::TRUE(h) => h.0,
+            post_op_fh3::TRUE(h) => Bytes::copy_from_slice(&h.0),
             _ => Bytes::new(),
         },
     }
@@ -112,15 +114,13 @@ fn into_page(res: READDIRPLUS3resok, position: DirectoryCookie) -> Result<Readdi
     let verifier: [u8; 8] = res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
     let mut last_cookie = position.cookie;
     let mut received = 0usize;
-    let mut entries = Vec::new();
-    let mut current = res.reply.entries;
-    while let Some(mut node) = current {
-        current = node.nextentry.take();
+    let mut entries = Vec::with_capacity(res.reply.entries.len());
+    for node in res.reply.entries {
         received += 1;
         last_cookie = node.cookie.0;
         let name = node.name.0.as_ref();
         if name != b"." && name != b".." {
-            entries.push(convert_entry(*node).into());
+            entries.push(convert_entry(node).into());
         }
     }
     let eof = res.reply.eof;

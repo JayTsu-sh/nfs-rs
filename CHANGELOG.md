@@ -7,6 +7,39 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Without a `readdir-buffer` URL parameter (Python `readdir_buffer`), READDIR
+  and READDIRPLUS `dircount` and `maxcount` now come from the server's published
+  read limit at mount time instead of a fixed 8192 bytes: NFSv3 FSINFO `rtmax`,
+  NFSv4.0 `maxread`, NFSv4.1 `maxread` bounded by the session's maximum
+  response size — the same limit READ uses, bounded by the 4 MiB client
+  payload ceiling. `dircount` equals `maxcount`: it bounds only a subset of the
+  reply, and `dtpref` is not used (Linux knfsd reports one page there). An
+  NFSv4.0 server that publishes no `maxread` keeps 8192. Both the page
+  interface and the streaming `readdirplus` use the new sizes; an explicit
+  `readdir-buffer` is unchanged. Measured on a 50,000-file directory: ONTAP
+  caps replies at its 32 KiB `dtpref` itself (NFSv3 41 → 175 entries per
+  reply, NFSv4.x 23 → 95; listing 2.2–2.5× faster); a DXN-2 server answers
+  the full 1 MiB (NFSv3 45 → about 5,600 entries per reply, NFSv4.0 39 →
+  5,000), so one reply is about 1 MiB and the first page arrives later
+  (milliseconds → a few hundred milliseconds) while the whole listing is
+  faster. Callers that hold several pages at once hold correspondingly more
+  memory; set `readdir-buffer` to keep the previous size.
+- READDIR and READDIRPLUS requests get the deadline a READ of their `maxcount`
+  gets (a fixed 5 s on NFSv3 and NFSv4.1, 10 s on NFSv4.0 before), since a
+  reply can now be up to the read limit.
+- The file handle of each directory entry is a copy, not a slice of the reply,
+  so keeping a handle no longer keeps the whole reply in memory.
+
+### Fixed
+
+- NFSv3 READDIR and READDIRPLUS replies are decoded one entry after another
+  instead of recursively along the XDR entry list, and are no longer held as a
+  boxed linked list. A reply with thousands of entries (about 6,000 READDIRPLUS
+  entries per MiB) overflowed the stack of a debug build; dropping such a list
+  was recursive too.
+
 ## [0.8.5] - 2026-09-27
 
 ### Added

@@ -234,8 +234,12 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         )
         .await?;
     let root_fh = decode_navigation_response(response, components.len())?;
-    let (lease_time, rsize, wsize, acl_supported) =
+    let (lease_time, rsize, wsize, acl_supported, maxread_published) =
         query_mount_parameters(&rpc, &auth, &root_fh).await?;
+    let (dircount, maxcount) = crate::mount::directory_reply_limits(
+        args.readdir_buffer,
+        maxread_published.then_some(rsize),
+    );
     let generation = 1;
     let lease = LeaseState::ready(generation, lease_time);
     let issuer = rand::random();
@@ -294,8 +298,8 @@ async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result
         _callback: callback,
         _callback_worker: callback_worker,
         callback_state,
-        dircount: args.dircount,
-        maxcount: args.maxcount,
+        dircount,
+        maxcount,
         rsize,
         wsize,
         acl_supported,
@@ -306,7 +310,7 @@ async fn query_mount_parameters(
     rpc: &rpc::Client,
     auth: &Auth,
     root_fh: &Bytes,
-) -> Result<(u32, u32, u32, bool)> {
+) -> Result<(u32, u32, u32, bool, bool)> {
     let response = rpc
         .call(
             CompoundBuilder::new("lease-time")
@@ -333,7 +337,8 @@ async fn query_mount_parameters(
     if seconds == 0 {
         return Err(NfsError::Xdr("NFSv4.0 lease_time is zero".into()));
     }
-    let server_maxread = if fattr4_has(&bitmap, 30) {
+    let maxread_published = fattr4_has(&bitmap, 30);
+    let server_maxread = if maxread_published {
         take_u64_attr(&mut values, "maxread")?
     } else {
         u64::MAX
@@ -351,7 +356,13 @@ async fn query_mount_parameters(
             "NFSv4.0 MAXREAD and MAXWRITE produced a zero effective I/O size".into(),
         ));
     }
-    Ok((seconds, rsize, wsize, fattr4_has(&supported_attrs, 12)))
+    Ok((
+        seconds,
+        rsize,
+        wsize,
+        fattr4_has(&supported_attrs, 12),
+        maxread_published,
+    ))
 }
 
 async fn establish_identity(
@@ -897,10 +908,11 @@ impl Mount40 {
             .putfh(fh)
             .readdir(cookie, verifier, self.dircount, self.maxcount, bitmap)
             .encode_with_header(&self.auth);
-        let payload = decode_readdir_response(
-            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
-                .await?,
-        )?;
+        // A reply sized from the server's MAXREAD gets the transfer time a READ of that size
+        // would, at the 1.25 MB/s floor the other versions assume.
+        let timeout = METADATA_TIMEOUT + Duration::from_secs(u64::from(self.maxcount) / 1_250_000);
+        let payload =
+            decode_readdir_response(self.activity_call(request, SAFE_REPLAY, timeout).await?)?;
         validate_readdir_payload(payload, self.maxcount)
     }
 
@@ -1028,11 +1040,16 @@ impl Mount40 {
             entries
                 .into_iter()
                 .map(|entry| {
-                    entry.map(|entry| mount::ReaddirplusEntry {
-                        fileid: entry.attr.fileid,
-                        file_name: entry.name,
-                        handle: entry.attr.filehandle.clone(),
-                        attr: Some(entry.attr),
+                    entry.map(|mut entry| {
+                        // A copy: a slice would keep the whole reply (up to the read limit)
+                        // alive for as long as the caller keeps the handle.
+                        entry.attr.filehandle = Bytes::copy_from_slice(&entry.attr.filehandle);
+                        mount::ReaddirplusEntry {
+                            fileid: entry.attr.fileid,
+                            file_name: entry.name,
+                            handle: entry.attr.filehandle.clone(),
+                            attr: Some(entry.attr),
+                        }
                     })
                 })
                 .collect(),
@@ -4012,14 +4029,15 @@ mod tests {
             nfsport: addr.port(),
             uid: 0,
             gid: 0,
-            dircount: 32 * 1024,
-            maxcount: 32 * 1024,
+            readdir_buffer: None,
             noresvport: true,
             retain_delegations: false,
         };
         let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
         assert_eq!(mount.get_max_read_size(), 65536);
         assert_eq!(mount.get_max_write_size(), 32768);
+        // Without `readdir-buffer`, READDIR replies are sized from the published MAXREAD.
+        assert_eq!((mount.dircount, mount.maxcount), (65536, 65536));
         assert_eq!(mount.root_fh, Bytes::from_static(b"scripted-fh"));
         mounted.notify_one();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4073,8 +4091,7 @@ mod tests {
             nfsport: addr.port(),
             uid: 0,
             gid: 0,
-            dircount: 32 * 1024,
-            maxcount: 32 * 1024,
+            readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: true,
         };
@@ -4477,8 +4494,7 @@ mod tests {
             nfsport: addr.port(),
             uid: 0,
             gid: 0,
-            dircount: 32 * 1024,
-            maxcount: 32 * 1024,
+            readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: false,
         };

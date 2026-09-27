@@ -114,7 +114,7 @@ impl Mount41 {
 
         let (dircount, maxcount) = self.directory_limits("readdir").await?;
         let resp = self
-            .compound("readdir", |b| {
+            .compound_data("readdir", maxcount as usize, |b| {
                 b.putfh(fh)
                     .readdir(cookie, cookieverf, dircount, maxcount, &attr_request)
             })
@@ -184,7 +184,7 @@ impl Mount41 {
 
         let (dircount, maxcount) = self.directory_limits("readdirplus").await?;
         let resp = self
-            .compound("readdirplus", |b| {
+            .compound_data("readdirplus", maxcount as usize, |b| {
                 b.putfh(fh)
                     .readdir(cookie, cookieverf, dircount, maxcount, &attr_request)
             })
@@ -222,7 +222,7 @@ impl Mount41 {
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie;
             let name = decode_string_from_bytes(&mut data)?;
-            let attr = match decode_entry_fattr4(&mut data) {
+            let mut attr = match decode_entry_fattr4(&mut data) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     tracing::warn!(
@@ -236,6 +236,11 @@ impl Mount41 {
             let fileid = attr.as_ref().map(|a| a.fileid).unwrap_or(entry_cookie);
             // NFSv4.1 FATTR4_FILEHANDLE (attr 19) provides per-entry file handles
             // when requested in the READDIR attr bitmap.
+            // A copy: a slice would keep the whole reply (up to the read limit) alive for as
+            // long as the caller keeps the handle.
+            if let Some(attr) = attr.as_mut() {
+                attr.filehandle = Bytes::copy_from_slice(&attr.filehandle);
+            }
             let handle = attr
                 .as_ref()
                 .map(|a| a.filehandle.clone())

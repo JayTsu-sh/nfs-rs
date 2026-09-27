@@ -87,15 +87,12 @@ pub(crate) use fastxdr::{
 /// Shared paging logic for `readdir` and `readdirplus` streams.
 ///
 /// Generates a `try_unfold + try_flatten` stream that fetches directory pages
-/// via `$fetch_page`, then yields entries directly from the XDR linked list
-/// without an intermediate `Vec` — each non-special entry node is converted by
+/// via `$fetch_page`, then yields the page's entries (decoded into a `Vec`, see
+/// `fastxdr::DirectoryReply`) — each non-special entry is converted by
 /// `$convert`. NFSv3 servers may include `.` and `..`; those names are omitted
 /// from the public stream while their cookies still count as page progress.
 /// RFC 1813 sections 3.3.16 and 3.3.17 define the raw `READDIR` and
 /// `READDIRPLUS` entry streams normalized here.
-///
-/// The linked list is walked twice per page: once (read-only) to find the last
-/// cookie and entry count, then once (destructive) via `from_fn` to yield entries.
 macro_rules! paged_dir_stream {
     ($self:expr_2021, $dir_fh:expr_2021, $fetch_page:ident, $convert:expr_2021, $label:literal) => {{
         let this = $self;
@@ -112,43 +109,24 @@ macro_rules! paged_dir_stream {
                 let new_verifier: [u8; 8] =
                     res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
                 let eof = res.reply.eof;
-                // Walk linked list (read-only) for last cookie and count.
-                let (new_cookie, entry_count, entries_head) = match res.reply.entries {
-                    Some(entry) => {
-                        let mut count = 0usize;
-                        let mut e = &*entry;
-                        let last_cookie = loop {
-                            count += 1;
-                            match &e.nextentry {
-                                Some(next) => e = next,
-                                None => break e.cookie.0,
-                            }
-                        };
-                        (last_cookie, count, Some(entry))
-                    }
-                    None => (cookie, 0, None),
-                };
+                let entries = res.reply.entries;
+                let entry_count = entries.len();
+                let new_cookie = entries.last().map_or(cookie, |entry| entry.cookie.0);
                 tracing::debug!(cookie = new_cookie, eof, entry_count, $label);
                 let next = if cursor.advance(new_cookie, new_verifier, entry_count, eof)? {
                     Some((fh, cursor))
                 } else {
                     None
                 };
-                // Yield non-special entries directly — no intermediate Vec.
+                // Yield non-special entries directly.
                 let convert = $convert;
-                let entry_iter = {
-                    let mut current = entries_head;
-                    std::iter::from_fn(move || {
-                        loop {
-                            let mut node = current.take()?;
-                            current = node.nextentry.take();
-                            let name = node.name.0.as_ref();
-                            if name != b"." && name != b".." {
-                                return Some(Ok(convert(node)));
-                            }
-                        }
+                let entry_iter = entries
+                    .into_iter()
+                    .filter(|node| {
+                        let name = node.name.0.as_ref();
+                        name != b"." && name != b".."
                     })
-                };
+                    .map(move |node| Ok(convert(node)));
                 Ok(Some((futures::stream::iter(entry_iter), next)))
             },
         )
@@ -339,7 +317,7 @@ const NFS_RETRIES: usize = 10;
 const MOUNT_REPLAY: crate::rpc::ReplayPolicy =
     crate::rpc::ReplayPolicy::byte_identical(MOUNT_RETRIES);
 const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
-// Timeout for metadata operations (LOOKUP, GETATTR, READDIR, etc.).
+// Timeout for metadata operations (LOOKUP, GETATTR, etc.; READDIR scales like READ).
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Base timeout for data operations (READ, WRITE). Scaled up for large payloads.
 const DATA_TIMEOUT_BASE_SECS: u64 = 10;
@@ -365,7 +343,11 @@ macro_rules! nfs3_call {
         nfs3_call!($name, $proc, $args, $resok, warn);
     };
     ($name:ident, $proc:ident, $args:ty, $resok:ty, $err_level:ident) => {
+        nfs3_call!($name, $proc, $args, $resok, $err_level, |_: &$args| METADATA_TIMEOUT);
+    };
+    ($name:ident, $proc:ident, $args:ty, $resok:ty, $err_level:ident, $timeout:expr) => {
         async fn $name(&self, args: $args) -> Result<$resok> {
+            let timeout: std::time::Duration = ($timeout)(&args);
             let procedure = NFSProc3::$proc;
             let operation_class = procedure.operation_class();
             let context = procedure.request_context();
@@ -377,7 +359,7 @@ macro_rules! nfs3_call {
                 .call(
                     buf,
                     procedure.replay_policy(),
-                    METADATA_TIMEOUT,
+                    timeout,
                 )
                 .await
                 .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
@@ -491,12 +473,23 @@ impl Mount {
             }
         }
     }
-    nfs3_call!(_readdir, Readdir, READDIR3args, READDIR3resok);
+    // A directory reply is sized from the server's read limit (up to the 4 MiB
+    // payload ceiling): give it the deadline a READ of that size gets.
+    nfs3_call!(
+        _readdir,
+        Readdir,
+        READDIR3args,
+        READDIR3resok,
+        warn,
+        |args: &READDIR3args| data_timeout(args.count as usize)
+    );
     nfs3_call!(
         _readdirplus,
         Readdirplus,
         READDIRPLUS3args,
-        READDIRPLUS3resok
+        READDIRPLUS3resok,
+        warn,
+        |args: &READDIRPLUS3args| data_timeout(args.maxcount as usize)
     );
     nfs3_call!(_readlink, Readlink, READLINK3args, READLINK3resok);
     nfs3_call!(_remove, Remove, REMOVE3args, REMOVE3resok);

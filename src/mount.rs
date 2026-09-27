@@ -101,6 +101,37 @@ impl DirectoryCursor {
 // Implementation payload ceiling; server and session limits may be smaller.
 pub(crate) const MAX_IO_SIZE: u32 = 4 * 1024 * 1024;
 
+/// READDIR / READDIRPLUS `dircount` and `maxcount` when neither the URL nor the server sets them.
+pub(crate) const DEFAULT_READDIR_BUFFER: u32 = 8192;
+
+/// The `(dircount, maxcount)` a mount sends with READDIR (v4.x) and READDIRPLUS (v3).
+///
+/// An explicit `readdir-buffer` URL value is used as given. Otherwise both come from
+/// `read_limit`, the server's published read limit as the mount already negotiated it for READ
+/// (v3 FSINFO `rtmax`, v4.0 `maxread`, v4.1 `maxread` bounded by the session's
+/// `ca_maxresponsesize`, all bounded by the client payload ceiling):
+///
+/// - `maxcount` is the read limit. The reply is at most that large and at most what the
+///   directory holds; a server that caps directory replies itself answers with less.
+/// - `dircount` equals `maxcount`. It bounds only the names, cookies and file ids of the reply
+///   (RFC 1813 §3.3.17; a hint in RFC 7530 §16.24 and RFC 5661 §18.23), a subset of what
+///   `maxcount` bounds, so it never cuts a reply `maxcount` allows. `dtpref` is not used for it:
+///   it is a preferred READDIR size, Linux knfsd reports one page there, and a server honoring a
+///   one-page `dircount` would return a few hundred names per reply.
+///
+/// A server that publishes no read limit (a v4.0 server without `maxread`) keeps
+/// [`DEFAULT_READDIR_BUFFER`] for both.
+pub(crate) fn directory_reply_limits(
+    explicit: Option<(u32, u32)>,
+    read_limit: Option<u32>,
+) -> (u32, u32) {
+    match (explicit, read_limit) {
+        (Some(explicit), _) => explicit,
+        (None, Some(limit)) => (limit, limit),
+        (None, None) => (DEFAULT_READDIR_BUFFER, DEFAULT_READDIR_BUFFER),
+    }
+}
+
 pub(crate) fn negotiated_io_size(server_max: u64) -> Result<u32> {
     let size = server_max.min(u64::from(MAX_IO_SIZE)) as u32;
     if size == 0 {
@@ -1362,7 +1393,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Reads one READDIRPLUS page (NFSv3) or one READDIR page with the
     /// [`Mount::readdirplus`] attribute set (NFSv4.x) starting after `position`,
-    /// using the mount's configured `readdir-buffer` sizes.
+    /// using the mount's directory reply sizes: the URL's `readdir-buffer`, or
+    /// without it the server's read limit at mount time.
     ///
     /// Unlike [`Mount::readdirplus`], the caller holds the position, so a listing
     /// interrupted by a transient failure can continue from the last page it
@@ -2170,6 +2202,27 @@ mod negotiated_size_tests {
         );
         assert_eq!(negotiated_io_size(u64::MAX).unwrap(), MAX_IO_SIZE);
         assert!(negotiated_io_size(0).is_err());
+    }
+
+    #[test]
+    fn directory_replies_are_sized_from_the_server_unless_the_url_sets_them() {
+        // An explicit `readdir-buffer` wins, whatever the server publishes.
+        assert_eq!(
+            directory_reply_limits(Some((2048, 4096)), Some(1 << 20)),
+            (2048, 4096)
+        );
+        // Otherwise the negotiated read limit sizes both.
+        assert_eq!(
+            directory_reply_limits(None, Some(1 << 20)),
+            (1 << 20, 1 << 20)
+        );
+        assert_eq!(directory_reply_limits(None, Some(32768)), (32768, 32768));
+        // No published limit: the previous default.
+        assert_eq!(
+            directory_reply_limits(None, None),
+            (DEFAULT_READDIR_BUFFER, DEFAULT_READDIR_BUFFER)
+        );
+        assert_eq!(DEFAULT_READDIR_BUFFER, 8192);
     }
 }
 

@@ -166,6 +166,11 @@ with Client.connect("nfs://server.example.com/export?version=4.1") as client:
         position = page.next
 ```
 
+Without `readdir_buffer` (or the URL's `readdir-buffer`), each page is sized
+from the server's published read limit at connection time (NFSv3 `rtmax`,
+NFSv4.x `maxread`, NFSv4.1 also bounded by the session), so a page may hold
+thousands of entries; a server may still send smaller replies.
+
 ## Read and write with a large buffer
 
 `File.read(size=-1)` and `File.read_at(offset, size=-1)` return `bytes` and

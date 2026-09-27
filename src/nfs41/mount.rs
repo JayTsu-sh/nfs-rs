@@ -854,9 +854,15 @@ async fn mount_on_addr(
     // 4. Get filesystem limits via GETATTR
     let (rsize, wsize, renewal_interval, acl_supported) =
         get_fs_limits(&client, &session, auth, &root_fh).await?;
+    // `rsize` is `maxread` bounded by the session's reply size (`effective_rsize`), which every
+    // v4.1 server publishes; READDIR bounds it by the live session again (`directory_limits`).
+    let (dircount, maxcount) =
+        crate::mount::directory_reply_limits(args.readdir_buffer, Some(rsize));
     info!(
         rsize,
         wsize,
+        dircount,
+        maxcount,
         acl_supported,
         renewal_secs = renewal_interval.as_secs(),
         "negotiated transfer sizes"
@@ -936,8 +942,8 @@ async fn mount_on_addr(
         recall_handle,
         recall_tx,
         retain_delegations: args.retain_delegations,
-        dircount: args.dircount,
-        maxcount: args.maxcount,
+        dircount,
+        maxcount,
         rsize,
         wsize,
         acl_supported,

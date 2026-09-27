@@ -43,7 +43,7 @@ Pure Rust NFS client library (NetApp), built as a native Rust library.
 
 `parse_url_and_mount(url)` in `src/lib.rs` parses a `nfs://host/export[?params]` URL and returns a `Box<dyn Mount>`. It dispatches to NFSv3, experimental NFSv4.0, or NFSv4.1 in the requested preference order. Exact `4.0` is required; `4.2` is not implemented.
 
-URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`, `noresvport`, `retain-delegations`. Read/write sizes are negotiated automatically; see `src/mount.rs::negotiated_io_size` and the version-specific mount code.
+URL query params: `uid`, `gid`, `version`, `nfsport`, `mountport`, `readdir-buffer`, `noresvport`, `retain-delegations`. Read/write sizes are negotiated automatically; see `src/mount.rs::negotiated_io_size` and the version-specific mount code. Without `readdir-buffer`, directory reply sizes come from the same server read limit (`src/mount.rs::directory_reply_limits`).
 
 ### Public Interface: `Mount` Trait (`src/mount.rs`)
 
