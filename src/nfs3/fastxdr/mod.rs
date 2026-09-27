@@ -213,4 +213,48 @@ mod tests {
         truncated.truncate(truncated.len() - 6);
         assert!(READDIRPLUS3resok::try_from(&mut truncated).is_err());
     }
+
+    /// Decodes every proper prefix of `reply` with `decode`: each must be a decode error.
+    fn every_cut_fails<T, E>(reply: &Bytes, decode: impl Fn(&mut Bytes) -> Result<T, E>) {
+        for length in 0..reply.len() {
+            let mut cut = reply.slice(..length);
+            assert!(
+                decode(&mut cut).is_err(),
+                "a reply cut to {length} of {} bytes decoded",
+                reply.len()
+            );
+        }
+    }
+
+    /// A reply that ends inside the XDR padding after a name (`e0` is followed by two zero bytes)
+    /// or a handle is a decode error, never a panic: fastxdr 1.0.2's header advanced past the
+    /// padding unchecked (`Bytes::advance`, "cannot advance past `remaining`"); build.rs now checks
+    /// it.
+    #[test]
+    fn a_reply_cut_off_anywhere_is_a_decode_error_never_a_panic() {
+        every_cut_fails(&reply(3, true), |v| READDIRPLUS3resok::try_from(v));
+        every_cut_fails(&reply(3, false), |v| READDIR3resok::try_from(v));
+
+        // LOOKUP3resok: a 5-byte handle (3 bytes of padding), no attributes.
+        let mut lookup = Vec::new();
+        lookup.extend(5u32.to_be_bytes());
+        lookup.extend([9; 5]);
+        lookup.extend([0; 3]);
+        lookup.extend(0u32.to_be_bytes()); // no object attributes
+        lookup.extend(0u32.to_be_bytes()); // no directory attributes
+        let lookup = Bytes::from(lookup);
+        let decoded = LOOKUP3resok::try_from(&mut lookup.clone()).unwrap();
+        assert_eq!(decoded.object.0.as_ref(), [9; 5]);
+        every_cut_fails(&lookup, |v| LOOKUP3resok::try_from(v));
+
+        // MOUNT MNT's mountres3_ok: the same handle, then an empty flavor list.
+        let mut mounted = Vec::new();
+        mounted.extend(5u32.to_be_bytes());
+        mounted.extend([9; 5]);
+        mounted.extend([0; 3]);
+        mounted.extend(0u32.to_be_bytes());
+        let mounted = Bytes::from(mounted);
+        assert!(mountres3_ok::try_from(&mut mounted.clone()).is_ok());
+        every_cut_fails(&mounted, |v| mountres3_ok::try_from(v));
+    }
 }
