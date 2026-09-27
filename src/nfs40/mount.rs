@@ -2336,6 +2336,62 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{Notify, oneshot};
 
+    /// Answers a v4.0 mount on `stream`: SETCLIENTID, SETCLIENTID_CONFIRM, the root navigation
+    /// and the mount-parameter GETATTR, whose attribute mask and values are `bitmap` / `values`.
+    async fn serve_mount(
+        stream: &mut TcpStream,
+        bitmap: u32,
+        values: &[u8],
+    ) -> std::io::Result<()> {
+        let identity = read_record(stream).await?;
+        assert!(
+            identity
+                .windows(4)
+                .any(|value| value == 35u32.to_be_bytes())
+        );
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x77; 8]);
+        reply(
+            stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+
+        let confirm = read_record(stream).await?;
+        let identity_tuple = [
+            0x0102_0304_0506_0708u64.to_be_bytes().as_slice(),
+            [0x77; 8].as_slice(),
+        ]
+        .concat();
+        assert!(confirm.windows(16).any(|value| value == identity_tuple));
+        reply(stream, &confirm, &compound_result("confirm", &[(36, &[])])).await?;
+
+        let navigation = read_record(stream).await?;
+        let minor_and_ops = [0u32.to_be_bytes(), 3u32.to_be_bytes()].concat();
+        assert!(navigation.windows(8).any(|value| value == minor_and_ops));
+        let mut fh = Vec::new();
+        xdr_opaque(&mut fh, b"scripted-fh");
+        reply(
+            stream,
+            &navigation,
+            &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
+        )
+        .await?;
+        let lease_time = read_record(stream).await?;
+        let mut attrs = Vec::new();
+        attrs.extend_from_slice(&1u32.to_be_bytes());
+        attrs.extend_from_slice(&bitmap.to_be_bytes());
+        xdr_opaque(&mut attrs, values);
+        reply(
+            stream,
+            &lease_time,
+            &compound_result("lease-time", &[(22, &[]), (9, &attrs)]),
+        )
+        .await
+    }
+
     async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;
         let mut record = vec![0; (marker & 0x7fff_ffff) as usize];
@@ -3952,65 +4008,13 @@ mod tests {
         let mounted_for_server = Arc::clone(&mounted);
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await?;
-
-            let identity = read_record(&mut first).await?;
-            assert!(
-                identity
-                    .windows(4)
-                    .any(|value| value == 35u32.to_be_bytes())
-            );
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x77; 8]);
-            reply(
-                &mut first,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-
-            let confirm = read_record(&mut first).await?;
-            let identity_tuple = [
-                0x0102_0304_0506_0708u64.to_be_bytes().as_slice(),
-                [0x77; 8].as_slice(),
-            ]
-            .concat();
-            assert!(confirm.windows(16).any(|value| value == identity_tuple));
-            reply(
-                &mut first,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-
-            let navigation = read_record(&mut first).await?;
-            let minor_and_ops = [0u32.to_be_bytes(), 3u32.to_be_bytes()].concat();
-            assert!(navigation.windows(8).any(|value| value == minor_and_ops));
-            let mut fh = Vec::new();
-            xdr_opaque(&mut fh, b"scripted-fh");
-            reply(
-                &mut first,
-                &navigation,
-                &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
-            )
-            .await?;
-            let lease_time = read_record(&mut first).await?;
-            let mut attrs = Vec::new();
-            attrs.extend_from_slice(&1u32.to_be_bytes());
-            attrs.extend_from_slice(&((1u32 << 10) | (1u32 << 30) | (1u32 << 31)).to_be_bytes());
             let values = [
                 60u32.to_be_bytes().as_slice(),
                 65536u64.to_be_bytes().as_slice(),
                 32768u64.to_be_bytes().as_slice(),
             ]
             .concat();
-            xdr_opaque(&mut attrs, &values);
-            reply(
-                &mut first,
-                &lease_time,
-                &compound_result("lease-time", &[(22, &[]), (9, &attrs)]),
-            )
-            .await?;
+            serve_mount(&mut first, (1 << 10) | (1 << 30) | (1 << 31), &values).await?;
             mounted_for_server.notified().await;
             socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
             drop(first);
@@ -4044,6 +4048,49 @@ mod tests {
         mount.null().await.unwrap();
         server.await.unwrap().unwrap();
         mount.umount().await.unwrap();
+    }
+
+    /// A v4.0 server that publishes no MAXREAD: READ falls back to the client ceiling, but
+    /// READDIR replies keep the 8 KiB default rather than growing to it (0.8.6); an explicit
+    /// `readdir-buffer` is used as given.
+    #[tokio::test]
+    async fn scripted_mount_without_maxread_keeps_the_default_directory_reply_size() {
+        let lease_and_maxwrite = [
+            60u32.to_be_bytes().as_slice(),
+            32768u64.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        let default = crate::mount::DEFAULT_READDIR_BUFFER;
+        for (readdir_buffer, expected) in [
+            (None, (default, default)),
+            (Some((2048, 4096)), (2048, 4096)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let values = lease_and_maxwrite.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                serve_mount(&mut stream, (1 << 10) | (1 << 31), &values).await?;
+                Ok::<TcpStream, std::io::Error>(stream)
+            });
+            let args = crate::MountArgs {
+                versions: vec![NFSVersion::NFSv4p0],
+                host: "127.0.0.1".to_string(),
+                dirpath: "/export".to_string(),
+                mountport: 0,
+                nfsport: addr.port(),
+                uid: 0,
+                gid: 0,
+                readdir_buffer,
+                noresvport: true,
+                retain_delegations: false,
+            };
+            let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
+            assert_eq!(mount.get_max_read_size(), crate::mount::MAX_IO_SIZE);
+            assert_eq!(mount.get_max_write_size(), 32768);
+            assert_eq!((mount.dircount, mount.maxcount), expected);
+            let _stream = server.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

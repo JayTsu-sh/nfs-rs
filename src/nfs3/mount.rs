@@ -432,3 +432,120 @@ async fn query_exports_on_addr(
         .await?;
     decode_exports(&mut bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let marker = stream.read_u32().await?;
+        let mut record = vec![0; (marker & 0x7fff_ffff) as usize];
+        stream.read_exact(&mut record).await?;
+        Ok(record)
+    }
+
+    /// An accepted RPC reply (AUTH_NONE verifier, SUCCESS) to `request` carrying `payload`.
+    async fn reply(stream: &mut TcpStream, request: &[u8], payload: &[u8]) -> std::io::Result<()> {
+        let mut response = request[0..4].to_vec();
+        for word in [1u32, 0, 0, 0, 0] {
+            response.extend_from_slice(&word.to_be_bytes());
+        }
+        response.extend_from_slice(payload);
+        stream
+            .write_u32(0x8000_0000 | response.len() as u32)
+            .await?;
+        stream.write_all(&response).await
+    }
+
+    /// MNT: status OK, a root handle and no auth flavors.
+    fn mnt_ok() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&4u32.to_be_bytes());
+        payload.extend_from_slice(b"root");
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload
+    }
+
+    /// FSINFO: status OK, no attributes, `rtmax` and a 64 KiB `wtmax`.
+    fn fsinfo_ok(rtmax: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // NFS3_OK
+        payload.extend_from_slice(&0u32.to_be_bytes()); // no attributes
+        for value in [rtmax, rtmax, 4096, 65536, 65536, 4096, 4096] {
+            payload.extend_from_slice(&value.to_be_bytes()); // rt*, wt*, dtpref
+        }
+        payload.extend_from_slice(&u64::MAX.to_be_bytes()); // maxfilesize
+        payload.extend_from_slice(&[0; 8]); // time_delta
+        payload.extend_from_slice(&0u32.to_be_bytes()); // properties
+        payload
+    }
+
+    /// Serves a mount (MNT, FSINFO) and one READDIRPLUS, which it refuses; returns the request's
+    /// `dircount` and `maxcount`, the last two words of READDIRPLUS3args (RFC 1813 §3.3.17).
+    async fn serve(listener: TcpListener, rtmax: u32) -> std::io::Result<(u32, u32)> {
+        let (mut stream, _) = listener.accept().await?;
+        let mnt = read_record(&mut stream).await?;
+        reply(&mut stream, &mnt, &mnt_ok()).await?;
+        let fsinfo = read_record(&mut stream).await?;
+        reply(&mut stream, &fsinfo, &fsinfo_ok(rtmax)).await?;
+        let readdirplus = read_record(&mut stream).await?;
+        let word = |from_end: usize| {
+            let at = readdirplus.len() - from_end;
+            u32::from_be_bytes(readdirplus[at..at + 4].try_into().unwrap())
+        };
+        let sizes = (word(8), word(4));
+        let mut refused = 13u32.to_be_bytes().to_vec(); // NFS3ERR_ACCES
+        refused.extend_from_slice(&0u32.to_be_bytes()); // no directory attributes
+        reply(&mut stream, &readdirplus, &refused).await?;
+        Ok(sizes)
+    }
+
+    /// Without `readdir-buffer`, an NFSv3 mount sizes READDIRPLUS `dircount` and `maxcount` from
+    /// the FSINFO `rtmax` it negotiated for READ (bounded by the client ceiling); an explicit
+    /// `readdir-buffer` is sent as given. Checked on the READDIRPLUS request itself.
+    #[tokio::test]
+    async fn directory_replies_are_sized_from_fsinfo_rtmax() {
+        let ceiling = crate::mount::MAX_IO_SIZE;
+        for (readdir_buffer, rtmax, expected) in [
+            (None, 1 << 20, (1 << 20, 1 << 20)),
+            (None, 32768, (32768, 32768)),
+            (None, 64 << 20, (ceiling, ceiling)),
+            (Some((2048, 4096)), 1 << 20, (2048, 4096)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(serve(listener, rtmax));
+            let args = crate::MountArgs {
+                versions: vec![NFSVersion::NFSv3],
+                host: "127.0.0.1".to_string(),
+                dirpath: "/export".to_string(),
+                mountport: addr.port(),
+                nfsport: addr.port(),
+                uid: 0,
+                gid: 0,
+                readdir_buffer,
+                noresvport: true,
+                retain_delegations: false,
+            };
+            let auth = crate::Auth::new_null();
+            let mount = mount_on_addr(&addr, &args, &auth, addr.port())
+                .await
+                .unwrap();
+            assert_eq!(mount.get_max_read_size(), rtmax.min(ceiling));
+            let refused = mount
+                .readdirplus_page(
+                    Bytes::from_static(b"root"),
+                    crate::DirectoryCookie::default(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(NfsError::Nfs3(nfs3::ErrorCode::NFS3ERR_ACCES))),
+                "{refused:?}"
+            );
+            assert_eq!(server.await.unwrap().unwrap(), expected, "rtmax {rtmax}");
+        }
+    }
+}
