@@ -41,7 +41,7 @@ options. Transfer sizes are negotiated; concurrency is capped at eight.
 | uid, gid | None | AUTH_SYS unsigned 32-bit numeric identity; default comes from the process/platform. |
 | nfs_port | None | NFS service port, 1–65535; URL spelling nfsport. |
 | mount_port | None | NFSv3 MOUNT service port, 1–65535; URL spelling mountport. |
-| readdir_buffer | None | Positive response-size limit, or positive (dircount, maxcount) pair, in bytes. |
+| readdir_buffer | None | Positive response-size limit, or positive (dircount, maxcount) pair, in bytes. None sizes directory replies from the server's read limit at mount (v3 rtmax, v4.x maxread, v4.1 also the session), or 8192 when the server publishes none. |
 | noresvport | None | Boolean; URL default false uses a privileged source port. True requires an export accepting unprivileged ports. |
 | retain_delegations | None | Boolean delegation-retention policy; effective support is reported by capabilities. |
 | connect_timeout | None | Positive seconds for connection setup; None adds no Python deadline. |
@@ -811,7 +811,7 @@ def scandir_page(
 ) -> DirectoryPage: ...
 ```
 
-Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's readdir_buffer sizes. None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress (no entries from the server before eof, or ending at the requested cookie) raises NfsEncodingError, like a malformed reply; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. When the server returned no entries at all (only valid at eof), next is position unchanged. Detecting a cookie repeated across pages is the caller's responsibility: check eof first, then keep the cookies already received and stop when next repeats one; otherwise a server whose cookies cycle can page forever.
+Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir attributes) starting after position, using the connection's directory reply sizes (readdir_buffer, or the server's limits without it). None or DirectoryCookie() starts at the beginning; pass each page's next until eof. The caller holds the position, so a listing interrupted by a transient failure resumes from the last page received instead of restarting. path and fh follow scandir. A page that makes no progress (no entries from the server before eof, or ending at the requested cookie) raises NfsEncodingError, like a malformed reply; a rejected position raises NfsBadCookieError, after which only a restart from the beginning is possible. When the server returned no entries at all (only valid at eof), next is position unchanged. Detecting a cookie repeated across pages is the caller's responsibility: check eof first, then keep the cookies already received and stop when next repeats one; otherwise a server whose cookies cycle can page forever.
 
 #### Client.listdir
 

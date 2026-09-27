@@ -336,8 +336,9 @@ struct MountArgs {
     nfsport: u16,
     uid: u32,
     gid: u32,
-    dircount: u32,
-    maxcount: u32,
+    /// Explicit `readdir-buffer=<dircount>,<maxcount>`; `None` sizes directory replies from the
+    /// server's limits at mount time ([`mount::directory_reply_limits`]).
+    readdir_buffer: Option<(u32, u32)>,
     noresvport: bool,
     retain_delegations: bool,
 }
@@ -400,9 +401,8 @@ fn get_uid_gid() -> (u32, u32) {
 }
 
 fn parse_url(url: &str) -> Result<MountArgs> {
-    let mut parsed_url =
-        Url::parse_with_params(url, &[("version", "3"), ("readdir-buffer", "8192,8192")])
-            .map_err(|e| NfsError::InvalidInput(e.to_string()))?;
+    let mut parsed_url = Url::parse_with_params(url, &[("version", "3")])
+        .map_err(|e| NfsError::InvalidInput(e.to_string()))?;
     if parsed_url.scheme() != "nfs" {
         return Err(NfsError::InvalidInput(
             "specified URL does not have scheme nfs".to_string(),
@@ -451,12 +451,11 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         gid_def,
         "specified URL contains bad GID",
     )?;
-    let readdir_buffer_str = parsed_url
+    let readdir_buffer = parsed_url
         .query_pairs()
         .find(|(name, _)| name == "readdir-buffer")
-        .ok_or_else(|| NfsError::InvalidInput("missing readdir-buffer parameter".to_string()))?
-        .1;
-    let (dircount, maxcount): (u32, u32) = parse_readdir_buffer_query_param(&readdir_buffer_str)?;
+        .map(|(_, value)| parse_readdir_buffer_query_param(&value))
+        .transpose()?;
     let nfsport = get_url_query_param(
         &parsed_url,
         "nfsport",
@@ -509,8 +508,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         dirpath: parsed_url.path().to_string(),
         uid,
         gid,
-        dircount,
-        maxcount,
+        readdir_buffer,
         noresvport,
         retain_delegations,
     })
@@ -830,7 +828,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -847,7 +845,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), (616, 666));
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -861,7 +859,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -875,7 +873,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -889,7 +887,7 @@ mod tests {
         assert_eq!(args.mountport, 20490);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -903,7 +901,7 @@ mod tests {
         assert_eq!(args.mountport, 20490);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -917,7 +915,7 @@ mod tests {
         assert_eq!(args.mountport, 20490);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -931,7 +929,7 @@ mod tests {
         assert_eq!(args.mountport, 20490);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (8192, 8192));
+        assert_eq!(args.readdir_buffer, None);
     }
 
     #[test]
@@ -961,7 +959,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (4096, 4096));
+        assert_eq!(args.readdir_buffer, Some((4096, 4096)));
     }
 
     #[test]
@@ -975,7 +973,7 @@ mod tests {
         assert_eq!(args.mountport, 0);
         assert_eq!(args.dirpath, "/some/export/path".to_string());
         assert_eq!((args.uid, args.gid), get_uid_gid());
-        assert_eq!((args.dircount, args.maxcount), (2048, 4096));
+        assert_eq!(args.readdir_buffer, Some((2048, 4096)));
     }
 
     #[tokio::test]
@@ -988,8 +986,7 @@ mod tests {
             dirpath: Default::default(),
             gid: Default::default(),
             uid: Default::default(),
-            dircount: Default::default(),
-            maxcount: Default::default(),
+            readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
         };
@@ -1009,8 +1006,7 @@ mod tests {
             dirpath: Default::default(),
             gid: Default::default(),
             uid: Default::default(),
-            dircount: Default::default(),
-            maxcount: Default::default(),
+            readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
         };
@@ -1030,8 +1026,7 @@ mod tests {
             dirpath: Default::default(),
             gid: Default::default(),
             uid: Default::default(),
-            dircount: Default::default(),
-            maxcount: Default::default(),
+            readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
         };

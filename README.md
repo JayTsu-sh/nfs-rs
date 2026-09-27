@@ -96,8 +96,12 @@ Supported arguments:
 - `nfsport=<port>` — NFS service port. This bypasses portmapper discovery.
 - `mountport=<port>` — MOUNT protocol port for NFSv3.
 - `readdir-buffer=<count>` or `<dircount>,<maxcount>` — response buffer limits
-  for directory reads. Both values default to 8192. All three implemented
-  versions honor this option; v4.1 further bounds the reply by session capacity.
+  for directory reads. Without it, both come from the server's published read
+  limit at mount time: NFSv3 FSINFO `rtmax`, NFSv4.0 `maxread`, NFSv4.1
+  `maxread` bounded by the session's maximum response size, all bounded by the
+  client payload ceiling (4 MiB); a server that publishes none keeps 8192. A
+  server may still answer with smaller replies. All three implemented versions
+  honor an explicit value; v4.1 further bounds the reply by session capacity.
 - `noresvport=<true|false>` — use an ephemeral source port when true. It
   defaults to false.
 

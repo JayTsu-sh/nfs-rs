@@ -310,7 +310,6 @@ async fn mount_on_addr(
     info!(addr = %addr, dirpath = %args.dirpath, "connecting to NFS server for mount");
     let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
     let dir: String = args.dirpath.to_owned();
-    let (dircount, maxcount) = (args.dircount, args.maxcount);
     let mount_mux = if mountport != addr.port() {
         let mut mount_addr = *addr;
         mount_addr.set_port(mountport);
@@ -348,8 +347,8 @@ async fn mount_on_addr(
         auth: auth.clone(),
         fh,
         dir,
-        dircount,
-        maxcount,
+        dircount: crate::mount::DEFAULT_READDIR_BUFFER,
+        maxcount: crate::mount::DEFAULT_READDIR_BUFFER,
         rsize: 0,
         wsize: 0,
     };
@@ -362,11 +361,15 @@ async fn mount_on_addr(
     let fsinfo = crate::mount::FSInfo::from(fsinfo_ok);
     m.rsize = crate::mount::negotiated_io_size(u64::from(fsinfo.rtmax))?;
     m.wsize = crate::mount::negotiated_io_size(u64::from(fsinfo.wtmax))?;
+    (m.dircount, m.maxcount) =
+        crate::mount::directory_reply_limits(args.readdir_buffer, Some(m.rsize));
     info!(
         rsize = m.rsize,
         wsize = m.wsize,
         rtmax = fsinfo.rtmax,
         wtmax = fsinfo.wtmax,
+        dircount = m.dircount,
+        maxcount = m.maxcount,
         "NFS mount complete, negotiated transfer sizes"
     );
 
