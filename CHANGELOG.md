@@ -26,6 +26,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   (milliseconds → a few hundred milliseconds) while the whole listing is
   faster. Callers that hold several pages at once hold correspondingly more
   memory; set `readdir-buffer` to keep the previous size.
+- READDIR and READDIRPLUS requests get the deadline a READ of their `maxcount`
+  gets (a fixed 5 s on NFSv3 and NFSv4.1, 10 s on NFSv4.0 before), since a
+  reply can now be up to the read limit.
+- The file handle of each directory entry is a copy, not a slice of the reply,
+  so keeping a handle no longer keeps the whole reply in memory.
 
 ### Fixed
 

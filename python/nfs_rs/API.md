@@ -41,7 +41,7 @@ options. Transfer sizes are negotiated; concurrency is capped at eight.
 | uid, gid | None | AUTH_SYS unsigned 32-bit numeric identity; default comes from the process/platform. |
 | nfs_port | None | NFS service port, 1–65535; URL spelling nfsport. |
 | mount_port | None | NFSv3 MOUNT service port, 1–65535; URL spelling mountport. |
-| readdir_buffer | None | Positive response-size limit, or positive (dircount, maxcount) pair, in bytes. None sizes directory replies from the server's read limit at mount (v3 rtmax, v4.x maxread, v4.1 also the session), or 8192 when the server publishes none. |
+| readdir_buffer | None | Positive response-size limit, or positive (dircount, maxcount) pair, in bytes. None sizes directory replies from the server's read limit at mount (v3 rtmax, v4.x maxread, v4.1 also the session), or 8192 on a v4.0 server without maxread. |
 | noresvport | None | Boolean; URL default false uses a privileged source port. True requires an export accepting unprivileged ports. |
 | retain_delegations | None | Boolean delegation-retention policy; effective support is reported by capabilities. |
 | connect_timeout | None | Positive seconds for connection setup; None adds no Python deadline. |

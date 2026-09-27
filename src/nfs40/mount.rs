@@ -908,10 +908,11 @@ impl Mount40 {
             .putfh(fh)
             .readdir(cookie, verifier, self.dircount, self.maxcount, bitmap)
             .encode_with_header(&self.auth);
-        let payload = decode_readdir_response(
-            self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
-                .await?,
-        )?;
+        // A reply sized from the server's MAXREAD gets the transfer time a READ of that size
+        // would, at the 1.25 MB/s floor the other versions assume.
+        let timeout = METADATA_TIMEOUT + Duration::from_secs(u64::from(self.maxcount) / 1_250_000);
+        let payload =
+            decode_readdir_response(self.activity_call(request, SAFE_REPLAY, timeout).await?)?;
         validate_readdir_payload(payload, self.maxcount)
     }
 
@@ -1039,11 +1040,16 @@ impl Mount40 {
             entries
                 .into_iter()
                 .map(|entry| {
-                    entry.map(|entry| mount::ReaddirplusEntry {
-                        fileid: entry.attr.fileid,
-                        file_name: entry.name,
-                        handle: entry.attr.filehandle.clone(),
-                        attr: Some(entry.attr),
+                    entry.map(|mut entry| {
+                        // A copy: a slice would keep the whole reply (up to the read limit)
+                        // alive for as long as the caller keeps the handle.
+                        entry.attr.filehandle = Bytes::copy_from_slice(&entry.attr.filehandle);
+                        mount::ReaddirplusEntry {
+                            fileid: entry.attr.fileid,
+                            file_name: entry.name,
+                            handle: entry.attr.filehandle.clone(),
+                            attr: Some(entry.attr),
+                        }
                     })
                 })
                 .collect(),

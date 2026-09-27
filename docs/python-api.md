@@ -61,7 +61,7 @@ Common options:
 | `version=4.1,4.0,3` | Try an explicit fallback order |
 | `uid=`, `gid=` | AUTH_SYS numeric identity |
 | `nfsport=`, `mountport=` | Override service ports |
-| `readdir-buffer=` | Directory response limit, or `dircount,maxcount`; honored by v3/v4.0/v4.1, additionally bounded by v4.1 session capacity. Without it, both come from the server's read limit at mount (v3 `rtmax`, v4.x `maxread`, v4.1 also the session); 8192 when the server publishes none |
+| `readdir-buffer=` | Directory response limit, or `dircount,maxcount`; honored by v3/v4.0/v4.1, additionally bounded by v4.1 session capacity. Without it, both come from the server's read limit at mount (v3 `rtmax`, v4.x `maxread`, v4.1 also the session); 8192 on a v4.0 server without `maxread` |
 | `noresvport=true` | Use an unprivileged source port |
 | `retain-delegations=true` | Retain delegations when supported |
 

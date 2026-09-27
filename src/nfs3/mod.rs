@@ -317,7 +317,7 @@ const NFS_RETRIES: usize = 10;
 const MOUNT_REPLAY: crate::rpc::ReplayPolicy =
     crate::rpc::ReplayPolicy::byte_identical(MOUNT_RETRIES);
 const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
-// Timeout for metadata operations (LOOKUP, GETATTR, READDIR, etc.).
+// Timeout for metadata operations (LOOKUP, GETATTR, etc.; READDIR scales like READ).
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Base timeout for data operations (READ, WRITE). Scaled up for large payloads.
 const DATA_TIMEOUT_BASE_SECS: u64 = 10;
@@ -343,7 +343,11 @@ macro_rules! nfs3_call {
         nfs3_call!($name, $proc, $args, $resok, warn);
     };
     ($name:ident, $proc:ident, $args:ty, $resok:ty, $err_level:ident) => {
+        nfs3_call!($name, $proc, $args, $resok, $err_level, |_: &$args| METADATA_TIMEOUT);
+    };
+    ($name:ident, $proc:ident, $args:ty, $resok:ty, $err_level:ident, $timeout:expr) => {
         async fn $name(&self, args: $args) -> Result<$resok> {
+            let timeout: std::time::Duration = ($timeout)(&args);
             let procedure = NFSProc3::$proc;
             let operation_class = procedure.operation_class();
             let context = procedure.request_context();
@@ -355,7 +359,7 @@ macro_rules! nfs3_call {
                 .call(
                     buf,
                     procedure.replay_policy(),
-                    METADATA_TIMEOUT,
+                    timeout,
                 )
                 .await
                 .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
@@ -469,12 +473,23 @@ impl Mount {
             }
         }
     }
-    nfs3_call!(_readdir, Readdir, READDIR3args, READDIR3resok);
+    // A directory reply is sized from the server's read limit (up to the 4 MiB
+    // payload ceiling): give it the deadline a READ of that size gets.
+    nfs3_call!(
+        _readdir,
+        Readdir,
+        READDIR3args,
+        READDIR3resok,
+        warn,
+        |args: &READDIR3args| data_timeout(args.count as usize)
+    );
     nfs3_call!(
         _readdirplus,
         Readdirplus,
         READDIRPLUS3args,
-        READDIRPLUS3resok
+        READDIRPLUS3resok,
+        warn,
+        |args: &READDIRPLUS3args| data_timeout(args.maxcount as usize)
     );
     nfs3_call!(_readlink, Readlink, READLINK3args, READLINK3resok);
     nfs3_call!(_remove, Remove, REMOVE3args, REMOVE3resok);

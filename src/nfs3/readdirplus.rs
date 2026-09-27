@@ -99,8 +99,10 @@ fn convert_entry(entry: entryplus3) -> ReaddirplusEntry {
         fileid: entry.fileid.0,
         file_name: bytes_to_string(entry.name.0),
         attr: entry.name_attributes.into(),
+        // A copy: a slice would keep the whole reply (up to the read limit) alive for as long
+        // as the caller keeps the handle.
         handle: match entry.name_handle {
-            post_op_fh3::TRUE(h) => h.0,
+            post_op_fh3::TRUE(h) => Bytes::copy_from_slice(&h.0),
             _ => Bytes::new(),
         },
     }
