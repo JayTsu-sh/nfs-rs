@@ -60,7 +60,7 @@ impl Mount {
             self,
             dir_fh,
             readdirplus_at,
-            |entry: Box<entryplus3>| convert_entry(*entry),
+            convert_entry,
             "readdirplus page received"
         )
     }
@@ -112,15 +112,13 @@ fn into_page(res: READDIRPLUS3resok, position: DirectoryCookie) -> Result<Readdi
     let verifier: [u8; 8] = res.cookieverf.0.as_ref().try_into().unwrap_or([0u8; 8]);
     let mut last_cookie = position.cookie;
     let mut received = 0usize;
-    let mut entries = Vec::new();
-    let mut current = res.reply.entries;
-    while let Some(mut node) = current {
-        current = node.nextentry.take();
+    let mut entries = Vec::with_capacity(res.reply.entries.len());
+    for node in res.reply.entries {
         received += 1;
         last_cookie = node.cookie.0;
         let name = node.name.0.as_ref();
         if name != b"." && name != b".." {
-            entries.push(convert_entry(*node).into());
+            entries.push(convert_entry(node).into());
         }
     }
     let eof = res.reply.eof;

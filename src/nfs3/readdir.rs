@@ -51,7 +51,7 @@ impl Mount {
             self,
             dir_fh,
             readdir_at,
-            |entry: Box<entry3>| ReaddirEntry {
+            |entry: entry3| ReaddirEntry {
                 fileid: entry.fileid.0,
                 file_name: bytes_to_string(entry.name.0),
             },
@@ -154,7 +154,7 @@ mod tests {
                 &pages,
                 Bytes::new(),
                 read,
-                |e: Box<crate::nfs3::entry3>| e.cookie.0,
+                |e: crate::nfs3::entry3| e.cookie.0,
                 "test page"
             );
             let result: Result<Vec<_>> = entries.try_collect().await;
@@ -164,7 +164,7 @@ mod tests {
                 &pages,
                 Bytes::new(),
                 plus,
-                |e: Box<crate::nfs3::entryplus3>| e.cookie.0,
+                |e: crate::nfs3::entryplus3| e.cookie.0,
                 "test plus page"
             );
             let result: Result<Vec<_>> = entries.try_collect().await;
@@ -184,7 +184,7 @@ mod tests {
             &pages,
             Bytes::new(),
             read,
-            |entry: Box<crate::nfs3::entry3>| bytes_to_string(entry.name.0),
+            |entry: crate::nfs3::entry3| bytes_to_string(entry.name.0),
             "test filtered readdir page"
         );
         let result: Result<Vec<_>> = entries.try_collect().await;
@@ -195,7 +195,7 @@ mod tests {
             &pages,
             Bytes::new(),
             plus,
-            |entry: Box<crate::nfs3::entryplus3>| bytes_to_string(entry.name.0),
+            |entry: crate::nfs3::entryplus3| bytes_to_string(entry.name.0),
             "test filtered readdirplus page"
         );
         let result: Result<Vec<_>> = entries.try_collect().await;
