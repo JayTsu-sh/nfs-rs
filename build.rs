@@ -6,6 +6,41 @@ fn disambiguate_empty_byte_slices(code: String) -> String {
     code.replace("assert_eq!(buf.as_ref(), &[]);", "assert!(buf.is_empty());")
 }
 
+/// fastxdr 1.0.2's decoder header checks that an opaque's data (`try_bytes`) or an array's
+/// elements (`try_variable_array`) are in the buffer, then advances past the XDR padding that
+/// follows them unchecked. A reply that ends inside that padding (RFC 4506 §4.10: 0 to 3 zero
+/// bytes after a name, handle or other opaque) makes `Bytes::advance` panic instead of failing
+/// the decode. Check the padding too, so a reply cut off inside padding is
+/// `Error::InvalidLength` (surfaced as `NfsError::Xdr`), not a panic. The
+/// `try_variable_array` check guards no current NFSv3 / MOUNT type (their only
+/// non-opaque array, `auth_flavors`, is decoded by the rewrite below).
+///
+/// The build fails if the generated header no longer holds exactly one of each unchecked
+/// advance, so an upgraded generator is looked at again rather than silently unpatched.
+fn check_padding(code: String, file: &str) -> Result<String, String> {
+    const PATCHES: [(&str, &str); 2] = [
+        (
+            "self.advance(n + pad_length(n));",
+            "if self.remaining() - n < pad_length(n) { return Err(Error::InvalidLength); }\n            self.advance(n + pad_length(n));",
+        ),
+        (
+            "self.advance(pad_length(sum));",
+            "if self.remaining() < pad_length(sum) { return Err(Error::InvalidLength); }\n            self.advance(pad_length(sum));",
+        ),
+    ];
+    let mut code = code;
+    for (unchecked, checked) in PATCHES {
+        let found = code.matches(unchecked).count();
+        if found != 1 {
+            return Err(format!(
+                "{file}: expected one `{unchecked}` in the fastxdr header, found {found}"
+            ));
+        }
+        code = code.replacen(unchecked, checked, 1);
+    }
+    Ok(code)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
 
@@ -20,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nfs_code = nfs_code.replace("0 => Self::FALSE,", "false => Self::FALSE,");
     fs::write(
         out_dir.join("nfs_xdr.rs"),
-        disambiguate_empty_byte_slices(nfs_code),
+        check_padding(disambiguate_empty_byte_slices(nfs_code), "nfs_xdr.rs")?,
     )?;
 
     let mount_xdr = fs::read_to_string("src/nfs3/xdr/mount.x")?;
@@ -34,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     fs::write(
         out_dir.join("mount_xdr.rs"),
-        disambiguate_empty_byte_slices(mount_code),
+        check_padding(disambiguate_empty_byte_slices(mount_code), "mount_xdr.rs")?,
     )?;
 
     // NFSv4 common XDR types plus explicit NFSv4.1 extensions.
@@ -75,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     fs::write(
         out_dir.join("nfs4_xdr.rs"),
-        disambiguate_empty_byte_slices(nfs4_code),
+        check_padding(disambiguate_empty_byte_slices(nfs4_code), "nfs4_xdr.rs")?,
     )?;
 
     println!("cargo:rerun-if-changed=src/nfs3/xdr/nfs.x");
