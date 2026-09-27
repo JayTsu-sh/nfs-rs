@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-27
+
 ### Changed
 
 - Without a `readdir-buffer` URL parameter (Python `readdir_buffer`), READDIR
@@ -407,7 +409,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.2...v0.8.3
