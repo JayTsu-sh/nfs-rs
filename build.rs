@@ -10,8 +10,10 @@ fn disambiguate_empty_byte_slices(code: String) -> String {
 /// elements (`try_variable_array`) are in the buffer, then advances past the XDR padding that
 /// follows them unchecked. A reply that ends inside that padding (RFC 4506 §4.10: 0 to 3 zero
 /// bytes after a name, handle or other opaque) makes `Bytes::advance` panic instead of failing
-/// the decode. Check the padding too, so a truncated or malformed reply is
-/// `Error::InvalidLength` (surfaced as `NfsError::Xdr`), never a panic.
+/// the decode. Check the padding too, so a reply cut off inside padding is
+/// `Error::InvalidLength` (surfaced as `NfsError::Xdr`), not a panic. The
+/// `try_variable_array` check guards no current NFSv3 / MOUNT type (their only
+/// non-opaque array, `auth_flavors`, is decoded by the rewrite below).
 ///
 /// The build fails if the generated header no longer holds exactly one of each unchecked
 /// advance, so an upgraded generator is looked at again rather than silently unpatched.
