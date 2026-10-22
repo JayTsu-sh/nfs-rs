@@ -651,7 +651,23 @@ fn callback_fault_coverage_is_explicit_and_capability_honest() {
 }
 
 #[test]
+fn pnfs_lab_gate_distinguishes_compatibility_from_ds_evidence() {
+    let output = Command::new("python3")
+        .arg(workspace_path("tests/lab/test_pnfs_runner.py"))
+        .output()
+        .expect("run pNFS lab gate regression tests");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn netapp_pnfs_lab_contract_is_wired() {
+    let release = fs::read_to_string(workspace_path(".github/workflows/release-validation.yml"))
+        .expect("release validation workflow must be readable");
     let common = fs::read_to_string(workspace_path("tests/lab/common.sh"))
         .expect("lab common config must be readable");
     let runner = fs::read_to_string(workspace_path("tests/lab/run-pnfs-e2e.sh"))
@@ -701,7 +717,19 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(runner.contains("BLOCKED_CAPABILITY(netapp-pnfs-independent-ds)"));
     assert!(runner.contains("nfs_v41_pnfs_multifile_sparse_io"));
     assert!(runner.contains("trap cleanup EXIT"));
-    assert!(workflow.contains("NetApp NFSv4.1 pNFS WRITE E2E"));
+    for workflow in [&workflow, &release] {
+        assert!(workflow.contains("LAB_PNFS_REQUIRE_INDEPENDENT_DS: \"0\""));
+        assert!(workflow.contains("netapp-v41-integrity.txt"));
+    }
+    assert_eq!(
+        workflow
+            .matches("if: steps.pnfs.outputs.independent_ds_observed == 'true'")
+            .count(),
+        4,
+        "all four physical DS fault scenarios need actual DS evidence"
+    );
+    assert!(workflow.contains("pNFS unsupported), not passed"));
+    assert!(workflow.contains("Legacy NetApp NFSv4.1 integrity and pNFS capability evidence"));
     assert!(workflow.contains("NetApp NFSv4.1 compatibility E2E"));
     assert!(workflow.contains("tests/lab/run-netapp-v41-e2e.sh \"$RUN_ID\""));
     assert!(compatibility.contains("nfs_v3_and_v41_end_to_end"));
