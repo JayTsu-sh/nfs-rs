@@ -101,9 +101,13 @@ pNFS configuration, installed fault tools, repository-owned lab commands, and
 the `ci-runner` sudo allow-list. Nightly uploads its output as an artifact. It
 must not change service or network state.
 
-The pNFS runner also creates 16 files whose writes cross the 1 GiB layout
-refresh boundary. This validates independent per-file layout renewal plus
-LAYOUTCOMMIT/LAYOUTRETURN cleanup in the real NetApp lab.
+The pNFS runner also creates 16 sparse files with writes at offset 0 and 1 GiB.
+This validates per-file high-offset integrity and LAYOUTCOMMIT/LAYOUTRETURN
+cleanup. It does not prove that the server changes layouts or DS endpoints.
+Layouts are fetched on range misses and definite rejection, not periodically
+at 1 GiB boundaries. `examples/pnfs_large_file.rs` provides the 20 GiB AFX
+diagnostic workload; use a unique `release-*` filename, shared lab locks, and
+packet evidence to verify actual DS remapping separately from throughput.
 
 `run-e2e.sh` mounts the isolated run directory on both source and destination
 over NFSv3 and NFSv4.1. For each endpoint it exercises server discovery,

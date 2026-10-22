@@ -27,6 +27,7 @@ const NFS4ERR_INVAL: u32 = 22;
 const CB_RECALL: u32 = 4;
 const CB_LAYOUTRECALL: u32 = 5;
 const CB_SEQUENCE: u32 = 11;
+const CB_NOTIFY_DEVICEID: u32 = 14;
 
 /// Callback program number communicated in CREATE_SESSION.
 pub(crate) const CB_PROGRAM: u32 = 0x40000000;
@@ -158,21 +159,23 @@ fn callback_slots(max_requests: u32) -> Vec<CallbackSlot> {
 pub(crate) fn make_backchannel_handler(
     state: Arc<CallbackState>,
     recall_tx: mpsc::Sender<RecallNotification>,
+    layouts: Arc<super::layout::LayoutManager>,
 ) -> BackchannelHandler {
-    Arc::new(move |frame| handle_cb_rpc(frame, &state, &recall_tx))
+    Arc::new(move |frame| handle_cb_rpc(frame, &state, &recall_tx, &layouts))
 }
 
 fn handle_cb_rpc(
     mut frame: Bytes,
     state: &CallbackState,
     recall_tx: &mpsc::Sender<RecallNotification>,
+    layouts: &super::layout::LayoutManager,
 ) -> Option<Vec<u8>> {
     let xid = if frame.remaining() >= 4 {
         frame.get_u32()
     } else {
         return None;
     };
-    match parse_rpc_call(xid, &mut frame, state, recall_tx) {
+    match parse_rpc_call(xid, &mut frame, state, recall_tx, layouts) {
         Ok(reply) => Some(reply),
         Err(error) => {
             warn!(error = %error, xid, "failed to handle CB_COMPOUND");
@@ -189,6 +192,7 @@ fn parse_rpc_call(
     buf: &mut Bytes,
     state: &CallbackState,
     recall_tx: &mpsc::Sender<RecallNotification>,
+    layouts: &super::layout::LayoutManager,
 ) -> Result<Vec<u8>> {
     if buf.remaining() < 20 {
         return Err(NfsError::Xdr("CB RPC header too short".to_string()));
@@ -224,7 +228,7 @@ fn parse_rpc_call(
         .inner
         .lock()
         .map_err(|_| NfsError::Rpc("callback state lock poisoned".to_string()))?;
-    let compound = parse_compound(buf, request, &mut session, recall_tx)?;
+    let compound = parse_compound(buf, request, &mut session, recall_tx, layouts)?;
     Ok(build_rpc_reply(xid, &compound))
 }
 
@@ -233,6 +237,7 @@ fn parse_compound(
     request: Bytes,
     session: &mut CallbackSession,
     recall_tx: &mpsc::Sender<RecallNotification>,
+    layouts: &super::layout::LayoutManager,
 ) -> Result<Arc<[u8]>> {
     let tag = read_opaque(buf)?;
     if buf.remaining() < 12 {
@@ -304,7 +309,8 @@ fn parse_compound(
             break;
         }
         let opcode = buf.get_u32();
-        let (reply, op_status) = parse_callback_op(opcode, buf, recall_tx)?;
+        let (reply, op_status) =
+            parse_callback_op(opcode, buf, recall_tx, layouts, session.generation)?;
         replies.push(reply);
         status = op_status;
         if status != NFS4_OK {
@@ -375,6 +381,8 @@ fn parse_callback_op(
     opcode: u32,
     buf: &mut Bytes,
     recall_tx: &mpsc::Sender<RecallNotification>,
+    layouts: &super::layout::LayoutManager,
+    generation: u64,
 ) -> Result<(Vec<u8>, u32)> {
     match opcode {
         CB_RECALL => {
@@ -403,8 +411,76 @@ fn parse_callback_op(
             Ok((op_status(opcode, status), status))
         }
         CB_LAYOUTRECALL => parse_layout_recall(opcode, buf, recall_tx),
+        CB_NOTIFY_DEVICEID => {
+            let status = match parse_device_notifications(buf) {
+                Ok(devices) => {
+                    for device in devices {
+                        layouts.invalidate_device(&device, generation, true);
+                    }
+                    NFS4_OK
+                }
+                Err(_) => NFS4ERR_BADXDR,
+            };
+            Ok((op_status(opcode, status), status))
+        }
         _ => Ok((op_status(opcode, NFS4ERR_OP_ILLEGAL), NFS4ERR_OP_ILLEGAL)),
     }
+}
+
+/// RFC 8881 §20.12: notify4 has a bitmap followed by packed CHANGE/DELETE
+/// values in bit order. Validate the entire array before publishing side effects.
+fn parse_device_notifications(buf: &mut Bytes) -> Result<Vec<[u8; 16]>> {
+    if buf.remaining() < 4 {
+        return Err(NfsError::Xdr("device notification count truncated".into()));
+    }
+    let count = buf.get_u32() as usize;
+    if count > 4096 || count > buf.remaining() / 12 {
+        return Err(NfsError::Xdr(
+            "device notification count exceeds payload".into(),
+        ));
+    }
+    let mut devices = Vec::new();
+    for _ in 0..count {
+        if buf.remaining() < 8 {
+            return Err(NfsError::Xdr("invalid device notification bitmap".into()));
+        }
+        let words = buf.get_u32() as usize;
+        if words == 0 || words > buf.remaining() / 4 {
+            return Err(NfsError::Xdr("device notification bitmap truncated".into()));
+        }
+        let mask = buf.get_u32();
+        // bitmap4 may include trailing zero words (RFC 8881 §3.3.7).
+        for _ in 1..words {
+            if buf.get_u32() != 0 {
+                return Err(NfsError::Xdr("unknown device notification type".into()));
+            }
+        }
+        if mask == 0 || mask & !6 != 0 {
+            return Err(NfsError::Xdr("unknown device notification type".into()));
+        }
+        let mut values = read_opaque(buf)?;
+        for (bit, size) in [(2, 24), (4, 20)] {
+            if mask & bit == 0 {
+                continue;
+            }
+            if values.remaining() < size {
+                return Err(NfsError::Xdr("device notification value truncated".into()));
+            }
+            let layout_type = values.get_u32();
+            let mut device = [0; 16];
+            values.copy_to_slice(&mut device);
+            if bit == 2 && values.get_u32() > 1 {
+                return Err(NfsError::Xdr("invalid device notification boolean".into()));
+            }
+            if layout_type == 1 {
+                devices.push(device);
+            }
+        }
+        if values.has_remaining() {
+            return Err(NfsError::Xdr("trailing device notification values".into()));
+        }
+    }
+    Ok(devices)
 }
 
 fn parse_layout_recall(
@@ -547,6 +623,20 @@ fn write_opaque(buf: &mut Vec<u8>, value: &[u8]) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::nfs41::layout::{DeviceInfo, LayoutManager};
+
+    fn handle_cb_rpc(
+        frame: Bytes,
+        state: &CallbackState,
+        tx: &mpsc::Sender<RecallNotification>,
+    ) -> Option<Vec<u8>> {
+        super::handle_cb_rpc(
+            frame,
+            state,
+            tx,
+            &super::super::layout::LayoutManager::new(true),
+        )
+    }
 
     fn be(value: u32) -> [u8; 4] {
         value.to_be_bytes()
@@ -586,6 +676,115 @@ mod tests {
 
     fn u32_at(value: &[u8], offset: usize) -> u32 {
         u32::from_be_bytes(value[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn device_frame(sequence: u32, mask: u32, values: &[u8]) -> Bytes {
+        let mut request = frame(1, [7; 16], sequence, 0, b"", None).to_vec();
+        request[52..56].copy_from_slice(&be(2)); // CB_COMPOUND opcount
+        request.extend(be(CB_NOTIFY_DEVICEID));
+        request.extend(be(1)); // one notify4
+        request.extend(be(1)); // one bitmap word
+        request.extend(be(mask));
+        write_opaque(&mut request, values);
+        request.into()
+    }
+
+    fn device_values(device: [u8; 16], immediate: Option<bool>) -> Vec<u8> {
+        let mut values = be(1).to_vec(); // files layout
+        values.extend(device);
+        if let Some(immediate) = immediate {
+            values.extend(be(u32::from(immediate)));
+        }
+        values
+    }
+
+    #[test]
+    fn device_notification_accepts_zero_padded_bitmap() {
+        let mut args = Vec::new();
+        for value in [1, 2, 2, 0] {
+            // one CHANGE, bitmap has a trailing zero word
+            args.extend(be(value));
+        }
+        write_opaque(&mut args, &device_values([9; 16], Some(false)));
+        assert_eq!(
+            parse_device_notifications(&mut args.into()).unwrap(),
+            vec![[9; 16]]
+        );
+    }
+
+    #[tokio::test]
+    async fn device_change_invalidates_before_ack_and_fences_late_getdeviceinfo() {
+        let state = CallbackState::new([7; 16], 1, 1);
+        let manager = LayoutManager::new(true);
+        let device = [9; 16];
+        let info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec!["192.0.2.10:2049".parse().unwrap()]],
+        };
+        manager.store_device(device, info.clone()).await;
+        let old_revision = manager.device_revision();
+        let (tx, _) = mpsc::channel(4);
+        let request = device_frame(1, 2, &device_values(device, Some(true)));
+        let reply = super::handle_cb_rpc(request.clone(), &state, &tx, &manager).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4_OK);
+        assert!(manager.get_device(&device).await.is_none());
+        assert!(!manager.store_device_if_current(device, 1, old_revision, info.clone()));
+        // A replay must not discard a mapping fetched after the notification.
+        manager.store_device(device, info).await;
+        let revision = manager.device_revision();
+        let replay = super::handle_cb_rpc(request, &state, &tx, &manager).unwrap();
+        assert_eq!(reply, replay);
+        assert_eq!(manager.device_revision(), revision);
+        assert!(manager.get_device(&device).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_device_notification_has_no_partial_invalidation() {
+        let state = CallbackState::new([7; 16], 1, 1);
+        let manager = LayoutManager::new(true);
+        let revision = manager.device_revision();
+        let (tx, _) = mpsc::channel(4);
+        let mut values = device_values([9; 16], Some(false));
+        values.extend([0; 4]); // truncated DELETE after valid CHANGE
+        let reply =
+            super::handle_cb_rpc(device_frame(1, 6, &values), &state, &tx, &manager).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4ERR_BADXDR);
+        assert_eq!(manager.device_revision(), revision);
+    }
+
+    #[tokio::test]
+    async fn device_delete_and_stale_generation_never_repopulate_old_mappings() {
+        let state = CallbackState::new([7; 16], 1, 1);
+        let manager = LayoutManager::new(true);
+        let device = [9; 16];
+        let info = DeviceInfo {
+            stripe_indices: vec![],
+            ds_addrs: vec![],
+        };
+        manager.store_device(device, info.clone()).await;
+        let (tx, _) = mpsc::channel(4);
+        let reply = super::handle_cb_rpc(
+            device_frame(1, 4, &device_values(device, None)),
+            &state,
+            &tx,
+            &manager,
+        )
+        .unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4_OK);
+        assert!(manager.get_device(&device).await.is_none());
+        manager.transition_to(2).await;
+        manager.store_device(device, info).await;
+        let revision = manager.device_revision();
+        let reply = super::handle_cb_rpc(
+            device_frame(2, 2, &device_values(device, Some(false))),
+            &state,
+            &tx,
+            &manager,
+        )
+        .unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4_OK);
+        assert_eq!(manager.device_revision(), revision);
+        assert!(manager.get_device(&device).await.is_some());
     }
 
     #[test]

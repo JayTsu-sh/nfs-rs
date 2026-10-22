@@ -29,7 +29,7 @@ The public API is still evolving while the crate is below version 1.0.
 
 ```toml
 [dependencies]
-nfs-rs = "0.8.6"
+nfs-rs = "0.8.7"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -117,6 +117,13 @@ and `verifier`. `committed` is the server's response, not the requested level;
 pNFS reports the weakest level across the contributing DS replies. Retain its acknowledgement
 for `Mount::commit_write_batch`, which also routes pNFS commits and completes
 required LAYOUTCOMMITs.
+
+NFSv4.1 pNFS reuses valid layouts without a periodic large-write barrier.
+Uncovered ranges fetch new layouts; device-change callbacks invalidate address
+mappings. When every DS write is explicitly rejected with `NFS4ERR_STALE`, the
+client refreshes the layout/device mapping and retries once before safe MDS
+fallback. Partial writes and transport-uncertain outcomes are never replayed
+through this recovery path.
 
 Each Rust `BufferedFile` owns one OPEN reference; separately constructed wrappers
 need separate opens even when their file handles are equal. Successful `close`

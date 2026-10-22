@@ -73,9 +73,9 @@ wait "$test_pid"
 test_pid=""
 cat "$test_log"
 
-# Exercise the proactive per-file layout lifecycle separately from the small
+# Exercise per-file sparse I/O and cleanup separately from the small
 # full-payload checksum above.  The first test proves that this export reaches
-# the independent DS; this test proves that multiple files can cross the
-# refresh boundary and still commit, return, read, and remove cleanly.
+# the independent DS; this test proves that multiple files can access high
+# offsets and still commit, return, read, and remove cleanly.
 timeout 300 cargo test --locked --test lab_e2e \
-  nfs_v41_pnfs_multifile_active_layout_refresh -- --ignored --nocapture
+  nfs_v41_pnfs_multifile_sparse_io -- --ignored --nocapture

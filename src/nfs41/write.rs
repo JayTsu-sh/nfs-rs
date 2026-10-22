@@ -12,35 +12,44 @@ use crate::mount::{WriteOutcome, WriteStability};
 use crate::nfs4::attrs::{decode_getattr_response, encode_setattr, standard_getattr_bitmap};
 
 impl Mount41 {
-    /// Try an UNSTABLE write through pNFS data servers. `None` means no DS
-    /// mutation was attempted and the caller must write through the MDS.
+    /// Try an UNSTABLE write through pNFS data servers. `None` proves no DS
+    /// mutation took place, permitting the caller to write through the MDS.
     pub(crate) async fn write_pnfs(
         &self,
         fh: &Bytes,
         offset: u64,
         data: Bytes,
     ) -> Option<Result<mount::WriteOutcome>> {
-        if let Err(error) = self.refresh_layout_for_write(fh, offset).await {
-            return Some(Err(error));
+        for attempt in 0..2 {
+            let io_guard = self.layout_manager.read_file_io(fh).await;
+            // Recall/refresh commits hold the exclusive I/O gate. Inspect failure
+            // only after settlement, while the layout is protected from replacement.
+            if self
+                .layout_manager
+                .pending_writes(fh)
+                .await
+                .iter()
+                .any(|w| w.failed() && !w.is_done())
+            {
+                return Some(Err(crate::NfsError::Rpc(
+                    "previous pNFS write failed; close and recover before writing again".into(),
+                )));
+            }
+            match self.pnfs_write(fh, offset, data.clone()).await {
+                PnfsWriteOutcome::NotAttempted => return None,
+                PnfsWriteOutcome::Attempted(result) => return Some(result),
+                PnfsWriteOutcome::RefreshRequired(layout) => {
+                    drop(io_guard);
+                    if let Err(error) = self.refresh_rejected_layout(fh, &layout).await {
+                        return Some(Err(error));
+                    }
+                    if attempt == 1 {
+                        return None;
+                    }
+                }
+            }
         }
-        let _io_guard = self.layout_manager.read_file_io(fh).await;
-        // Recall/refresh commits hold the exclusive I/O gate. Inspect failure
-        // only after settlement, while the layout is protected from replacement.
-        if self
-            .layout_manager
-            .pending_writes(fh)
-            .await
-            .iter()
-            .any(|w| w.failed() && !w.is_done())
-        {
-            return Some(Err(crate::NfsError::Rpc(
-                "previous pNFS write failed; close and recover before writing again".into(),
-            )));
-        }
-        match self.pnfs_write(fh, offset, data).await {
-            PnfsWriteOutcome::NotAttempted => None,
-            PnfsWriteOutcome::Attempted(result) => Some(result),
-        }
+        None
     }
 
     /// WRITE to the MDS with the requested stability level; no COMMIT is

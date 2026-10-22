@@ -3,7 +3,7 @@
 Build: cargo build --release --example benchmark_three_way
 Run with --rust-bin <target-dir>/release/examples/benchmark_three_way
 and --kernel-root pointing to the same export as --url.
-Scans use identical sorted BFS inventories. I/O uses fresh 8 MiB files, one
+Scans use identical sorted BFS inventories. I/O uses fresh configurable-size files, one
 file at a time, and every writer is verified by every reader. Timings exclude
 payload generation, verification, control IPC and connection setup. Kernel
 writes fsync once per buffer; native writes finish their durable batch.
@@ -90,6 +90,16 @@ def read(client, path, buffer, payload):
         raise RuntimeError(f"read content mismatch: {path}, bytes={n}")
     return dict(seconds=elapsed, bytes=n, verified=True)
 
+def kernel_read_rpc_count(mountpoint):
+    """Mount-scoped RPC evidence, sampled outside the timed read."""
+    active = False
+    for line in Path('/proc/self/mountstats').read_text().splitlines():
+        if line.startswith('device '):
+            active = f' mounted on {mountpoint} with fstype ' in line
+        elif active and line.lstrip().startswith('READ:'):
+            return int(line.split()[1])
+    raise RuntimeError(f'missing NFS READ counters for {mountpoint}')
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", default="nfs://10.131.7.214/data-500w-dj-5?version=3&mountport=20048&nfsport=2049")
@@ -98,14 +108,19 @@ def main():
     p.add_argument("--max-dirs", type=positive, default=300)
     p.add_argument("--scan-rounds", type=positive, default=3)
     p.add_argument("--io-rounds", type=positive, default=9)
+    p.add_argument("--sizes-kib", type=positive, nargs="+", default=[8192],
+                   help="file and single caller-buffer sizes in KiB")
+    p.add_argument("--kernel-read-cache", choices=("natural", "both"), default="natural",
+                   help="also measure kernel reads after per-file POSIX_FADV_DONTNEED")
     p.add_argument("--json-output", type=Path, required=True)
     args = p.parse_args()
     if hasattr(_internal, "_arm_open_test_barrier"):
         p.error("production extension required, rebuild with --features python-extension")
-    report = dict(url=args.url, file_bytes=SIZE, buffer_bytes=SIZE, concurrency_limit=8,
+    report = dict(url=args.url, sizes_bytes=[n * 1024 for n in args.sizes_kib], concurrency_limit=8,
+                  kernel_read_cache=args.kernel_read_cache,
                   kernel_mount=mount_information(args.kernel_root),
                   scan_timing="enumeration + attributes + sorted BFS + inventory construction; verification excluded",
-                  io_timing="open + read/write + close; writes durable; verification excluded; no cache dropping",
+                  io_timing="open + read/write + close; writes durable; verification and optional per-file cache eviction excluded",
                   rust_read_api="BufferedFile::read_at (includes its result allocation)",
                   scan_runs=[], write_runs=[], read_runs=[])
     kernel = KernelClient(args.kernel_root)
@@ -142,30 +157,44 @@ def main():
             try:
                 if not kernel.local_path(directory).is_dir():
                     raise RuntimeError('scratch directory not visible on local mount')
-                buffer = bytearray(SIZE)
-                for round_index in range(args.io_rounds):
-                    order = names[round_index%3:] + names[:round_index%3]
-                    for wi, writer in enumerate(order):
-                        payload = os.urandom(SIZE)
-                        local = temp/'payload.bin'
-                        local.write_bytes(payload)
-                        worker.call(op='load', local=str(local))
-                        path = f'{directory}/{round_index}-{writer}.bin'
-                        owned.add(path)
-                        wall_started = time.time()
-                        result = worker.call(op='write', path=path) if writer=='rust' else write(backends[writer], path, payload)
-                        result.update(backend=writer, round=round_index+1, wall_started=wall_started, wall_finished=time.time())
-                        report['write_runs'].append(result)
-                        print('WRITE', json.dumps(result), flush=True)
-                        shift=(2*round_index+wi)%3
-                        for reader_position, reader in enumerate(names[shift:]+names[:shift]):
+                for size in report['sizes_bytes']:
+                    buffer = bytearray(size)
+                    for round_index in range(args.io_rounds):
+                        order = names[round_index%3:] + names[:round_index%3]
+                        for wi, writer in enumerate(order):
+                            payload = os.urandom(size)
+                            local = temp/'payload.bin'
+                            local.write_bytes(payload)
+                            worker.call(op='load', local=str(local))
+                            path = f'{directory}/{size}-{round_index}-{writer}.bin'
+                            owned.add(path)
                             wall_started = time.time()
-                            result = worker.call(op='read', path=path) if reader=='rust' else read(backends[reader], path, buffer, payload)
-                            result.update(backend=reader, writer=writer, reader_position=reader_position, round=round_index+1, wall_started=wall_started, wall_finished=time.time())
-                            report['read_runs'].append(result)
-                            print('READ', json.dumps(result), flush=True)
-                        client.remove(path)
-                        owned.remove(path)
+                            result = worker.call(op='write', path=path) if writer=='rust' else write(backends[writer], path, payload)
+                            result.update(size_bytes=size, backend=writer, round=round_index+1, wall_started=wall_started, wall_finished=time.time())
+                            report['write_runs'].append(result)
+                            print('WRITE', json.dumps(result), flush=True)
+                            shift=(2*round_index+wi)%3
+                            for reader_position, reader in enumerate(names[shift:]+names[:shift]):
+                                cache_modes = ['natural', 'evicted'] if reader == 'kernel' and args.kernel_read_cache == 'both' else ['natural']
+                                for cache_mode in cache_modes:
+                                    if cache_mode == 'evicted':
+                                        # Invalidate only this run-owned, already durable file.
+                                        # Avoid global drop_caches or touching dataset files.
+                                        fd = os.open(kernel.local_path(path), os.O_RDONLY)
+                                        try:
+                                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                                        finally:
+                                            os.close(fd)
+                                    rpc_before = kernel_read_rpc_count(report['kernel_mount']['target']) if reader == 'kernel' else None
+                                    wall_started = time.time()
+                                    result = worker.call(op='read', path=path) if reader=='rust' else read(backends[reader], path, buffer, payload)
+                                    result.update(size_bytes=size, backend=reader, cache_mode=cache_mode, writer=writer, reader_position=reader_position, round=round_index+1, wall_started=wall_started, wall_finished=time.time())
+                                    if reader == 'kernel':
+                                        result['read_rpc_count'] = kernel_read_rpc_count(report['kernel_mount']['target']) - rpc_before
+                                    report['read_runs'].append(result)
+                                    print('READ', json.dumps(result), flush=True)
+                            client.remove(path)
+                            owned.remove(path)
             finally:
                 for path in sorted(owned):
                     client.remove(path, missing_ok=True)
@@ -175,11 +204,14 @@ def main():
                 # A kernel dentry can remain visible until its attribute cache expires.
                 report['cleanup_verified_kernel'] = not kernel.local_path(directory).exists()
                 report['cleanup_verified'] = report['cleanup_verified_native'] and report['cleanup_verified_kernel']
-            report['summary'] = {name: dict(
-                scan_median_seconds=statistics.median(v['seconds'] for v in report['scan_runs'] if v['backend']==name),
-                write_median_seconds=statistics.median(v['seconds'] for v in report['write_runs'] if v['backend']==name),
-                read_by_writer_median_seconds={writer: statistics.median(v['seconds'] for v in report['read_runs'] if v['backend']==name and v['writer']==writer) for writer in names}
-            ) for name in names}
+            report['summary'] = {
+                'scan_median_seconds': {name: statistics.median(v['seconds'] for v in report['scan_runs'] if v['backend']==name) for name in names},
+                'io_by_size': {str(size): {name: dict(
+                    write_median_seconds=statistics.median(v['seconds'] for v in report['write_runs'] if v['backend']==name and v['size_bytes']==size),
+                    read_by_writer_median_seconds={writer: statistics.median(v['seconds'] for v in report['read_runs'] if v['backend']==name and v['writer']==writer and v['size_bytes']==size and v['cache_mode']=='natural') for writer in names},
+                    read_evicted_median_seconds=statistics.median(v['seconds'] for v in report['read_runs'] if v['backend']==name and v['size_bytes']==size and v['cache_mode']=='evicted') if name=='kernel' and args.kernel_read_cache=='both' else None,
+                ) for name in names} for size in report['sizes_bytes']}
+            }
             print('SUMMARY', json.dumps(report['summary']), flush=True)
     except Exception as error:
         report['error'] = str(error)

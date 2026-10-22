@@ -3060,7 +3060,7 @@ async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a NetApp multi-node pNFS FlexGroup lab"]
-async fn nfs_v41_pnfs_multifile_active_layout_refresh() -> TestResult {
+async fn nfs_v41_pnfs_multifile_sparse_io() -> TestResult {
     ensure(
         env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
         "lab disabled",
@@ -3103,7 +3103,7 @@ async fn nfs_v41_pnfs_multifile_active_layout_refresh() -> TestResult {
             mount.close(opened.fh).await?;
             mount.remove_path(&file).await?;
         }
-        eprintln!("pnfs-active-refresh files=16 sparse-boundary=1GiB checksum=ok");
+        eprintln!("pnfs-sparse-io files=16 high-offset=1GiB checksum=ok");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;

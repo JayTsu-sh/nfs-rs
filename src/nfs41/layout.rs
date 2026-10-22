@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock as SyncRwLock};
 
 use bytes::{Buf, Bytes};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -32,6 +32,8 @@ const DS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 type DataServerInitKey = (u64, SocketAddr);
 type DataServerInitGate = Mutex<()>;
+type LayoutFetchGates = Mutex<HashMap<(u64, Bytes), std::sync::Weak<Mutex<()>>>>;
+type DeviceFetchGates = Mutex<HashMap<(u64, [u8; 16]), std::sync::Weak<Mutex<()>>>>;
 
 fn should_negative_cache_ds_error(error: &NfsError) -> bool {
     matches!(
@@ -202,14 +204,15 @@ pub(crate) struct LayoutManager {
     /// includes the MDS generation so recovery never waits behind stale work.
     data_server_init_gates: Mutex<HashMap<DataServerInitKey, std::sync::Weak<DataServerInitGate>>>,
     /// Cached device info indexed by device ID.
-    device_cache: RwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
+    // The backchannel invalidates mappings before acknowledging a device
+    // notification. Critical sections only access in-memory maps, never I/O.
+    device_cache: SyncRwLock<HashMap<[u8; 16], (u64, DeviceInfo)>>,
+    device_revision: AtomicU64,
+    layout_fetch_gates: LayoutFetchGates,
+    device_fetch_gates: DeviceFetchGates,
     /// 已通过 layout 写入但尚未 LAYOUTCOMMIT 的字节范围（fh → (start, end)）。
     /// LAYOUTCOMMIT 聚合到 close/layoutreturn 前一次性发送，而非每次 WRITE 后。
     dirty: RwLock<HashMap<Bytes, DirtyRange>>,
-    /// Next sequential file offset at which the client proactively returns
-    /// and reacquires this file's layout. Entries are per file so a large-file
-    /// lifecycle transition never disturbs layouts for sibling files.
-    layout_refresh_offsets: RwLock<HashMap<Bytes, u64>>,
     /// Per-file I/O gates. WRITEs take a shared guard; recall/CLOSE take an
     /// exclusive guard so different files and same-file parallel WRITEs remain
     /// concurrent while layout lifecycle transitions are serialized.
@@ -220,13 +223,11 @@ pub(crate) struct LayoutManager {
     /// 连接失败的 DS 地址负缓存（mount 生命周期内不再尝试）。
     /// server 可能下发客户端不可达网段的 DS LIF（如 ONTAP 多网段拓扑），
     /// 不拉黑会导致每次 I/O 都重复付一次连接超时。
-    unreachable_ds: RwLock<HashSet<SocketAddr>>,
+    unreachable_ds: SyncRwLock<HashSet<SocketAddr>>,
     /// Whether to use ephemeral (non-privileged) source ports for DS connections.
     noresvport: bool,
     active_generation: AtomicU64,
 }
-
-pub(crate) const PNFS_LAYOUT_REFRESH_INTERVAL: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirtyRange {
@@ -242,13 +243,15 @@ impl LayoutManager {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
             data_server_init_gates: Mutex::new(HashMap::new()),
-            device_cache: RwLock::new(HashMap::new()),
+            device_cache: SyncRwLock::new(HashMap::new()),
+            device_revision: AtomicU64::new(0),
+            layout_fetch_gates: Mutex::new(HashMap::new()),
+            device_fetch_gates: Mutex::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
-            layout_refresh_offsets: RwLock::new(HashMap::new()),
             file_io_gates: Mutex::new(HashMap::new()),
             pending_writes: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
-            unreachable_ds: RwLock::new(HashSet::new()),
+            unreachable_ds: SyncRwLock::new(HashSet::new()),
             noresvport,
             active_generation: AtomicU64::new(1),
         }
@@ -261,20 +264,45 @@ impl LayoutManager {
         self.active_generation.store(generation, Ordering::Release);
         let mut layouts = self.layouts.write().await;
         let mut servers = self.data_servers.write().await;
-        let mut devices = self.device_cache.write().await;
         let mut dirty = self.dirty.write().await;
         layouts.clear();
         servers.clear();
         self.data_server_init_gates.lock().await.clear();
-        devices.clear();
+        self.clear_devices();
         dirty.clear();
         self.pending_writes.lock().await.clear();
-        self.unreachable_ds.write().await.clear();
-        self.layout_refresh_offsets.write().await.clear();
+        self.unreachable_ds
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn generation(&self) -> u64 {
         self.active_generation.load(Ordering::Acquire)
+    }
+
+    pub async fn layout_fetch_gate(&self, fh: &Bytes) -> Arc<Mutex<()>> {
+        let mut gates = self.layout_fetch_gates.lock().await;
+        let key = (self.generation(), fh.clone());
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    pub async fn device_fetch_gate(&self, device: [u8; 16], generation: u64) -> Arc<Mutex<()>> {
+        let mut gates = self.device_fetch_gates.lock().await;
+        let key = (generation, device);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
     }
 
     async fn data_server_init_gate(
@@ -350,7 +378,10 @@ impl LayoutManager {
     }
 
     async fn mark_ds_unreachable_at(&self, addr: SocketAddr, generation: u64) -> bool {
-        let mut set = self.unreachable_ds.write().await;
+        let mut set = self
+            .unreachable_ds
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if generation != self.active_generation.load(Ordering::Acquire) {
             return false;
         }
@@ -362,7 +393,10 @@ impl LayoutManager {
 
     /// DS 地址是否已被标记为不可达。
     pub async fn is_ds_unreachable(&self, addr: &SocketAddr) -> bool {
-        let set = self.unreachable_ds.read().await;
+        let set = self
+            .unreachable_ds
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         set.contains(addr)
     }
 
@@ -437,29 +471,14 @@ impl LayoutManager {
     /// Remove the layout for a file.
     pub async fn remove_layout(&self, fh: &Bytes) -> Option<Layout> {
         let mut map = self.layouts.write().await;
-        let removed = map.remove(fh);
-        self.layout_refresh_offsets.write().await.remove(fh);
-        removed
+        map.remove(fh)
     }
 
-    pub async fn layout_refresh_due(&self, fh: &Bytes, offset: u64) -> bool {
-        let offsets = self.layout_refresh_offsets.read().await;
-        offset
-            >= offsets
-                .get(fh)
-                .copied()
-                .unwrap_or(PNFS_LAYOUT_REFRESH_INTERVAL)
-    }
-
-    pub async fn record_layout_refresh(&self, fh: &Bytes, offset: u64) {
-        let next = offset
-            .saturating_div(PNFS_LAYOUT_REFRESH_INTERVAL)
-            .saturating_add(1)
-            .saturating_mul(PNFS_LAYOUT_REFRESH_INTERVAL);
-        self.layout_refresh_offsets
-            .write()
-            .await
-            .insert(fh.clone(), next);
+    /// Preserve the server-owned stateid while requiring a fresh byte mapping.
+    pub async fn invalidate_layout_segments(&self, fh: &Bytes) {
+        if let Some(layout) = self.layouts.write().await.get_mut(fh) {
+            layout.segments.clear();
+        }
     }
 
     pub async fn all_layouts(&self) -> Vec<(Bytes, Layout)> {
@@ -471,18 +490,15 @@ impl LayoutManager {
 
     /// Remove all layouts and device cache atomically.
     ///
-    /// Both locks are acquired before clearing to prevent a window where one map
-    /// is empty but the other still has stale entries.
-    /// Lock order: layouts -> device_cache -> dirty (consistent with all other callers to prevent deadlock).
+    /// Lock order: layouts -> dirty -> device cache. No synchronous guard is
+    /// held across an await or network operation.
     pub async fn clear(&self) {
         let mut map = self.layouts.write().await;
-        let mut devices = self.device_cache.write().await;
         let mut dirty = self.dirty.write().await;
         map.clear();
-        devices.clear();
+        self.clear_devices();
         dirty.clear();
         self.pending_writes.lock().await.clear();
-        self.layout_refresh_offsets.write().await.clear();
     }
 
     /// 记录一段已通过 layout 写入、待 LAYOUTCOMMIT 的范围；与已有范围 merge（min/max）。
@@ -537,10 +553,6 @@ impl LayoutManager {
     /// Discard dirty metadata that can no longer be committed with its
     /// originating layout stateid. The caller must already be returning an
     /// uncertain outcome that requires data verification before resuming.
-    pub async fn invalidate_dirty(&self, fh: &Bytes) {
-        self.dirty.write().await.remove(fh);
-    }
-
     /// Test/teardown helper that removes a pending range immediately.
     #[cfg(test)]
     pub async fn take_dirty(&self, fh: &Bytes) -> Option<(u64, u64)> {
@@ -558,14 +570,31 @@ impl LayoutManager {
         let _ = self.store_device_at(device_id, generation, info).await;
     }
 
+    #[cfg(test)]
     pub async fn store_device_at(
         &self,
         device_id: [u8; 16],
         generation: u64,
         info: DeviceInfo,
     ) -> bool {
-        let mut cache = self.device_cache.write().await;
-        if generation != self.active_generation.load(Ordering::Acquire) {
+        self.store_device_if_current(device_id, generation, self.device_revision(), info)
+    }
+
+    pub fn device_revision(&self) -> u64 {
+        self.device_revision.load(Ordering::Acquire)
+    }
+
+    /// RFC 8881 §18.40.4: a notification racing GETDEVICEINFO makes that
+    /// response stale, even when it refers to an uncached device.
+    pub fn store_device_if_current(
+        &self,
+        device_id: [u8; 16],
+        generation: u64,
+        revision: u64,
+        info: DeviceInfo,
+    ) -> bool {
+        let mut cache = self.device_cache.write().unwrap_or_else(|e| e.into_inner());
+        if generation != self.generation() || revision != self.device_revision() {
             return false;
         }
         debug!(device_id = ?device_id, ds_count = info.ds_addrs.len(), "device info cached");
@@ -575,7 +604,7 @@ impl LayoutManager {
 
     /// Get a device info entry from the cache.
     pub async fn get_device(&self, device_id: &[u8; 16]) -> Option<DeviceInfo> {
-        let cache = self.device_cache.read().await;
+        let cache = self.device_cache.read().unwrap_or_else(|e| e.into_inner());
         let generation = self.generation();
         cache
             .get(device_id)
@@ -583,10 +612,48 @@ impl LayoutManager {
             .map(|(_, info)| info.clone())
     }
 
+    /// Invalidate before acknowledging CB_NOTIFY_DEVICEID. Healthy DS sessions
+    /// remain usable for retained WRITE receipts; only address mappings change.
+    pub fn invalidate_device(&self, device_id: &[u8; 16], generation: u64, notified: bool) {
+        let mut cache = self.device_cache.write().unwrap_or_else(|e| e.into_inner());
+        if generation != self.generation() {
+            return;
+        }
+        self.device_revision.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, info)) = cache.remove(device_id)
+            && notified
+        {
+            let mut unreachable = self
+                .unreachable_ds
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for addr in info.ds_addrs.iter().flatten() {
+                unreachable.remove(addr);
+            }
+        }
+    }
+
+    fn clear_devices(&self) {
+        let mut cache = self.device_cache.write().unwrap_or_else(|e| e.into_inner());
+        self.device_revision.fetch_add(1, Ordering::AcqRel);
+        cache.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) async fn store_test_data_server(&self, addr: SocketAddr, client: rpc::Client) {
+        self.data_servers.write().await.insert(
+            addr,
+            DsConnection {
+                client,
+                session: Arc::new(Session::for_pnfs_test(1)),
+                owner_generation: self.generation(),
+            },
+        );
+    }
+
     /// Get or create a connection (with session) to a data server.
-    ///
-    /// 明确的 endpoint 连接失败（含超时）会进入不可达负缓存；NFS/RPC
-    /// session 协议错误不会污染地址可达性。
+    /// Endpoint connection failures are negative-cached; NFS/RPC session
+    /// protocol errors do not poison address reachability.
     pub async fn get_data_server(
         &self,
         addr: SocketAddr,
@@ -1788,6 +1855,28 @@ mod tests {
         assert!(mgr.get_device(&dev_id).await.is_none());
     }
 
+    #[tokio::test]
+    async fn device_change_resets_only_related_negative_cache_and_fences_uncached_lookup() {
+        let manager = LayoutManager::new(true);
+        let device = [4; 16];
+        let related = "192.0.2.10:2049".parse().unwrap();
+        let unrelated = "192.0.2.11:2049".parse().unwrap();
+        let info = DeviceInfo {
+            stripe_indices: vec![0],
+            ds_addrs: vec![vec![related]],
+        };
+        manager.store_device(device, info.clone()).await;
+        manager.mark_ds_unreachable_at(related, 1).await;
+        manager.mark_ds_unreachable_at(unrelated, 1).await;
+        manager.invalidate_device(&device, 1, true);
+        assert!(!manager.is_ds_unreachable(&related).await);
+        assert!(manager.is_ds_unreachable(&unrelated).await);
+        let revision = manager.device_revision();
+        // Even an uncached device may have an old GETDEVICEINFO in flight.
+        manager.invalidate_device(&device, 1, true);
+        assert!(!manager.store_device_if_current(device, 1, revision, info));
+    }
+
     // --- parse_netaddr4 tests ---
 
     #[test]
@@ -2083,86 +2172,6 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].ds_index, 0);
         assert_eq!(chunks[0].ds_offset, 0);
-    }
-
-    #[tokio::test]
-    async fn layout_refresh_crossing_is_recorded_once_per_window() {
-        let manager = LayoutManager::new(true);
-        let fh = Bytes::from_static(b"large-file");
-
-        assert!(
-            !manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL - 1)
-                .await
-        );
-        assert!(
-            manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
-                .await
-        );
-        manager
-            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
-            .await;
-        assert!(
-            !manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
-                .await
-        );
-        assert!(
-            manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL * 2)
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn layout_refresh_offsets_are_independent_per_file() {
-        let manager = LayoutManager::new(true);
-        let first = Bytes::from_static(b"first");
-        let second = Bytes::from_static(b"second");
-        manager
-            .record_layout_refresh(&first, PNFS_LAYOUT_REFRESH_INTERVAL)
-            .await;
-
-        assert!(
-            !manager
-                .layout_refresh_due(&first, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
-                .await
-        );
-        assert!(
-            manager
-                .layout_refresh_due(&second, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn removing_layout_resets_its_refresh_lifecycle() {
-        let manager = LayoutManager::new(true);
-        let fh = Bytes::from_static(b"reopened-file");
-        let layout = Layout {
-            generation: manager.generation(),
-            stateid: [9; 16],
-            return_on_close: false,
-            segments: vec![],
-        };
-        manager.store_layout(&fh, layout).await;
-        manager
-            .record_layout_refresh(&fh, PNFS_LAYOUT_REFRESH_INTERVAL)
-            .await;
-        assert!(
-            !manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
-                .await
-        );
-
-        manager.remove_layout(&fh).await;
-
-        assert!(
-            manager
-                .layout_refresh_due(&fh, PNFS_LAYOUT_REFRESH_INTERVAL + 1)
-                .await
-        );
     }
 
     #[tokio::test]
