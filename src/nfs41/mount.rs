@@ -885,6 +885,7 @@ async fn mount_on_addr(
     client.enable_backchannel(super::callback::make_backchannel_handler(
         Arc::clone(&callback_state),
         recall_tx.clone(),
+        Arc::clone(&layout_manager),
     ));
 
     // A connection is not NFSv4.1-ready until BOTH has been confirmed.

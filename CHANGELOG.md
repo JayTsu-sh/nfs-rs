@@ -7,7 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-10-22
+
 ### Fixed
+
+- pNFS layout/device refresh is now driven by uncovered file ranges, device
+  notifications, and definite DS rejection rather than synchronous 1 GiB
+  write barriers. Concurrent cache misses share control RPCs. A batch wholly
+  rejected with `NFS4ERR_STALE` refreshes its mapping and retries once on the
+  DS before safe MDS fallback; partial, short-write, and transport-uncertain
+  outcomes remain non-replayable. Dirty receipts retain their original DS
+  identities and must commit before an obsolete mapping is replaced.
+
+- A layout-cache waiter from an old session generation cannot issue a new-session
+  LAYOUTGET through its obsolete singleflight gate after recovery.
 
 - An NFSv3 or MOUNT reply that ends inside the XDR padding after a name, file
   handle or other opaque (RFC 4506 §4.10) is now a decode error
@@ -420,7 +433,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.7...HEAD
+[0.8.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.3...v0.8.4

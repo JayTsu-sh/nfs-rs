@@ -809,8 +809,10 @@ impl CompoundBuilder {
         args.extend_from_slice(device_id); // deviceid4 = 16 bytes
         xdr_u32(&mut args, layout_type);
         xdr_u32(&mut args, max_count);
-        // notify_types bitmap (empty)
-        xdr_u32(&mut args, 0);
+        // RFC 8881 §18.40/§20.12: subscribe to CHANGE and DELETE so normal
+        // I/O can reuse mappings without periodic GETDEVICEINFO polling.
+        xdr_u32(&mut args, 1);
+        xdr_u32(&mut args, (1 << 1) | (1 << 2));
         self.ops.push(EncodedOp {
             opcode: OpNum::GetDeviceInfo,
             args,

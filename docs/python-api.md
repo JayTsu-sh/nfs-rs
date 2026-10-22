@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.6/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.7/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -27,6 +27,12 @@ x86_64 wheel and a wheel rebuilt from the final source distribution against
 real NFSv3, NFSv4.0, NFSv4.1, and NFSv4.1 pNFS environments.
 
 Read and write RPC sizes are determined automatically during mount from server limits, bounded by the client payload ceiling (4 MiB) and negotiated NFSv4.1 session capacities. URL and Python `rsize`/`wsize` options are no longer accepted. Python `io_limits` reports the effective mount limits; pNFS data servers may require smaller chunks.
+
+NFSv4.1 pNFS reuses valid layouts without periodic large-write barriers. It
+fetches missing file ranges and reacts to device-change callbacks. A write
+wholly rejected with `NFS4ERR_STALE` refreshes the layout and device mapping and
+retries once on the DS before safe MDS fallback. Partial writes and uncertain
+transport outcomes still require verification and are not replayed by this path.
 
 ## Installation
 

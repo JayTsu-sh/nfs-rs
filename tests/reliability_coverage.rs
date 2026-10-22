@@ -699,7 +699,7 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(runner.contains("validate_export_path"));
     assert!(runner.contains("observed_connections > baseline_connections"));
     assert!(runner.contains("BLOCKED_CAPABILITY(netapp-pnfs-independent-ds)"));
-    assert!(runner.contains("nfs_v41_pnfs_multifile_active_layout_refresh"));
+    assert!(runner.contains("nfs_v41_pnfs_multifile_sparse_io"));
     assert!(runner.contains("trap cleanup EXIT"));
     assert!(workflow.contains("NetApp NFSv4.1 pNFS WRITE E2E"));
     assert!(workflow.contains("NetApp NFSv4.1 compatibility E2E"));
@@ -713,8 +713,8 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(cleanup.contains("nfs_v41_pnfs_cleanup_run"));
     assert!(capability.contains("BLOCKED_CAPABILITY(netapp-pnfs-data-lif)"));
     assert!(rust_test.contains("nfs_v41_pnfs_write_uses_independent_ds"));
-    assert!(rust_test.contains("nfs_v41_pnfs_multifile_active_layout_refresh"));
-    assert!(rust_test.contains("pnfs-active-refresh files=16"));
+    assert!(rust_test.contains("nfs_v41_pnfs_multifile_sparse_io"));
+    assert!(rust_test.contains("pnfs-sparse-io files=16"));
     assert!(rust_test.contains("pNFS full-payload checksum mismatch"));
     assert!(workflow.contains("NetApp pNFS DS reset uncertain-outcome E2E"));
     assert!(workflow.contains("tests/lab/run-pnfs-ds-reset-e2e.sh \"$RUN_ID\""));
@@ -767,8 +767,22 @@ fn netapp_pnfs_lab_contract_is_wired() {
     assert!(pnfs_io.contains("attempted=true outcome=success"));
     assert!(pnfs_io.contains("attempted=true outcome=error"));
     assert!(pnfs_io.contains("RecoveryAction::VerifyThenResume"));
-    assert!(layout.contains("PNFS_LAYOUT_REFRESH_INTERVAL"));
-    assert!(pnfs_io.contains("refresh_layout_for_write"));
+    assert!(!layout.contains("PNFS_LAYOUT_REFRESH_INTERVAL"));
+    assert!(pnfs_io.contains("refresh_rejected_layout"));
+    let refresh_tests = fs::read_to_string(workspace_path("src/nfs41/pnfs_refresh_tests.rs"))
+        .expect("event-driven layout regression tests must be readable");
+    for test in [
+        "cached_large_write_has_no_periodic_layout_rpc",
+        "stale_write_refreshes_same_device_id_and_retries_new_ds_once",
+        "stale_after_short_write_does_not_refresh_or_replay",
+        "mixed_success_and_stale_does_not_refresh_or_replay",
+        "concurrent_layout_misses_share_one_layoutget_and_device_lookup",
+    ] {
+        assert!(
+            refresh_tests.contains(test),
+            "missing layout refresh regression {test}"
+        );
+    }
 
     for path in [
         common,

@@ -328,6 +328,15 @@ impl Drop for AcquiredSlot<'_> {
 
 impl Session {
     #[cfg(test)]
+    pub(crate) fn for_pnfs_test(marker: u8) -> Session {
+        let mut session = Self::for_test(marker);
+        session.pnfs_mds = true;
+        session.max_request_size = 1024 * 1024;
+        session.max_response_size = 1024 * 1024;
+        session
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_test(marker: u8) -> Session {
         Session {
             generation: 0,

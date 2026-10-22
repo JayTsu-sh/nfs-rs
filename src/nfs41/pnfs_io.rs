@@ -30,14 +30,20 @@ use crate::error::{
 use crate::mount::write_verifier_changed;
 use crate::nfs4::fastxdr::nfsstat4;
 
+#[cfg(test)]
+#[path = "pnfs_refresh_tests.rs"]
+mod refresh_tests;
+
 /// Whether pNFS WRITE transmitted a DS mutation.
 ///
-/// Only `NotAttempted` permits the caller to fall back to an MDS WRITE. Once a
-/// DS batch starts, every result remains on the `Attempted` path so an
-/// ambiguous mutation can never be silently overwritten through the MDS.
+/// Only `NotAttempted` permits immediate MDS fallback. `RefreshRequired`
+/// proves the complete batch made no mutation; mixed or uncertain results
+/// stay on `Attempted` and cannot be replayed by layout recovery.
 pub(crate) enum PnfsWriteOutcome {
     NotAttempted,
     Attempted(Result<crate::WriteOutcome>),
+    /// Every issued WRITE was rejected before mutation, or DS preflight failed.
+    RefreshRequired(Layout),
 }
 
 struct PlannedDsWrite {
@@ -305,6 +311,36 @@ fn ds_batch_diagnostic<T>(completions: &[DsWriteCompletion<T>]) -> String {
         .join("; ")
 }
 
+/// A successful RPC reply carrying NFS4ERR_STALE rejects the operation before
+/// WRITE can mutate data. MDS fallback is safe only when every issued stripe
+/// has that authoritative result; a success or transport error makes the
+/// aggregate outcome uncertain (RFC 8881 §15.2, §18.32).
+fn ds_batch_rejected_without_write<T>(completions: &[DsWriteCompletion<T>]) -> bool {
+    !completions.is_empty()
+        && completions.iter().all(|completion| {
+            matches!(
+                completion.result,
+                Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE))
+            )
+        })
+}
+
+fn ds_error_after_progress(error: NfsError, confirmed: u32) -> NfsError {
+    if confirmed > 0 && matches!(error, NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)) {
+        // A later rejected WRITE does not undo earlier short WRITE successes.
+        uncertain_pnfs_write(
+            RequestContext {
+                operation: "pnfs_write".into(),
+                protocol: NFSVersion::NFSv4p1,
+                request_id: None,
+            },
+            error,
+        )
+    } else {
+        error
+    }
+}
+
 fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
     NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
         OperationOutcome::Uncertain,
@@ -333,18 +369,6 @@ where
         },
     ))
     .await
-}
-
-#[cfg(test)]
-async fn invalidate_layout_after_ds_error(
-    layout_manager: &LayoutManager,
-    fh: &Bytes,
-    error: &NfsError,
-) {
-    if matches!(error, NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)) {
-        layout_manager.remove_layout(fh).await;
-        layout_manager.invalidate_dirty(fh).await;
-    }
 }
 
 /// Find the layout segment covering a given file offset.
@@ -384,16 +408,6 @@ impl Mount41 {
         iomode: IoMode,
         offset: u64,
     ) -> Option<Layout> {
-        self.fetch_layout(fh, iomode, offset, false).await
-    }
-
-    async fn fetch_layout(
-        &self,
-        fh: &Bytes,
-        iomode: IoMode,
-        offset: u64,
-        force_update: bool,
-    ) -> Option<Layout> {
         // RFC 5661 §18.35.3：server 未在 EXCHANGE_ID 中声明 USE_PNFS_MDS，
         // 整个 mount 禁用 pNFS，跳过 LAYOUTGET（省每文件一次注定失败的 RTT）
         if !self.session_holder.get().await.pnfs_mds() {
@@ -401,9 +415,18 @@ impl Mount41 {
         }
 
         // 1. Check cache
-        if !force_update
-            && let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await
-        {
+        if let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await {
+            return Some(layout);
+        }
+        let generation = self.layout_manager.generation();
+        let gate = self.layout_manager.layout_fetch_gate(fh).await;
+        let _fetch_guard = gate.lock().await;
+        // Recovery gives the new generation its own singleflight gate. An old
+        // waiter must not issue a new-session LAYOUTGET through the old gate.
+        if generation != self.layout_manager.generation() {
+            return None;
+        }
+        if let Some(layout) = self.layout_manager.get_layout_covering(fh, offset).await {
             return Some(layout);
         }
 
@@ -425,7 +448,7 @@ impl Mount41 {
             .unwrap_or(sid.raw);
         let result = self
             .compound("layoutget", |b| {
-                b.require_generation(sid.generation).putfh(fh).layoutget(
+                b.require_generation(generation).putfh(fh).layoutget(
                     false, // signal_layout_avail
                     1,     // LAYOUT4_NFSV4_1_FILES
                     iomode as u32,
@@ -511,50 +534,72 @@ impl Mount41 {
                 if !seen.insert(*device_id) {
                     continue;
                 }
-                if self.layout_manager.get_device(device_id).await.is_some() {
-                    continue;
-                }
-                // GETDEVICEINFO: COMPOUND(SEQUENCE, PUTROOTFH, GETDEVICEINFO)
-                match self
-                    .compound("getdeviceinfo", |b| {
-                        b.require_generation(layout.generation)
-                            .putrootfh()
-                            .getdeviceinfo(device_id, 1, 1024 * 1024)
-                    })
-                    .await
-                {
-                    Ok(resp) => {
-                        // GETDEVICEINFO is after SEQUENCE=0, PUTROOTFH=1 → index 2
-                        if let Ok(op) = resp.op_ok(2) {
-                            let mut data = op.data.clone();
-                            if let Ok(mut info) =
-                                super::layout::decode_getdeviceinfo_response(&mut data)
+                self.get_or_fetch_device(device_id, layout.generation).await;
+            }
+        }
+    }
+
+    async fn get_or_fetch_device(
+        &self,
+        device_id: &[u8; 16],
+        generation: u64,
+    ) -> Option<super::layout::DeviceInfo> {
+        if let Some(device) = self.layout_manager.get_device(device_id).await {
+            return Some(device);
+        }
+        let gate = self
+            .layout_manager
+            .device_fetch_gate(*device_id, generation)
+            .await;
+        let _fetch_guard = gate.lock().await;
+        if let Some(device) = self.layout_manager.get_device(device_id).await {
+            return Some(device);
+        }
+        // Retry once if CB_NOTIFY_DEVICEID races this lookup (RFC 8881 §18.40.4).
+        for _ in 0..2 {
+            let revision = self.layout_manager.device_revision();
+            // GETDEVICEINFO: COMPOUND(SEQUENCE, PUTROOTFH, GETDEVICEINFO)
+            match self
+                .compound("getdeviceinfo", |b| {
+                    b.require_generation(generation).putrootfh().getdeviceinfo(
+                        device_id,
+                        1,
+                        1024 * 1024,
+                    )
+                })
+                .await
+            {
+                Ok(resp) => {
+                    // GETDEVICEINFO is after SEQUENCE=0, PUTROOTFH=1 → index 2
+                    if let Ok(op) = resp.op_ok(2) {
+                        let mut data = op.data.clone();
+                        if let Ok(mut info) =
+                            super::layout::decode_getdeviceinfo_response(&mut data)
+                        {
+                            // multipath 地址按与 MDS 的网络接近度排序后再缓存，
+                            // 避免 DS I/O 选到客户端不可达网段的 LIF
+                            super::layout::sort_multipath_by_affinity(&mut info, &self.server_addr);
+                            if !self
+                                .layout_manager
+                                .store_device_if_current(*device_id, generation, revision, info)
                             {
-                                // multipath 地址按与 MDS 的网络接近度排序后再缓存，
-                                // 避免 DS I/O 选到客户端不可达网段的 LIF
-                                super::layout::sort_multipath_by_affinity(
-                                    &mut info,
-                                    &self.server_addr,
+                                debug!(
+                                    layout_generation = generation,
+                                    "discarding stale GETDEVICEINFO response"
                                 );
-                                if !self
-                                    .layout_manager
-                                    .store_device_at(*device_id, layout.generation, info)
-                                    .await
-                                {
-                                    debug!(
-                                        layout_generation = layout.generation,
-                                        "discarding stale GETDEVICEINFO response"
-                                    );
-                                }
+                            } else {
+                                return self.layout_manager.get_device(device_id).await;
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "GETDEVICEINFO failed");
-                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "GETDEVICEINFO failed");
+                    return None;
                 }
             }
         }
+        None
     }
 
     // ─── DS chunk I/O ───────────────────────────────────────────────────────
@@ -674,16 +719,43 @@ impl Mount41 {
 
     /// Attempt a pNFS parallel read.
     /// Returns `None` if layout is unavailable (caller should fall back to MDS).
-    /// Returns `Some(Ok(data))` on success, `Some(Err(e))` is never returned —
-    /// on DS error the layout is evicted and `None` is returned for MDS fallback.
+    /// A DS error triggers one layout/device refresh before MDS fallback.
+    /// Generation changes or a failed commit of retained writes are propagated.
     pub(crate) async fn pnfs_read(
         &self,
         fh: &Bytes,
         offset: u64,
         count: u32,
     ) -> Option<Result<Bytes>> {
-        let layout = self.get_or_fetch_layout(fh, IoMode::Read, offset).await?;
-        let seg = find_covering_segment(&layout, offset)?;
+        for attempt in 0..2 {
+            let io_guard = self.layout_manager.read_file_io(fh).await;
+            let layout = self.get_or_fetch_layout(fh, IoMode::Read, offset).await?;
+            let result = self.pnfs_read_layout(fh, offset, count, &layout).await;
+            if !matches!(result, Some(Err(_))) {
+                return result;
+            }
+            if layout.generation != self.layout_manager.generation() {
+                return result;
+            }
+            drop(io_guard);
+            if let Err(error) = self.refresh_rejected_layout(fh, &layout).await {
+                return Some(Err(error));
+            }
+            if attempt == 1 {
+                return None;
+            }
+        }
+        None
+    }
+
+    async fn pnfs_read_layout(
+        &self,
+        fh: &Bytes,
+        offset: u64,
+        count: u32,
+        layout: &Layout,
+    ) -> Option<Result<Bytes>> {
+        let seg = find_covering_segment(layout, offset)?;
         let (device_id, stripe_unit, is_dense, first_stripe_index, pattern_offset, fh_list) =
             match &seg.content {
                 LayoutContent::FilesLayout {
@@ -708,7 +780,9 @@ impl Mount41 {
         if stripe_unit == 0 || fh_list.is_empty() {
             return None;
         }
-        let device = self.layout_manager.get_device(&device_id).await?;
+        let device = self
+            .get_or_fetch_device(&device_id, layout.generation)
+            .await?;
         if device.ds_addrs.len() < fh_list.len() {
             return None;
         }
@@ -731,6 +805,8 @@ impl Mount41 {
             .raw;
 
         let num_ds = fh_list.len() as u32;
+        let covered = seg.offset.saturating_add(seg.length).saturating_sub(offset);
+        let count = count.min(u32::try_from(covered).unwrap_or(u32::MAX));
         let chunks = super::layout::split_into_stripes(
             offset,
             count,
@@ -829,10 +905,8 @@ impl Mount41 {
                 }
             }
             Err(e) => {
-                // On DS error, evict layout and return None to fall back to MDS
-                self.layout_manager.remove_layout(fh).await;
-                debug!(error = %e, "pNFS read failed, falling back to MDS");
-                None
+                debug!(error = %e, "pNFS read failed; refreshing layout before retry");
+                Some(Err(e))
             }
         }
     }
@@ -841,8 +915,8 @@ impl Mount41 {
 
     /// Attempt a pNFS parallel write.
     /// Returns `NotAttempted` only while MDS fallback is provably safe. After
-    /// any DS batch starts, failures are returned as an uncertain attempted
-    /// mutation and must be verified by the migration consumer.
+    /// a DS batch starts, only an entirely rejected, unwritten batch may
+    /// request a new layout. Other failures require consumer verification.
     pub(crate) async fn pnfs_write(
         &self,
         fh: &Bytes,
@@ -890,7 +964,10 @@ impl Mount41 {
         if stripe_unit == 0 || fh_list.is_empty() {
             return PnfsWriteOutcome::NotAttempted;
         }
-        let Some(device) = self.layout_manager.get_device(&device_id).await else {
+        let Some(device) = self
+            .get_or_fetch_device(&device_id, layout.generation)
+            .await
+        else {
             return PnfsWriteOutcome::NotAttempted;
         };
         if device.ds_addrs.len() < fh_list.len() {
@@ -986,7 +1063,7 @@ impl Mount41 {
             .await
         {
             debug!(error = %error, "pNFS DS preflight failed before send; using MDS");
-            return PnfsWriteOutcome::NotAttempted;
+            return PnfsWriteOutcome::RefreshRequired(layout);
         }
 
         // Phase 2: after this boundary, any error is potentially post-send and
@@ -1052,14 +1129,13 @@ impl Mount41 {
                 pnfs: Some(pending),
             }))
         } else {
-            if completions.iter().any(|completion| {
-                matches!(
-                    completion.result,
-                    Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE))
-                )
-            }) {
-                self.layout_manager.remove_layout(fh).await;
-                self.layout_manager.invalidate_dirty(fh).await;
+            let rejected_without_write = ds_batch_rejected_without_write(&completions);
+            if rejected_without_write {
+                debug!(
+                    diagnostic = ds_batch_diagnostic(&completions),
+                    "stale pNFS layout rejected every DS write; refreshing layout"
+                );
+                return PnfsWriteOutcome::RefreshRequired(layout);
             }
             let known: Vec<_> = completions
                 .iter()
@@ -1125,7 +1201,10 @@ impl Mount41 {
                 {
                     continue;
                 }
-                result => return result,
+                result => {
+                    return result
+                        .map_err(|error| ds_error_after_progress(error, u32::from(attempt > 0)));
+                }
             }
         }
         unreachable!("last stripe write attempt always returns")
@@ -1150,9 +1229,15 @@ impl Mount41 {
                     write.ds_offset + done as u64,
                     write.data.slice(done..),
                 )
-                .await?;
-            resp.op_ok(1)?;
-            let mut d = resp.op_ok(2)?.data.clone();
+                .await
+                .map_err(|error| ds_error_after_progress(error, done as u32))?;
+            resp.op_ok(1)
+                .map_err(|error| ds_error_after_progress(error, done as u32))?;
+            let mut d = resp
+                .op_ok(2)
+                .map_err(|error| ds_error_after_progress(error, done as u32))?
+                .data
+                .clone();
             if d.remaining() < 16 {
                 return Err(NfsError::Xdr("DS WRITE result too short".into()));
             }
@@ -1422,24 +1507,31 @@ impl Mount41 {
         Ok(())
     }
 
-    pub(crate) async fn refresh_layout_for_write(&self, fh: &Bytes, offset: u64) -> Result<()> {
-        if self.layout_manager.get_layout(fh).await.is_none()
-            || !self.layout_manager.layout_refresh_due(fh, offset).await
-        {
-            return Ok(());
-        }
-
+    /// A cold-path transition only. Preserve and commit receipts using their
+    /// original DS mapping before discarding an obsolete layout.
+    pub(crate) async fn refresh_rejected_layout(
+        &self,
+        fh: &Bytes,
+        rejected: &Layout,
+    ) -> Result<()> {
         let _io_guard = self.layout_manager.write_file_io(fh).await;
-        if self.layout_manager.get_layout(fh).await.is_some()
-            && self.layout_manager.layout_refresh_due(fh, offset).await
+        if rejected.generation != self.layout_manager.generation() {
+            return Err(NfsError::Rpc(
+                "pNFS layout refresh crossed a session generation".into(),
+            ));
+        }
+        if let Some(current) = self.layout_manager.get_layout(fh).await
+            && current.stateid == rejected.stateid
         {
             self.flush_layoutcommit(fh).await?;
-            if self
-                .fetch_layout(fh, IoMode::ReadWrite, offset, true)
-                .await
-                .is_some()
-            {
-                self.layout_manager.record_layout_refresh(fh, offset).await;
+            // Keep the layout stateid: RFC 8881 §12.5.2 requires it on later
+            // LAYOUTGETs until the server disposes of the layout state.
+            self.layout_manager.invalidate_layout_segments(fh).await;
+            for segment in &rejected.segments {
+                if let LayoutContent::FilesLayout { device_id, .. } = &segment.content {
+                    self.layout_manager
+                        .invalidate_device(device_id, rejected.generation, false);
+                }
             }
         }
         Ok(())
@@ -1880,50 +1972,51 @@ mod tests {
         assert_eq!(outcome.context().operation, "pnfs_write");
     }
 
-    #[tokio::test]
-    async fn stale_ds_write_evicts_layout_and_invalidates_old_dirty_range() {
-        let manager = LayoutManager::new(true);
-        let fh = Bytes::from_static(b"multipart-file");
-        let layout = Layout {
-            generation: manager.generation(),
-            stateid: [7; 16],
-            return_on_close: false,
-            segments: vec![],
+    #[test]
+    fn stale_only_ds_batch_is_safe_for_mds_fallback() {
+        let stale = |stripe_index, ds_addr: &str| DsWriteCompletion::<()> {
+            stripe_index,
+            ds_addr: ds_addr.parse().unwrap(),
+            result: Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)),
         };
-        manager.store_layout(&fh, layout).await;
-        manager.mark_dirty(&fh, 0, 4096).await;
 
-        invalidate_layout_after_ds_error(
-            &manager,
-            &fh,
-            &NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE),
-        )
-        .await;
-
-        assert!(manager.get_layout(&fh).await.is_none());
-        assert_eq!(manager.take_dirty(&fh).await, None);
+        assert!(ds_batch_rejected_without_write(&[
+            stale(0, "192.0.2.10:2049"),
+            stale(1, "192.0.2.11:2049"),
+        ]));
     }
 
-    #[tokio::test]
-    async fn transport_ds_write_error_retains_layout_for_verification() {
-        let manager = LayoutManager::new(true);
-        let fh = Bytes::from_static(b"ordinary-file");
-        let layout = Layout {
-            generation: manager.generation(),
-            stateid: [8; 16],
-            return_on_close: false,
-            segments: vec![],
-        };
-        manager.store_layout(&fh, layout).await;
+    #[test]
+    fn mixed_ds_batch_is_not_safe_for_mds_fallback() {
+        let address = "192.0.2.10:2049".parse().unwrap();
+        let with_success = [
+            DsWriteCompletion {
+                stripe_index: 0,
+                ds_addr: address,
+                result: Ok(()),
+            },
+            DsWriteCompletion {
+                stripe_index: 1,
+                ds_addr: address,
+                result: Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)),
+            },
+        ];
+        let with_transport_error = [
+            DsWriteCompletion::<()> {
+                stripe_index: 0,
+                ds_addr: address,
+                result: Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)),
+            },
+            DsWriteCompletion::<()> {
+                stripe_index: 1,
+                ds_addr: address,
+                result: Err(NfsError::Rpc("connection reset after send".into())),
+            },
+        ];
 
-        invalidate_layout_after_ds_error(
-            &manager,
-            &fh,
-            &NfsError::Rpc("connection reset after send".to_string()),
-        )
-        .await;
-
-        assert!(manager.get_layout(&fh).await.is_some());
+        assert!(!ds_batch_rejected_without_write(&with_success));
+        assert!(!ds_batch_rejected_without_write(&with_transport_error));
+        assert!(!ds_batch_rejected_without_write::<()>(&[]));
     }
 
     #[tokio::test]
