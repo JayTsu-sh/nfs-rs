@@ -720,6 +720,17 @@ fn netapp_pnfs_lab_contract_is_wired() {
     for workflow in [&workflow, &release] {
         assert!(workflow.contains("LAB_PNFS_REQUIRE_INDEPENDENT_DS: \"0\""));
         assert!(workflow.contains("netapp-v41-integrity.txt"));
+        let integrity_step = workflow
+            .split("- name: Legacy NetApp NFSv4.1 integrity and pNFS capability evidence")
+            .nth(1)
+            .expect("integrity step")
+            .split("- name:")
+            .next()
+            .expect("integrity step body");
+        assert!(
+            integrity_step.contains("shell: bash"),
+            "explicit bash enables Actions pipefail so tee cannot hide I/O failure"
+        );
     }
     assert_eq!(
         workflow

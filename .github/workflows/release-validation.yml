@@ -133,6 +133,7 @@ jobs:
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: Legacy NetApp NFSv4.1 integrity and pNFS capability evidence
+        shell: bash
         env:
           # This physical cluster does not support pNFS. Ordinary NFS is required.
           LAB_PNFS_REQUIRE_INDEPENDENT_DS: "0"
