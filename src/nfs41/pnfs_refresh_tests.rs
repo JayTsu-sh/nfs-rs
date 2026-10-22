@@ -85,6 +85,163 @@ async fn enable_pnfs(mount: &mut Mount41) {
         .unwrap();
 }
 
+// RFC 8881 §§13.3, 13.4: stripe count, physical DS count and FH count
+// are independent. Exercise the production READ/WRITE wire path, not just
+// the stripe arithmetic, including repeated physical DS indices.
+async fn single_file_striping_case(is_dense: bool, handles: Vec<Bytes>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut data_servers = Vec::new();
+    let mut servers = Vec::new();
+    for index in 0..2u8 {
+        let observed = calls.clone();
+        let (ds, server) = serve(move |tag, mut args| {
+            assert_eq!(args.get_u32(), 22);
+            let fh = take_opaque(&mut args, "DS filehandle").unwrap();
+            let opcode = args.get_u32();
+            args.advance(16); // OPEN stateid
+            let offset = args.get_u64();
+            let mut reply = Vec::new();
+            let count = match tag {
+                "ds-write" => {
+                    assert_eq!(opcode, 38);
+                    assert_eq!(args.get_u32(), 0);
+                    let payload = take_opaque(&mut args, "WRITE payload").unwrap();
+                    assert!(payload.iter().all(|byte| *byte == 0x5a));
+                    xdr_u32(&mut reply, payload.len() as u32);
+                    xdr_u32(&mut reply, 2); // FILE_SYNC4
+                    reply.extend([3; 8]);
+                    payload.len() as u32
+                }
+                "ds-read" => {
+                    assert_eq!(opcode, 25);
+                    let count = args.get_u32();
+                    xdr_u32(&mut reply, 0);
+                    xdr_opaque(&mut reply, &vec![index; count as usize]);
+                    count
+                }
+                other => panic!("unexpected DS RPC {other}"),
+            };
+            observed
+                .lock()
+                .unwrap()
+                .push((opcode, index, fh, offset, count));
+            vec![ok(22, vec![]), ok(opcode, reply)]
+        })
+        .await;
+        data_servers.push(ds);
+        servers.push(server);
+    }
+    let (mut mount, server) = serve(|tag, _| panic!("unexpected MDS RPC {tag}")).await;
+    servers.push(server);
+    enable_pnfs(&mut mount).await;
+    mount.rsize = 4096;
+    mount.wsize = 4096;
+    let fh = Bytes::from_static(b"file");
+    let mut granted = layout(0, u64::MAX, b"shared");
+    if let LayoutContent::FilesLayout {
+        is_dense: dense,
+        fh_list,
+        ..
+    } = &mut granted.segments[0].content
+    {
+        *dense = is_dense;
+        *fh_list = handles.clone();
+    }
+    mount.layout_manager.store_layout(&fh, granted).await;
+    mount
+        .layout_manager
+        .store_device(
+            DEVICE,
+            DeviceInfo {
+                stripe_indices: vec![1, 0, 1, 0],
+                ds_addrs: data_servers.iter().map(|ds| vec![ds.server_addr]).collect(),
+            },
+        )
+        .await;
+    for ds in &data_servers {
+        mount
+            .layout_manager
+            .store_test_data_server(ds.server_addr, ds.rpc.clone())
+            .await;
+    }
+    // One logical request spans multiple DSs, so both routing and parallel
+    // batch assembly are tested for the same OPEN filehandle.
+    let outcome = mount
+        .pnfs_write(&fh, 0, Bytes::from(vec![0x5a; 16384]))
+        .await;
+    assert!(
+        matches!(outcome, PnfsWriteOutcome::Attempted(Ok(_))),
+        "valid multi-DS layout must not fall back to MDS"
+    );
+    let read = mount.pnfs_read(&fh, 0, 16384).await.unwrap().unwrap();
+    assert_eq!(read.len(), 16384);
+    let stripes: Vec<_> = read
+        .chunks(4096)
+        .map(|chunk| {
+            assert!(chunk.iter().all(|byte| *byte == chunk[0]));
+            chunk[0]
+        })
+        .collect();
+    assert_eq!(
+        stripes,
+        [1, 0, 1, 0],
+        "single file must read both DSs in stripe order"
+    );
+    let mut expected_calls = Vec::new();
+    for opcode in [25, 38] {
+        for (stripe, index) in [1u8, 0, 1, 0].into_iter().enumerate() {
+            let ds_fh = if is_dense {
+                handles[stripe].clone()
+            } else {
+                match handles.len() {
+                    0 => fh.clone(),
+                    1 => handles[0].clone(),
+                    _ => handles[index as usize].clone(),
+                }
+            };
+            let offset = if is_dense { 0 } else { stripe as u64 * 4096 };
+            expected_calls.push((opcode, index, ds_fh, offset, 4096));
+        }
+    }
+    let mut actual = calls.lock().unwrap().clone();
+    actual.sort();
+    expected_calls.sort();
+    assert_eq!(actual, expected_calls);
+    for server in servers {
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn single_file_sparse_shared_fh_uses_multiple_ds() {
+    single_file_striping_case(false, vec![Bytes::from_static(b"shared")]).await;
+}
+
+#[tokio::test]
+async fn single_file_sparse_open_fh_uses_multiple_ds() {
+    single_file_striping_case(false, vec![]).await;
+}
+
+#[tokio::test]
+async fn single_file_sparse_fhs_are_indexed_by_physical_ds() {
+    single_file_striping_case(
+        false,
+        vec![Bytes::from_static(b"ds0"), Bytes::from_static(b"ds1")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn single_file_dense_fhs_are_indexed_by_stripe() {
+    single_file_striping_case(
+        true,
+        (0..4)
+            .map(|index| Bytes::from(format!("stripe{index}")))
+            .collect(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn cached_large_write_has_no_periodic_layout_rpc() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -179,6 +336,72 @@ async fn remapping_case(
     reject_new: bool,
 ) -> RemappingCase {
     remapping_case_with_layoutcommit(old_handler, reject_new, 5).await
+}
+
+#[tokio::test]
+async fn invalid_file_layout_mapping_falls_back_before_any_ds_io() {
+    let case = remapping_case(|tag, _| panic!("invalid layout sent {tag}"), false).await;
+    let fh = Bytes::from_static(b"file");
+    // Missing stripe table, out-of-bounds DS, missing address, invalid FH
+    // cardinalities and invalid first index must all be rejected before I/O.
+    for (indices, addresses, dense, handles, first) in [
+        (vec![], vec![vec![case.old]], false, 1, 0),
+        (
+            vec![0, 2],
+            vec![vec![case.old], vec![case.new]],
+            false,
+            1,
+            0,
+        ),
+        (vec![0, 1], vec![vec![case.old], vec![]], false, 1, 0),
+        (
+            vec![0, 1],
+            vec![vec![case.old], vec![case.new]],
+            false,
+            3,
+            0,
+        ),
+        (vec![0, 1], vec![vec![case.old], vec![case.new]], true, 1, 0),
+        (
+            vec![0, 1],
+            vec![vec![case.old], vec![case.new]],
+            false,
+            1,
+            2,
+        ),
+    ] {
+        let mut granted = layout(0, u64::MAX, b"shared");
+        if let LayoutContent::FilesLayout {
+            is_dense,
+            fh_list,
+            first_stripe_index,
+            ..
+        } = &mut granted.segments[0].content
+        {
+            *is_dense = dense;
+            *fh_list = vec![Bytes::from_static(b"shared"); handles];
+            *first_stripe_index = first;
+        }
+        case.mount.layout_manager.store_layout(&fh, granted).await;
+        case.mount
+            .layout_manager
+            .store_device(
+                DEVICE,
+                DeviceInfo {
+                    stripe_indices: indices,
+                    ds_addrs: addresses,
+                },
+            )
+            .await;
+        assert!(matches!(
+            case.mount
+                .pnfs_write(&fh, 0, Bytes::from(vec![1; 8192]))
+                .await,
+            PnfsWriteOutcome::NotAttempted
+        ));
+        assert!(case.mount.pnfs_read(&fh, 0, 8192).await.is_none());
+    }
+    assert!(case.calls.lock().unwrap().is_empty());
 }
 
 async fn remapping_case_with_layoutcommit(

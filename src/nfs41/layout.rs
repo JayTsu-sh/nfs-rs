@@ -970,16 +970,16 @@ fn decode_files_layout(data: &mut Bytes) -> Result<LayoutContent> {
     })
 }
 
-/// Calculate which DS index handles a given file offset.
+/// Calculate the stripe-table index (not the physical DS index).
 pub(crate) fn stripe_ds_index(
     offset: u64,
     stripe_unit: u32,
     first_stripe_index: u32,
-    num_ds: u32,
+    stripe_count: u32,
 ) -> u32 {
     let su = stripe_unit as u64;
     let stripe_num = offset / su;
-    ((stripe_num + first_stripe_index as u64) % num_ds as u64) as u32
+    ((stripe_num + first_stripe_index as u64) % stripe_count as u64) as u32
 }
 
 /// Calculate the offset on the data server for a given file offset.
@@ -987,15 +987,16 @@ pub(crate) fn ds_offset(
     file_offset: u64,
     stripe_unit: u32,
     _first_stripe_index: u32,
-    num_ds: u32,
+    stripe_count: u32,
     is_dense: bool,
 ) -> u64 {
     let su = stripe_unit as u64;
     let stripe_num = file_offset / su;
     let offset_in_stripe = file_offset % su;
     if is_dense {
-        // Dense: DS holds every num_ds-th stripe, compacted without gaps
-        let ds_stripe_num = stripe_num / num_ds as u64;
+        // Dense: each stripe-table position has its own FH, compacted
+        // without gaps (RFC 8881 §13.4.4).
+        let ds_stripe_num = stripe_num / stripe_count as u64;
         ds_stripe_num * su + offset_in_stripe
     } else {
         // Sparse: DS preserves original file offsets (with holes for other DSs).
@@ -1012,25 +1013,34 @@ pub(crate) fn split_into_stripes(
     stripe_unit: u32,
     is_dense: bool,
     first_stripe_index: u32,
-    num_ds: u32,
+    stripe_count: u32,
     pattern_offset: u64,
 ) -> Vec<StripeChunk> {
     let mut chunks = Vec::new();
-    if stripe_unit == 0 || num_ds == 0 {
+    if stripe_unit == 0 || stripe_count == 0 || offset < pattern_offset {
         return chunks;
     }
     let su = stripe_unit as u64;
-    let end = offset + count as u64;
+    let end = offset.saturating_add(count as u64);
     let mut pos = offset;
     while pos < end {
-        // How many bytes until end of current stripe?
-        let stripe_end = ((pos / su) + 1) * su;
-        let chunk_end = end.min(stripe_end);
+        // RFC 8881 §§13.4.1, 13.4.4: stripe boundaries use relative
+        // offsets; sparse data files nevertheless retain logical offsets.
+        let adjusted = pos - pattern_offset;
+        let chunk_end = end.min(pos.saturating_add(su - adjusted % su));
         let chunk_len = (chunk_end - pos) as u32;
-        // Adjust for pattern_offset: stripe numbering starts at pattern_offset
-        let adjusted = pos.saturating_sub(pattern_offset);
-        let ds_idx = stripe_ds_index(adjusted, stripe_unit, first_stripe_index, num_ds);
-        let ds_off = ds_offset(adjusted, stripe_unit, first_stripe_index, num_ds, is_dense);
+        let ds_idx = stripe_ds_index(adjusted, stripe_unit, first_stripe_index, stripe_count);
+        let ds_off = if is_dense {
+            ds_offset(
+                adjusted,
+                stripe_unit,
+                first_stripe_index,
+                stripe_count,
+                true,
+            )
+        } else {
+            pos
+        };
         chunks.push(StripeChunk {
             ds_index: ds_idx,
             file_offset: pos,
@@ -2167,11 +2177,38 @@ mod tests {
     #[test]
     fn split_into_stripes_pattern_offset_nonzero() {
         // pattern_offset=4096: stripe pattern starts at byte 4096
-        // Range [4096, 8192): adjusted offset = 0, so DS0, ds_offset=0
+        // RFC 8881 §13.4.4: sparse DS offsets remain logical file offsets.
         let chunks = split_into_stripes(4096, 4096, 4096, false, 0, 2, 4096);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].ds_index, 0);
-        assert_eq!(chunks[0].ds_offset, 0);
+        assert_eq!(chunks[0].ds_offset, 4096);
+    }
+
+    #[test]
+    fn split_into_stripes_unaligned_pattern_offset() {
+        // RFC 8881 §§13.4.1, 13.4.4: boundaries and dense offsets use
+        // relative offsets, even when the pattern does not start at a multiple
+        // of stripe_unit. A nonzero first index rotates targets, not offsets.
+        for dense in [false, true] {
+            let chunks = split_into_stripes(103, 8192, 4096, dense, 1, 2, 100);
+            let actual: Vec<_> = chunks
+                .iter()
+                .map(|c| (c.ds_index, c.file_offset, c.ds_offset, c.length))
+                .collect();
+            let offsets = if dense {
+                [3, 0, 4096]
+            } else {
+                [103, 4196, 8292]
+            };
+            assert_eq!(
+                actual,
+                vec![
+                    (1, 103, offsets[0], 4093),
+                    (0, 4196, offsets[1], 4096),
+                    (1, 8292, offsets[2], 3),
+                ]
+            );
+        }
     }
 
     #[tokio::test]
