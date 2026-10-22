@@ -19,7 +19,7 @@ use super::Nfs4ErrorCode;
 use super::compound::CompoundResponse;
 #[cfg(test)]
 use super::layout::LayoutManager;
-use super::layout::{IoMode, Layout, LayoutContent, LayoutSegment};
+use super::layout::{DeviceInfo, IoMode, Layout, LayoutContent, LayoutSegment};
 use super::mount::{Mount41, effective_rsize, effective_wsize};
 use super::state::{AccessMode, StateId};
 use crate::NFSVersion;
@@ -33,6 +33,58 @@ use crate::nfs4::fastxdr::nfsstat4;
 #[cfg(test)]
 #[path = "pnfs_refresh_tests.rs"]
 mod refresh_tests;
+
+/// RFC 8881 §§13.3–13.4: the stripe table, not the FH list or physical
+/// server list, defines the stripe count. Validate before any DS mutation.
+fn file_layout_stripe_count(
+    device: &DeviceInfo,
+    fh_count: usize,
+    is_dense: bool,
+    first_stripe_index: u32,
+) -> Option<u32> {
+    let count = u32::try_from(device.stripe_indices.len()).ok()?;
+    let valid_handles = if is_dense {
+        fh_count == device.stripe_indices.len()
+    } else {
+        fh_count <= 1 || fh_count == device.ds_addrs.len()
+    };
+    if first_stripe_index >= count
+        || !valid_handles
+        || device.stripe_indices.iter().any(|index| {
+            device
+                .ds_addrs
+                .get(*index as usize)
+                .is_none_or(|addresses| addresses.is_empty())
+        })
+    {
+        return None;
+    }
+    Some(count)
+}
+
+fn file_layout_target(
+    device: &DeviceInfo,
+    stripe_index: u32,
+    is_dense: bool,
+    handles: &[Bytes],
+    open_fh: &Bytes,
+) -> Result<(Bytes, SocketAddr)> {
+    let target = || {
+        let physical = *device.stripe_indices.get(stripe_index as usize)? as usize;
+        let addr = *device.ds_addrs.get(physical)?.first()?;
+        let fh = if is_dense {
+            handles.get(stripe_index as usize)?
+        } else {
+            match handles.len() {
+                0 => open_fh,
+                1 => &handles[0],
+                _ => handles.get(physical)?,
+            }
+        };
+        Some((fh.clone(), addr))
+    };
+    target().ok_or_else(|| NfsError::Rpc(format!("invalid file-layout stripe {stripe_index}")))
+}
 
 /// Whether pNFS WRITE transmitted a DS mutation.
 ///
@@ -777,15 +829,14 @@ impl Mount41 {
                 _ => return None,
             };
 
-        if stripe_unit == 0 || fh_list.is_empty() {
+        if stripe_unit == 0 || offset < pattern_offset {
             return None;
         }
         let device = self
             .get_or_fetch_device(&device_id, layout.generation)
             .await?;
-        if device.ds_addrs.len() < fh_list.len() {
-            return None;
-        }
+        let stripe_count =
+            file_layout_stripe_count(&device, fh_list.len(), is_dense, first_stripe_index)?;
         // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
         if self.device_degenerate(&device) {
             return None;
@@ -804,7 +855,6 @@ impl Mount41 {
             .unwrap_or_else(StateId::anonymous)
             .raw;
 
-        let num_ds = fh_list.len() as u32;
         let covered = seg.offset.saturating_add(seg.length).saturating_sub(offset);
         let count = count.min(u32::try_from(covered).unwrap_or(u32::MAX));
         let chunks = super::layout::split_into_stripes(
@@ -813,7 +863,7 @@ impl Mount41 {
             stripe_unit,
             is_dense,
             first_stripe_index,
-            num_ds,
+            stripe_count,
             pattern_offset,
         );
 
@@ -821,30 +871,11 @@ impl Mount41 {
         let futures: Vec<_> = chunks
             .iter()
             .map(|chunk| {
-                // fh_list is indexed by stripe position (ds_index)
-                // ds_addrs is indexed by physical DS (needs stripe_indices indirection)
-                let ds_fh_res = fh_list
-                    .get(chunk.ds_index as usize)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index))
-                    });
-                let ds_phys_idx = device
-                    .stripe_indices
-                    .get(chunk.ds_index as usize)
-                    .copied()
-                    .unwrap_or(chunk.ds_index) as usize;
-                let ds_addr_res = device
-                    .ds_addrs
-                    .get(ds_phys_idx)
-                    .and_then(|a| a.first())
-                    .copied()
-                    .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
+                let target = file_layout_target(&device, chunk.ds_index, is_dense, fh_list, fh);
                 let chunk_len = chunk.length;
                 let chunk_ds_offset = chunk.ds_offset;
                 async move {
-                    let ds_fh = ds_fh_res?;
-                    let ds_addr = ds_addr_res?;
+                    let (ds_fh, ds_addr) = target?;
                     let mut combined = BytesMut::with_capacity(chunk_len as usize);
                     while combined.len() < chunk_len as usize {
                         let remaining = chunk_len as usize - combined.len();
@@ -961,7 +992,7 @@ impl Mount41 {
             _ => return PnfsWriteOutcome::NotAttempted,
         };
 
-        if stripe_unit == 0 || fh_list.is_empty() {
+        if stripe_unit == 0 || offset < pattern_offset {
             return PnfsWriteOutcome::NotAttempted;
         }
         let Some(device) = self
@@ -970,9 +1001,11 @@ impl Mount41 {
         else {
             return PnfsWriteOutcome::NotAttempted;
         };
-        if device.ds_addrs.len() < fh_list.len() {
+        let Some(stripe_count) =
+            file_layout_stripe_count(&device, fh_list.len(), is_dense, first_stripe_index)
+        else {
             return PnfsWriteOutcome::NotAttempted;
-        }
+        };
         // 退化设备（DS == MDS）：DS 路径无收益，回退 MDS I/O
         if self.device_degenerate(&device) {
             return PnfsWriteOutcome::NotAttempted;
@@ -997,7 +1030,6 @@ impl Mount41 {
                 .len()
                 .min(usize::try_from(covered).unwrap_or(usize::MAX)),
         );
-        let num_ds = fh_list.len() as u32;
         let data_len = data.len();
         let chunks = super::layout::split_into_stripes(
             offset,
@@ -1005,7 +1037,7 @@ impl Mount41 {
             stripe_unit,
             is_dense,
             first_stripe_index,
-            num_ds,
+            stripe_count,
             pattern_offset,
         );
 
@@ -1015,33 +1047,16 @@ impl Mount41 {
             .iter()
             .enumerate()
             .map(|(stripe_index, chunk)| {
-                // fh_list is indexed by stripe position (ds_index)
-                // ds_addrs is indexed by physical DS (needs stripe_indices indirection)
-                let ds_fh_res = fh_list
-                    .get(chunk.ds_index as usize)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NfsError::Rpc(format!("fh_list index {} out of range", chunk.ds_index))
-                    });
-                let ds_phys_idx = device
-                    .stripe_indices
-                    .get(chunk.ds_index as usize)
-                    .copied()
-                    .unwrap_or(chunk.ds_index) as usize;
-                let ds_addr_res = device
-                    .ds_addrs
-                    .get(ds_phys_idx)
-                    .and_then(|a| a.first())
-                    .copied()
-                    .ok_or_else(|| NfsError::Rpc(format!("DS index {} out of range", ds_phys_idx)));
+                let (ds_fh, ds_addr) =
+                    file_layout_target(&device, chunk.ds_index, is_dense, fh_list, fh)?;
                 // Zero-copy slice of the write data for this stripe chunk
                 let chunk_start = (chunk.file_offset - offset) as usize;
                 let chunk_data = data.slice(chunk_start..chunk_start + chunk.length as usize);
                 Ok::<PlannedDsWrite, NfsError>(PlannedDsWrite {
                     file_offset: chunk.file_offset,
                     stripe_index,
-                    ds_fh: ds_fh_res?,
-                    ds_addr: ds_addr_res?,
+                    ds_fh,
+                    ds_addr,
                     ds_offset: chunk.ds_offset,
                     data: chunk_data,
                 })

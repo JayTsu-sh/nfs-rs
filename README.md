@@ -125,6 +125,12 @@ client refreshes the layout/device mapping and retries once before safe MDS
 fallback. Partial writes and transport-uncertain outcomes are never replayed
 through this recovery path.
 
+Single-file pNFS striping follows the server's stripe table, independently of
+the number of filehandles or physical DSs. Sparse layouts support OPEN, shared,
+and per-DS filehandles; dense layouts use per-stripe filehandles. Requests that
+cross stripe boundaries can issue data RPCs to multiple DSs concurrently;
+requests within one stripe remain on its assigned DS.
+
 Each Rust `BufferedFile` owns one OPEN reference; separately constructed wrappers
 need separate opens even when their file handles are equal. Successful `close`
 is idempotent and subsequent reads, writes and flushes return `ClosedResource`.

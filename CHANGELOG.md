@@ -11,6 +11,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- A single pNFS file now uses the full server-provided stripe table even when
+  all data servers share one filehandle. Sparse layouts use the OPEN, shared,
+  or per-physical-DS filehandle as specified by RFC 8881; dense layouts use
+  per-stripe filehandles, including repeated DS entries. Invalid mappings are
+  rejected before data I/O. Nonzero pattern offsets preserve sparse logical
+  offsets and split requests at the correct relative stripe boundaries.
+
 - pNFS layout/device refresh is now driven by uncovered file ranges, device
   notifications, and definite DS rejection rather than synchronous 1 GiB
   write barriers. Concurrent cache misses share control RPCs. A batch wholly
