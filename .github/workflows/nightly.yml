@@ -93,15 +93,35 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
       - name: NetApp NFSv4.1 negotiated channel limits E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-channel-limits-e2e.sh "$RUN_ID"
-      - name: NetApp NFSv4.1 pNFS WRITE E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
+      - name: Legacy NetApp NFSv4.1 integrity and pNFS capability evidence
+        id: pnfs
+        shell: bash
+        env:
+          # This physical cluster does not support pNFS. Ordinary NFS is required.
+          LAB_PNFS_REQUIRE_INDEPENDENT_DS: "0"
+        run: |
+          flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID" \
+            2>&1 | tee "$RUNNER_TEMP/netapp-v41-integrity.txt"
+      - name: Upload NetApp NFSv4.1 integrity and capability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netapp-v41-integrity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/netapp-v41-integrity.txt
+      - name: Report unavailable physical pNFS fault coverage
+        if: steps.pnfs.outputs.independent_ds_observed == 'false'
+        run: echo 'pNFS DS preflight/reset, LAYOUTCOMMIT failure, and layout recall physical tests are SKIPPED on the legacy cluster (pNFS unsupported), not passed.' >> "$GITHUB_STEP_SUMMARY"
       - name: NetApp pNFS pre-WRITE DS failure fallback E2E
+        if: steps.pnfs.outputs.independent_ds_observed == 'true'
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-preflight-fallback-e2e.sh "$RUN_ID"
       - name: NetApp pNFS DS reset uncertain-outcome E2E
+        if: steps.pnfs.outputs.independent_ds_observed == 'true'
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-ds-reset-e2e.sh "$RUN_ID"
       - name: NetApp pNFS LAYOUTCOMMIT failure recovery E2E
+        if: steps.pnfs.outputs.independent_ds_observed == 'true'
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-layoutcommit-fault-e2e.sh "$RUN_ID"
       - name: NetApp pNFS layout recall during WRITE/CLOSE E2E
+        if: steps.pnfs.outputs.independent_ds_observed == 'true'
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-layout-recall-e2e.sh "$RUN_ID"
       - name: NFSv4.1 session recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"

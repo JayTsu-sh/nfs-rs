@@ -9,6 +9,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [0.8.7] - 2026-10-22
 
+### Changed
+
+- Legacy NetApp lab acceptance explicitly requires ordinary NFSv4.1 integrity,
+  not pNFS on a cluster that does not support it. Full read-back and sparse-file
+  checks remain mandatory; DS evidence and unavailable physical pNFS fault
+  scenarios are reported separately. The standalone pNFS runner remains strict
+  by default, and per-environment performance baselines are unchanged.
+
 ### Fixed
 
 - A single pNFS file now uses the full server-provided stripe table even when

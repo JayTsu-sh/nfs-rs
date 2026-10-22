@@ -139,7 +139,7 @@
     {
       "id": "T11",
       "ci": "pnfs two-phase DS preflight before zero-copy WRITE batch",
-      "nightly": "ontap-pre-write-ds-isolate zero-ds-connection mds-fallback checksum",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-unsupported;conditional:ontap-pre-write-ds-isolate zero-ds-connection mds-fallback checksum",
       "required": true,
       "ci_tests": [],
       "ci_status": "unmapped"
@@ -147,7 +147,7 @@
     {
       "id": "T12",
       "ci": "pnfs attempted-write error requires verify-then-resume",
-      "nightly": "ontap-ds-isolate uncertain-no-fallback restart-resume-checksum",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-unsupported;conditional:ontap-ds-isolate uncertain-no-fallback restart-resume-checksum",
       "required": true,
       "ci_tests": [
         "nfs41::pnfs_io::tests::attempted_ds_error_is_uncertain_and_requires_verification"
@@ -157,7 +157,7 @@
     {
       "id": "T13",
       "ci": "versioned dirty snapshot survives failure/cancellation/concurrent write and clears only on matching acknowledgement",
-      "nightly": "ontap-layoutcommit mds-isolate uncertain dirty-retained reopen-verify restore checksum",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-unsupported;conditional:ontap-layoutcommit mds-isolate uncertain dirty-retained reopen-verify restore checksum",
       "required": true,
       "ci_tests": [
         "nfs41::layout::tests::dirty_snapshot_survives_unacknowledged_commit",
@@ -170,7 +170,7 @@
     {
       "id": "T14",
       "ci": "per-file shared WRITE exclusive recall-close gate+ordered atomic layoutcommit-layoutreturn+cross-file concurrency",
-      "nightly": "ontap-real-cb-layoutrecall during active write ordered return close full checksum",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-unsupported;conditional:ontap-real-cb-layoutrecall during active write ordered return close full checksum",
       "required": true,
       "ci_tests": [
         "nfs41::layout::tests::file_io_gate_allows_parallel_writes_and_serializes_recall",
@@ -200,12 +200,13 @@
     },
     {
       "id": "T17",
-      "ci": "coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired",
-      "nightly": "lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:netapp-file-layout-capability-artifact",
+      "ci": "coverage_manifest_is_complete+netapp_pnfs_lab_contract_is_wired+pnfs_lab_gate_distinguishes_compatibility_from_ds_evidence",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-unsupported;additional-evidence:ordinary-nfsv41-integrity+explicit-independent-ds-observation-artifact",
       "required": true,
       "ci_tests": [
         "coverage_manifest_is_complete",
-        "netapp_pnfs_lab_contract_is_wired"
+        "netapp_pnfs_lab_contract_is_wired",
+        "pnfs_lab_gate_distinguishes_compatibility_from_ds_evidence"
       ],
       "ci_status": "mapped"
     },
@@ -260,7 +261,7 @@
     {
       "id": "T23",
       "ci": "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload",
-      "nightly": "lab_e2e::nfs_v41_pnfs_write_uses_independent_ds:zero-copy-stripes+full-checksum",
+      "nightly": "blocked-capability:legacy-cluster-pnfs-stripes-unsupported;additional-evidence:ordinary-nfsv41-full-checksum",
       "required": true,
       "ci_tests": [
         "rpc::tests::retransmission_changes_only_xid_and_preserves_zero_copy_payload"

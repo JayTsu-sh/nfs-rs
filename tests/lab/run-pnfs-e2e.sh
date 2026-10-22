@@ -8,6 +8,12 @@ validate_ipv4 "$LAB_PNFS_MDS_DATA"
 validate_ipv4 "$LAB_PNFS_DS_DATA"
 validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
 
+require_independent_ds="${LAB_PNFS_REQUIRE_INDEPENDENT_DS:-1}"
+[[ "$require_independent_ds" == 0 || "$require_independent_ds" == 1 ]] || {
+  echo "LAB_PNFS_REQUIRE_INDEPENDENT_DS must be 0 or 1" >&2
+  exit 2
+}
+
 ready_file="$(mktemp)"
 done_file="$(mktemp)"
 test_log="$(mktemp)"
@@ -24,8 +30,10 @@ cleanup() {
 trap cleanup EXIT
 
 ds_connections() {
-  ss -Hnt state established 2>/dev/null |
-    grep -F -c "$LAB_PNFS_DS_DATA:2049" || true
+  local connections
+  connections="$(ss -Hnt state established)" || return 1
+  # grep returns 1 for a valid observation with no matching connections.
+  grep -F -c "$LAB_PNFS_DS_DATA:2049" <<<"$connections" || true
 }
 
 baseline_connections="$(ds_connections)"
@@ -60,22 +68,46 @@ for _ in $(seq 1 30); do
   ((observed_connections > baseline_connections)) && break
   sleep 1
 done
-if ((observed_connections <= baseline_connections)); then
+independent_ds_observed=false
+if ((observed_connections > baseline_connections)); then
+  independent_ds_observed=true
+  printf 'pnfs-ds-observed endpoint=%s:2049 baseline=%s observed=%s\n' \
+    "$LAB_PNFS_DS_DATA" "$baseline_connections" "$observed_connections"
+fi
+
+# Even in compatibility-only mode, finish CLOSE/reopen/full-payload verification.
+touch "$done_file"
+if wait "$test_pid"; then
+  test_pid=""
+else
+  status=$?
+  test_pid=""
   cat "$test_log" >&2
+  exit "$status"
+fi
+cat "$test_log"
+
+# Exercise per-file sparse I/O and cleanup separately from the small
+# full-payload checksum above. Both tests also work through the MDS when the
+# environment does not support pNFS; neither checksum alone proves DS routing.
+timeout 300 cargo test --locked --test lab_e2e \
+  nfs_v41_pnfs_multifile_sparse_io -- --ignored --nocapture
+
+if [[ "$independent_ds_observed" == false && "$require_independent_ds" == 1 ]]; then
   echo "BLOCKED_CAPABILITY(netapp-pnfs-independent-ds): no new $LAB_PNFS_DS_DATA:2049 connection" >&2
   exit 1
 fi
 
-printf 'pnfs-ds-observed endpoint=%s:2049 baseline=%s observed=%s\n' \
-  "$LAB_PNFS_DS_DATA" "$baseline_connections" "$observed_connections"
-touch "$done_file"
-wait "$test_pid"
-test_pid=""
-cat "$test_log"
-
-# Exercise per-file sparse I/O and cleanup separately from the small
-# full-payload checksum above.  The first test proves that this export reaches
-# the independent DS; this test proves that multiple files can access high
-# offsets and still commit, return, read, and remove cleanly.
-timeout 300 cargo test --locked --test lab_e2e \
-  nfs_v41_pnfs_multifile_sparse_io -- --ignored --nocapture
+pnfs_status=OBSERVED
+if [[ "$independent_ds_observed" == false ]]; then
+  pnfs_status=NOT_OBSERVED
+fi
+printf 'NFSv4.1 integrity: PASS; pNFS independent DS: %s (required=%s)\n' \
+  "$pnfs_status" "$require_independent_ds"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  printf 'NFSv4.1 integrity: PASS; pNFS independent DS: %s (required=%s). NOT_OBSERVED is not a pNFS pass.\n' \
+    "$pnfs_status" "$require_independent_ds" >> "$GITHUB_STEP_SUMMARY"
+fi
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'independent_ds_observed=%s\n' "$independent_ds_observed" >> "$GITHUB_OUTPUT"
+fi

@@ -132,8 +132,20 @@ jobs:
         run: tests/lab/run-netapp-v40-release-matrix.sh "$RUN_ID" "$NFS_RS_LAB_V40_EVIDENCE_DIR"
       - name: NetApp NFSv4.1 compatibility E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-netapp-v41-e2e.sh "$RUN_ID"
-      - name: NetApp NFSv4.1 pNFS compatibility E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID"
+      - name: Legacy NetApp NFSv4.1 integrity and pNFS capability evidence
+        shell: bash
+        env:
+          # This physical cluster does not support pNFS. Ordinary NFS is required.
+          LAB_PNFS_REQUIRE_INDEPENDENT_DS: "0"
+        run: |
+          flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-e2e.sh "$RUN_ID" \
+            2>&1 | tee "$RUNNER_TEMP/netapp-v41-integrity.txt"
+      - name: Upload NetApp NFSv4.1 integrity and capability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netapp-v41-integrity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/netapp-v41-integrity.txt
       - name: Build final x86_64 Python wheel and source artifact once
         run: |
           mkdir -p target/python-release-artifacts

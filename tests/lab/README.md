@@ -8,8 +8,8 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
-| NetApp pNFS MDS | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y` |
-| NetApp pNFS DS | — | 10.128.56.161 | Independent NFSv4.1 data LIF |
+| Legacy NetApp primary LIF | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y`; pNFS unsupported |
+| Legacy NetApp secondary LIF | — | 10.128.56.161 | Independent NFSv4.1 data LIF; not proof of DS routing |
 | DXN NFSv4.0 | — | 10.131.7.201 | NFSv4.0 export `/jay_nfs` |
 
 Every run must call `prepare-run.sh` with a unique `nightly-*` or `release-*`
@@ -21,10 +21,26 @@ Credentials are provisioned on the self-hosted runner and must not be committed.
 The NetApp baseline uses `/nfsrs_pnfs_a` and `/nfsrs_pnfs_b`, both dedicated
 NFSv4-only FlexGroup exports. `run-netapp-v41-e2e.sh` first runs the ordinary
 NFSv4.1 compatibility suite against both exports without requiring pNFS path
-evidence. `run-pnfs-e2e.sh` then mounts the second export through
-the `.160` MDS LIF, performs an 8 MiB+ multi-chunk write through `nfs-rs`, and
-requires a new established connection to the `.161` DS LIF before accepting the
-full-payload checksum. ONTAP management credentials are not needed by nightly.
+evidence. `run-pnfs-e2e.sh` then mounts the second export through the `.160`
+LIF, performs an 8 MiB+ multi-chunk write through `nfs-rs`, closes/reopens and
+checks the full payload, and verifies sparse files. By default it also requires
+a new established connection to the `.161` DS LIF; a preexisting connection is
+not sufficient. Missing or failed connection-observation tools fail closed.
+
+The legacy physical cluster does not support pNFS: both `nfs-rs` and Linux
+returned `NFS4ERR_LAYOUTUNAVAILABLE` for the same file's LAYOUTGET while ordinary
+NFSv4.1 read/write verification succeeded. Release and nightly explicitly set
+`LAB_PNFS_REQUIRE_INDEPENDENT_DS=0` for this environment only. This accepts
+ordinary NFS integrity, not a pNFS pass. Logs, uploaded evidence, and the job
+summary distinguish `NOT_OBSERVED` from `OBSERVED`; nightly reports DS-dependent
+fault scenarios as skipped when no independent DS was observed. I/O and checksum
+failures remain failures in either mode; unconditional run cleanup is still
+required. ONTAP management credentials are not needed by nightly.
+
+The `192.168.9.101:/pnfs_test2` multi-DS test export belongs to a different
+physical cluster. Its single-file multi-DS and concurrent READ packet evidence
+is supplemental validation, not a replacement for the legacy environment's
+accepted performance baselines or an automated physical fault test.
 
 The DXN baseline uses `10.131.7.201:/jay_nfs` with an exact NFSv4.0 client URL.
 Nightly fails closed if TCP/2049 is unavailable, then exercises server I/O
@@ -102,8 +118,9 @@ the `ci-runner` sudo allow-list. Nightly uploads its output as an artifact. It
 must not change service or network state.
 
 The pNFS runner also creates 16 sparse files with writes at offset 0 and 1 GiB.
-This validates per-file high-offset integrity and LAYOUTCOMMIT/LAYOUTRETURN
-cleanup. It does not prove that the server changes layouts or DS endpoints.
+This validates per-file high-offset integrity and cleanup, including
+LAYOUTCOMMIT/LAYOUTRETURN when layouts are available. It does not prove that
+the server supplies or changes layouts or DS endpoints.
 Layouts are fetched on range misses and definite rejection, not periodically
 at 1 GiB boundaries. `examples/pnfs_large_file.rs` provides the 20 GiB AFX
 diagnostic workload; use a unique `release-*` filename, shared lab locks, and
