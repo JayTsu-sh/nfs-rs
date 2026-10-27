@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.7/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.8/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -90,6 +90,11 @@ secure-port convention and may require elevated privileges. Use
 
 If no `version` is present and no `versions` argument is passed, the client
 uses NFSv3. This is a default, not automatic negotiation across all versions.
+
+Export URL path segments are percent-decoded once before mounting. Raw Unicode
+names and percent-encoded UTF-8 spellings address the same export; `%25` names a
+literal `%`. A literal `%20` in a server name is written `%2520` in the URL.
+Encoded separators, NUL, and invalid UTF-8 are rejected.
 
 Options can also be passed as keyword arguments. Explicit arguments override
 defaults while the URL selects the export and may carry the same connection

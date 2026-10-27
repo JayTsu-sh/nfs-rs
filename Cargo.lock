@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -619,6 +619,7 @@ dependencies = [
  "futures",
  "nix",
  "path-clean",
+ "percent-encoding",
  "pyo3",
  "pyo3-async-runtimes",
  "rand",

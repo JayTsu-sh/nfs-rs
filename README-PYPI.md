@@ -14,10 +14,15 @@ exports directly from Python without a kernel mount or a C NFS library.
 
 Authentication uses AUTH_SYS. Kerberos and RPCSEC_GSS are not implemented.
 
+Export URL path segments are percent-decoded once before mounting. Raw Unicode
+and percent-encoded UTF-8 names resolve to the same export; encoded separators,
+NUL, and invalid UTF-8 are rejected. A literal `%20` in an export name is
+written `%2520` in the URL.
+
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.7/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.7/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.8/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.8.8/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,
