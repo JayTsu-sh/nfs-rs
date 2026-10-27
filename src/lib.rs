@@ -49,6 +49,7 @@
 //! `noresvport=true` when the server export accepts non-privileged source
 //! ports.
 
+use percent_encoding::percent_decode_str;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use tokio::net::{TcpSocket, TcpStream};
 
@@ -500,12 +501,28 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         ));
     }
     let host = parsed_url.host_str().unwrap_or_default().to_string();
+    let dirpath = parsed_url
+        .path()
+        .split('/')
+        .map(|encoded| {
+            let decoded = percent_decode_str(encoded)
+                .decode_utf8()
+                .map_err(|_| NfsError::InvalidInput("NFS export path is not valid UTF-8".into()))?;
+            if decoded.contains('/') || decoded.contains('\0') {
+                return Err(NfsError::InvalidInput(
+                    "NFS export path contains an encoded separator or NUL".into(),
+                ));
+            }
+            Ok(decoded.into_owned())
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("/");
     Ok(MountArgs {
         versions,
         host,
         mountport,
         nfsport,
-        dirpath: parsed_url.path().to_string(),
+        dirpath,
         uid,
         gid,
         readdir_buffer,
@@ -679,6 +696,30 @@ mod tests {
             let err = res.unwrap_err();
             assert!(
                 matches!(&err, NfsError::InvalidInput(msg) if msg == "specified URL does not have scheme nfs")
+            );
+        }
+    }
+
+    #[test]
+    fn parse_url_decodes_export_path_once() {
+        for (path, expected) in [
+            ("测试", "/测试"),
+            ("%E6%B5%8B%E8%AF%95", "/测试"),
+            ("a b", "/a b"),
+            ("a%20b", "/a b"),
+            ("100%", "/100%"),
+            ("100%25", "/100%"),
+            ("100%2525", "/100%25"),
+            ("100%20done", "/100 done"),
+            ("100%2520done", "/100%20done"),
+        ] {
+            let args = parse_url(&format!("nfs://127.0.0.1/{path}")).expect("valid export URL");
+            assert_eq!(args.dirpath, expected, "{path}");
+        }
+        for path in ["%FF", "a%2Fb", "a%00b"] {
+            assert!(
+                parse_url(&format!("nfs://127.0.0.1/{path}")).is_err(),
+                "{path}"
             );
         }
     }

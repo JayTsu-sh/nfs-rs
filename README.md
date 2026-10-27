@@ -29,12 +29,18 @@ The public API is still evolving while the crate is below version 1.0.
 
 ```toml
 [dependencies]
-nfs-rs = "0.8.7"
+nfs-rs = "0.8.8"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 The minimum supported Rust version is 1.95.
+
+Export URL path segments are percent-decoded once before mounting. For example,
+`/测试`, `/%E6%B5%8B%E8%AF%95`, `/a b`, and `/a%20b` use the corresponding
+server-side names. Encode a literal `%` as `%25`; encoded separators and invalid
+UTF-8 are rejected. To name a literal `%20` in an export, write `%2520` in
+the URL.
 
 For Python on Linux x86_64:
 
