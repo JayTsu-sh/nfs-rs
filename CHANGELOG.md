@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-28
+
 ### Added
 
 - Rust `Mount::get_posix_acl` and `Mount::set_posix_acl` read and replace complete
@@ -23,6 +25,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- This release advances the Cargo SemVer compatibility boundary to 0.9 because
+  adding the public `MountCapabilities::posix_acl` field breaks exhaustive struct
+  literals used by 0.8 callers. Supply the new field or use `..Default::default()`.
 - Authoritative RPC program, version and procedure unavailability is reported as
   `NfsError::Unsupported`. Authentication, malformed arguments and server failures
   remain RPC errors. Per-object ACL rejection does not disable the extension for
@@ -478,7 +483,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.5...v0.8.6

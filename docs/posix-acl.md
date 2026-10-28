@@ -1,6 +1,6 @@
 # Native POSIX ACLs over NFSv3
 
-The unreleased Rust API exposes the optional Sun NFSACL extension (RPC program
+The Rust API added in 0.9.0 exposes the optional Sun NFSACL extension (RPC program
 100227, version 3). Use `Mount::get_posix_acl` and `Mount::set_posix_acl` with an
 NFSv3 file handle. NFSv4 engines return `NfsError::Unsupported` for these methods;
 their existing `getacl`/`setacl` API operates on NFSv4 ACLs.

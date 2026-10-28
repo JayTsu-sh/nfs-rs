@@ -29,7 +29,7 @@ The public API is still evolving while the crate is below version 1.0.
 
 ```toml
 [dependencies]
-nfs-rs = "0.8.8"
+nfs-rs = "0.9.0"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -173,7 +173,7 @@ The experimental profile has real FAS2750 reconnect and lease validation, but
 dedicated-server restart grace/reclaim evidence remains an explicit exception
 until a safe maintenance fixture is available.
 
-### Native POSIX ACLs over NFSv3 (unreleased)
+### Native POSIX ACLs over NFSv3
 
 The Rust `Mount::get_posix_acl` and `Mount::set_posix_acl` methods support the
 optional Sun NFSACL v3 extension (RPC program 100227). They transfer complete
