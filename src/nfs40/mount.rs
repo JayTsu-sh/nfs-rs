@@ -1414,6 +1414,7 @@ impl Mount for Mount40 {
     fn capabilities(&self) -> crate::MountCapabilities {
         crate::MountCapabilities {
             acl: self.acl_supported,
+            posix_acl: false,
             named_attributes: false,
             locks: true,
             callbacks: true,

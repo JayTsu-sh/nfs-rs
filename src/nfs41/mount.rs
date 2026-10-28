@@ -1481,6 +1481,7 @@ impl crate::Mount for Mount41Wrapper {
     fn capabilities(&self) -> crate::MountCapabilities {
         crate::MountCapabilities {
             acl: self.m.acl_supported,
+            posix_acl: false,
             // Server-effective named attributes are not negotiated yet.
             named_attributes: false,
             locks: true,

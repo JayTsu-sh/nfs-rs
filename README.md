@@ -173,6 +173,22 @@ The experimental profile has real FAS2750 reconnect and lease validation, but
 dedicated-server restart grace/reclaim evidence remains an explicit exception
 until a safe maintenance fixture is available.
 
+### Native POSIX ACLs over NFSv3 (unreleased)
+
+The Rust `Mount::get_posix_acl` and `Mount::set_posix_acl` methods support the
+optional Sun NFSACL v3 extension (RPC program 100227). They transfer complete
+`PosixAcl` access/default entry lists, including raw permissions hidden by a mask.
+The `get_posix_acl_path` and `set_posix_acl_path` forms resolve a path first.
+Setting an empty default list explicitly clears the destination default ACL.
+`MountCapabilities::posix_acl` reports the mount-time extension probe; the existing
+`acl` capability continues to describe NFSv4 ACLs.
+
+NFSv3 does not guarantee this extension, and an individual filesystem or object
+can still return `Unsupported`. SETACL is sent once; after a failed or uncertain
+write, read back the ACL before deciding whether to resume. Native ACL transport
+does not perform identity mapping or POSIX/NFSv4 semantic conversion. See the
+[native POSIX ACL guide](docs/posix-acl.md) for tags, qualifiers and failure behavior.
+
 ## Documentation
 
 The complete API documentation is published on
