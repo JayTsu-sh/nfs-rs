@@ -15,6 +15,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod access;
+mod acl;
 mod commit;
 mod create;
 mod export;

@@ -32,10 +32,33 @@ use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
 #[derive(Debug)]
 struct Mount3 {
     m: Mount,
+    posix_acl: Option<super::acl::Client>,
 }
 
 #[async_trait]
 impl crate::Mount for Mount3 {
+    fn capabilities(&self) -> crate::MountCapabilities {
+        crate::MountCapabilities {
+            posix_acl: self.posix_acl.is_some(),
+            ..Default::default()
+        }
+    }
+
+    async fn get_posix_acl(&self, fh: Bytes) -> Result<crate::PosixAcl> {
+        self.posix_acl
+            .as_ref()
+            .ok_or_else(|| NfsError::Unsupported("NFSACL v3 extension is unavailable".into()))?
+            .get(fh)
+            .await
+    }
+
+    async fn set_posix_acl(&self, fh: Bytes, acl: &crate::PosixAcl) -> Result<()> {
+        self.posix_acl
+            .as_ref()
+            .ok_or_else(|| NfsError::Unsupported("NFSACL v3 extension is unavailable".into()))?
+            .set(fh, acl)
+            .await
+    }
     fn get_max_read_size(&self) -> u32 {
         self.m.rsize
     }
@@ -373,7 +396,8 @@ async fn mount_on_addr(
         "NFS mount complete, negotiated transfer sizes"
     );
 
-    Ok(Box::new(Mount3 { m }))
+    let posix_acl = super::acl::Client::discover(*addr, &m.rpc, auth, args.noresvport).await;
+    Ok(Box::new(Mount3 { m, posix_acl }))
 }
 
 /// Query the MOUNT service and return all exported file systems — the `showmount -e` equivalent.
@@ -491,6 +515,25 @@ mod tests {
         reply(&mut stream, &mnt, &mnt_ok()).await?;
         let fsinfo = read_record(&mut stream).await?;
         reply(&mut stream, &fsinfo, &fsinfo_ok(rtmax)).await?;
+        // Mount now probes the optional NFSACL extension before directory I/O.
+        // Refuse that program explicitly so the fixture still tests the next
+        // actual READDIRPLUS request, not the capability probe's arguments.
+        let probe = read_record(&mut stream).await?;
+        assert_eq!(
+            u32::from_be_bytes(probe[12..16].try_into().unwrap()),
+            rpc::NFSACL_PROG
+        );
+        assert_eq!(u32::from_be_bytes(probe[16..20].try_into().unwrap()), 3);
+        assert_eq!(u32::from_be_bytes(probe[20..24].try_into().unwrap()), 0);
+        let mut unsupported = probe[..4].to_vec();
+        for word in [1u32, 0, 0, 0, 1] {
+            // Accepted RPC reply, PROG_UNAVAIL.
+            unsupported.extend_from_slice(&word.to_be_bytes());
+        }
+        stream
+            .write_u32(0x8000_0000 | unsupported.len() as u32)
+            .await?;
+        stream.write_all(&unsupported).await?;
         let readdirplus = read_record(&mut stream).await?;
         let word = |from_end: usize| {
             let at = readdirplus.len() - from_end;

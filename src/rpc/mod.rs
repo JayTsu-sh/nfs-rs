@@ -42,6 +42,7 @@ pub(crate) const PORTMAP_PORT: u16 = 111;
 pub(crate) const MOUNT_PROG: u32 = 100005;
 pub(crate) const MOUNT3_VERSION: u32 = 3;
 pub(crate) const NFS_PROG: u32 = 100003;
+pub(crate) const NFSACL_PROG: u32 = 100227;
 pub(crate) const NFS3_VERSION: u32 = 3;
 
 const IPPROTO_TCP: u32 = 6;
@@ -831,7 +832,7 @@ impl Client {
     fn get_mux(&self, program: u32) -> Result<&Arc<StreamMux>> {
         match program {
             MOUNT_PROG => Ok(self.mount_mux.as_ref().unwrap_or(&self.nfs_mux)),
-            NFS_PROG | PORTMAP_PROG => Ok(&self.nfs_mux),
+            NFS_PROG | PORTMAP_PROG | NFSACL_PROG => Ok(&self.nfs_mux),
             _ => Err(NfsError::InvalidInput(format!(
                 "unknown RPC program {}",
                 program
@@ -1160,6 +1161,15 @@ fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
     pos += 4;
     if accept_status != AcceptStatus::Success as i32 {
         error!(xid, accept_status, "RPC request rejected by server");
+        // Preserve authoritative unsupported-program evidence for optional RPC
+        // extensions. Authentication, garbage arguments and system failures
+        // must remain errors rather than silently disabling a feature.
+        // RFC 5531 section 9: PROG_UNAVAIL, PROG_MISMATCH, PROC_UNAVAIL.
+        if matches!(accept_status, 1..=3) {
+            return Err(NfsError::Unsupported(format!(
+                "RPC service unavailable (accept status {accept_status})"
+            )));
+        }
         return Err(NfsError::Rpc("request rejected".to_string()));
     }
 
@@ -1214,6 +1224,41 @@ pub(crate) fn get_current_time() -> u32 {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn unavailable_rpc_services_do_not_hide_other_rpc_errors() {
+        // RFC 5531 section 9 accepted_reply vectors, AUTH_NONE verifier.
+        for accept in [1u32, 2, 3] {
+            let mut reply: Vec<u8> = [42, 1, 0, 0, 0, accept]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect();
+            if accept == 2 {
+                // PROG_MISMATCH carries the supported low/high program versions.
+                reply.extend_from_slice(&3u32.to_be_bytes());
+                reply.extend_from_slice(&3u32.to_be_bytes());
+            }
+            assert!(matches!(
+                parse_rpc_response(Bytes::from(reply), 42),
+                Err(NfsError::Unsupported(_))
+            ));
+        }
+        for reply in [
+            vec![42u32, 1, 0, 0, 0, 4], // GARBAGE_ARGS
+            vec![42, 1, 0, 0, 0, 5],    // SYSTEM_ERR
+            vec![42, 1, 1, 1, 5],       // MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK
+            vec![42, 1, 0, 0, 0],       // Missing accept status
+        ] {
+            let reply = reply
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                parse_rpc_response(Bytes::from(reply), 42),
+                Err(NfsError::Rpc(_))
+            ));
+        }
+    }
 
     async fn read_test_record(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;

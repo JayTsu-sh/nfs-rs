@@ -313,13 +313,40 @@ pub struct Nfs41CallbackStats {
 /// Protocol-neutral features exposed by a mounted client.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MountCapabilities {
+    /// NFSv4 ACL attribute support; native POSIX ACL support is separate.
     pub acl: bool,
+    /// Native NFSACL v3 POSIX access/default ACL extension was probed successfully.
+    pub posix_acl: bool,
     pub named_attributes: bool,
     pub locks: bool,
     pub callbacks: bool,
     pub delegation_retention: bool,
     pub pnfs: bool,
     pub session_diagnostics: bool,
+}
+
+/// One native POSIX ACL entry. Tags use the POSIX values 1, 2, 4, 8, 16, 32.
+/// Only named user/group identifiers have portable meaning; NFSACL may return
+/// actual owner/group identifiers in the corresponding object entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PosixAclEntry {
+    /// Owner (1), named user (2), owning group (4), named group (8), mask (16),
+    /// or other (32). Default entries use the same tags, without wire bit 0x1000.
+    pub tag: u32,
+    /// UID/GID for named user/group entries; otherwise a server-defined qualifier.
+    pub id: u32,
+    /// Raw read/write/execute bits (4/2/1), before applying an ACL mask.
+    pub permissions: u32,
+}
+
+/// Complete POSIX ACL state. An empty default list explicitly clears defaults
+/// when written. Entries retain raw permissions, including those hidden by mask.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PosixAcl {
+    /// Access ACL entries, including any mask and permissions hidden by it.
+    pub access: Vec<PosixAclEntry>,
+    /// Directory default ACL entries; an empty list explicitly clears defaults.
+    pub default: Vec<PosixAclEntry>,
 }
 
 /// High-level lifecycle state of a mount.
@@ -801,6 +828,64 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
             token.length,
         )
         .await
+    }
+
+    /// Read complete native POSIX access/default ACLs through NFSACL v3.
+    ///
+    /// Requires an NFSv3 server supporting the optional Sun NFSACL extension.
+    /// Other protocol engines and unsupported objects return [`NfsError::Unsupported`].
+    /// [`MountCapabilities::posix_acl`] reports the mount-time extension probe;
+    /// an individual filesystem or object can still reject this operation.
+    ///
+    /// Raw entry permissions, mask entries and server-supplied object identifiers
+    /// are retained. A mode-only ACL may contain the extension's synthesized mask.
+    /// This is a typed native ACL, not Linux xattr bytes or an NFSv4 ACL mapping.
+    ///
+    /// ```no_run
+    /// use nfs_rs::{Result, parse_url_and_mount};
+    ///
+    /// # async fn example() -> Result<()> {
+    /// let mount = parse_url_and_mount("nfs://127.0.0.1/export?version=3").await?;
+    /// let acl = mount.get_posix_acl_path("file.txt").await?;
+    /// println!("access: {:?}; default: {:?}", acl.access, acl.default);
+    /// mount.set_posix_acl_path("file.txt", &acl).await?;
+    /// mount.umount().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn get_posix_acl(&self, _fh: Bytes) -> Result<PosixAcl> {
+        Err(NfsError::Unsupported(
+            "POSIX ACL requires the NFSACL v3 extension".into(),
+        ))
+    }
+
+    /// Resolve a path and read its native POSIX ACL through [`Mount::get_posix_acl`].
+    async fn get_posix_acl_path(&self, path: &str) -> Result<PosixAcl> {
+        let res = self.lookup_path(path).await?;
+        self.get_posix_acl(res.fh).await
+    }
+
+    /// Replace native POSIX access/default ACLs, including clearing absent ACLs.
+    ///
+    /// Both lists are sent; an empty default list removes any existing default ACL.
+    /// Tags must use the native POSIX values, permissions must fit `rwx`, and each
+    /// list is bounded to 1024 entries. The server validates the complete ACL.
+    ///
+    /// SETACL is sent once. A lost or malformed reply can return an
+    /// [`NfsError::OperationOutcome`] requiring readback before resuming. Servers
+    /// may apply the access ACL before rejecting the default ACL, so an error does
+    /// not guarantee that the previous ACL remains unchanged. Identity mapping and
+    /// equivalence checks between servers belong to the caller.
+    async fn set_posix_acl(&self, _fh: Bytes, _acl: &PosixAcl) -> Result<()> {
+        Err(NfsError::Unsupported(
+            "POSIX ACL requires the NFSACL v3 extension".into(),
+        ))
+    }
+
+    /// Resolve a path and replace its native POSIX ACL through [`Mount::set_posix_acl`].
+    async fn set_posix_acl_path(&self, path: &str, acl: &PosixAcl) -> Result<()> {
+        let res = self.lookup_path(path).await?;
+        self.set_posix_acl(res.fh, acl).await
     }
 
     /// Retrieve the NFSv4 ACL for a file (NFSv4 only; returns Unsupported on NFSv3).

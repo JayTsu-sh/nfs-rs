@@ -7,6 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Rust `Mount::get_posix_acl` and `Mount::set_posix_acl` read and replace complete
+  native POSIX access/default ACLs over the optional NFSACL v3 extension, with
+  matching `get_posix_acl_path` and `set_posix_acl_path` convenience methods. Raw
+  permissions and masks are preserved, and an empty default list explicitly
+  clears the destination default ACL. GETACL responses require complete masks
+  and bounded arrays; SETACL is sent once and preserves uncertain outcomes.
+- `PosixAcl`, `PosixAclEntry`, and `MountCapabilities::posix_acl` expose the native
+  POSIX ACL model separately from NFSv4 `acl` support. NFSv3 mounts probe the
+  extension, including a discovered dedicated port when needed; failure of the
+  optional probe does not prevent ordinary NFS operations. Existing struct
+  literals for `MountCapabilities` must supply the new field or use `Default`.
+
+### Changed
+
+- Authoritative RPC program, version and procedure unavailability is reported as
+  `NfsError::Unsupported`. Authentication, malformed arguments and server failures
+  remain RPC errors. Per-object ACL rejection does not disable the extension for
+  the rest of the mount.
+
 ## [0.8.8] - 2026-10-27
 
 ### Fixed
