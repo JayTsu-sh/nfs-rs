@@ -21,8 +21,8 @@ written `%2520` in the URL.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.0/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.0/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.1/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.1/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,

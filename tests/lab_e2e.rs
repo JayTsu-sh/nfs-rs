@@ -9,8 +9,9 @@ use bytes::Bytes;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
-    AceFlags, AceMask, AceType, Acl, Acl41Flags, DirectoryCookie, Mount, MountLifecycleState,
-    NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time, parse_url_and_mount,
+    AceFlags, AceMask, AceType, Acl, Acl41Flags, DirectoryCookie, Mount, MountCapabilities,
+    MountLifecycleState, NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time,
+    parse_url_and_mount,
 };
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
@@ -2818,8 +2819,14 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             format!("{url}: NFSv4.1 health is incomplete: {health:?}"),
         )?;
     } else {
+        // Native POSIX ACLs are a stateless NFSv3 extension. Keep rejecting all
+        // other NFSv4-only/stateful capabilities, including future added flags.
         ensure(
-            capabilities == Default::default(),
+            capabilities
+                == MountCapabilities {
+                    posix_acl: capabilities.posix_acl,
+                    ..MountCapabilities::default()
+                },
             format!("{url}: NFSv3 advertised stateful capabilities: {capabilities:?}"),
         )?;
         ensure(
