@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
+use futures::TryStreamExt as _;
 
 use super::*;
 use crate::nfs4::compound::{take_opaque, xdr_opaque, xdr_u32};
@@ -1089,4 +1090,652 @@ async fn concurrent_layout_misses_share_one_layoutget_and_device_lookup() {
         *case.calls.lock().unwrap(),
         ["mds:layoutget", "mds:getdeviceinfo"]
     );
+}
+
+struct AbandonedWriteCase {
+    wrapper: Arc<crate::nfs41::mount::Mount41Wrapper>,
+    manager: Arc<crate::nfs41::layout::LayoutManager>,
+    calls: Arc<Mutex<Vec<String>>>,
+    servers: Vec<tokio::task::JoinHandle<()>>,
+}
+impl Drop for AbandonedWriteCase {
+    fn drop(&mut self) {
+        for server in &self.servers {
+            server.abort();
+        }
+    }
+}
+
+fn destroy_reply(tag: &str, mut args: Bytes) -> Vec<Reply> {
+    let opcode = if tag.ends_with("destroy_session") {
+        44
+    } else {
+        57
+    };
+    assert_eq!(args.get_u32(), opcode);
+    vec![ok(opcode, vec![])]
+}
+
+async fn abandoned_write_case(cancel: bool) -> AbandonedWriteCase {
+    multids_write_case(cancel, true, false).await
+}
+
+async fn multids_write_case(cancel: bool, fail: bool, fail_return: bool) -> AbandonedWriteCase {
+    multids_write_case_with_admission_probe(cancel, fail, fail_return, false).await
+}
+
+async fn multids_write_case_with_admission_probe(
+    cancel: bool,
+    fail: bool,
+    fail_return: bool,
+    probe_admission: bool,
+) -> AbandonedWriteCase {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (fast_tx, fast_rx) = tokio::sync::oneshot::channel();
+    let mut fast_tx = Some(fast_tx);
+    let (fast, fast_server) = serve_with_reply_hook(
+        |tag, mut args| {
+            if tag.starts_with("ds_destroy_") {
+                destroy_reply(tag, args)
+            } else {
+                write_reply(&mut args, None)
+            }
+        },
+        None,
+        move |tag| {
+            if tag == "ds-write"
+                && let Some(tx) = fast_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        },
+    )
+    .await;
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+    let mut sent_tx = Some(sent_tx);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (replied_tx, replied_rx) = tokio::sync::oneshot::channel();
+    let mut replied_tx = Some(replied_tx);
+    let slow_calls = calls.clone();
+    let (slow, slow_server) = serve_with_reply_hook(
+        move |tag, mut args| {
+            slow_calls.lock().unwrap().push(format!("slow:{tag}"));
+            if tag.starts_with("ds_destroy_") {
+                destroy_reply(tag, args)
+            } else if tag == "ds-commit" {
+                putfh(&mut args);
+                assert_eq!(args.get_u32(), 5);
+                vec![ok(22, vec![]), ok(5, vec![3; 8])]
+            } else {
+                assert_eq!(tag, "ds-write");
+                if let Some(tx) = sent_tx.take() {
+                    let _ = tx.send(());
+                }
+                if fail {
+                    stale_reply()
+                } else {
+                    let mut reply = write_reply(&mut args, None);
+                    reply[1].data[4..8].copy_from_slice(&0u32.to_be_bytes());
+                    reply
+                }
+            }
+        },
+        Some(release_rx),
+        move |tag| {
+            if tag == "ds-write"
+                && let Some(tx) = replied_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        },
+    )
+    .await;
+    let observed = calls.clone();
+    let (mut mount, mds_server) = serve(move |tag, mut args| {
+        observed.lock().unwrap().push(tag.to_owned());
+        match tag {
+            "close" => {
+                putfh(&mut args);
+                assert_eq!(args.get_u32(), 4);
+                vec![ok(22, vec![]), ok(4, vec![1; 16])]
+            }
+            "layoutreturn" if fail_return => vec![
+                ok(22, vec![]),
+                Reply {
+                    opcode: 51,
+                    status: 5,
+                    data: vec![],
+                },
+            ],
+            "layoutreturn" => vec![ok(22, vec![]), ok(51, vec![0; 4])],
+            "layoutcommit" => vec![ok(22, vec![]), ok(49, vec![0; 4])],
+            "destroy_session" | "destroy_clientid" => destroy_reply(tag, args),
+            "layoutget" => vec![
+                ok(22, vec![]),
+                Reply {
+                    opcode: 50,
+                    status: 10004,
+                    data: vec![],
+                },
+            ],
+            "write" => write_reply(&mut args, None),
+            other => panic!("unexpected MDS operation {other}"),
+        }
+    })
+    .await;
+    enable_pnfs(&mut mount).await;
+    mount.wsize = 64;
+    let fh = Bytes::from_static(b"file");
+    let mut striped = layout(0, u64::MAX, b"shared");
+    if let LayoutContent::FilesLayout { stripe_unit, .. } = &mut striped.segments[0].content {
+        *stripe_unit = 64;
+    }
+    mount.layout_manager.store_layout(&fh, striped).await;
+    mount
+        .layout_manager
+        .store_device(
+            DEVICE,
+            DeviceInfo {
+                stripe_indices: vec![0, 1],
+                ds_addrs: vec![vec![fast.server_addr], vec![slow.server_addr]],
+            },
+        )
+        .await;
+    mount
+        .layout_manager
+        .store_test_data_server(fast.server_addr, fast.rpc.clone())
+        .await;
+    mount
+        .layout_manager
+        .store_test_data_server(slow.server_addr, slow.rpc.clone())
+        .await;
+    let manager = mount.layout_manager.clone();
+    let wrapper = Arc::new(crate::nfs41::mount::test_wrapper(mount));
+    let writer = wrapper.clone();
+    let task = tokio::spawn(async move {
+        crate::Mount::write(
+            writer.as_ref(),
+            Bytes::from_static(b"file"),
+            0,
+            Bytes::from(vec![9; 128]),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        fast_rx.await.unwrap();
+        sent_rx.await.unwrap();
+    })
+    .await
+    .unwrap();
+    if cancel {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        if probe_admission {
+            let mut next = Box::pin(crate::Mount::write(
+                wrapper.as_ref(),
+                fh.clone(),
+                0,
+                Bytes::from_static(b"next"),
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(next.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                crate::nfs41::mount::test_owned_write_count(wrapper.as_ref()),
+                1,
+                "a later WRITE must not be admitted before the abandoned batch settles"
+            );
+            drop(next);
+        }
+    } else {
+        release_tx.send(()).unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.operation_outcome().unwrap().outcome,
+            OperationOutcome::Uncertain
+        );
+        return AbandonedWriteCase {
+            wrapper,
+            manager,
+            calls,
+            servers: vec![fast_server, slow_server, mds_server],
+        };
+    }
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), replied_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    AbandonedWriteCase {
+        wrapper,
+        manager,
+        calls,
+        servers: vec![fast_server, slow_server, mds_server],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_multids_error_closes_open_and_tears_down_with_uncertainty() {
+    let case = abandoned_write_case(true).await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::Mount::close(case.wrapper.as_ref(), Bytes::from_static(b"file")),
+    )
+    .await
+    .unwrap()
+    .expect_err("abandoned WRITE must remain observable at CLOSE");
+    assert_eq!(
+        error.operation_outcome().unwrap().outcome,
+        OperationOutcome::Uncertain
+    );
+    assert!(
+        case.calls.lock().unwrap().iter().any(|tag| tag == "close"),
+        "uncertainty must not prevent releasing OPEN"
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::Mount::umount(case.wrapper.as_ref()),
+    )
+    .await
+    .unwrap()
+    .expect_err("teardown must preserve the abandoned outcome");
+    assert_eq!(
+        error.operation_outcome().unwrap().recovery,
+        RecoveryAction::VerifyThenResume
+    );
+    let calls = case.calls.lock().unwrap();
+    assert!(calls.iter().any(|tag| tag == "destroy_session"));
+    assert!(calls.iter().any(|tag| tag == "destroy_clientid"));
+    assert_eq!(
+        crate::Mount::health(case.wrapper.as_ref()).lifecycle,
+        crate::MountLifecycleState::Closed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_uncertainty_survives_layout_cache_and_generation_reset() {
+    for generation_change in [false, true] {
+        let case = abandoned_write_case(true).await;
+        // CLOSE is the public settlement barrier; it may report the prior error.
+        let _ = crate::Mount::close(case.wrapper.as_ref(), Bytes::from_static(b"file")).await;
+        if generation_change {
+            case.manager.transition_to(2).await;
+        } else {
+            case.manager.clear().await;
+        }
+        let before = case.calls.lock().unwrap().clone();
+        let error = crate::Mount::write(
+            case.wrapper.as_ref(),
+            Bytes::from_static(b"file"),
+            0,
+            Bytes::from_static(b"next"),
+        )
+        .await
+        .expect_err("cache reset must not enable replay of an abandoned WRITE");
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            RecoveryAction::VerifyThenResume
+        );
+        assert_eq!(
+            *case.calls.lock().unwrap(),
+            before,
+            "uncertainty check must precede layout fetch or MDS WRITE"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observed_multids_error_does_not_poison_close_or_umount() {
+    let case = abandoned_write_case(false).await;
+    crate::Mount::close(case.wrapper.as_ref(), Bytes::from_static(b"file"))
+        .await
+        .unwrap();
+    crate::Mount::umount(case.wrapper.as_ref()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_success_is_committed_before_close() {
+    let case = multids_write_case(true, false, false).await;
+    crate::Mount::close(case.wrapper.as_ref(), Bytes::from_static(b"file"))
+        .await
+        .unwrap();
+    let calls = case.calls.lock().unwrap().clone();
+    let commit = calls
+        .iter()
+        .position(|tag| tag == "slow:ds-commit")
+        .expect("unclaimed UNSTABLE receipt must be committed");
+    let layoutcommit = calls.iter().position(|tag| tag == "layoutcommit").unwrap();
+    let close = calls.iter().position(|tag| tag == "close").unwrap();
+    assert!(commit < layoutcommit && layoutcommit < close);
+    crate::Mount::umount(case.wrapper.as_ref()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_layoutreturn_does_not_skip_open_or_session_cleanup() {
+    let case = multids_write_case(false, true, true).await;
+    assert!(crate::Mount::umount(case.wrapper.as_ref()).await.is_err());
+    let calls = case.calls.lock().unwrap();
+    for tag in [
+        "layoutreturn",
+        "close",
+        "destroy_session",
+        "destroy_clientid",
+    ] {
+        assert!(
+            calls.iter().any(|seen| seen == tag),
+            "cleanup omitted {tag}: {calls:?}"
+        );
+    }
+    assert_eq!(
+        crate::Mount::health(case.wrapper.as_ref()).lifecycle,
+        crate::MountLifecycleState::Closed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_umount_waiter_does_not_cancel_cleanup_or_admit_new_opens() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let mut entered_tx = Some(entered_tx);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let (mut mount, server) = serve_with_reply_hook(
+        move |tag, mut args| {
+            observed.lock().unwrap().push(tag.to_owned());
+            if tag == "close" {
+                if let Some(tx) = entered_tx.take() {
+                    let _ = tx.send(());
+                }
+                putfh(&mut args);
+                assert_eq!(args.get_u32(), 4);
+                vec![ok(22, vec![]), ok(4, vec![1; 16])]
+            } else {
+                destroy_reply(tag, args)
+            }
+        },
+        Some(release_rx),
+        |_| {},
+    )
+    .await;
+    enable_pnfs(&mut mount).await;
+    let wrapper = Arc::new(crate::nfs41::mount::test_wrapper(mount));
+    let closing = wrapper.clone();
+    let waiter = tokio::spawn(async move { crate::Mount::umount(closing.as_ref()).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    let error = crate::Mount::open_path(wrapper.as_ref(), "another", crate::OPEN_BOTH)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, NfsError::ClientClosed(_)));
+    let error = crate::Mount::write(
+        wrapper.as_ref(),
+        Bytes::from_static(b"file"),
+        0,
+        Bytes::from_static(b"next"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, NfsError::ClientClosed(_)));
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::Mount::umount(wrapper.as_ref()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["close", "destroy_session", "destroy_clientid"]
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_write_holds_later_admission_until_the_batch_settles() {
+    let case = multids_write_case_with_admission_probe(true, true, false, true).await;
+    let error = crate::Mount::close(case.wrapper.as_ref(), Bytes::from_static(b"file"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.operation_outcome().unwrap().recovery,
+        RecoveryAction::VerifyThenResume
+    );
+}
+
+#[tokio::test]
+async fn destroy_protocol_errors_are_reported_after_remaining_cleanup() {
+    for rejected in ["destroy_session", "destroy_clientid"] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (mount, server) = serve(move |tag, args| {
+            observed.lock().unwrap().push(tag.to_owned());
+            let mut reply = destroy_reply(tag, args);
+            if tag == rejected {
+                reply[0].status = Nfs4ErrorCode::NFS4ERR_CLIENTID_BUSY as u32;
+            }
+            reply
+        })
+        .await;
+        let wrapper = crate::nfs41::mount::test_wrapper(mount);
+        let error = crate::Mount::umount(&wrapper)
+            .await
+            .expect_err("NFS destroy rejection must not count as successful teardown");
+        assert!(format!("{error:?}").contains("NFS4ERR_CLIENTID_BUSY"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["destroy_session", "destroy_clientid"]
+        );
+        assert_eq!(
+            crate::Mount::health(&wrapper).lifecycle,
+            crate::MountLifecycleState::Closed
+        );
+        let before = calls.lock().unwrap().clone();
+        assert!(crate::Mount::umount(&wrapper).await.is_err());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            before,
+            "terminal teardown must not be replayed"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn idle_directory_streams_do_not_block_umount_or_start_new_pages_afterward() {
+    use futures::StreamExt as _;
+    for plus in [false, true] {
+        let (mount, server) = serve(destroy_reply).await;
+        let wrapper = crate::nfs41::mount::test_wrapper(mount);
+        let mut stream = if plus {
+            crate::Mount::readdirplus(&wrapper, Bytes::from_static(b"root"))
+                .await
+                .map_ok(|_| ())
+                .boxed()
+        } else {
+            crate::Mount::readdir(&wrapper, Bytes::from_static(b"root"))
+                .await
+                .map_ok(|_| ())
+                .boxed()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::Mount::umount(&wrapper),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            stream.try_next().await,
+            Err(NfsError::ClientClosed(_))
+        ));
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_directory_pages_are_admitted_until_the_reply_is_consumed() {
+    use futures::StreamExt as _;
+    for plus in [false, true] {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut entered_tx = Some(entered_tx);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (mount, server) = serve_with_reply_hook(
+            move |tag, args| {
+                observed.lock().unwrap().push(tag.to_owned());
+                if tag.starts_with("readdir") {
+                    if let Some(tx) = entered_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    vec![
+                        ok(22, vec![]),
+                        ok(
+                            26,
+                            crate::nfs41::test_support::directory_page(Some(1), true, [0; 8]),
+                        ),
+                    ]
+                } else {
+                    destroy_reply(tag, args)
+                }
+            },
+            Some(release_rx),
+            |_| {},
+        )
+        .await;
+        let wrapper = Arc::new(crate::nfs41::mount::test_wrapper(mount));
+        let reading = wrapper.clone();
+        let reader = tokio::spawn(async move {
+            let mut stream = if plus {
+                crate::Mount::readdirplus(reading.as_ref(), Bytes::from_static(b"root"))
+                    .await
+                    .map_ok(|_| ())
+                    .boxed()
+            } else {
+                crate::Mount::readdir(reading.as_ref(), Bytes::from_static(b"root"))
+                    .await
+                    .map_ok(|_| ())
+                    .boxed()
+            };
+            stream.try_next().await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::nfs41::mount::test_operation_count(wrapper.as_ref()),
+            1,
+            "the lazy page RPC must participate in close draining"
+        );
+        let closing = wrapper.clone();
+        let closer = tokio::spawn(async move { crate::Mount::umount(closing.as_ref()).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::nfs41::mount::test_wait_closing(wrapper.as_ref()),
+        )
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            reader.await.unwrap(),
+            Err(NfsError::ClientClosed(_))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), closer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            [
+                if plus { "readdirplus" } else { "readdir" },
+                "destroy_session",
+                "destroy_clientid"
+            ]
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_directory_next_does_not_keep_an_unpolled_stream_in_flight() {
+    use futures::StreamExt as _;
+    for plus in [false, true] {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut entered_tx = Some(entered_tx);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (replied_tx, replied_rx) = tokio::sync::oneshot::channel();
+        let mut replied_tx = Some(replied_tx);
+        let (mount, server) = serve_with_reply_hook(
+            move |tag, args| {
+                if tag.starts_with("readdir") {
+                    if let Some(tx) = entered_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    vec![
+                        ok(22, vec![]),
+                        ok(
+                            26,
+                            crate::nfs41::test_support::directory_page(Some(1), true, [0; 8]),
+                        ),
+                    ]
+                } else {
+                    destroy_reply(tag, args)
+                }
+            },
+            Some(release_rx),
+            move |tag| {
+                if tag.starts_with("readdir")
+                    && let Some(tx) = replied_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            },
+        )
+        .await;
+        let wrapper = crate::nfs41::mount::test_wrapper(mount);
+        let mut stream = if plus {
+            crate::Mount::readdirplus(&wrapper, Bytes::from_static(b"root"))
+                .await
+                .map_ok(|_| ())
+                .boxed()
+        } else {
+            crate::Mount::readdir(&wrapper, Bytes::from_static(b"root"))
+                .await
+                .map_ok(|_| ())
+                .boxed()
+        };
+        let mut next = Box::pin(stream.try_next());
+        tokio::select! {
+            received=entered_rx => received.unwrap(),
+            item=&mut next => panic!("page completed before release: {item:?}"),
+        }
+        drop(next); // retain the stream and its pending try_unfold state
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), replied_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::Mount::umount(&wrapper),
+        )
+        .await
+        .expect("UMOUNT must not require repolling an abandoned directory page")
+        .unwrap();
+        assert!(matches!(
+            stream.try_next().await,
+            Err(NfsError::ClientClosed(_))
+        ));
+        server.abort();
+    }
 }

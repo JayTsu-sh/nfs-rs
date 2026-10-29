@@ -146,9 +146,22 @@ state with `Mount::umount` before discarding the mount.
 RPC deadlines include waiting for readiness, the writer lock, socket transmission
 and the reply. Dropping a Rust future during a partial send shuts down that TCP
 connection; later retryable calls can reconnect. Cancellation still does not undo
-remote mutations. Settle a modifying future to obtain its outcome, or verify the
-remote file before resuming. Python owns and settles admitted operations as described
-in its API guide. Directory scans report non-EOF pages that make no progress as
+remote mutations. NFSv4.1 owns an admitted `Mount::write` until the result is
+claimed or settled: dropping its caller does not cancel the sibling DS writes.
+An unclaimed successful write is committed; an unclaimed error remains attached
+to that file independently of layout-cache or session changes. Later WRITE and
+COMMIT calls report `Uncertain/VerifyThenResume`. CLOSE waits for these writes,
+attempts to release its OPEN reference, and preserves the uncertainty. UMOUNT
+stops admission, drains admitted operations, and attempts all protocol cleanup
+even when an earlier phase fails; its result still reports those errors. DS
+session/client-id destruction remains best-effort. Directory page requests also
+drain independently of a cancelled iterator wait, without blocking shutdown on
+an idle retained iterator. Verify
+the remote file and use a fresh mount before resuming an uncertain write.
+
+Other raw Rust modifying futures still require caller settlement or remote
+verification after cancellation. Python owns and settles admitted operations as
+described in its API guide. Directory scans report non-EOF pages that make no progress as
 errors instead of silently reporting a complete listing.
 
 Python `readinto(buffer)` and `readinto_at(buffer, offset)` fill a caller-owned

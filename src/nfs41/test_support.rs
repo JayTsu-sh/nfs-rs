@@ -64,11 +64,19 @@ pub(super) async fn serve_with_reply_hook(
             let tag = take_opaque(&mut request, "tag").unwrap();
             assert_eq!(request.get_u32(), 1);
             let _count = request.get_u32();
-            assert_eq!(request.get_u32(), 53);
-            let mut sequence = request.split_to(28).to_vec(); // session, sequence, slot, highest
-            request.advance(4); // cachethis
-            xdr_u32(&mut sequence, 0); // target highest
-            xdr_u32(&mut sequence, 0); // status flags
+            let opcode = request.get_u32();
+            let sequence = if opcode == 53 {
+                let mut sequence = request.split_to(28).to_vec();
+                request.advance(4); // cachethis
+                xdr_u32(&mut sequence, 0); // target highest
+                xdr_u32(&mut sequence, 0); // status flags
+                Some(sequence)
+            } else {
+                let mut args = opcode.to_be_bytes().to_vec();
+                args.extend_from_slice(&request);
+                request = Bytes::from(args);
+                None
+            };
             let replies = handler(std::str::from_utf8(&tag).unwrap(), request);
             let mut reply = Vec::new();
             for word in [xid, 1, 0, 0, 0, 0] {
@@ -76,10 +84,15 @@ pub(super) async fn serve_with_reply_hook(
             }
             xdr_u32(&mut reply, replies.last().map_or(0, |op| op.status));
             xdr_opaque(&mut reply, &tag);
-            xdr_u32(&mut reply, 1 + replies.len() as u32);
-            xdr_u32(&mut reply, 53);
-            xdr_u32(&mut reply, 0);
-            reply.extend(sequence);
+            xdr_u32(
+                &mut reply,
+                u32::from(sequence.is_some()) + replies.len() as u32,
+            );
+            if let Some(sequence) = sequence {
+                xdr_u32(&mut reply, 53);
+                xdr_u32(&mut reply, 0);
+                reply.extend(sequence);
+            }
             for op in replies {
                 xdr_u32(&mut reply, op.opcode);
                 xdr_u32(&mut reply, op.status);

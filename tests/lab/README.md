@@ -153,3 +153,11 @@ The NFSv4.0 callback fault uses the same run-owned helper, but drops only new
 inbound TCP connections whose source is the selected `.200` or `.201` LIF. It
 arms after OPEN exposes the typed grant/no-grant outcome, verifies ordinary
 public-API I/O, and restores with a shell trap before cross-LIF checksum checks.
+
+### Local investigation artifacts
+
+Keep raw probe scripts, RPC/pcap captures, credentials, command transcripts and
+machine-local JSON dumps outside the checkout (for example in a private local
+evidence directory or `$RUNNER_TEMP`). They are not repository changes or release
+acceptance baselines. Commit only reusable tests and deliberately redacted,
+reviewed documentation; retain raw investigation data locally for reproduction.

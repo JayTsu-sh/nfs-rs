@@ -14,7 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lifecycle seam used by private language adapters.
+//! Admission, owned-task draining and terminal cleanup for native mounts and adapters.
 
 use crate::{NFSVersion, NfsError, OperationOutcome, RecoveryAction, Result};
 use async_trait::async_trait;
@@ -174,7 +174,7 @@ impl ClientCore {
         })
     }
 
-    fn ensure_ready(&self) -> Result<()> {
+    pub(crate) fn ensure_ready(&self) -> Result<()> {
         if self.lifecycle.load(Ordering::Acquire) == READY {
             Ok(())
         } else {
@@ -318,6 +318,11 @@ impl ClientCore {
 
     fn finish_owned_task(&self) {
         self.owned_tasks.decrement();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_count(&self) -> u64 {
+        self.in_flight.count()
     }
 
     pub fn owned_task_count(&self) -> u64 {

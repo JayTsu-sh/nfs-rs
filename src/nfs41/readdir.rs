@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::{Buf, Bytes};
 use futures::stream::TryStreamExt as _;
 
@@ -5,6 +7,42 @@ use super::mount::{Mount41, decode_string_from_bytes};
 use crate::error::{NfsError, Result};
 use crate::mount;
 use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
+
+type DirectoryPage<T> = (Vec<T>, u64, [u8; 8], bool);
+
+fn directory_stream<'a, T, Fetch, Page>(
+    fh: Bytes,
+    fetch: Fetch,
+) -> futures::stream::BoxStream<'a, Result<T>>
+where
+    T: Send + 'a,
+    Fetch: Fn(Bytes, u64, [u8; 8]) -> Page + Clone + Send + 'a,
+    Page: std::future::Future<Output = Result<DirectoryPage<T>>> + Send + 'a,
+{
+    Box::pin(
+        futures::stream::try_unfold(
+            Some((fh, mount::DirectoryCursor::default())),
+            move |state| {
+                let fetch = fetch.clone();
+                async move {
+                    let Some((fh, mut cursor)) = state else {
+                        return Ok::<_, NfsError>(None);
+                    };
+                    let (entries, cookie, verifier, eof) =
+                        fetch(fh.clone(), cursor.cookie, cursor.verifier).await?;
+                    let next = if cursor.advance(cookie, verifier, entries.len(), eof)? {
+                        Some((fh, cursor))
+                    } else {
+                        None
+                    };
+                    let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
+                    Ok(Some((page, next)))
+                }
+            },
+        )
+        .try_flatten(),
+    )
+}
 
 impl Mount41 {
     async fn directory_limits(&self, tag: &str) -> Result<(u32, u32)> {
@@ -22,67 +60,60 @@ impl Mount41 {
         Ok((self.dircount.min(maxcount), maxcount))
     }
 
+    // Private xattr scans fully consume this stream under their outer operation guard.
     pub(crate) async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
-        let this = self;
-        Box::pin(
-            futures::stream::try_unfold(
-                Some((dir_fh, mount::DirectoryCursor::default())),
-                move |state| async move {
-                    let Some((fh, mut cursor)) = state else {
-                        return Ok::<_, NfsError>(None);
-                    };
-                    let (entries, last_cookie, new_verf, eof) = this
-                        .readdir_page(&fh, cursor.cookie, &cursor.verifier)
-                        .await?;
-                    let next = if cursor.advance(last_cookie, new_verf, entries.len(), eof)? {
-                        Some((fh, cursor))
-                    } else {
-                        None
-                    };
-                    let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
-                    Ok(Some((page, next)))
-                },
-            )
-            .try_flatten(),
-        )
+        directory_stream(dir_fh, move |fh, cookie, verifier| async move {
+            self.readdir_page(&fh, cookie, &verifier).await
+        })
     }
 
-    pub(crate) async fn readdir_path(&self, dir_path: &str) -> Result<mount::ReaddirStream<'_>> {
-        let obj = self.lookup_path(dir_path).await?;
-        Ok(self.readdir(obj.fh).await)
-    }
-
+    #[cfg(test)]
     pub(crate) async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
-        let this = self;
-        Box::pin(
-            futures::stream::try_unfold(
-                Some((dir_fh, mount::DirectoryCursor::default())),
-                move |state| async move {
-                    let Some((fh, mut cursor)) = state else {
-                        return Ok::<_, NfsError>(None);
-                    };
-                    let (entries, last_cookie, new_verf, eof) = this
-                        .readdirplus_page(&fh, cursor.cookie, &cursor.verifier)
-                        .await?;
-                    let next = if cursor.advance(last_cookie, new_verf, entries.len(), eof)? {
-                        Some((fh, cursor))
-                    } else {
-                        None
-                    };
-                    let page = futures::stream::iter(entries.into_iter().map(Ok::<_, NfsError>));
-                    Ok(Some((page, next)))
-                },
-            )
-            .try_flatten(),
-        )
+        directory_stream(dir_fh, move |fh, cookie, verifier| async move {
+            self.readdirplus_page(&fh, cookie, &verifier).await
+        })
     }
 
-    pub(crate) async fn readdirplus_path(
-        &self,
-        dir_path: &str,
-    ) -> Result<mount::ReaddirplusStream<'_>> {
-        let obj = self.lookup_path(dir_path).await?;
-        Ok(self.readdirplus(obj.fh).await)
+    pub(super) fn readdir_owned(
+        self: &Arc<Self>,
+        core: Arc<crate::client_core::ClientCore>,
+        dir_fh: Bytes,
+    ) -> mount::ReaddirStream<'static> {
+        let mount = self.clone();
+        directory_stream(dir_fh, move |fh, cookie, verifier| {
+            let mount = mount.clone();
+            let core = core.clone();
+            async move {
+                let operation = core.begin_operation()?;
+                tokio::spawn(async move {
+                    let _operation = operation;
+                    mount.readdir_page(&fh, cookie, &verifier).await
+                })
+                .await
+                .map_err(|_| NfsError::Rpc("directory page task ended without a result".into()))?
+            }
+        })
+    }
+
+    pub(super) fn readdirplus_owned(
+        self: &Arc<Self>,
+        core: Arc<crate::client_core::ClientCore>,
+        dir_fh: Bytes,
+    ) -> mount::ReaddirplusStream<'static> {
+        let mount = self.clone();
+        directory_stream(dir_fh, move |fh, cookie, verifier| {
+            let mount = mount.clone();
+            let core = core.clone();
+            async move {
+                let operation = core.begin_operation()?;
+                tokio::spawn(async move {
+                    let _operation = operation;
+                    mount.readdirplus_page(&fh, cookie, &verifier).await
+                })
+                .await
+                .map_err(|_| NfsError::Rpc("directory page task ended without a result".into()))?
+            }
+        })
     }
 
     /// One READDIR page from a caller-held position (RFC 5661 §18.23).
