@@ -187,9 +187,4 @@ impl Mount41 {
         d.copy_to_slice(&mut verifier);
         Ok(Some(verifier))
     }
-
-    pub(crate) async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
-        let obj = self.lookup_path(path).await?;
-        self.commit(obj.fh, offset, count).await
-    }
 }

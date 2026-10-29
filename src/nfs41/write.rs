@@ -31,8 +31,15 @@ impl Mount41 {
                 .iter()
                 .any(|w| w.failed() && !w.is_done())
             {
-                return Some(Err(crate::NfsError::Rpc(
-                    "previous pNFS write failed; close and recover before writing again".into(),
+                return Some(Err(super::pnfs_io::uncertain_pnfs_write(
+                    crate::error::RequestContext {
+                        operation: "pnfs_write".into(),
+                        protocol: crate::NFSVersion::NFSv4p1,
+                        request_id: None,
+                    },
+                    crate::NfsError::Rpc(
+                        "previous pNFS write failed; close and recover before writing again".into(),
+                    ),
                 )));
             }
             match self.pnfs_write(fh, offset, data.clone()).await {
@@ -183,14 +190,20 @@ impl Mount41 {
     }
 
     pub(crate) async fn close_file(&self, fh: Bytes) -> Result<()> {
+        self.close_file_inner(fh, false).await
+    }
+
+    pub(crate) async fn close_file_inner(&self, fh: Bytes, terminal: bool) -> Result<()> {
         let _io_guard = self.layout_manager.write_file_io(&fh).await;
-        // CLOSE 前提交累积的 layout 写入范围（size/mtime 对 MDS 可见）
-        self.flush_layoutcommit(&fh).await?;
-        // Return pNFS layout before CLOSE if server requested return_on_close
-        if let Some(layout) = self.layout_manager.get_layout(&fh).await
+        let mut failure = self.flush_layoutcommit(&fh).await.err();
+        if failure.is_none()
+            && let Some(layout) = self.layout_manager.get_layout(&fh).await
             && layout.return_on_close
         {
-            self.layoutreturn_file(&fh).await?;
+            failure = self.layoutreturn_file(&fh).await.err();
+        }
+        if !terminal && let Some(error) = failure {
+            return Err(error);
         }
         // Release ref in StateManager; if ref_count hits 0, send CLOSE to server
         if let Some(sid) = self.state.release(&fh).await {
@@ -202,7 +215,7 @@ impl Mount41 {
             .await?;
             self.state.close_succeeded(&fh, &sid).await;
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     pub(crate) async fn create(

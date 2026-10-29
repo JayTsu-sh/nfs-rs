@@ -1374,6 +1374,10 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// took, the server's full [`WriteCommitted`] level, and the write verifier to
     /// pass to [`Mount::commit_write_batch`]. Use [`crate::write_all`] for a
     /// complete write that is durable when it returns.
+    ///
+    /// NFSv4.1 retains admitted writes if the waiting caller is cancelled.
+    /// Unclaimed errors fence later writes/commits until file verification and
+    /// recovery with a new mount; CLOSE/UMOUNT still attempt protocol cleanup.
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
 
     /// Same as [`Mount::write`] but takes a path resolved via LOOKUP.

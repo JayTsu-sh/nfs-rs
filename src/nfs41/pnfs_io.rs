@@ -393,7 +393,7 @@ fn ds_error_after_progress(error: NfsError, confirmed: u32) -> NfsError {
     }
 }
 
-fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
+pub(super) fn uncertain_pnfs_write(context: RequestContext, source: NfsError) -> NfsError {
     NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
         OperationOutcome::Uncertain,
         OperationClass::ReplaySensitive,
@@ -1555,11 +1555,14 @@ impl Mount41 {
     /// Return all cached layouts to the server (used during umount).
     pub(crate) async fn layoutreturn_all(&self) -> Result<()> {
         let layouts = self.layout_manager.all_layouts().await;
+        let mut failure = None;
         for (fh, _) in layouts {
             let _io_guard = self.layout_manager.write_file_io(&fh).await;
-            self.layoutreturn_file(&fh).await?;
+            if let Err(error) = self.layoutreturn_file(&fh).await {
+                failure.get_or_insert(error);
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 

@@ -229,7 +229,7 @@ pub enum NfsError {
     #[error("{0}")]
     LostOpenState(String),
 
-    /// Ordered failures observed while flushing and closing one open file.
+    /// Ordered failures observed during terminal file or mount cleanup.
     #[error("file close completed with errors")]
     FileClose(Vec<FileCloseFailure>),
 
@@ -245,7 +245,7 @@ pub enum NfsError {
 /// One ordered phase failure from a terminal file close.
 #[derive(Debug)]
 pub struct FileCloseFailure {
-    /// Stable operation name (`write`, `commit` or `close`).
+    /// Stable operation name (`write`, `commit`, `close` or `umount`).
     pub operation: &'static str,
     /// The original structured failure.
     pub error: std::sync::Arc<NfsError>,
@@ -299,6 +299,9 @@ impl NfsError {
     pub fn operation_outcome(&self) -> Option<&OperationOutcomeError> {
         match self {
             Self::OperationOutcome(error) => Some(error),
+            Self::FileClose(failures) => failures
+                .iter()
+                .find_map(|failure| failure.error.operation_outcome()),
             _ => None,
         }
     }

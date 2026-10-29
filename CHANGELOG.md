@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- NFSv4.1 retains admitted WRITE tasks after caller cancellation, settles
+  unclaimed successful receipts, and preserves unclaimed uncertain outcomes
+  independently of layout-cache/session invalidation. CLOSE and COMMIT wait for
+  owned writes; uncertain files require verification and a fresh mount.
+- NFSv4.1 UMOUNT drains admitted operations and attempts OPEN/session/transport
+  cleanup after layout-return errors, including when its waiting caller is
+  cancelled. Structured uncertainty remains discoverable in close error reports.
+- NFSv4.1 directory page requests participate in shutdown draining independently
+  of iterator polling; cancelled waits on retained streams cannot stall UMOUNT.
+- Validate bare MDS session/client destruction responses instead of treating a
+  successful RPC exchange as successful protocol cleanup.
+
 ## [0.9.1] - 2026-10-28
 
 ### Testing
