@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
+use futures::TryStreamExt as _;
 use tracing::{debug, info, warn};
 
 use super::callback::{CallbackState, RecallNotification};
@@ -811,7 +812,6 @@ impl Mount41Wrapper {
         &self,
         inner: futures::stream::BoxStream<'a, Result<T>>,
     ) -> futures::stream::BoxStream<'a, Result<T>> {
-        use futures::TryStreamExt as _;
         Box::pin(futures::stream::try_unfold(
             (self.core.clone(), inner),
             |(core, mut inner)| async move {
