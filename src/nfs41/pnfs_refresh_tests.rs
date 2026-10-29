@@ -8,7 +8,7 @@ use super::*;
 use crate::nfs4::compound::{take_opaque, xdr_opaque, xdr_u32};
 use crate::nfs41::layout::{DeviceInfo, LayoutType};
 use crate::nfs41::session::{Session, SessionHolder};
-use crate::nfs41::test_support::{Reply, ok, putfh, serve};
+use crate::nfs41::test_support::{Reply, ok, putfh, serve, serve_with_reply_hook};
 
 const DEVICE: [u8; 16] = [9; 16];
 
@@ -594,6 +594,156 @@ async fn stale_after_short_write_does_not_refresh_or_replay() {
         *case.calls.lock().unwrap(),
         ["old:ds-write", "old:ds-write"]
     );
+}
+
+// RFC 8881 §18.32: an error on one data server does not undo a sibling WRITE.
+async fn mixed_ds_reply_order(failure_first: bool) {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (delayed_failure, delayed_success) = if failure_first {
+        (None, Some(release_rx))
+    } else {
+        (Some(release_rx), None)
+    };
+    let mut first_reply = Some(release_tx);
+    let first_failure_reply = if failure_first {
+        first_reply.take()
+    } else {
+        None
+    };
+    let first_success_reply = first_reply;
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let fail_order = order.clone();
+    let (failure_ds, failure_server) = serve_with_reply_hook(
+        move |tag, mut args| {
+            assert_eq!(tag, "ds-write");
+            assert_eq!(args.get_u32(), 22);
+            assert_eq!(
+                take_opaque(&mut args, "DS filehandle").unwrap().as_ref(),
+                b"private-fh-one"
+            );
+            assert_eq!(args.get_u32(), 38);
+            stale_reply()
+        },
+        delayed_failure,
+        {
+            let mut sender = first_failure_reply;
+            move |_| {
+                fail_order.lock().unwrap().push("failure");
+                if let Some(sender) = sender.take() {
+                    sender.send(()).unwrap();
+                }
+            }
+        },
+    )
+    .await;
+    let success_order = order.clone();
+    let (success_ds, success_server) = serve_with_reply_hook(
+        move |tag, mut args| {
+            assert_eq!(tag, "ds-write");
+            let mut checked = args.clone();
+            assert_eq!(checked.get_u32(), 22);
+            assert_eq!(
+                take_opaque(&mut checked, "DS filehandle").unwrap().as_ref(),
+                b"private-fh-one"
+            );
+            write_reply(&mut args, None)
+        },
+        delayed_success,
+        {
+            let mut sender = first_success_reply;
+            move |_| {
+                success_order.lock().unwrap().push("success");
+                if let Some(sender) = sender.take() {
+                    sender.send(()).unwrap();
+                }
+            }
+        },
+    )
+    .await;
+    let mds_calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = mds_calls.clone();
+    let (mut mount, mds_server) = serve(move |tag, _| {
+        observed.lock().unwrap().push(tag.to_owned());
+        stale_reply()
+    })
+    .await;
+    enable_pnfs(&mut mount).await;
+    mount.wsize = 64;
+    let fh = Bytes::from_static(b"file");
+    let mut striped = layout(0, u64::MAX, b"private-fh-one");
+    if let LayoutContent::FilesLayout { stripe_unit, .. } = &mut striped.segments[0].content {
+        *stripe_unit = 64;
+    }
+    mount.layout_manager.store_layout(&fh, striped).await;
+    mount
+        .layout_manager
+        .store_device(
+            DEVICE,
+            DeviceInfo {
+                stripe_indices: vec![0, 1],
+                ds_addrs: vec![vec![failure_ds.server_addr], vec![success_ds.server_addr]],
+            },
+        )
+        .await;
+    mount
+        .layout_manager
+        .store_test_data_server(failure_ds.server_addr, failure_ds.rpc.clone())
+        .await;
+    mount
+        .layout_manager
+        .store_test_data_server(success_ds.server_addr, success_ds.rpc.clone())
+        .await;
+    let failure_address = failure_ds.server_addr;
+    let success_address = success_ds.server_addr;
+    let wrapper = crate::nfs41::mount::test_wrapper(mount);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::Mount::write(&wrapper, fh.clone(), 0, Bytes::from(vec![0x5a; 128])),
+    )
+    .await
+    .expect("both simulated DS replies must settle")
+    .unwrap_err();
+    let outcome = error.operation_outcome().unwrap();
+    assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+    assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+    let diagnostic = format!("{error:?}");
+    assert!(diagnostic.contains(&format!(
+        "stripe=0 ds={failure_address} attempted=true outcome=error"
+    )));
+    assert!(diagnostic.contains(&format!(
+        "stripe=1 ds={success_address} attempted=true outcome=success"
+    )));
+    assert!(!diagnostic.contains("private-fh"));
+    assert!(!diagnostic.contains("ZZZZ"));
+    assert!(!diagnostic.contains("[90, 90, 90"));
+    assert!(!diagnostic.contains("5a5a5a5a"));
+    assert!(!diagnostic.contains("[112, 114, 105, 118"));
+    assert!(!diagnostic.contains("70726976"));
+    assert!(
+        mds_calls.lock().unwrap().is_empty(),
+        "MDS must not receive a replay"
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        if failure_first {
+            vec!["failure", "success"]
+        } else {
+            vec!["success", "failure"]
+        }
+    );
+    failure_server.abort();
+    success_server.abort();
+    mds_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_ds_failure_reply_first_has_no_mds_replay() {
+    mixed_ds_reply_order(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_ds_success_reply_first_has_no_mds_replay() {
+    mixed_ds_reply_order(false).await;
 }
 
 #[tokio::test]

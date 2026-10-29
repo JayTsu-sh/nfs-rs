@@ -35,7 +35,15 @@ pub(super) fn putfh(args: &mut Bytes) {
 }
 
 pub(super) async fn serve(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+) -> (Mount41, JoinHandle<()>) {
+    serve_with_reply_hook(handler, None, |_| {}).await
+}
+
+pub(super) async fn serve_with_reply_hook(
     mut handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+    mut reply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    mut after_reply: impl FnMut(&str) + Send + 'static,
 ) -> (Mount41, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -77,11 +85,15 @@ pub(super) async fn serve(
                 xdr_u32(&mut reply, op.status);
                 reply.extend(op.data);
             }
+            if let Some(gate) = reply_gate.take() {
+                gate.await.unwrap();
+            }
             stream
                 .write_u32(0x80000000 | reply.len() as u32)
                 .await
                 .unwrap();
             stream.write_all(&reply).await.unwrap();
+            after_reply(std::str::from_utf8(&tag).unwrap());
         }
     });
     let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
