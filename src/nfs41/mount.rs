@@ -2337,6 +2337,14 @@ pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mou
 }
 
 #[cfg(test)]
+pub(super) fn test_wrapper(m: Mount41) -> Mount41Wrapper {
+    Mount41Wrapper {
+        m,
+        issuer: NEXT_MOUNT_ISSUER.fetch_add(1, Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
