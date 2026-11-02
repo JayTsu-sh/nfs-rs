@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/nfs-rs/badge.svg)](https://docs.rs/nfs-rs)
 [![license](https://img.shields.io/crates/l/nfs-rs.svg)](LICENSE)
 
-An asynchronous, pure Rust client library for NFSv3, NFSv4.0, and NFSv4.1.
+An asynchronous, pure Rust client library for NFSv3, NFSv4.0, NFSv4.1, and NFSv4.2.
 
 `nfs-rs` implements the NFS client protocol without linking to a C NFS
 implementation. It is intended for applications that need to access NFS
@@ -19,9 +19,21 @@ kernel-mounted filesystem.
   AUTH_SYS interoperability profile. RPCSEC_GSS/Kerberos is not implemented,
   so this release does not claim unconditional RFC 7530 conformance.
 - NFSv4.1 client operations are supported.
-- NFSv4.2 may be accepted in a URL preference list but is not implemented.
+- NFSv4.2 runs the existing file APIs over minor version 2, including sessions,
+  locks, callbacks, and negotiated pNFS file layouts. Optional synchronous
+  intra-server COPY, CLONE, SEEK, ALLOCATE/DEALLOCATE, READ_PLUS and RFC 8276
+  xattrs are exposed; server support is required and rejection is explicit.
 - The library uses Tokio and communicates with the server over TCP.
 - Linux is exercised by CI and by the physical NFS integration lab.
+
+NFSv4.2 support is available in 0.10.0. Select it explicitly with
+`version=4.2`; this does not silently downgrade to another minor version.
+AFX validation with the related server features enabled confirmed ordinary
+file APIs, ACLs, RFC 8276 xattrs, ALLOCATE, SEEK and whole-file DEALLOCATE.
+The tested AFX export rejects COPY, CLONE and READ_PLUS as unsupported;
+partial DEALLOCATE returns a server IO error. Optional operations therefore
+still require support from the selected server. See the
+[AFX validation report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
 
 The public API is still evolving while the crate is below version 1.0.
 
@@ -29,7 +41,7 @@ The public API is still evolving while the crate is below version 1.0.
 
 ```toml
 [dependencies]
-nfs-rs = "0.9.1"
+nfs-rs = "0.10.0"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -95,7 +107,8 @@ Supported arguments:
 - `version=<3|4.0|4.1|4.2>` — preferred protocol version or a comma-separated
   preference list such as `4.1,4.0,3`. The default is `3`. The exact `4.0`
   selector selects the experimental NFSv4.0 engine; ambiguous `4` is rejected.
-  Version 4.2 is not currently implemented.
+  Exact `version=4.2` requires v4.2; `version=4.2,4.1` explicitly allows fallback.
+  pNFS data servers negotiate their version independently (v4.2 or v4.1).
 - `retain-delegations=true` — opt into automatic delegation retention. It is
   disabled by default; NFSv4.0 publishes a separately reachable callback
   listener when enabled.
@@ -146,9 +159,22 @@ state with `Mount::umount` before discarding the mount.
 RPC deadlines include waiting for readiness, the writer lock, socket transmission
 and the reply. Dropping a Rust future during a partial send shuts down that TCP
 connection; later retryable calls can reconnect. Cancellation still does not undo
-remote mutations. Settle a modifying future to obtain its outcome, or verify the
-remote file before resuming. Python owns and settles admitted operations as described
-in its API guide. Directory scans report non-EOF pages that make no progress as
+remote mutations. NFSv4.1 owns an admitted `Mount::write` until the result is
+claimed or settled: dropping its caller does not cancel the sibling DS writes.
+An unclaimed successful write is committed; an unclaimed error remains attached
+to that file independently of layout-cache or session changes. Later WRITE and
+COMMIT calls report `Uncertain/VerifyThenResume`. CLOSE waits for these writes,
+attempts to release its OPEN reference, and preserves the uncertainty. UMOUNT
+stops admission, drains admitted operations, and attempts all protocol cleanup
+even when an earlier phase fails; its result still reports those errors. DS
+session/client-id destruction remains best-effort. Directory page requests also
+drain independently of a cancelled iterator wait, without blocking shutdown on
+an idle retained iterator. Verify
+the remote file and use a fresh mount before resuming an uncertain write.
+
+Other raw Rust modifying futures still require caller settlement or remote
+verification after cancellation. Python owns and settles admitted operations as
+described in its API guide. Directory scans report non-EOF pages that make no progress as
 errors instead of silently reporting a complete listing.
 
 Python `readinto(buffer)` and `readinto_at(buffer, offset)` fill a caller-owned
@@ -216,3 +242,10 @@ the NFS URL. Definite connection loss (reset, EOF, broken pipe, or a disconnecte
 socket) then returns the original typed transport error without reconnect/replay.
 The default recovery policy is unchanged. Silent packet loss still requires an
 operation deadline; `fail_fast` does not guess that a slow server disconnected.
+
+Server-busy responses use a fixed bounded retry policy across v3, v4.0, v4.1
+and v4.2, including independent pNFS DS reads. Safely reissuable requests have
+at most 16 busy reissues within 60 s, using equal-jitter exponential backoff
+(200 ms base, 5 s cap). Exhaustion preserves the original protocol status in a
+structured ServerBusy error. See [retry behavior](docs/bounded-retries.md) for
+stateful-operation safety, deadlines and application recovery.

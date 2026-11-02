@@ -52,7 +52,7 @@ struct DetachedSettlement<T: 'static> {
 impl<T: 'static> DetachedSettlement<T> {
     fn new(future: impl Future<Output = Result<T>> + Send + 'static) -> Self {
         Self {
-            future: Some(Box::pin(future)),
+            future: Some(Box::pin(crate::retry::inherit(future))),
         }
     }
 }
@@ -592,13 +592,44 @@ async fn settled_call(
     class: OperationClass,
     ctx: RequestContext,
 ) -> Result<Bytes> {
-    tokio::spawn(async move {
-        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-            .await
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
-    })
+    tokio::spawn(crate::retry::inherit(async move {
+        call_with_busy_retry(
+            &rpc,
+            request,
+            Bytes::new(),
+            ReplayPolicy::ONE_ATTEMPT,
+            METADATA_TIMEOUT,
+            ctx.clone(),
+        )
+        .await
+        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+    }))
     .await
     .map_err(|error| NfsError::Rpc(format!("NFSv4.0 settlement task failed: {error}")))?
+}
+
+async fn call_with_busy_retry(
+    rpc: &rpc::Client,
+    request: Vec<u8>,
+    data: Bytes,
+    replay: ReplayPolicy,
+    timeout: Duration,
+    context: RequestContext,
+) -> Result<Bytes> {
+    crate::retry::scope(async {
+        let budget = crate::retry::current();
+        loop {
+            let reply = rpc
+                .call_with_data(request.clone(), data.clone(), replay, timeout)
+                .await?;
+            let Some(error) = super::compound::retryable_busy_response(reply.clone(), &request)?
+            else {
+                return Ok(reply);
+            };
+            budget.backoff(context.clone(), error).await?;
+        }
+    })
+    .await
 }
 
 impl Mount40 {
@@ -1260,7 +1291,19 @@ impl Mount40 {
         replay: ReplayPolicy,
         timeout: Duration,
     ) -> Result<Bytes> {
-        let response = self.rpc.call(request, replay, timeout).await?;
+        let response = call_with_busy_retry(
+            &self.rpc,
+            request,
+            Bytes::new(),
+            replay,
+            timeout,
+            RequestContext {
+                operation: "compound".into(),
+                protocol: NFSVersion::NFSv4p0,
+                request_id: None,
+            },
+        )
+        .await?;
         Ok(response)
     }
 
@@ -1384,15 +1427,16 @@ impl Mount40 {
                 .write_header(&stateid, offset, stable, data.len() as u32)
                 .encode_with_header(&auth);
             let (class, ctx) = context("write", owner, next_seqid, OperationClass::ReplaySensitive);
-            let response = rpc
-                .call_with_data(
-                    request,
-                    data.clone(),
-                    ReplayPolicy::ONE_ATTEMPT,
-                    METADATA_TIMEOUT,
-                )
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+            let response = call_with_busy_retry(
+                &rpc,
+                request,
+                data.clone(),
+                ReplayPolicy::ONE_ATTEMPT,
+                METADATA_TIMEOUT,
+                ctx.clone(),
+            )
+            .await
+            .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
             let (count, committed, verifier) = decode_write_response(response)
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
             lease.finish_stateful(expected_generation, "write")?;
@@ -1452,7 +1496,8 @@ impl Mount for Mount40 {
     async fn null(&self) -> Result<()> {
         let mut request = Vec::new();
         crate::nfs3::rpc_header(100003, 4, 0, &self.auth).encode(&mut request);
-        self.activity_call(request, SAFE_REPLAY, METADATA_TIMEOUT)
+        self.rpc
+            .call(request, SAFE_REPLAY, METADATA_TIMEOUT)
             .await?;
         Ok(())
     }
@@ -2176,8 +2221,21 @@ impl Mount for Mount40 {
                 .putfh(&fh)
                 .read(&stateid, offset, count)
                 .encode_with_header(&auth);
-            let data =
-                decode_read_response(rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?)?;
+            let data = decode_read_response(
+                call_with_busy_retry(
+                    &rpc,
+                    request,
+                    Bytes::new(),
+                    SAFE_REPLAY,
+                    METADATA_TIMEOUT,
+                    RequestContext {
+                        operation: "read".into(),
+                        protocol: NFSVersion::NFSv4p0,
+                        request_id: None,
+                    },
+                )
+                .await?,
+            )?;
             lease.finish_stateful(expected_generation, "read")?;
             Ok::<_, NfsError>(data)
         })
@@ -6083,5 +6141,41 @@ mod tests {
         .await
         .expect("cancelled CLOSE did not remove settled owner state");
         callback.stop().await;
+    }
+    #[tokio::test]
+    async fn busy_v40_read_retries_delay_with_or_without_open() {
+        for stateful in [false, true] {
+            for status in [10008, 10013] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mount = connected_direct_mount(&listener).await;
+                if stateful {
+                    register_scripted_open(&mount, 99, b"fh").await;
+                }
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = calls.clone();
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    while let Ok(request) = read_record(&mut stream).await {
+                        let n = seen.fetch_add(1, Ordering::SeqCst);
+                        let payload = if n == 0 {
+                            failed_lock_result("read", 25, status)
+                        } else {
+                            let mut data = 1u32.to_be_bytes().to_vec();
+                            xdr_opaque(&mut data, b"abc");
+                            compound_result("read", &[(22, &[]), (25, &data)])
+                        };
+                        reply(&mut stream, &request, &payload).await.unwrap();
+                    }
+                });
+                let first = mount.read(Bytes::from_static(b"fh"), 0, 3).await;
+                eprintln!(
+                    "v4.0 stateful={stateful}: first={first:?}, calls={}",
+                    calls.load(Ordering::SeqCst)
+                );
+                assert_eq!(first.unwrap(), b"abc"[..]);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                server.abort();
+            }
+        }
     }
 }

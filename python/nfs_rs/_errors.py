@@ -44,6 +44,9 @@ class NfsError(RuntimeError):
     errno: int | None
     filename: str | None
     errors: tuple[NfsError, ...]
+    retry_count: int | None
+    retry_elapsed_ms: int | None
+    retry_reason: str | None
 
     def __init__(
         self,
@@ -60,6 +63,9 @@ class NfsError(RuntimeError):
         errno: int | None = None,
         filename: str | None = None,
         errors: tuple[NfsError, ...] = (),
+        retry_count: int | None = None,
+        retry_elapsed_ms: int | None = None,
+        retry_reason: str | None = None,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
         values = {
@@ -75,6 +81,9 @@ class NfsError(RuntimeError):
             "errno": errno,
             "filename": filename,
             "errors": tuple(errors),
+            "retry_count": retry_count,
+            "retry_elapsed_ms": retry_elapsed_ms,
+            "retry_reason": retry_reason,
         }
         for name, value in values.items():
             object.__setattr__(self, name, value)
@@ -94,7 +103,7 @@ class NfsError(RuntimeError):
             for name in (
                 "message", "operation", "protocol", "code", "code_name",
                 "recovery_action", "outcome", "operation_class", "completed_bytes",
-                "errno", "filename", "errors",
+                "errno", "filename", "errors", "retry_count", "retry_elapsed_ms", "retry_reason",
             )
         }
         return _restore_error, (type(self), state)
@@ -140,6 +149,7 @@ class NfsInvalidInputError(ValueError, NfsError): __init__ = _structured_init
 class NfsProtocolError(NfsError): pass
 class NfsStateLostError(NfsProtocolError): pass
 class NfsRetryableError(NfsProtocolError): pass
+class NfsServerBusyError(NfsRetryableError): pass
 class NfsBadCookieError(NfsProtocolError): pass
 class NfsOperationOutcomeError(NfsError): pass
 class NfsUncertainOutcomeError(NfsOperationOutcomeError): pass

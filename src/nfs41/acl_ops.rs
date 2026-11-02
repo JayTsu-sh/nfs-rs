@@ -8,7 +8,24 @@ use crate::mount;
 use crate::nfs4::acl;
 
 impl Mount41 {
+    async fn require_acl_attribute(&self, fh: &Bytes, attribute: u32) -> Result<()> {
+        // RFC 8881 §5.8.1.1: supported_attrs is per filesystem. A valid
+        // omission of an unadvertised optional ACL is not malformed XDR.
+        if self.protocol_version() == crate::NFSVersion::NFSv4p2
+            && !self
+                .v42_attributes(fh.clone())
+                .await?
+                .supports_attribute(attribute)
+        {
+            return Err(NfsError::Unsupported(format!(
+                "filesystem does not advertise NFSv4 ACL attribute {attribute}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn getacl(&self, fh: Bytes) -> Result<mount::Acl> {
+        self.require_acl_attribute(&fh, 12).await?;
         let bitmap: [u32; 1] = [1 << 12]; // FATTR4_ACL
         let resp = self
             .compound("getacl", |b| b.putfh(&fh).getattr(&bitmap))
@@ -21,6 +38,7 @@ impl Mount41 {
     }
 
     pub(crate) async fn setacl(&self, fh: Bytes, acl: &mount::Acl) -> Result<()> {
+        self.require_acl_attribute(&fh, 12).await?;
         let (attrmask, attr_vals) = acl::encode_setattr_acl(acl);
         // Anonymous stateid is acceptable for SETATTR when no conflicting share reservations
         // exist (RFC 5661 §8.2.3). Consistent with how setattr.rs handles the same case.
@@ -43,6 +61,7 @@ impl Mount41 {
     }
 
     pub(crate) async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
+        self.require_acl_attribute(&fh, 13).await?;
         let bitmap: [u32; 1] = [1 << 13]; // FATTR4_ACLSUPPORT
         let resp = self
             .compound("aclsupport", |b| b.putfh(&fh).getattr(&bitmap))
@@ -59,6 +78,7 @@ impl Mount41 {
         attribute: u32,
         operation: &str,
     ) -> Result<mount::NfsAcl41> {
+        self.require_acl_attribute(&fh, attribute).await?;
         let bitmap = [0, 1 << (attribute - 32)];
         let resp = self
             .compound(operation, |b| b.putfh(&fh).getattr(&bitmap))
@@ -77,6 +97,7 @@ impl Mount41 {
         attribute: u32,
         operation: &str,
     ) -> Result<()> {
+        self.require_acl_attribute(&fh, attribute).await?;
         let (attrmask, attr_vals) = acl::encode_setattr_acl41(value, attribute);
         let stateid = [0u8; 16];
         let resp = self

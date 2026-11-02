@@ -11,6 +11,66 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-02
+
+### Changed
+
+- Rust `NfsError` gains the public `ServerBusy` variant and retry metadata.
+  Downstream exhaustive matches must handle the new variant. Python adds
+  `NfsServerBusyError` under `NfsRetryableError`.
+
+### Added
+
+- NFSv4.2 support for the existing Rust/Python file APIs through exact
+  `version=4.2`, ordered fallback lists, and Python `Version.NFS_V4_2`.
+  Sessions, recovery, lease renewal, callbacks and teardown retain the selected
+  minor version; pNFS data servers independently negotiate v4.2/v4.1.
+  Optional synchronous intra-server COPY, CLONE, SEEK, ALLOCATE/DEALLOCATE,
+  READ_PLUS and RFC 8276 extended attributes are exposed in Rust and Python.
+  Server rejections remain explicit; no client-side or async-copy fallback is
+  implicit. Mutations retain OPENs/barriers through cancellation and COPY
+  commits its returned verifier before reporting durable bytes.
+- NFSv4.2 xattrs use the separate RFC 8276 namespace, including atomic
+  create/replace policy and bounded cookie-checked LISTXATTRS pagination.
+  v4.0/v4.1 retain OPENATTR named attributes. Missing RFC 8276 keys preserve
+  NOXATTR (mapped to Python FileNotFoundError); XATTR2BIG maps to E2BIG.
+- NFSv4.2 ACL calls distinguish per-filesystem unsupported attributes from
+  malformed XDR responses.
+- Isolated AFX NFSv4.2 lab runner covering all four data LIFs, with shared
+  locking, kernel-client preparation and unconditional cleanup.
+  Enabled-feature validation covers ordinary ACLs, xattrs, ALLOCATE, SEEK and
+  whole-file DEALLOCATE. Partial DEALLOCATE remains an explicit server IO
+  failure; COPY/CLONE/READ_PLUS remain unsupported on the tested AFX export.
+
+### Fixed
+
+- Apply one fixed bounded server-busy retry policy to NFSv3 JUKEBOX and safe
+  NFSv4.0/v4.1/v4.2 DELAY/GRACE reissues, including independent pNFS DS calls.
+  Share 16 busy retries and a 60 s budget across nested calls, using equal-jitter
+  exponential backoff (200 ms base, 5 s cap), without a disabled mode. Preserve
+  SEQUENCE identities correctly, never replay completed mutations, and avoid
+  restarting exhausted backpressure through pNFS layout refresh. Rust ServerBusy
+  and Python NfsServerBusyError retain the original status and retry metadata.
+
+- NFSv4.2 mutations retain uncertain results when cancellation happens after
+  result readiness, and publish task failure before releasing file barriers.
+  Python retains nested operation/CLOSE recovery failures and identifies the
+  COPY/CLONE destination as the file requiring verification.
+- NFSv4.1/v4.2 resolve `.` path components locally, allowing default mount-root
+  attribute queries without sending an invalid LOOKUP name.
+
+- NFSv4.1 retains admitted WRITE tasks after caller cancellation, settles
+  unclaimed successful receipts, and preserves unclaimed uncertain outcomes
+  independently of layout-cache/session invalidation. CLOSE and COMMIT wait for
+  owned writes; uncertain files require verification and a fresh mount.
+- NFSv4.1 UMOUNT drains admitted operations and attempts OPEN/session/transport
+  cleanup after layout-return errors, including when its waiting caller is
+  cancelled. Structured uncertainty remains discoverable in close error reports.
+- NFSv4.1 directory page requests participate in shutdown draining independently
+  of iterator polling; cancelled waits on retained streams cannot stall UMOUNT.
+- Validate bare MDS session/client destruction responses instead of treating a
+  successful RPC exchange as successful protocol cleanup.
+
 ## [0.9.1] - 2026-10-28
 
 ### Testing
@@ -498,7 +558,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.7...v0.8.8

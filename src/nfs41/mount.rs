@@ -10,8 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Buf, Bytes};
+use futures::TryStreamExt as _;
 use tracing::{debug, info, warn};
 
+use super::MinorVersion;
 use super::callback::{CallbackState, RecallNotification};
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::layout::{DsConnection, LayoutManager};
@@ -37,18 +39,22 @@ static NEXT_MOUNT_ISSUER: AtomicU64 = AtomicU64::new(1);
 // Retry counts
 const NFS_RETRIES: usize = 10;
 const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
-// Equal-jitter exponential backoff for NFS4ERR_DELAY/GRACE retries.
-// Without jitter, concurrent workers (e.g. integrity-check parallel LOOKUPs)
-// resync to the same retry instant and sustain the thundering-herd that
-// triggered the error. Total expected DELAY wait across 17 attempts ≈ 46s
-// (max < 61s), covering observed 60+ s server-busy windows.
-pub(super) const DELAY_RETRY_MAX: usize = 16;
-const DELAY_RETRY_BASE_MS: u64 = 200;
-const DELAY_RETRY_CAP_MS: u64 = 5000;
-const GRACE_RETRY_BASE_MS: u64 = 1000;
-const GRACE_RETRY_CAP_MS: u64 = 8000;
+// Session recovery has an independent iteration bound; busy reissues also
+// consume the shared operation retry/time budget.
+pub(super) const DELAY_RETRY_MAX: usize = crate::retry::MAX_RETRIES as usize;
 const RPC_CALL_PREFIX_SIZE: usize = 8; // XID + message type; record marker is transport framing.
 const MIN_RPC_REPLY_ENVELOPE_SIZE: usize = 24;
+
+fn decode_destroy_response(data: Bytes, expected_opcode: u32) -> Result<()> {
+    let reply = CompoundResponse::decode(data)?;
+    reply.check_status()?;
+    let operation = reply.op_ok(0)?;
+    if reply.results.len() != 1 || operation.opcode != expected_opcode || !operation.data.is_empty()
+    {
+        return Err(NfsError::Xdr("invalid destroy COMPOUND response".into()));
+    }
+    Ok(())
+}
 
 fn enforce_request_size(session: &Session, header_len: usize, data_len: usize) -> Result<()> {
     let encoded = header_len
@@ -95,11 +101,15 @@ fn enforce_response_operations(
     Ok(())
 }
 
-fn bind_connection_request(auth: &Auth, session_id: &[u8; 16]) -> Vec<u8> {
+fn bind_connection_request(
+    auth: &Auth,
+    session_id: &[u8; 16],
+    minor_version: MinorVersion,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     CompoundBuilder::new("bind_conn")
         .bind_conn_to_session(session_id, 3, false)
-        .encode_with_header(auth, &mut buf);
+        .encode_with_header(auth, minor_version, &mut buf);
     buf
 }
 
@@ -133,8 +143,9 @@ async fn bind_connection(
     auth: &Auth,
     session_id: &[u8; 16],
     during_reconnect: bool,
+    minor_version: MinorVersion,
 ) -> Result<u32> {
-    let request = bind_connection_request(auth, session_id);
+    let request = bind_connection_request(auth, session_id, minor_version);
     let response = if during_reconnect {
         client
             .call_during_reconnect(request, METADATA_TIMEOUT)
@@ -147,17 +158,12 @@ async fn bind_connection(
     validate_bound_connection(response, session_id)
 }
 
-fn request_context(
-    tag: &str,
-    session_id: &[u8; 16],
-    slot_id: u32,
-    sequence_id: u32,
-) -> RequestContext {
+fn request_context(tag: &str, session: &Session, slot_id: u32, sequence_id: u32) -> RequestContext {
     RequestContext {
         operation: tag.chars().take(64).collect(),
-        protocol: NFSVersion::NFSv4p1,
+        protocol: session.minor_version().version(),
         request_id: Some(crate::error::RequestId::nfs41(
-            *session_id,
+            *session.id(),
             slot_id,
             sequence_id,
         )),
@@ -170,25 +176,6 @@ fn sent_error(
     error: NfsError,
 ) -> NfsError {
     classify_sent_nfs41_error(operation_class, context.clone(), error)
-}
-
-fn backoff_jitter_ms(attempt: usize, base_ms: u64, cap_ms: u64) -> u64 {
-    let base = base_ms
-        .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
-        .min(cap_ms);
-    let half = base / 2;
-    if half == 0 {
-        return base;
-    }
-    rand::random_range(half..base)
-}
-
-pub(super) fn delay_with_jitter_ms(attempt: usize) -> u64 {
-    backoff_jitter_ms(attempt, DELAY_RETRY_BASE_MS, DELAY_RETRY_CAP_MS)
-}
-
-pub(super) fn grace_with_jitter_ms(attempt: usize) -> u64 {
-    backoff_jitter_ms(attempt, GRACE_RETRY_BASE_MS, GRACE_RETRY_CAP_MS)
 }
 
 // SEQ4_STATUS flag constants (RFC 5661 §2.10.6.2)
@@ -249,9 +236,14 @@ pub(crate) struct Mount41 {
     pub(crate) rsize: u32,
     pub(crate) wsize: u32,
     pub(crate) acl_supported: bool,
+    pub(super) writes: Arc<super::write_owner::WriteOwner>,
 }
 
 impl Mount41 {
+    pub(super) fn protocol_version(&self) -> NFSVersion {
+        self.client_identity.minor_version.version()
+    }
+
     /// Check SEQ4_STATUS flags from SEQUENCE result and take corrective action.
     ///
     /// RFC 5661 §2.10.6.2: the server reports session/state conditions via
@@ -318,7 +310,7 @@ impl Mount41 {
                             .sequence(&sess_id, seq_id, slot_id, highest)
                             .reclaim_complete(false);
                         let mut buf = Vec::new();
-                        builder.encode_with_header(&auth, &mut buf);
+                        builder.encode_with_header(&auth, sess.minor_version(), &mut buf);
                         slot.fence_on_drop();
                         let response = rpc
                             .call(buf, super::ONE_ATTEMPT, std::time::Duration::from_secs(10))
@@ -427,7 +419,27 @@ impl Mount41 {
         progress_index: Option<usize>,
         build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
     ) -> Result<CompoundResponse> {
-        for attempt in 0..=DELAY_RETRY_MAX {
+        crate::retry::scope(self.compound_budgeted(
+            tag,
+            timeout,
+            write_data,
+            progress_index,
+            build_ops,
+        ))
+        .await
+    }
+
+    async fn compound_budgeted(
+        &self,
+        tag: &str,
+        timeout: std::time::Duration,
+        write_data: Option<bytes::Bytes>,
+        progress_index: Option<usize>,
+        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+    ) -> Result<CompoundResponse> {
+        let budget = crate::retry::current();
+        let mut attempt = 0;
+        loop {
             let sess = self.session_holder.get().await;
             let mut slot = sess.acquire_slot().await?;
 
@@ -447,7 +459,7 @@ impl Mount41 {
                         OperationOutcome::DefiniteFailure,
                         builder.operation_class(),
                         RecoveryAction::Reopen,
-                        request_context(tag, sess.id(), slot.slot_id, seq_id),
+                        request_context(tag, &sess, slot.slot_id, seq_id),
                         NfsError::Rpc(format!(
                             "stale session generation {required}, active {}",
                             sess.generation()
@@ -459,28 +471,50 @@ impl Mount41 {
             builder.enforce_max_operations(sess.max_operations())?;
             let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
-            let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
+            let original_session_only = builder.requires_original_session();
+            let context = request_context(tag, &sess, slot.slot_id, seq_id);
+            let mut buf = Vec::new();
+            builder.encode_with_header(&self.auth, sess.minor_version(), &mut buf);
+            enforce_request_size(&sess, buf.len(), write_data.as_ref().map_or(0, Bytes::len))?;
+
             if operation_class != OperationClass::ReadOnly {
                 slot.fence_on_drop();
             }
-            let mut buf = Vec::new();
-            builder.encode_with_header(&self.auth, &mut buf);
-            enforce_request_size(&sess, buf.len(), write_data.as_ref().map_or(0, Bytes::len))?;
 
-            let response_bytes = if let Some(ref data) = write_data {
-                self.rpc
-                    .call_with_data(buf, data.clone(), NFS_REPLAY, timeout)
-                    .await
-            } else {
-                self.rpc.call(buf, NFS_REPLAY, timeout).await
-            }
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-            enforce_response_size(&sess, response_bytes.len())
+            let mut resp = loop {
+                if operation_class != OperationClass::ReadOnly {
+                    slot.fence_on_drop();
+                }
+                let response_bytes = if let Some(ref data) = write_data {
+                    self.rpc
+                        .call_with_data(buf.clone(), data.clone(), NFS_REPLAY, timeout)
+                        .await
+                } else {
+                    self.rpc.call(buf.clone(), NFS_REPLAY, timeout).await
+                }
                 .map_err(|error| sent_error(operation_class, &context, error))?;
-            let mut resp = CompoundResponse::decode(response_bytes)
-                .map_err(|error| sent_error(operation_class, &context, error))?;
-            enforce_response_operations(&sess, &resp, request_op_count)
-                .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_size(&sess, response_bytes.len())
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                let decoded = CompoundResponse::decode(response_bytes)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_operations(&sess, &decoded, request_op_count)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                if decoded.results.len() == 1
+                    && decoded.results[0].opcode == super::compound::OpNum::Sequence as u32
+                    && matches!(
+                        decoded.results[0].status,
+                        nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE
+                    )
+                    && decoded.status == decoded.results[0].status
+                {
+                    slot.resolve();
+                    budget
+                        .backoff(context.clone(), NfsError::Nfs4(decoded.status))
+                        .await?;
+                    continue;
+                }
+                break decoded;
+            };
             resp.session_generation = sess.generation();
             // Validate the wire identity before advancing or changing slot limits.
             let sequence_result = if let Some(sequence_op) = resp.results.first()
@@ -516,22 +550,27 @@ impl Mount41 {
                 return Ok(resp);
             }
             match resp.check_status() {
-                Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = delay_with_jitter_ms(attempt);
-                    warn!(tag, attempt, delay_ms, "NFS4ERR_DELAY, retrying with jitter");
+                Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE)) => {
                     slot.resolve();
+                    if !builder.can_retry_busy(&resp).map_err(|e| sent_error(operation_class, &context, e))? {
+                        return Err(NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+                            OperationOutcome::Uncertain, operation_class,
+                            RecoveryAction::VerifyThenResume, context, error,
+                        ))));
+                    }
                     drop(slot);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    budget.backoff(context, error).await?;
                     continue;
                 }
-                Err(NfsError::Nfs4(nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = grace_with_jitter_ms(attempt);
-                    warn!(tag, attempt, delay_ms, "NFS4ERR_GRACE, waiting for server grace period");
-                    slot.resolve();
-                    drop(slot);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    continue;
-                }
+                Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION | nfsstat4::NFS4ERR_DEADSESSION | nfsstat4::NFS4ERR_SEQ_MISORDERED))
+                    if original_session_only => {
+                        // RFC 8881 §2.10.13: do not repeat a possibly completed
+                        // mutation using a fresh session/slot/sequence identity.
+                        return Err(NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+                            OperationOutcome::Uncertain, operation_class,
+                            RecoveryAction::VerifyThenResume, context, error,
+                        ))));
+                    }
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION))
                 | Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DEADSESSION))
                 // RFC 5661 §2.10.6.1: SEQ_MISORDERED — RPC retransmit after server
@@ -539,6 +578,7 @@ impl Mount41 {
                 | Err(NfsError::Nfs4(nfsstat4::NFS4ERR_SEQ_MISORDERED))
                     if attempt < DELAY_RETRY_MAX =>
                 {
+                    attempt += 1;
                     warn!(tag, attempt, "session invalid — re-establishing");
                     let expected_generation = sess.generation();
                     slot.resolve();
@@ -601,9 +641,6 @@ impl Mount41 {
             slot.resolve();
             return Ok(resp);
         }
-        Err(NfsError::Rpc(
-            "NFS4ERR_DELAY/GRACE retry exhausted".to_string(),
-        ))
     }
 
     /// Send a COMPOUND to a pNFS data server with SEQUENCE on the DS's own
@@ -613,173 +650,329 @@ impl Mount41 {
         auth: &Auth,
         tag: &str,
         data_size: usize,
-        build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        let mut slot = ds.session.acquire_slot().await?;
-        let builder = CompoundBuilder::new(tag).sequence(
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-            ds.session.highest_slot_id(),
-        );
-        let builder = build_ops(builder)
-            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
-        builder.enforce_max_operations(ds.session.max_operations())?;
-        let request_op_count = builder.op_count();
-        let operation_class = builder.operation_class();
-        let context = request_context(
-            tag,
-            ds.session.id(),
-            slot.slot_id,
-            slot.current_sequence_id(),
-        );
-        if operation_class != OperationClass::ReadOnly {
-            slot.fence_on_drop();
-        }
-        let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
-        enforce_request_size(&ds.session, buf.len(), 0)?;
-        let timeout = data_timeout(data_size);
-        let response_bytes = ds
-            .client
-            .call(buf, NFS_REPLAY, timeout)
-            .await
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_size(&ds.session, response_bytes.len())
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        let mut resp = CompoundResponse::decode(response_bytes)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_operations(&ds.session, &resp, request_op_count)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        resp.session_generation = ds.session.generation();
-        // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
-        if let Err(error) = resp.op_ok(0) {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
-            }
-            return Err(error);
-        }
-        let sequence = match validate_sequence_result(
-            &resp.results[0],
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-        ) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                slot.fence_on_drop();
-                return Err(sent_error(operation_class, &context, error));
-            }
-        };
-        if let Err(error) = ds
-            .session
-            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
-        {
-            slot.fence_on_drop();
-            return Err(sent_error(operation_class, &context, error));
-        }
-        slot.advance();
-        if let Err(error) = resp.check_status() {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
-            }
-            return Err(error);
-        }
-        slot.resolve();
-        Ok(resp)
+        crate::retry::scope(Self::compound_ds_budgeted(
+            ds, auth, tag, data_size, None, &build_ops,
+        ))
+        .await
     }
 
-    /// Send a COMPOUND to a DS with zero-copy write data (SEQUENCE on DS session).
+    /// DS writes retain the same session replay identity and the same bounded
+    /// backpressure policy as reads; transport failure is not a busy response.
     pub(crate) async fn compound_ds_write(
         ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data: Bytes,
-        build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        let mut slot = ds.session.acquire_slot().await?;
-        let builder = CompoundBuilder::new(tag).sequence(
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-            ds.session.highest_slot_id(),
-        );
-        let builder = build_ops(builder)
-            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
-        builder.enforce_max_operations(ds.session.max_operations())?;
-        let request_op_count = builder.op_count();
-        let operation_class = builder.operation_class();
-        let context = request_context(
+        crate::retry::scope(Self::compound_ds_budgeted(
+            ds,
+            auth,
             tag,
-            ds.session.id(),
-            slot.slot_id,
-            slot.current_sequence_id(),
-        );
-        if operation_class != OperationClass::ReadOnly {
-            slot.fence_on_drop();
-        }
-        let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
-        enforce_request_size(&ds.session, buf.len(), data.len())?;
-        let timeout = data_timeout(data.len());
-        let response_bytes = ds
-            .client
-            .call_with_data(buf, data, NFS_REPLAY, timeout)
-            .await
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_size(&ds.session, response_bytes.len())
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        let mut resp = CompoundResponse::decode(response_bytes)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_operations(&ds.session, &resp, request_op_count)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        resp.session_generation = ds.session.generation();
-        if let Err(error) = resp.op_ok(0) {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
+            data.len(),
+            Some(data),
+            &build_ops,
+        ))
+        .await
+    }
+
+    async fn compound_ds_budgeted(
+        ds: &DsConnection,
+        auth: &Auth,
+        tag: &str,
+        data_size: usize,
+        write_data: Option<Bytes>,
+        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+    ) -> Result<CompoundResponse> {
+        let budget = crate::retry::current();
+        loop {
+            let mut slot = ds.session.acquire_slot().await?;
+            let builder = CompoundBuilder::new(tag).sequence(
+                ds.session.id(),
+                slot.current_sequence_id(),
+                slot.slot_id,
+                ds.session.highest_slot_id(),
+            );
+            let builder = build_ops(builder)
+                .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+            builder.enforce_max_operations(ds.session.max_operations())?;
+            let request_op_count = builder.op_count();
+            let operation_class = builder.operation_class();
+            let context =
+                request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
+            let mut buf = Vec::new();
+            builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
+            enforce_request_size(
+                &ds.session,
+                buf.len(),
+                write_data.as_ref().map_or(0, Bytes::len),
+            )?;
+            let timeout = data_timeout(data_size);
+            let mut resp = loop {
+                if operation_class != OperationClass::ReadOnly {
+                    slot.fence_on_drop();
+                }
+                let response_bytes = ds
+                    .client
+                    .call_with_data(
+                        buf.clone(),
+                        write_data.clone().unwrap_or_default(),
+                        NFS_REPLAY,
+                        timeout,
+                    )
+                    .await
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_size(&ds.session, response_bytes.len())
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                let decoded = CompoundResponse::decode(response_bytes)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_operations(&ds.session, &decoded, request_op_count)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                if decoded.results.len() == 1
+                    && decoded.results[0].opcode == 53
+                    && matches!(
+                        decoded.results[0].status,
+                        nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE
+                    )
+                    && decoded.status == decoded.results[0].status
+                {
+                    slot.resolve();
+                    budget
+                        .backoff(context.clone(), NfsError::Nfs4(decoded.status))
+                        .await?;
+                    continue;
+                }
+                break decoded;
+            };
+            resp.session_generation = ds.session.generation();
+            // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
+            if let Err(error) = resp.op_ok(0) {
+                let error = sent_error(operation_class, &context, error);
+                if error.operation_outcome().is_none() {
+                    slot.resolve();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        let sequence = match validate_sequence_result(
-            &resp.results[0],
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-        ) {
-            Ok(sequence) => sequence,
-            Err(error) => {
+            let sequence = match validate_sequence_result(
+                &resp.results[0],
+                ds.session.id(),
+                slot.current_sequence_id(),
+                slot.slot_id,
+            ) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    slot.fence_on_drop();
+                    return Err(sent_error(operation_class, &context, error));
+                }
+            };
+            if let Err(error) = ds.session.update_sequence_slot_limits(
+                sequence.highest_slot_id,
+                sequence.target_highest_slot_id,
+            ) {
                 slot.fence_on_drop();
                 return Err(sent_error(operation_class, &context, error));
             }
-        };
-        if let Err(error) = ds
-            .session
-            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
-        {
-            slot.fence_on_drop();
-            return Err(sent_error(operation_class, &context, error));
-        }
-        slot.advance();
-        if let Err(error) = resp.check_status() {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
+            slot.advance();
+            if let Err(error) = resp.check_status() {
+                if error.is_server_busy() {
+                    slot.resolve();
+                    if !builder
+                        .can_retry_busy(&resp)
+                        .map_err(|e| sent_error(operation_class, &context, e))?
+                    {
+                        return Err(NfsError::OperationOutcome(Box::new(
+                            OperationOutcomeError::new(
+                                OperationOutcome::Uncertain,
+                                operation_class,
+                                RecoveryAction::VerifyThenResume,
+                                context,
+                                error,
+                            ),
+                        )));
+                    }
+                    drop(slot);
+                    budget.backoff(context, error).await?;
+                    continue;
+                }
+                let error = sent_error(operation_class, &context, error);
+                if error.operation_outcome().is_none() {
+                    slot.resolve();
+                }
+                return Err(error);
             }
-            return Err(error);
+            slot.resolve();
+            return Ok(resp);
         }
-        slot.resolve();
-        Ok(resp)
     }
 }
 
 /// Outer wrapper implementing the public `crate::Mount` trait.
 #[derive(Debug)]
 pub(crate) struct Mount41Wrapper {
-    m: Mount41,
+    m: Arc<Mount41>,
+    core: Arc<crate::client_core::ClientCore>,
     issuer: u64,
+}
+
+impl Mount41Wrapper {
+    fn new(mount: Mount41) -> Self {
+        let m = Arc::new(mount);
+        let core = crate::client_core::ClientCore::new(m.clone());
+        Self {
+            m,
+            core,
+            issuer: NEXT_MOUNT_ISSUER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+    // Page tasks own admission independently of a retained/unpolled stream.
+    // Cached entries also stop being delivered once shutdown starts.
+    fn ready_stream<'a, T: Send + 'a>(
+        &self,
+        inner: futures::stream::BoxStream<'a, Result<T>>,
+    ) -> futures::stream::BoxStream<'a, Result<T>> {
+        Box::pin(futures::stream::try_unfold(
+            (self.core.clone(), inner),
+            |(core, mut inner)| async move {
+                core.ensure_ready()?;
+                let item = inner.try_next().await?;
+                core.ensure_ready()?;
+                Ok::<_, NfsError>(item.map(|item| (item, (core, inner))))
+            },
+        ))
+    }
+}
+
+impl Mount41 {
+    async fn write_inner(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<crate::WriteOutcome> {
+        // Keep the nested pNFS state machine off the runtime worker stack.
+        crate::retry::scope(Box::pin(async {
+            if let Some(result) = self.write_pnfs(&fh, offset, data.clone()).await {
+                return result;
+            }
+            self.write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
+                .await
+        }))
+        .await
+    }
+
+    async fn commit_write_batch_inner(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        count: u32,
+        writes: &[crate::WriteOutcome],
+    ) -> Result<()> {
+        let _guard = self.layout_manager.read_file_io(&fh).await;
+        let ordinary: Vec<_> = writes
+            .iter()
+            .filter(|w| w.pnfs.is_none())
+            .cloned()
+            .collect();
+        if ordinary
+            .iter()
+            .any(|w| w.committed != crate::WriteCommitted::FileSync)
+        {
+            let actual = self.commit_with_verifier(fh.clone(), offset, count).await?;
+            crate::mount::verify_write_batch(self.protocol_version(), &ordinary, actual)?;
+        }
+        let pending: Vec<_> = writes.iter().filter_map(|w| w.pnfs.clone()).collect();
+        self.commit_pending_writes(&fh, &pending).await
+    }
+
+    async fn teardown(&self) -> Result<()> {
+        // Stop recall handler (the backchannel handler itself lives in the RPC
+        // layer and is torn down when the connection closes).
+        if let Some(ref handle) = self.recall_handle {
+            handle.abort();
+        }
+        // Stop lease renewal
+        self.lease_renewal.stop();
+        // Return pNFS layouts before CLOSE. Each file is exclusively fenced so
+        // LAYOUTCOMMIT -> LAYOUTRETURN cannot race a foreground WRITE/CLOSE.
+        let mut failure = self.layoutreturn_all().await.err();
+        // CLOSE all open files before destroying session
+        let open_files = self.state.drain().await;
+        for (fh, sid) in &open_files {
+            let result = self
+                .compound("close", |b| {
+                    b.require_generation(sid.generation)
+                        .putfh(fh)
+                        .close(0, &sid.raw)
+                })
+                .await
+                .and_then(|reply| reply.op_ok(2).map(|_| ()));
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        // Tear down DS connections: destroy each DS session/client-id (best-effort)
+        for (addr, ds) in self.layout_manager.drain_data_servers().await {
+            debug!(addr = %addr, "destroying DS session");
+            ds.destroy(&self.auth).await;
+        }
+        // DESTROY_SESSION — send without SEQUENCE (H3: cannot use session to
+        // destroy itself). Use a bare COMPOUND with only DESTROY_SESSION.
+        let current_sess = self.session_holder.get().await;
+        let client_id = current_sess.client_id();
+        {
+            let builder =
+                CompoundBuilder::new("destroy_session").destroy_session(current_sess.id());
+            let mut buf = Vec::new();
+            builder.encode_with_header(&self.auth, current_sess.minor_version(), &mut buf);
+            if let Err(e) = self
+                .rpc
+                .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await
+                .and_then(|reply| decode_destroy_response(reply, 44))
+            {
+                debug!(error = %e, "DESTROY_SESSION failed (may already be destroyed)");
+                failure.get_or_insert(e);
+            }
+        }
+        // DESTROY_CLIENTID (no session needed)
+        let builder = CompoundBuilder::new("destroy_clientid").destroy_client_id(client_id);
+        let mut buf = Vec::new();
+        builder.encode_with_header(&self.auth, current_sess.minor_version(), &mut buf);
+        if let Err(error) = self
+            .rpc
+            .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
+            .await
+            .and_then(|reply| decode_destroy_response(reply, 57))
+        {
+            failure.get_or_insert(error);
+        }
+        self.rpc.shutdown().await;
+        if let Some(error) = self.writes.any_error() {
+            return Err(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+// Raw mounts track OPENs by filehandle in StateManager, rather than publishing
+// ClientCore resource keys. The core owns admission, task drain and teardown.
+#[async_trait::async_trait]
+impl crate::client_core::ClientDriver for Mount41 {
+    async fn execute(&self, _: crate::client_core::CoreOperation) -> Result<()> {
+        Err(NfsError::Unsupported(
+            "raw mount operations use the Mount interface".into(),
+        ))
+    }
+    async fn close_resource(&self, _: crate::client_core::ResourceKey) -> Result<()> {
+        Err(NfsError::InvalidInput(
+            "raw mount has no core resource keys".into(),
+        ))
+    }
+    async fn umount(&self) -> Result<()> {
+        self.teardown().await
+    }
 }
 
 impl std::fmt::Debug for Mount41 {
@@ -797,7 +990,10 @@ impl std::fmt::Debug for Mount41 {
 
 // ─── Mount entry point ──────────────────────────────────────────────────────
 
-pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
+pub(crate) async fn mount(
+    args: &crate::MountArgs,
+    minor_version: MinorVersion,
+) -> Result<Box<dyn crate::Mount>> {
     let nfsport = if args.nfsport != 0 {
         args.nfsport
     } else {
@@ -815,7 +1011,7 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
 
     let mut last_error = None;
     for addr in &addrs {
-        match mount_on_addr(addr, args, &auth).await {
+        match mount_on_addr(addr, args, &auth, minor_version).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "NFSv4.1 mount attempt failed");
@@ -830,6 +1026,7 @@ async fn mount_on_addr(
     addr: &std::net::SocketAddr,
     args: &crate::MountArgs,
     auth: &Auth,
+    minor_version: MinorVersion,
 ) -> Result<Box<dyn crate::Mount>> {
     info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
 
@@ -840,7 +1037,7 @@ async fn mount_on_addr(
 
     // 2. Establish session (EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE)
     // 每个 mount 实例生成唯一的 ClientIdentity，避免 co_ownerid 冲突导致服务端销毁其他 session
-    let client_identity = ClientIdentity::new();
+    let client_identity = ClientIdentity::with_minor_version(minor_version);
     let raw_session = Session::establish(&client, auth, &client_identity).await?;
     let session_holder = Arc::new(SessionHolder::new(raw_session));
     let session = session_holder.get().await;
@@ -882,6 +1079,7 @@ async fn mount_on_addr(
         session.backchannel_max_requests(),
         session.backchannel_max_request_size(),
         session.backchannel_max_operations(),
+        session.minor_version(),
     );
     client.enable_backchannel(super::callback::make_backchannel_handler(
         Arc::clone(&callback_state),
@@ -890,7 +1088,8 @@ async fn mount_on_addr(
     ));
 
     // A connection is not NFSv4.1-ready until BOTH has been confirmed.
-    let direction = bind_connection(&client, auth, session.id(), false).await?;
+    let direction =
+        bind_connection(&client, auth, session.id(), false, session.minor_version()).await?;
     info!(direction, "backchannel bound via BIND_CONN_TO_SESSION");
     let reconnect_auth = auth.clone();
     let reconnect_sessions = Arc::clone(&session_holder);
@@ -900,7 +1099,9 @@ async fn mount_on_addr(
         async move {
             let session = sessions.get().await;
             let session_generation = session.generation();
-            let direction = bind_connection(&client, &auth, session.id(), true).await?;
+            let direction =
+                bind_connection(&client, &auth, session.id(), true, session.minor_version())
+                    .await?;
             info!(
                 connection_generation,
                 session_generation, direction, "NFSv4.1 connection rebound and ready"
@@ -949,12 +1150,10 @@ async fn mount_on_addr(
         rsize,
         wsize,
         acl_supported,
+        writes: Arc::new(super::write_owner::WriteOwner::new(minor_version)),
     };
 
-    Ok(Box::new(Mount41Wrapper {
-        m,
-        issuer: NEXT_MOUNT_ISSUER.fetch_add(1, Ordering::Relaxed),
-    }))
+    Ok(Box::new(Mount41Wrapper::new(m)))
 }
 
 /// Background task that processes recall notifications (delegation + pNFS layout).
@@ -1142,14 +1341,10 @@ async fn send_recall_return(
             }
             let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
-            let context = request_context(
-                "recall_return",
-                session.id(),
-                slot.slot_id,
-                slot.sequence_id,
-            );
+            let context =
+                request_context("recall_return", &session, slot.slot_id, slot.sequence_id);
             let mut buf = Vec::new();
-            builder.encode_with_header(auth, &mut buf);
+            builder.encode_with_header(auth, session.minor_version(), &mut buf);
             if let Err(e) = enforce_request_size(&session, buf.len(), 0) {
                 warn!(error = %e, "recall return request limit rejected");
                 return false;
@@ -1265,7 +1460,7 @@ async fn navigate_to_export(
     let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, session.minor_version(), &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc
         .call(
@@ -1339,7 +1534,7 @@ async fn get_fs_limits(
     let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, session.minor_version(), &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc
         .call(
@@ -1496,10 +1691,13 @@ impl crate::Mount for Mount41Wrapper {
     fn health(&self) -> crate::MountHealth {
         let lease_healthy = self.m.lease_renewal.health() == LeaseHealth::Healthy;
         crate::MountHealth {
-            lifecycle: if lease_healthy {
-                crate::MountLifecycleState::Ready
-            } else {
-                crate::MountLifecycleState::Recovering
+            lifecycle: match self.core.lifecycle() {
+                crate::client_core::ClientLifecycle::Closing => crate::MountLifecycleState::Closing,
+                crate::client_core::ClientLifecycle::Closed => crate::MountLifecycleState::Closed,
+                crate::client_core::ClientLifecycle::Ready if lease_healthy => {
+                    crate::MountLifecycleState::Ready
+                }
+                _ => crate::MountLifecycleState::Recovering,
             },
             lease_healthy: Some(lease_healthy),
             // The current callback executor exposes counters but no liveness
@@ -1539,7 +1737,7 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     fn version(&self) -> NFSVersion {
-        NFSVersion::NFSv4p1
+        self.m.protocol_version()
     }
 
     async fn getfh(&self) -> Bytes {
@@ -1547,6 +1745,7 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     async fn null(&self) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         // NFSv4 NULL is procedure 0 (same as v3), no COMPOUND needed
         let mut buf = Vec::new();
         crate::nfs3::rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_NULL_PROC, &self.m.auth)
@@ -1556,10 +1755,22 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     async fn close(&self, fh: Bytes) -> Result<()> {
-        self.m.close_file(fh).await
+        let _operation = self.core.begin_operation()?;
+        let _barrier = self.m.writes.barrier(&fh).await;
+        let terminal = self.m.writes.error(&fh).is_some();
+        let result = if terminal {
+            self.m.close_file_inner(fh.clone(), true).await
+        } else {
+            self.m.close_file(fh.clone()).await
+        };
+        if let Some(error) = self.m.writes.error(&fh) {
+            return Err(error);
+        }
+        result
     }
 
     async fn delegreturn(&self, stateid: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         // 客户端 OPEN 一律带 WANT_NO_DELEG，从不持有 delegation，无可归还。
         Err(NfsError::Rpc(format!(
             "no delegation held (client opens with WANT_NO_DELEG); stateid prefix {:#x}",
@@ -1568,137 +1779,183 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     async fn delegpurge(&self, _clientid: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         Err(NfsError::Unsupported(
             "DELEGPURGE not supported".to_string(),
         ))
     }
 
     async fn umount(&self) -> Result<()> {
-        // Stop recall handler (the backchannel handler itself lives in the RPC
-        // layer and is torn down when the connection closes).
-        if let Some(ref handle) = self.m.recall_handle {
-            handle.abort();
+        let report = self.core.close().await;
+        if report.errors().is_empty() {
+            return Ok(());
         }
-        // Stop lease renewal
-        self.m.lease_renewal.stop();
-        // Return pNFS layouts before CLOSE. Each file is exclusively fenced so
-        // LAYOUTCOMMIT -> LAYOUTRETURN cannot race a foreground WRITE/CLOSE.
-        self.m.layoutreturn_all().await?;
-        // CLOSE all open files before destroying session
-        let open_files = self.m.state.drain().await;
-        for (fh, sid) in &open_files {
-            let _ = self
-                .m
-                .compound("close", |b| {
-                    b.require_generation(sid.generation)
-                        .putfh(fh)
-                        .close(0, &sid.raw)
+        Err(NfsError::FileClose(
+            report
+                .errors()
+                .iter()
+                .map(|error| crate::error::FileCloseFailure {
+                    operation: "umount",
+                    error: error.clone(),
                 })
-                .await;
-        }
-        // Tear down DS connections: destroy each DS session/client-id (best-effort)
-        for (addr, ds) in self.m.layout_manager.drain_data_servers().await {
-            debug!(addr = %addr, "destroying DS session");
-            ds.destroy(&self.m.auth).await;
-        }
-        // DESTROY_SESSION — send without SEQUENCE (H3: cannot use session to
-        // destroy itself). Use a bare COMPOUND with only DESTROY_SESSION.
-        let current_sess = self.m.session_holder.get().await;
-        let client_id = current_sess.client_id();
-        {
-            let builder =
-                CompoundBuilder::new("destroy_session").destroy_session(current_sess.id());
-            let mut buf = Vec::new();
-            builder.encode_with_header(&self.m.auth, &mut buf);
-            if let Err(e) = self
-                .m
-                .rpc
-                .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-            {
-                debug!(error = %e, "DESTROY_SESSION failed (may already be destroyed)");
-            }
-        }
-        // DESTROY_CLIENTID (no session needed)
-        let builder = CompoundBuilder::new("destroy_clientid").destroy_client_id(client_id);
-        let mut buf = Vec::new();
-        builder.encode_with_header(&self.m.auth, &mut buf);
-        let _ = self
-            .m
-            .rpc
-            .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
-            .await;
-        Ok(())
+                .collect(),
+        ))
     }
 
     // ─── Operations — delegate to impl Mount41 in sub-files ───────────
 
     async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.lookup(dir_fh, filename).await
     }
     async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.lookup_path(path).await
     }
     async fn getattr(&self, fh: Bytes) -> Result<mount::Attr> {
+        let _operation = self.core.begin_operation()?;
         self.m.getattr(fh).await
     }
     async fn getattr_path(&self, path: &str) -> Result<mount::Attr> {
+        let _operation = self.core.begin_operation()?;
         self.m.getattr_path(path).await
     }
     async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
+        let _operation = self.core.begin_operation()?;
         self.m.access(fh, mode).await
     }
     async fn access_path(&self, path: &str, mode: u32) -> Result<u32> {
+        let _operation = self.core.begin_operation()?;
         self.m.access_path(path, mode).await
     }
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        let _operation = self.core.begin_operation()?;
         self.m.read(fh, offset, count).await
     }
     async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+        let _operation = self.core.begin_operation()?;
         self.m.read_path(path, offset, count).await
     }
     async fn readlink(&self, fh: Bytes) -> Result<String> {
+        let _operation = self.core.begin_operation()?;
         self.m.readlink(fh).await
     }
     async fn readlink_path(&self, path: &str) -> Result<String> {
+        let _operation = self.core.begin_operation()?;
         self.m.readlink_path(path).await
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
-        self.m.readdir(dir_fh).await
+        self.ready_stream(self.m.readdir_owned(self.core.clone(), dir_fh))
     }
     async fn readdir_path(&self, dir_path: &str) -> Result<mount::ReaddirStream<'_>> {
-        self.m.readdir_path(dir_path).await
+        let _operation = self.core.begin_operation()?;
+        let directory = self.m.lookup_path(dir_path).await?;
+        Ok(self.ready_stream(self.m.readdir_owned(self.core.clone(), directory.fh)))
     }
     async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
-        self.m.readdirplus(dir_fh).await
+        self.ready_stream(self.m.readdirplus_owned(self.core.clone(), dir_fh))
     }
     async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
-        self.m.readdirplus_path(dir_path).await
+        let _operation = self.core.begin_operation()?;
+        let directory = self.m.lookup_path(dir_path).await?;
+        Ok(self.ready_stream(self.m.readdirplus_owned(self.core.clone(), directory.fh)))
     }
     async fn readdirplus_page(
         &self,
         dir_fh: Bytes,
         position: mount::DirectoryCookie,
     ) -> Result<mount::ReaddirplusPage> {
+        let _operation = self.core.begin_operation()?;
         self.m.readdirplus_page_from(dir_fh, position).await
     }
-    async fn write(
-        &self,
-        fh: Bytes,
-        offset: u64,
-        data: Bytes,
-    ) -> Result<crate::mount::WriteOutcome> {
-        if let Some(result) = self.m.write_pnfs(&fh, offset, data.clone()).await {
-            return result;
+    async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<crate::WriteOutcome> {
+        let _operation = self.core.begin_operation()?;
+        let file_guard = self.m.writes.admit(&fh).await;
+        if let Some(error) = self.m.writes.error(&fh) {
+            return Err(error);
         }
-        self.m
-            .write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
-            .await
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let slot = result.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_abandoned = abandoned.clone();
+        let mount = self.m.clone();
+        let task_fh = fh.clone();
+        self.core.spawn_owned(async move {
+            let _file_guard = file_guard;
+            let mut task = super::write_owner::WriteTaskGuard::new(
+                mount.writes.clone(),
+                task_fh.clone(),
+                task_abandoned,
+            );
+            let written = mount.write_inner(task_fh.clone(), offset, data).await;
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(written);
+            let _ = ready_tx.send(());
+            if ack_rx.await.is_err() {
+                let abandoned = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let settled = match abandoned {
+                    Some(Ok(outcome)) => {
+                        mount
+                            .commit_write_batch_inner(
+                                task_fh.clone(),
+                                offset,
+                                outcome.count,
+                                &[outcome],
+                            )
+                            .await
+                    }
+                    Some(Err(error)) => Err(error),
+                    None => Err(NfsError::Rpc("WRITE result was not acknowledged".into())),
+                };
+                if let Err(error) = settled {
+                    mount.writes.record(task_fh, error);
+                }
+            }
+            task.settled();
+        })?;
+        let mut waiter = super::write_owner::WriteWaiter::new(
+            self.m.writes.clone(),
+            fh.clone(),
+            abandoned,
+            ack_tx,
+        );
+        if ready_rx.await.is_err() {
+            waiter.acknowledge();
+            self.m.writes.record(
+                fh.clone(),
+                NfsError::Rpc("WRITE task ended without a result".into()),
+            );
+            return Err(self.m.writes.error(&fh).unwrap_or_else(|| {
+                super::pnfs_io::uncertain_pnfs_write(
+                    RequestContext {
+                        operation: "write".into(),
+                        protocol: self.m.protocol_version(),
+                        request_id: None,
+                    },
+                    NfsError::Rpc("WRITE task ended without a result".into()),
+                )
+            }));
+        }
+        let value = result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        waiter.acknowledge();
+        value.unwrap_or_else(|| Err(NfsError::Rpc("WRITE result was already consumed".into())))
     }
+
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.open(dir_fh, filename, access).await
     }
     async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.open_path(path, access).await
     }
     async fn create(
@@ -1707,9 +1964,11 @@ impl crate::Mount for Mount41Wrapper {
         filename: &str,
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.create(dir_fh, filename, mode).await
     }
     async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.create_path(path, mode).await
     }
     async fn create_path_stateful_with_access(
@@ -1718,26 +1977,33 @@ impl crate::Mount for Mount41Wrapper {
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
+        let _operation = self.core.begin_operation()?;
         Ok(mount::OpenFile::from_object(
             self.m.create_path_with_access(path, mode, access).await?,
         ))
     }
     async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.mkdir(dir_fh, dirname, mode).await
     }
     async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.mkdir_path(path, mode).await
     }
     async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.remove(dir_fh, filename).await
     }
     async fn remove_path(&self, path: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.remove_path(path).await
     }
     async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.rmdir(dir_fh, dirname).await
     }
     async fn rmdir_path(&self, path: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.rmdir_path(path).await
     }
     async fn rename(
@@ -1747,17 +2013,21 @@ impl crate::Mount for Mount41Wrapper {
         to_dir_fh: Bytes,
         to_name: &str,
     ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m
             .rename(from_dir_fh, from_name, to_dir_fh, to_name)
             .await
     }
     async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.rename_path(from_path, to_path).await
     }
     async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &str) -> Result<mount::Attr> {
+        let _operation = self.core.begin_operation()?;
         self.m.link(src_fh, dst_dir_fh, dst_name).await
     }
     async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+        let _operation = self.core.begin_operation()?;
         self.m.link_path(src_path, dst_path).await
     }
     async fn symlink(
@@ -1766,9 +2036,11 @@ impl crate::Mount for Mount41Wrapper {
         dst_dir_fh: Bytes,
         dst_name: &str,
     ) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.symlink(target, dst_dir_fh, dst_name).await
     }
     async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m.symlink_path(target, dst_path).await
     }
     async fn symlink_with_attrs(
@@ -1781,6 +2053,7 @@ impl crate::Mount for Mount41Wrapper {
         atime: Option<crate::Time>,
         mtime: Option<crate::Time>,
     ) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
         self.m
             .symlink_with_attrs(target, dst_dir_fh, dst_name, uid, gid, atime, mtime)
             .await
@@ -1796,6 +2069,7 @@ impl crate::Mount for Mount41Wrapper {
         atime: Option<crate::Time>,
         mtime: Option<crate::Time>,
     ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m
             .setattr(fh, guard_ctime, mode, uid, gid, size, atime, mtime)
             .await
@@ -1811,12 +2085,19 @@ impl crate::Mount for Mount41Wrapper {
         atime: Option<crate::Time>,
         mtime: Option<crate::Time>,
     ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m
             .setattr_path(path, specify_guard, mode, uid, gid, size, atime, mtime)
             .await
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
-        self.m.commit(fh, offset, count).await
+        let _operation = self.core.begin_operation()?;
+        let _barrier = self.m.writes.barrier(&fh).await;
+        let result = self.m.commit(fh.clone(), offset, count).await;
+        if let Some(error) = self.m.writes.error(&fh) {
+            return Err(error);
+        }
+        result
     }
     async fn commit_write_batch(
         &self,
@@ -1825,24 +2106,16 @@ impl crate::Mount for Mount41Wrapper {
         count: u32,
         writes: &[crate::WriteOutcome],
     ) -> Result<()> {
-        let _guard = self.m.layout_manager.read_file_io(&fh).await;
-        let ordinary: Vec<_> = writes
-            .iter()
-            .filter(|w| w.pnfs.is_none())
-            .cloned()
-            .collect();
-        if ordinary
-            .iter()
-            .any(|w| w.committed != crate::WriteCommitted::FileSync)
-        {
-            let actual = self
-                .m
-                .commit_with_verifier(fh.clone(), offset, count)
-                .await?;
-            crate::mount::verify_write_batch(crate::NFSVersion::NFSv4p1, &ordinary, actual)?;
+        let _operation = self.core.begin_operation()?;
+        let _barrier = self.m.writes.barrier(&fh).await;
+        let result = self
+            .m
+            .commit_write_batch_inner(fh.clone(), offset, count, writes)
+            .await;
+        if let Some(error) = self.m.writes.error(&fh) {
+            return Err(error);
         }
-        let pending: Vec<_> = writes.iter().filter_map(|w| w.pnfs.clone()).collect();
-        self.m.commit_pending_writes(&fh, &pending).await
+        result
     }
 
     async fn commit_with_verifier(
@@ -1851,15 +2124,30 @@ impl crate::Mount for Mount41Wrapper {
         offset: u64,
         count: u32,
     ) -> Result<Option<[u8; 8]>> {
-        self.m.commit_with_verifier(fh, offset, count).await
+        let _operation = self.core.begin_operation()?;
+        let _barrier = self.m.writes.barrier(&fh).await;
+        let result = self.m.commit_with_verifier(fh.clone(), offset, count).await;
+        if let Some(error) = self.m.writes.error(&fh) {
+            return Err(error);
+        }
+        result
     }
     async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
-        self.m.commit_path(path, offset, count).await
+        let _operation = self.core.begin_operation()?;
+        let object = self.m.lookup_path(path).await?;
+        let _barrier = self.m.writes.barrier(&object.fh).await;
+        let result = self.m.commit(object.fh.clone(), offset, count).await;
+        if let Some(error) = self.m.writes.error(&object.fh) {
+            return Err(error);
+        }
+        result
     }
     async fn lock(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<Bytes> {
+        let _operation = self.core.begin_operation()?;
         self.m.lock(fh, lock_type, offset, length).await
     }
     async fn lock_test(&self, fh: Bytes, lock_type: u32, offset: u64, length: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.lock_test(fh, lock_type, offset, length).await
     }
     async fn lock_stateful(
@@ -1869,6 +2157,7 @@ impl crate::Mount for Mount41Wrapper {
         offset: u64,
         length: u64,
     ) -> Result<crate::LockToken> {
+        let _operation = self.core.begin_operation()?;
         let generation = self.m.session_holder.get().await.generation();
         let stateid = self.m.lock(fh.clone(), lock_type, offset, length).await?;
         if self.m.session_holder.get().await.generation() != generation {
@@ -1879,7 +2168,7 @@ impl crate::Mount for Mount41Wrapper {
                     RecoveryAction::Reopen,
                     RequestContext {
                         operation: "lock".to_string(),
-                        protocol: NFSVersion::NFSv4p1,
+                        protocol: self.m.protocol_version(),
                         request_id: None,
                     },
                     NfsError::Rpc("session generation changed while acquiring lock".to_string()),
@@ -1897,6 +2186,7 @@ impl crate::Mount for Mount41Wrapper {
         ))
     }
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         let generation = self.m.session_holder.get().await.generation();
         if token.issuer != self.issuer || token.generation != generation {
             return Err(NfsError::InvalidInput(
@@ -1921,47 +2211,205 @@ impl crate::Mount for Mount41Wrapper {
         offset: u64,
         length: u64,
     ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m
             .locku(fh, lock_stateid, lock_type, offset, length)
             .await
     }
+    async fn allocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_space(fh, offset, length, true).await },
+        )
+        .await
+    }
+    async fn deallocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_space(fh, offset, length, false).await },
+        )
+        .await
+    }
+    async fn seek_content(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        what: crate::SeekContent,
+    ) -> Result<crate::SeekResult> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_seek(fh, offset, what).await
+    }
+    async fn read_plus(&self, fh: Bytes, offset: u64, count: u32) -> Result<crate::ReadPlusResult> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_read_plus(fh, offset, count).await
+    }
+    async fn copy_range(
+        &self,
+        source: Bytes,
+        destination: Bytes,
+        source_offset: u64,
+        destination_offset: u64,
+        count: u64,
+    ) -> Result<crate::CopyResult> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            Some(source.clone()),
+            destination.clone(),
+            move |m| async move {
+                m.v42_copy(
+                    source,
+                    destination,
+                    source_offset,
+                    destination_offset,
+                    count,
+                    false,
+                )
+                .await
+            },
+        )
+        .await
+    }
+    async fn clone_range(
+        &self,
+        source: Bytes,
+        destination: Bytes,
+        source_offset: u64,
+        destination_offset: u64,
+        count: u64,
+    ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            Some(source.clone()),
+            destination.clone(),
+            move |m| async move {
+                m.v42_copy(
+                    source,
+                    destination,
+                    source_offset,
+                    destination_offset,
+                    count,
+                    true,
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await
+    }
+    async fn nfs42_attributes(&self, fh: Bytes) -> Result<crate::Nfs42Attributes> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_attributes(fh).await
+    }
+    async fn setxattr_with_mode(
+        &self,
+        fh: Bytes,
+        name: &str,
+        value: Bytes,
+        mode: crate::XattrSetMode,
+    ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        let name = name.to_owned();
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_setxattr(fh, &name, value, mode).await },
+        )
+        .await
+    }
     async fn getacl(&self, fh: Bytes) -> Result<mount::Acl> {
+        let _operation = self.core.begin_operation()?;
         self.m.getacl(fh).await
     }
     async fn setacl(&self, fh: Bytes, acl: &mount::Acl) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.setacl(fh, acl).await
     }
     async fn getdacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        let _operation = self.core.begin_operation()?;
         self.m.getdacl(fh).await
     }
     async fn setdacl(&self, fh: Bytes, acl: &mount::NfsAcl41) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.setdacl(fh, acl).await
     }
     async fn getsacl(&self, fh: Bytes) -> Result<mount::NfsAcl41> {
+        let _operation = self.core.begin_operation()?;
         self.m.getsacl(fh).await
     }
     async fn setsacl(&self, fh: Bytes, acl: &mount::NfsAcl41) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
         self.m.setsacl(fh, acl).await
     }
     async fn aclsupport(&self, fh: Bytes) -> Result<mount::AclSupport> {
+        let _operation = self.core.begin_operation()?;
         self.m.aclsupport(fh).await
     }
     async fn getxattr(&self, fh: Bytes, name: &str) -> Result<Bytes> {
+        let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            return self.m.v42_getxattr(fh, name).await;
+        }
         self.m.getxattr(fh, name).await
     }
     async fn setxattr(&self, fh: Bytes, name: &str, value: Bytes) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            let name = name.to_owned();
+            return super::v42_ops::run_owned(
+                self.m.clone(),
+                self.core.clone(),
+                None,
+                fh.clone(),
+                move |m| async move {
+                    m.v42_setxattr(fh, &name, value, crate::XattrSetMode::Either)
+                        .await
+                },
+            )
+            .await;
+        }
         self.m.setxattr(fh, name, value).await
     }
     async fn listxattr(&self, fh: Bytes) -> Result<Vec<String>> {
+        let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            return self.m.v42_listxattrs(fh).await;
+        }
         self.m.listxattr(fh).await
     }
     async fn removexattr(&self, fh: Bytes, name: &str) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            let name = name.to_owned();
+            return super::v42_ops::run_owned(
+                self.m.clone(),
+                self.core.clone(),
+                None,
+                fh.clone(),
+                move |m| async move { m.v42_removexattr(fh, &name).await },
+            )
+            .await;
+        }
         self.m.removexattr(fh, name).await
     }
 
     // ─── FS info operations (inline — no sub-file needed) ────────────
 
     async fn fsinfo(&self) -> Result<mount::FSInfo> {
+        let _operation = self.core.begin_operation()?;
         // Query filesystem attrs via GETATTR on root fh
         // NFSv4.1: maxfilesize(27), maxread(30), maxwrite(31)
         // word1: time_delta(#51 = bit 19)
@@ -2042,6 +2490,7 @@ impl crate::Mount for Mount41Wrapper {
         })
     }
     async fn fsstat(&self) -> Result<mount::FSStat> {
+        let _operation = self.core.begin_operation()?;
         // NFSv4.1: files_avail(21), files_free(22), files_total(23),
         //          space_avail(42), space_free(43), space_total(44)
         let bitmap = [
@@ -2106,10 +2555,12 @@ impl crate::Mount for Mount41Wrapper {
         Ok(stat)
     }
     async fn pathconf(&self, fh: Bytes) -> Result<mount::Pathconf> {
+        let _operation = self.core.begin_operation()?;
         Ok(self.pathconf_with_support(fh).await?.values)
     }
 
     async fn pathconf_with_support(&self, fh: Bytes) -> Result<mount::SupportedPathconf> {
+        let _operation = self.core.begin_operation()?;
         let target_fh = if fh.is_empty() {
             self.m.root_fh.clone()
         } else {
@@ -2220,10 +2671,12 @@ impl crate::Mount for Mount41Wrapper {
         })
     }
     async fn pathconf_path(&self, path: &str) -> Result<mount::Pathconf> {
+        let _operation = self.core.begin_operation()?;
         let obj = self.m.lookup_path(path).await?;
         self.pathconf(obj.fh).await
     }
     async fn exports(&self) -> Result<Vec<mount::ExportEntry>> {
+        let _operation = self.core.begin_operation()?;
         Err(NfsError::Unsupported(
             "NFSv4.1 does not have a separate EXPORT procedure".to_string(),
         ))
@@ -2320,7 +2773,7 @@ pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mou
         auth,
         root_fh: Bytes::from_static(b"root"),
         session_holder,
-        callback_state: CallbackState::new_negotiated([1; 16], 1, 1, 4096, 2),
+        callback_state: CallbackState::new_negotiated([1; 16], 1, 1, 4096, 2, MinorVersion::V1),
         recovery_lock: tokio::sync::Mutex::new(()),
         client_identity: ClientIdentity::new(),
         state: StateManager::new(),
@@ -2334,7 +2787,30 @@ pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mou
         rsize: 4,
         wsize: 4,
         acl_supported: false,
+        writes: Arc::default(),
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_wrapper(m: Mount41) -> Mount41Wrapper {
+    Mount41Wrapper::new(m)
+}
+
+#[cfg(test)]
+pub(super) fn test_owned_write_count(wrapper: &Mount41Wrapper) -> u64 {
+    wrapper.core.owned_task_count()
+}
+
+#[cfg(test)]
+pub(super) fn test_operation_count(wrapper: &Mount41Wrapper) -> u64 {
+    wrapper.core.operation_count()
+}
+#[cfg(test)]
+pub(super) async fn test_wait_closing(wrapper: &Mount41Wrapper) {
+    wrapper
+        .core
+        .wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
+        .await;
 }
 
 #[cfg(test)]
@@ -2439,31 +2915,6 @@ mod tests {
         assert!(usize::MAX.checked_add(1).is_none());
     }
 
-    #[test]
-    fn jitter_lands_in_half_to_full_range() {
-        for _ in 0..200 {
-            let d = backoff_jitter_ms(0, 200, 5000);
-            assert!((100..200).contains(&d), "attempt=0 produced {} ms", d);
-        }
-    }
-
-    #[test]
-    fn jitter_caps_at_cap_ms() {
-        for _ in 0..200 {
-            let d = backoff_jitter_ms(20, 200, 5000);
-            assert!((2500..5000).contains(&d), "attempt=20 produced {} ms", d);
-        }
-    }
-
-    #[test]
-    fn jitter_does_not_panic_on_huge_attempt() {
-        // checked_shl + saturating_mul + min(cap) must absorb shifts past 63.
-        for attempt in [32usize, 63, 64, 100, usize::MAX] {
-            let d = backoff_jitter_ms(attempt, 200, 5000);
-            assert!(d > 0 && d < 5000, "attempt={} produced {}", attempt, d);
-        }
-    }
-
     /// 构造 extract_stateid 之后的 OPEN4resok 剩余字节。
     fn open_resok_tail(delegation_type: u32, deleg_sid: Option<[u8; 16]>) -> Bytes {
         let mut buf = Vec::new();
@@ -2510,7 +2961,89 @@ mod tests {
             "nfs://127.0.0.1/export?version=4.1&nfsport={port}&noresvport=true"
         ))
         .unwrap();
-        let error = mount(&args).await.unwrap_err();
+        let error = mount(&args, MinorVersion::V1).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+}
+
+#[cfg(test)]
+mod teardown_response_tests {
+    use super::*;
+    #[test]
+    fn destroy_response_requires_exact_void_operation_and_complete_body() {
+        for expected in [44, 57] {
+            let valid: Vec<u8> = [0u32, 0, 1, expected, 0]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect();
+            assert!(decode_destroy_response(Bytes::from(valid.clone()), expected).is_ok());
+            for mut invalid in [
+                valid[..valid.len() - 1].to_vec(),
+                [0u32, 0, 0]
+                    .into_iter()
+                    .flat_map(u32::to_be_bytes)
+                    .collect(),
+                valid.clone(),
+            ] {
+                if invalid.len() == valid.len() {
+                    invalid.extend_from_slice(&[0; 4]);
+                }
+                assert!(decode_destroy_response(Bytes::from(invalid), expected).is_err());
+            }
+            assert!(
+                decode_destroy_response(Bytes::from(valid), if expected == 44 { 57 } else { 44 })
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn busy_session_recovery_does_not_consume_busy_retry_count() {
+        use crate::nfs41::test_support::{Reply, ok, serve_observed};
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mut first = true;
+        let (mount, server) = serve_observed(
+            move |_, _| {
+                if std::mem::take(&mut first) {
+                    vec![Reply {
+                        opcode: 53,
+                        status: 10052,
+                        data: vec![],
+                    }]
+                } else {
+                    vec![
+                        ok(22, vec![]),
+                        Reply {
+                            opcode: 25,
+                            status: 10008,
+                            data: vec![],
+                        },
+                    ]
+                }
+            },
+            super::super::MinorVersion::V1,
+            observed,
+        )
+        .await;
+        let held = mount.recovery_lock.lock().await;
+        let work = mount.read(Bytes::from_static(b"fh"), 0, 4);
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("read settled before recovery: {result:?}"),
+            _ = async { while calls.lock().unwrap().is_empty() { tokio::task::yield_now().await; } } => {}
+        }
+        // Model another request winning recovery while this request waits for
+        // recovery_lock, then exhaust DELAY using the same logical budget.
+        assert!(
+            mount
+                .session_holder
+                .replace_if_current(1, Session::for_test(2))
+                .await
+        );
+        drop(held);
+        let error = work.await.unwrap_err();
+        assert!(matches!(error, NfsError::ServerBusy(_)), "{error:?}");
+        assert!(calls.lock().unwrap().len() >= 17);
+        server.abort();
     }
 }

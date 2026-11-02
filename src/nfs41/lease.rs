@@ -156,7 +156,7 @@ impl LeaseRenewal {
                             continue;
                         }
                         let mut buf = Vec::new();
-                        builder.encode_with_header(&auth, &mut buf);
+                        builder.encode_with_header(&auth, session.minor_version(), &mut buf);
                         let request_len = buf.len();
                         slot.fence_on_drop();
                         let result = rpc

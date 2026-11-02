@@ -16,7 +16,7 @@
 
 use bytes::{Buf, Bytes};
 
-use super::{NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION, NFS41_MINOR_VERSION};
+use super::{MinorVersion, NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION};
 use crate::error::{NfsError, Result};
 use crate::nfs3::rpc_header;
 use crate::nfs4::compound::{
@@ -75,6 +75,18 @@ pub(crate) enum OpNum {
     DelegReturn = 8,
     TestStateId = 55,
     FreeStateId = 56,
+    // RFC 7863 and RFC 8276 operation numbers.
+    Allocate = 59,
+    Copy = 60,
+    Deallocate = 62,
+    OffloadCancel = 66,
+    ReadPlus = 68,
+    Seek = 69,
+    Clone = 71,
+    GetXattr = 72,
+    SetXattr = 73,
+    ListXattrs = 74,
+    RemoveXattr = 75,
 }
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -101,7 +113,11 @@ impl OpNum {
             | Self::ReadLink
             | Self::RestoreFh
             | Self::SaveFh
-            | Self::TestStateId => OperationClass::ReadOnly,
+            | Self::TestStateId
+            | Self::ReadPlus
+            | Self::Seek
+            | Self::GetXattr
+            | Self::ListXattrs => OperationClass::ReadOnly,
             Self::BindConnToSession
             | Self::CreateSession
             | Self::DestroyClientId
@@ -125,7 +141,14 @@ impl OpNum {
             | Self::Remove
             | Self::Rename
             | Self::SetAttr
-            | Self::Write => OperationClass::ReplaySensitive,
+            | Self::Write
+            | Self::Allocate
+            | Self::Deallocate
+            | Self::Copy
+            | Self::Clone
+            | Self::OffloadCancel
+            | Self::SetXattr
+            | Self::RemoveXattr => OperationClass::ReplaySensitive,
         }
     }
 }
@@ -193,6 +216,30 @@ const MIN_OPERATION_REPLY_SIZE: usize = 8;
 
 #[allow(dead_code)] // Builder offers full NFSv4.1 op set; not all ops used yet
 impl CompoundBuilder {
+    /// RFC 8881 §15.1.1.3: a later DELAY cannot replay an earlier mutation.
+    pub(crate) fn can_retry_busy(&self, response: &CompoundResponse) -> Result<bool> {
+        if response.results.is_empty() || response.results.len() > self.ops.len() {
+            return Err(NfsError::Xdr("invalid busy COMPOUND result count".into()));
+        }
+        let mut safe = true;
+        for (index, (request, reply)) in self.ops.iter().zip(&response.results).enumerate() {
+            if request.opcode as u32 != reply.opcode {
+                return Err(NfsError::Xdr("busy COMPOUND opcode mismatch".into()));
+            }
+            if reply.status != nfsstat4::NFS4_OK {
+                if index + 1 != response.results.len() || reply.status != response.status {
+                    return Err(NfsError::Xdr("busy COMPOUND status mismatch".into()));
+                }
+                return Ok(safe);
+            }
+            if request.opcode.class() == OperationClass::ReplaySensitive {
+                safe = false;
+            }
+        }
+        Err(NfsError::Xdr(
+            "busy COMPOUND omitted its failing operation".into(),
+        ))
+    }
     pub fn new(tag: &str) -> Self {
         Self {
             tag: tag.to_string(),
@@ -225,6 +272,23 @@ impl CompoundBuilder {
             .max()
             .unwrap_or(OperationClass::SessionControl)
             .into()
+    }
+
+    /// These v4.2 mutations may only replay within the original session's
+    /// exactly-once context. Session loss does not prove the first attempt failed.
+    pub(crate) fn requires_original_session(&self) -> bool {
+        self.ops.iter().any(|op| {
+            matches!(
+                op.opcode,
+                OpNum::Allocate
+                    | OpNum::Deallocate
+                    | OpNum::Copy
+                    | OpNum::Clone
+                    | OpNum::OffloadCancel
+                    | OpNum::SetXattr
+                    | OpNum::RemoveXattr
+            )
+        })
     }
 
     pub(crate) fn require_generation(mut self, generation: u64) -> Self {
@@ -301,11 +365,23 @@ impl CompoundBuilder {
     fn minimum_cached_response_size(&self) -> u32 {
         let padded_tag_len = self.tag.len().saturating_add(3) & !3;
         let remaining_ops = self.ops.len().saturating_sub(1);
+        // Fixed result payloads of the new replay-sensitive operations must
+        // fit the slot's reply cache before any mutation is sent.
+        let extra: usize = self
+            .ops
+            .iter()
+            .map(|op| match op.opcode {
+                OpNum::Copy => 32,
+                OpNum::SetXattr | OpNum::RemoveXattr => 20,
+                _ => 0,
+            })
+            .sum();
         let size = MIN_RPC_REPLY_ENVELOPE_SIZE
             .saturating_add(MIN_COMPOUND_REPLY_ENVELOPE_SIZE)
             .saturating_add(padded_tag_len)
             .saturating_add(SEQUENCE_SUCCESS_REPLY_SIZE)
-            .saturating_add(remaining_ops.saturating_mul(MIN_OPERATION_REPLY_SIZE));
+            .saturating_add(remaining_ops.saturating_mul(MIN_OPERATION_REPLY_SIZE))
+            .saturating_add(extra);
         u32::try_from(size).unwrap_or(u32::MAX)
     }
 
@@ -946,25 +1022,146 @@ impl CompoundBuilder {
         self
     }
 
+    /// RFC 7863: ALLOCATE/DEALLOCATE share stateid, offset and length.
+    pub fn space(mut self, allocate: bool, stateid: &[u8; 16], offset: u64, length: u64) -> Self {
+        let mut args = stateid.to_vec();
+        xdr_u64(&mut args, offset);
+        xdr_u64(&mut args, length);
+        self.ops.push(EncodedOp {
+            opcode: if allocate {
+                OpNum::Allocate
+            } else {
+                OpNum::Deallocate
+            },
+            args,
+        });
+        self
+    }
+
+    pub fn seek(mut self, stateid: &[u8; 16], offset: u64, what: crate::SeekContent) -> Self {
+        let mut args = stateid.to_vec();
+        xdr_u64(&mut args, offset);
+        xdr_u32(&mut args, what as u32);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Seek,
+            args,
+        });
+        self
+    }
+
+    pub fn read_plus(mut self, stateid: &[u8; 16], offset: u64, count: u32) -> Self {
+        let mut args = stateid.to_vec();
+        xdr_u64(&mut args, offset);
+        xdr_u32(&mut args, count);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ReadPlus,
+            args,
+        });
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_range(
+        mut self,
+        clone: bool,
+        source: &[u8; 16],
+        destination: &[u8; 16],
+        source_offset: u64,
+        destination_offset: u64,
+        count: u64,
+    ) -> Self {
+        let mut args = source.to_vec();
+        args.extend(destination);
+        xdr_u64(&mut args, source_offset);
+        xdr_u64(&mut args, destination_offset);
+        xdr_u64(&mut args, count);
+        if !clone {
+            xdr_bool(&mut args, true); // consecutive
+            xdr_bool(&mut args, true); // synchronous: no async offload state
+            xdr_u32(&mut args, 0); // intra-server: no source servers
+        }
+        self.ops.push(EncodedOp {
+            opcode: if clone { OpNum::Clone } else { OpNum::Copy },
+            args,
+        });
+        self
+    }
+
+    pub fn offload_cancel(mut self, stateid: &[u8; 16]) -> Self {
+        self.ops.push(EncodedOp {
+            opcode: OpNum::OffloadCancel,
+            args: stateid.to_vec(),
+        });
+        self
+    }
+
+    pub fn getxattr(mut self, name: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_string(&mut args, name);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::GetXattr,
+            args,
+        });
+        self
+    }
+
+    pub fn setxattr(mut self, name: &str, value: &[u8], mode: crate::XattrSetMode) -> Self {
+        let mut args = Vec::new();
+        xdr_u32(&mut args, mode as u32);
+        xdr_string(&mut args, name);
+        xdr_var_bytes(&mut args, value);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::SetXattr,
+            args,
+        });
+        self
+    }
+
+    pub fn listxattrs(mut self, cookie: u64, maxcount: u32) -> Self {
+        let mut args = Vec::new();
+        xdr_u64(&mut args, cookie);
+        xdr_u32(&mut args, maxcount);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::ListXattrs,
+            args,
+        });
+        self
+    }
+
+    pub fn removexattr(mut self, name: &str) -> Self {
+        let mut args = Vec::new();
+        xdr_string(&mut args, name);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::RemoveXattr,
+            args,
+        });
+        self
+    }
+
     // ─── Encode to wire format ───────────────────────────────────────────
 
     /// Encode the COMPOUND4args into a buffer, prefixed with the RPC header.
-    pub fn encode_with_header(self, auth: &Auth, buf: &mut Vec<u8>) {
+    pub fn encode_with_header(&self, auth: &Auth, minor_version: MinorVersion, buf: &mut Vec<u8>) {
         // RPC header: program=100003, version=4, procedure=1 (COMPOUND)
         rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_COMPOUND_PROC, auth).encode(buf);
-        self.encode_body(buf);
+        self.encode_body_for_version(minor_version, buf);
     }
 
     /// Encode just the COMPOUND4args body (without RPC header).
+    #[cfg(test)]
     fn encode_body(self, buf: &mut Vec<u8>) {
+        self.encode_body_for_version(MinorVersion::V1, buf);
+    }
+
+    fn encode_body_for_version(&self, minor_version: MinorVersion, buf: &mut Vec<u8>) {
         // tag (utf8str_cs)
         xdr_string(buf, &self.tag);
         // minorversion
-        xdr_u32(buf, NFS41_MINOR_VERSION);
+        xdr_u32(buf, minor_version as u32);
         // argarray length
         xdr_u32(buf, self.ops.len() as u32);
         // argarray entries
-        for op in self.ops {
+        for op in &self.ops {
             xdr_u32(buf, op.opcode as u32);
             buf.extend_from_slice(&op.args);
         }
@@ -1225,6 +1422,11 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
     // If status != NFS4_OK, most ops have no additional data (void default arm).
     // Exceptions: SETATTR always returns attrsset bitmap.
     if status != 0 {
+        // COPY's OFFLOAD_NO_REQS arm carries copy_requirements4 even on error.
+        if opcode == OpNum::Copy as u32 && status == 10094 {
+            super::v42_ops::decode_bool(buf)?;
+            super::v42_ops::decode_bool(buf)?;
+        }
         // SETATTR4res always has status + bitmap, even on error
         if opcode == OpNum::SetAttr as u32 {
             skip_bitmap(buf)?;
@@ -1241,6 +1443,32 @@ fn skip_op_result(opcode: u32, status: u32, buf: &mut Bytes) -> Result<()> {
     }
 
     match opcode {
+        op if op == OpNum::Allocate as u32
+            || op == OpNum::Deallocate as u32
+            || op == OpNum::Clone as u32
+            || op == OpNum::OffloadCancel as u32 => {}
+        op if op == OpNum::Copy as u32 => {
+            super::v42_ops::decode_copy(buf)?;
+        }
+        op if op == OpNum::Seek as u32 => {
+            super::v42_ops::decode_bool(buf)?;
+            super::v42_ops::decode_u64(buf)?;
+        }
+        op if op == OpNum::ReadPlus as u32 => {
+            super::v42_ops::decode_read_plus(buf)?;
+        }
+        op if op == OpNum::GetXattr as u32 => {
+            skip_var_bytes(buf)?;
+        }
+        op if op == OpNum::SetXattr as u32 || op == OpNum::RemoveXattr as u32 => {
+            super::v42_ops::decode_bool(buf)?;
+            super::v42_ops::decode_u64(buf)?;
+            super::v42_ops::decode_u64(buf)?;
+        }
+        op if op == OpNum::ListXattrs as u32 => {
+            super::v42_xattr::decode_list(buf)?;
+        }
+
         // Void results (no data on success)
         op if op == OpNum::PutRootFh as u32 => {}
         op if op == OpNum::PutFh as u32 => {}

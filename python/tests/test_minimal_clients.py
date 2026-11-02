@@ -75,13 +75,13 @@ def test_async_connect_inspect_and_context_close():
 
 def test_sync_factory_rejects_invalid_options_before_adapter():
     with pytest.raises(ValueError, match="versions"):
-        Client.connect("nfs://server/export", versions=["4.2"])
+        Client.connect("nfs://server/export", versions=["4.3"])
 
 
 def test_async_factory_rejects_invalid_options_before_adapter():
     async def scenario():
         with pytest.raises(ValueError, match="versions"):
-            await AsyncClient.connect("nfs://server/export", versions=["4.2"])
+            await AsyncClient.connect("nfs://server/export", versions=["4.3"])
 
     asyncio.run(scenario())
 
@@ -162,5 +162,23 @@ def test_io_sizes_are_negotiated_and_not_configurable(name):
             await AsyncClient.connect("nfs://server/export", **{name: 1048576})
         with pytest.raises(ValueError, match=name):
             await AsyncClient.connect(f"nfs://server/export?{name}=1048576")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("version", ["4.2", Version.NFS_V4_2])
+def test_sync_v42_selection_and_reported_version(monkeypatch, version):
+    monkeypatch.setattr(FakeSyncClient, "version", (4, 2))
+    with Client.connect("nfs://server/export", versions=[version, "4.1"]) as client:
+        assert client.version is Version.NFS_V4_2
+        assert "version=4.2%2C4.1" in FakeSyncClient.last_url
+
+
+def test_async_v42_selection_and_reported_version(monkeypatch):
+    monkeypatch.setattr(FakeAsyncClient, "version", (4, 2))
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs://server/export", versions=[Version.NFS_V4_2]) as client:
+            assert client.version is Version.NFS_V4_2
 
     asyncio.run(scenario())

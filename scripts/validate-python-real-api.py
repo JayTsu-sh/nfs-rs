@@ -22,7 +22,7 @@ PUBLIC_API_COVERAGE = {
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "scandir_page", "setdacl", "setsacl", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "__enter__",
+        "touch", "truncate", "unlink", "utime", "version", "allocate", "deallocate", "seek_content", "read_plus", "copy_range", "clone_range", "nfs42_attributes", "__enter__",
         "__exit__",
     ),
     "AsyncClient": (
@@ -31,7 +31,7 @@ PUBLIC_API_COVERAGE = {
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
         "mkdir", "open", "readlink", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "scandir_page", "setdacl", "setsacl", "setxattr", "stat", "symlink",
-        "touch", "truncate", "unlink", "utime", "version", "__aenter__",
+        "touch", "truncate", "unlink", "utime", "version", "allocate", "deallocate", "seek_content", "read_plus", "copy_range", "clone_range", "nfs42_attributes", "__aenter__",
         "__aexit__",
     ),
     "File": (
@@ -56,7 +56,50 @@ EXPECTED_UNAVAILABLE = (
     "AsyncClient.setsacl",
 )
 
-SAFE_ID = re.compile(r"^nightly-[A-Za-z0-9._-]{1,80}$")
+V42_OPTIONAL_METHODS = ("allocate", "deallocate", "seek_content", "read_plus", "copy_range", "clone_range", "nfs42_attributes")
+
+
+def v42_sync_scenario(client: nfs_rs.Client, root: str, checks: list[str]) -> None:
+    source, destination, space = (f"{root}/{name}" for name in ("v42-source", "v42-target", "v42-space"))
+    if client.version is nfs_rs.Version.NFS_V4_2:
+        for path in (source, destination, space):
+            with client.open(path, "wb") as file:
+                file.write(b"x" * 4096)
+    calls = {
+        "nfs42_attributes": lambda: client.nfs42_attributes(root),
+        "allocate": lambda: client.allocate(space, 8192, 4096),
+        # ONTAP supports whole-file deallocation; partial punching is probed
+        # separately by the Rust optional-operation matrix and remains explicit.
+        "deallocate": lambda: client.deallocate(space, 0, 12288),
+        "seek_content": lambda: client.seek_content(source, 0, nfs_rs.SeekContent.DATA),
+        "read_plus": lambda: client.read_plus(source, 0, 4096),
+        "copy_range": lambda: client.copy_range(source, destination, count=4096),
+        "clone_range": lambda: client.clone_range(source, destination, count=0),
+    }
+    for name, call in calls.items():
+        capability_call(call, f"Client.{name}", checks)
+
+
+async def v42_async_scenario(client: nfs_rs.AsyncClient, root: str, checks: list[str]) -> None:
+    source, destination, space = (f"{root}/{name}" for name in ("v42-async-source", "v42-async-target", "v42-async-space"))
+    if client.version is nfs_rs.Version.NFS_V4_2:
+        for path in (source, destination, space):
+            async with await client.open(path, "wb") as file:
+                await file.write(b"x" * 4096)
+    calls = {
+        "nfs42_attributes": lambda: client.nfs42_attributes(root),
+        "allocate": lambda: client.allocate(space, 8192, 4096),
+        "deallocate": lambda: client.deallocate(space, 0, 12288),
+        "seek_content": lambda: client.seek_content(source, 0, nfs_rs.SeekContent.DATA),
+        "read_plus": lambda: client.read_plus(source, 0, 4096),
+        "copy_range": lambda: client.copy_range(source, destination, count=4096),
+        "clone_range": lambda: client.clone_range(source, destination, count=0),
+    }
+    for name, call in calls.items():
+        await capability_call_async(call, f"AsyncClient.{name}", checks)
+
+
+SAFE_ID = re.compile(r"^(nightly|release)-[A-Za-z0-9._-]{1,80}$")
 
 
 @dataclass(frozen=True)
@@ -69,7 +112,7 @@ class Case:
 
 def parse_case(value: str) -> Case:
     parts = value.split("|", 3)
-    if len(parts) != 4 or parts[1] not in {"3", "4.0", "4.1"}:
+    if len(parts) != 4 or parts[1] not in {"3", "4.0", "4.1", "4.2"}:
         raise argparse.ArgumentTypeError("case must be NAME|VERSION|URL|REQUIRE_PNFS")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", parts[0]):
         raise argparse.ArgumentTypeError("unsafe case name")
@@ -334,6 +377,8 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
             client.setsacl(data, sacl)
             checks.extend(("Client.getsacl", "Client.setsacl"))
 
+        v42_sync_scenario(client, root, checks)
+
         xattr = "user.nfs_rs_conformance"
         try:
             client.setxattr(data, xattr, b"value")
@@ -527,6 +572,8 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             await client.setsacl(data, sacl)
             checks.extend(("AsyncClient.getsacl", "AsyncClient.setsacl"))
 
+        await v42_async_scenario(client, root, checks)
+
         xattr = "user.nfs_rs_conformance"
         try:
             await client.setxattr(data, xattr, b"value")
@@ -591,10 +638,12 @@ def export_scenario(case: Case) -> list[str]:
 def validate_case(case: Case, run_id: str) -> dict[str, object]:
     _, leaf = conformance_url(case, run_id)
     parent = nfs_rs.Client.connect(case.url)
+    xattrs_supported = False
     primary_error: Exception | None = None
     sync_checks: list[str] = []
     async_checks: list[str] = []
     try:
+        xattrs_supported = case.version == "4.2" and parent.nfs42_attributes().xattr_support
         parent.mkdir(leaf)
         try:
             sync_checks = sync_client_scenario(case.url, case, leaf)
@@ -624,7 +673,12 @@ def validate_case(case: Case, run_id: str) -> dict[str, object]:
         raise primary_error
     unavailable = unavailable_methods(sync_checks + async_checks)
     expected_unavailable = set(EXPECTED_UNAVAILABLE)
-    if unavailable != expected_unavailable:
+    # New optional v4.2 calls have individually recorded outcomes, independent
+    # of the existing configured lab contract for ACL/named attributes.
+    optional = {f"{cls}.{name}" for cls in ("Client", "AsyncClient") for name in V42_OPTIONAL_METHODS}
+    if xattrs_supported:
+        expected_unavailable -= {f"{cls}.{name}" for cls in ("Client", "AsyncClient") for name in ("getxattr", "setxattr", "listxattr", "removexattr")}
+    if unavailable - optional != expected_unavailable:
         raise AssertionError(
             "real capability contract changed: "
             f"expected unavailable={sorted(expected_unavailable)}, actual={sorted(unavailable)}"

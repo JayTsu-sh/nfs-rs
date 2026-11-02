@@ -5,7 +5,7 @@ exports directly from Python without a kernel mount or a C NFS library.
 
 - NFSv3 (the default when no version is selected)
 - experimental NFSv4.0, selected explicitly as `4.0`
-- NFSv4.1, including negotiated file-layout pNFS
+- NFSv4.1 and NFSv4.2, including negotiated file-layout pNFS
 - synchronous and native async APIs
 - file, directory, metadata, link, and extended-attribute operations
 - directory scans with reusable file handles and file attributes
@@ -21,8 +21,8 @@ written `%2520` in the URL.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.1/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.1/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,
@@ -35,12 +35,15 @@ print(files("nfs_rs").joinpath("API.md").read_text(encoding="utf-8"))
 print(files("nfs_rs").joinpath("GUIDE.md").read_text(encoding="utf-8"))
 ```
 
-Named attributes use the optional NFSv4.1 OPENATTR file interface, not the
-NFSv4.2 GETXATTR/SETXATTR extension or a portable mapping of Linux POSIX xattrs.
-There is no fixed client limit on the complete value size; server and file system
-limits still apply. Negotiated read/write sizes limit individual requests.
-`getxattr` continues short reads to EOF and buffers the complete value in memory.
-`setxattr` replaces the entire value, including truncating old contents when
+The xattr methods use OPENATTR named attributes on v4.0/v4.1 and RFC 8276
+extended attributes on v4.2. These are distinct namespaces with no implicit
+fallback. Inspect `client.nfs42_attributes(path).xattr_support` on v4.2.
+OPENATTR values have no fixed client limit on their complete size; server and
+file system limits still apply. RFC 8276 values are bounded by the 4 MiB client
+ceiling and negotiated channel/server limits. Negotiated read/write sizes limit
+individual requests.
+For OPENATTR, `getxattr` continues short reads to EOF and buffers the complete value in memory.
+For OPENATTR, `setxattr` replaces the entire value, including truncating old contents when
 setting a shorter or empty value, and completes short writes before closing.
 Replacement is not atomic across clients: an error after truncation can leave a
 partial value. Inspect the uncertain outcome and verify the value before retrying;
@@ -48,7 +51,7 @@ write and cleanup failures remain available in the error source chain.
 
 ## Select a protocol version
 
-The Python API accepts exactly `"3"`, `"4.0"`, and `"4.1"`. Select one in the
+The Python API accepts exactly `"3"`, `"4.0"`, `"4.1"`, and `"4.2"`. Select one in the
 URL or pass an ordered fallback list to `versions`:
 
 ```python
@@ -73,8 +76,21 @@ with Client.connect(
     print("negotiated", client.version)
 ```
 
-The ambiguous selector `"4"` and unimplemented NFSv4.2 are rejected. NFSv4.0
+NFSv4.2 runs the existing file APIs with `version=4.2` or `Version.NFS_V4_2`.
+`versions=["4.2", "4.1"]` explicitly allows fallback. Optional server-side
+COPY/CLONE, SEEK, ALLOCATE/DEALLOCATE, READ_PLUS and RFC 8276 xattrs are exposed.
+COPY is synchronous and intra-server; cross-server/async offload is not exposed.
+The ambiguous selector `"4"` is rejected. NFSv4.0
 is experimental and requires the exact `"4.0"` selector.
+
+NFSv4.2 support is available in 0.10.0. Select it explicitly with
+`version=4.2`; this does not silently downgrade to another minor version.
+AFX validation with the related server features enabled confirmed ordinary
+file APIs, ACLs, RFC 8276 xattrs, ALLOCATE, SEEK and whole-file DEALLOCATE.
+The tested AFX export rejects COPY, CLONE and READ_PLUS as unsupported;
+partial DEALLOCATE returns a server IO error. Optional operations therefore
+still require support from the selected server. See the
+[AFX validation report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
 
 ## Install
 

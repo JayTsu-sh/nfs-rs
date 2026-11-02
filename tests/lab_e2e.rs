@@ -2790,7 +2790,9 @@ async fn cleanup_case(mount: &dyn Mount) {
 
 async fn exercise_endpoint(url: &str) -> TestResult {
     let mount = parse_url_and_mount(url).await?;
-    let expected_version = if url.contains("version=4.1") {
+    let expected_version = if url.contains("version=4.2") {
+        NFSVersion::NFSv4p2
+    } else if url.contains("version=4.1") {
         NFSVersion::NFSv4p1
     } else {
         NFSVersion::NFSv3
@@ -2809,14 +2811,14 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         format!("{url}: newly mounted client is not ready: {health:?}"),
     )?;
     let callback_stats = mount.callback_stats().await;
-    if expected_version == NFSVersion::NFSv4p1 {
+    if matches!(expected_version, NFSVersion::NFSv4p1 | NFSVersion::NFSv4p2) {
         ensure(
             capabilities.locks && capabilities.callbacks && capabilities.session_diagnostics,
-            format!("{url}: NFSv4.1 common capabilities are incomplete: {capabilities:?}"),
+            format!("{url}: NFSv4.1/v4.2 common capabilities are incomplete: {capabilities:?}"),
         )?;
         ensure(
             health.lease_healthy == Some(true) && health.callback_healthy.is_none(),
-            format!("{url}: NFSv4.1 health is incomplete: {health:?}"),
+            format!("{url}: NFSv4.1/v4.2 health is incomplete: {health:?}"),
         )?;
     } else {
         // Native POSIX ACLs are a stateless NFSv3 extension. Keep rejecting all
@@ -2845,22 +2847,26 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         mount.mkdir_path(CASE_DIR, 0o755).await?;
         let created = mount.create_path(ORIGINAL_FILE, Some(0o640)).await?;
         let expected = payload();
-        if expected_version == NFSVersion::NFSv4p1 {
+        if matches!(expected_version, NFSVersion::NFSv4p1 | NFSVersion::NFSv4p2) {
             ensure(
-                capabilities.acl,
+                capabilities.acl || expected_version == NFSVersion::NFSv4p2,
                 format!("{url}: server negotiation omitted the NFSv4 ACL capability"),
             )?;
-            let acl_support = mount.aclsupport(created.fh.clone()).await?;
-            ensure(
-                acl_support.supports(nfs_rs::AclSupport::ALLOW),
-                format!("{url}: ACLSUPPORT omitted ALLOW"),
-            )?;
-            let original_acl = mount.getacl(created.fh.clone()).await?;
-            mount.setacl(created.fh.clone(), &original_acl).await?;
-            ensure(
-                mount.getacl(created.fh.clone()).await? == original_acl,
-                format!("{url}: NFSv4.1 ACL round trip mismatch"),
-            )?;
+            if capabilities.acl {
+                let acl_support = mount.aclsupport(created.fh.clone()).await?;
+                ensure(
+                    acl_support.supports(nfs_rs::AclSupport::ALLOW),
+                    format!("{url}: ACLSUPPORT omitted ALLOW"),
+                )?;
+                let original_acl = mount.getacl(created.fh.clone()).await?;
+                mount.setacl(created.fh.clone(), &original_acl).await?;
+                ensure(
+                    mount.getacl(created.fh.clone()).await? == original_acl,
+                    format!("{url}: NFSv4 ACL round trip mismatch"),
+                )?;
+            } else {
+                eprintln!("{url}: capability acl=unsupported (not exercised)");
+            }
             let lock = mount
                 .lock_stateful(created.fh.clone(), 2, 0, expected.len() as u64)
                 .await?;
@@ -2905,7 +2911,7 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             format!("{url}: read data differs from written payload"),
         )?;
 
-        if expected_version == NFSVersion::NFSv4p1 {
+        if matches!(expected_version, NFSVersion::NFSv4p1 | NFSVersion::NFSv4p2) {
             let negotiated_wsize = mount.get_max_write_size() as usize;
             ensure(
                 negotiated_wsize < NFS41_FORE_CHANNEL_MAX_REQUEST_SIZE,
@@ -2971,7 +2977,11 @@ async fn exercise_endpoint(url: &str) -> TestResult {
 
         mount.rename_path(ORIGINAL_FILE, RENAMED_FILE).await?;
         mount.link_path(RENAMED_FILE, HARD_LINK).await?;
-        let linked = mount.read_path(HARD_LINK, 0, expected.len() as u32).await?;
+        // A single READ may be short, particularly with appliance MAXREAD
+        // limits. Verify the entire hard link using the same bounded read loop.
+        let linked_fh = mount.open_path(HARD_LINK, OPEN_READ).await?.fh;
+        let linked = read_all(mount.as_ref(), linked_fh.clone(), expected.len()).await?;
+        mount.close(linked_fh).await?;
         ensure(
             linked == expected,
             format!("{url}: hard-link read differs from written payload"),
@@ -3012,6 +3022,35 @@ async fn nfs_v3_and_v41_end_to_end() -> TestResult {
         tokio::time::timeout(Duration::from_secs(120), exercise_endpoint(url))
             .await
             .map_err(|_| io::Error::other(format!("{url}: E2E timed out")))??;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires writable AFX NFSv4.2 fixtures in an isolated run directory"]
+async fn nfs_v42_end_to_end() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let urls = env::var("NFS_RS_LAB_V42_URLS")?;
+    let urls = urls.split_ascii_whitespace().collect::<Vec<_>>();
+    ensure(!urls.is_empty(), "NFS_RS_LAB_V42_URLS is empty")?;
+    for url in urls {
+        let parsed = url::Url::parse(url)?;
+        ensure(
+            parsed
+                .query_pairs()
+                .find(|(k, _)| k == "version")
+                .map(|(_, v)| v.to_string())
+                .as_deref()
+                == Some("4.2"),
+            "exact version=4.2 required",
+        )?;
+        eprintln!("running NFSv4.2 E2E against {url}");
+        tokio::time::timeout(Duration::from_secs(120), exercise_endpoint(url))
+            .await
+            .map_err(|_| io::Error::other(format!("{url}: NFSv4.2 E2E timed out")))??;
     }
     Ok(())
 }
@@ -3646,4 +3685,211 @@ async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
     mount.remove_path(CALLBACK_FILE).await?;
     mount.umount().await?;
     Ok(())
+}
+
+// RFC 7862/8276 optional operations are probed individually. Unsupported is an
+// explicit outcome in the artifact, never counted as a successful operation.
+fn v42_observe<T>(
+    outcomes: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    result: nfs_rs::Result<T>,
+) -> Option<T> {
+    match result {
+        Ok(value) => {
+            outcomes.insert(name.into(), serde_json::json!({"status":"passed"}));
+            Some(value)
+        }
+        Err(error) => {
+            let code = match &error {
+                NfsError::Nfs4(code) => Some(*code as u32),
+                _ => None,
+            };
+            let unsupported = matches!(&error, NfsError::Unsupported(_))
+                || matches!(code, Some(10004 | 10032 | 10044 | 10088 | 10090 | 10094));
+            outcomes.insert(name.into(),serde_json::json!({"status":if unsupported {"unsupported"} else {"failed"},"code":code,"error":error.to_string()}));
+            None
+        }
+    }
+}
+
+async fn v42_optional_endpoint(url: &str) -> TestResult<serde_json::Value> {
+    let mount = parse_url_and_mount(url).await?;
+    ensure(
+        mount.version() == NFSVersion::NFSv4p2,
+        "exact NFSv4.2 required",
+    )?;
+    let dir = "nfs42-operations";
+    mount.mkdir_path(dir, 0o700).await?;
+    let mut outcomes = serde_json::Map::new();
+    let mut files = Vec::new();
+    let mut opened = Vec::new();
+    let result = async {
+        let data = Bytes::from((0..65536).map(|n| ((n * 17 + 9) % 251) as u8).collect::<Vec<_>>());
+        for name in ["source", "copy", "clone", "space"] {
+            let path = format!("{dir}/{name}");
+            let object = mount.create_path(&path, Some(0o600)).await?;
+            files.push(path); opened.push(object.fh);
+        }
+        let source = opened[0].clone();
+        let copy = opened[1].clone();
+        let clone = opened[2].clone();
+        let space = opened[3].clone();
+        write_all(mount.as_ref(), source.clone(), &data).await?;
+        write_all(mount.as_ref(), space.clone(), &data).await?;
+        let attrs = mount.nfs42_attributes(source.clone()).await?;
+        outcomes.insert("attributes".into(), serde_json::json!({"status":"passed", "supported_attrs":attrs.supported_attrs,"clone_blksize":attrs.clone_blksize,"xattr_support":attrs.xattr_support,"acl":attrs.supports_attribute(12),"dacl":attrs.supports_attribute(58),"sacl":attrs.supports_attribute(59)}));
+        if let Some(acl) = v42_observe(&mut outcomes, "getacl", mount.getacl(source.clone()).await) {
+            if v42_observe(&mut outcomes,"setacl",mount.setacl(source.clone(),&acl).await).is_some() {
+                ensure(mount.getacl(source.clone()).await? == acl,"ACL full replacement mismatch")?;
+            }
+        } else { outcomes.insert("setacl".into(),serde_json::json!({"status":"not_exercised","reason":"no original readable ACL to replace safely"})); }
+        if let Some(acl) = v42_observe(&mut outcomes, "getdacl", mount.getdacl(source.clone()).await)
+            && v42_observe(&mut outcomes,"setdacl",mount.setdacl(source.clone(),&acl).await).is_some() {
+                ensure(mount.getdacl(source.clone()).await? == acl,"DACL replacement mismatch")?;
+        }
+        if let Some(acl) = v42_observe(&mut outcomes, "getsacl", mount.getsacl(source.clone()).await)
+            && v42_observe(&mut outcomes,"setsacl",mount.setsacl(source.clone(),&acl).await).is_some() {
+                ensure(mount.getsacl(source.clone()).await? == acl,"SACL replacement mismatch")?;
+        }
+        if let Some(value) = v42_observe(&mut outcomes,"aclsupport",mount.aclsupport(source.clone()).await) {
+            outcomes.insert("aclsupport".into(),serde_json::json!({"status":"passed","value":value.0}));
+        }
+        if let Some(copied) = v42_observe(&mut outcomes,"copy",mount.copy_range(source.clone(),copy.clone(),0,0,4096).await) {
+            ensure(copied.count > 0 && copied.count <= 4096,"COPY returned invalid count")?;
+            ensure(read_all(mount.as_ref(),copy.clone(),copied.count as usize).await? == data.slice(..copied.count as usize),"COPY content mismatch")?;
+            outcomes.insert("copy".into(),serde_json::json!({"status":"passed","count":copied.count}));
+        }
+        if v42_observe(&mut outcomes,"clone",mount.clone_range(source.clone(),clone.clone(),0,0,0).await).is_some() {
+            ensure(read_all(mount.as_ref(),clone.clone(),data.len()).await? == data,"CLONE content mismatch")?;
+            write_all(mount.as_ref(),clone.clone(),&Bytes::from(vec![0x5a;4096])).await?;
+            ensure(read_all(mount.as_ref(),source.clone(),data.len()).await? == data,"CLONE destination mutation changed source")?;
+        }
+        let before_size = mount.getattr(space.clone()).await?.filesize;
+        if v42_observe(&mut outcomes,"allocate",mount.allocate(space.clone(),131072,4096).await).is_some() {
+            ensure(mount.getattr(space.clone()).await?.filesize >= 135168,"ALLOCATE did not extend EOF")?;
+        }
+        let deallocate_size = mount.getattr(space.clone()).await?.filesize;
+        if v42_observe(&mut outcomes,"deallocate",mount.deallocate(space.clone(),4096,4096).await).is_some() {
+            ensure(mount.getattr(space.clone()).await?.filesize == deallocate_size,"DEALLOCATE changed EOF")?;
+            let actual=read_all(mount.as_ref(),space.clone(),before_size as usize).await?;
+            ensure(actual[4096..8192].iter().all(|b| *b==0) && actual[..4096]==data[..4096] && actual[8192..]==data[8192..],"DEALLOCATE data/edge mismatch")?;
+        }
+        if let Some(found) = v42_observe(&mut outcomes,"seek_data",mount.seek_content(source.clone(),0,nfs_rs::SeekContent::Data).await) {
+            ensure(!found.eof && found.offset==0,"SEEK DATA missed existing data")?;
+        }
+        if let Some(found) = v42_observe(&mut outcomes,"seek_hole",mount.seek_content(source.clone(),0,nfs_rs::SeekContent::Hole).await) {
+            ensure(found.offset <= data.len() as u64,"SEEK HOLE beyond file size")?;
+        }
+        if let Some(reply) = v42_observe(&mut outcomes,"read_plus",mount.read_plus(source.clone(),0,8192).await) {
+            let mut actual=Vec::new();
+            for extent in reply.contents {
+                match extent {
+                    nfs_rs::ReadPlusContent::Data {offset,data}=>{ensure(offset==actual.len() as u64,"READ_PLUS data gap")?;actual.extend(data);},
+                    nfs_rs::ReadPlusContent::Hole {offset,length}=>{ensure(offset==actual.len() as u64 && length<=8192,"READ_PLUS hole gap/bound")?;actual.resize(actual.len()+length as usize,0);},
+                }
+            }
+            ensure(!actual.is_empty() && actual.len()<=8192 && actual[..]==data[..actual.len()],"READ_PLUS content mismatch")?;
+        }
+        // RFC 7862 section 15.4 preserves EOF and makes the range read as zeros.
+        // ONTAP supports a whole-file range while rejecting partial punching;
+        // retain the independent partial-range outcome above, including IO.
+        if v42_observe(&mut outcomes,"deallocate_full",mount.deallocate(space.clone(),0,deallocate_size).await).is_some() {
+            ensure(mount.getattr(space.clone()).await?.filesize == deallocate_size,"whole-file DEALLOCATE changed EOF")?;
+            ensure(read_all(mount.as_ref(),space.clone(),deallocate_size as usize).await?.iter().all(|byte| *byte==0),"whole-file DEALLOCATE left nonzero data")?;
+        }
+        let key="user.nfs_rs_v42";
+        let binary=Bytes::from_static(b"\0binary\xff\x80value");
+        if v42_observe(&mut outcomes,"setxattr",mount.setxattr_with_mode(source.clone(),key,binary.clone(),nfs_rs::XattrSetMode::Create).await).is_some() {
+            ensure(mount.getxattr(source.clone(),key).await?==binary,"binary GETXATTR mismatch")?;
+            outcomes.insert("getxattr".into(),serde_json::json!({"status":"passed","binary":true}));
+            let duplicate=mount.setxattr_with_mode(source.clone(),key,Bytes::new(),nfs_rs::XattrSetMode::Create).await.unwrap_err();
+            ensure(duplicate.is_exist(),"SETXATTR CREATE existing did not return EXIST")?;
+            for replacement in [Bytes::from_static(b"xy"), Bytes::new()] {
+                mount.setxattr_with_mode(source.clone(),key,replacement.clone(),nfs_rs::XattrSetMode::Replace).await?;
+                ensure(mount.getxattr(source.clone(),key).await?==replacement,"SETXATTR shorter/empty replacement mismatch")?;
+            }
+            outcomes.insert("setxattr_modes".into(),serde_json::json!({"status":"passed","create_existing":"EXIST","replace_shorter":true,"replace_empty":true}));
+            // Force pagination beyond the client's 4096-byte LISTXATTRS budget.
+            let keys=(0..48).map(|n|format!("user.pagination-{n:03}-{}","x".repeat(100))).collect::<Vec<_>>();
+            for name in &keys { mount.setxattr(source.clone(),name,Bytes::from_static(b"v")).await?; }
+            let listed=mount.listxattr(source.clone()).await?;
+            ensure(listed.iter().any(|v|v==key) && keys.iter().all(|name|listed.contains(name)),"LISTXATTRS pagination lost keys")?;
+            outcomes.insert("listxattr".into(),serde_json::json!({"status":"passed","created_keys":keys.len()+1,"list_count":listed.len(),"maxcount":4096}));
+            for name in &keys { mount.removexattr(source.clone(),name).await?; }
+            mount.removexattr(source.clone(),key).await?;
+            let missing=mount.getxattr(source.clone(),key).await.unwrap_err();
+            ensure(matches!(missing,NfsError::Nfs4(code) if code as u32==10095),"missing xattr did not return NOXATTR")?;
+            let missing=mount.setxattr_with_mode(source.clone(),key,Bytes::new(),nfs_rs::XattrSetMode::Replace).await.unwrap_err();
+            ensure(matches!(missing,NfsError::Nfs4(code) if code as u32==10095),"REPLACE missing did not return NOXATTR")?;
+            outcomes.insert("removexattr".into(),serde_json::json!({"status":"passed","missing":"NOXATTR","replace_missing":"NOXATTR"}));
+            let directory = mount.lookup_path(dir).await?.fh;
+            mount.setxattr_with_mode(directory.clone(),key,Bytes::from_static(b"directory"),nfs_rs::XattrSetMode::Create).await?;
+            ensure(mount.getxattr(directory.clone(),key).await?==b"directory"[..],"directory GETXATTR mismatch")?;
+            ensure(mount.listxattr(directory.clone()).await?.iter().any(|name|name==key),"directory LISTXATTRS omitted key")?;
+            ensure(mount.getxattr(source.clone(),key).await.unwrap_err().is_not_found(),"directory xattr leaked into file namespace")?;
+            mount.removexattr(directory,key).await?;
+            outcomes.insert("directory_xattrs".into(),serde_json::json!({"status":"passed","separate_file_namespace":true}));
+        } else {
+            ensure(!attrs.xattr_support,"advertised RFC 8276 xattrs failed their round trip")?;
+        }
+        Ok::<(),Box<dyn std::error::Error+Send+Sync>>(())
+    }.await;
+    for fh in opened {
+        let _ = mount.close(fh).await;
+    }
+    for path in files {
+        let _ = mount.remove_path(&path).await;
+    }
+    let _ = mount.rmdir_path(dir).await;
+    let unmount = mount.umount().await;
+    if let Err(error) = result {
+        outcomes.insert(
+            "validation".into(),
+            serde_json::json!({"status":"failed","error":error.to_string()}),
+        );
+    }
+    if let Err(error) = unmount {
+        outcomes.insert(
+            "cleanup".into(),
+            serde_json::json!({"status":"failed","error":error.to_string()}),
+        );
+    }
+    Ok(serde_json::json!({"url":url,"operations":outcomes}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated writable AFX NFSv4.2 fixtures"]
+async fn nfs_v42_optional_operations() -> TestResult {
+    ensure(
+        env::var(LAB_ENABLE_ENV).as_deref() == Ok("1"),
+        "lab disabled",
+    )?;
+    let urls = env::var("NFS_RS_LAB_V42_URLS")?;
+    let mut results = Vec::new();
+    for url in urls.split_ascii_whitespace() {
+        ensure(
+            url::Url::parse(url)?
+                .query_pairs()
+                .any(|(k, v)| k == "version" && v == "4.2"),
+            "exact v4.2 URL required",
+        )?;
+        eprintln!("probing NFSv4.2 optional operations against {url}");
+        results.push(v42_optional_endpoint(url).await?);
+    }
+    ensure(!results.is_empty(), "no v4.2 endpoints supplied")?;
+    let output = serde_json::json!({"schema_version":1,"results":results});
+    if let Ok(path) = env::var("NFS_RS_LAB_V42_OPS_EVIDENCE") {
+        std::fs::write(path, serde_json::to_vec_pretty(&output)?)?;
+    }
+    eprintln!("{}", serde_json::to_string_pretty(&output)?);
+    ensure(
+        !output["results"].as_array().into_iter().flatten().any(|r| {
+            r["operations"]
+                .as_object()
+                .into_iter()
+                .flat_map(|o| o.values())
+                .any(|o| o["status"] == "failed")
+        }),
+        "NFSv4.2 operation validation failed; see explicit outcomes",
+    )
 }

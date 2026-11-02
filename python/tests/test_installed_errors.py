@@ -169,3 +169,28 @@ def test_async_classification_matches_sync() -> None:
     import asyncio
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path, reason", [("__busy_exhausted__", "retry_limit"), ("__busy_deadline__", "deadline")])
+def test_native_server_busy_exhaustion_preserves_original_status(path, reason):
+    import asyncio
+    from nfs_rs import AsyncClient, Client, NfsServerBusyError, RecoveryAction
+
+    def verify(error):
+        assert (error.code, error.code_name) == (10008, "NFS3ERR_JUKEBOX")
+        assert (error.retry_count, error.retry_elapsed_ms, error.retry_reason) == (16, 45000, reason)
+        assert error.recovery_action is RecoveryAction.RETRY
+        assert error.__cause__.code == 10008
+
+    with Client.connect("nfs-test://fixture/export") as client:
+        with pytest.raises(NfsServerBusyError) as caught:
+            client.stat(path)
+        verify(caught.value)
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            with pytest.raises(NfsServerBusyError) as caught:
+                await client.stat(path)
+            verify(caught.value)
+
+    asyncio.run(scenario())

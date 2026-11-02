@@ -21,7 +21,7 @@ use crate::error::{
 };
 use crate::nfs4::fastxdr::nfsstat4;
 
-fn xattr_uncertain(error: NfsError, completed: u64) -> NfsError {
+fn xattr_uncertain(error: NfsError, completed: u64, protocol: crate::NFSVersion) -> NfsError {
     NfsError::OperationOutcome(Box::new(
         OperationOutcomeError::new(
             OperationOutcome::Uncertain,
@@ -29,7 +29,7 @@ fn xattr_uncertain(error: NfsError, completed: u64) -> NfsError {
             RecoveryAction::VerifyThenResume,
             RequestContext {
                 operation: "setxattr".into(),
-                protocol: crate::NFSVersion::NFSv4p1,
+                protocol,
                 request_id: None,
             },
             error,
@@ -133,7 +133,7 @@ impl Mount41 {
             let mut fh_data = getfh.data.clone();
             Ok((stateid, decode_fh(&mut fh_data)?))
         })()
-        .map_err(|error| xattr_uncertain(error, 0))?;
+        .map_err(|error| xattr_uncertain(error, 0, self.protocol_version()))?;
 
         let generation = resp.session_generation;
         let mut completed = 0usize;
@@ -195,6 +195,7 @@ impl Mount41 {
             Err(xattr_uncertain(
                 NfsError::FileClose(failures),
                 completed as u64,
+                self.protocol_version(),
             ))
         }
     }
