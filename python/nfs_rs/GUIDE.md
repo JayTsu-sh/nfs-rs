@@ -452,6 +452,13 @@ I/O is preferable when concurrent tasks operate on distinct ranges.
 
 ## Errors and retry decisions
 
+Definite connection loss gets a short default recovery budget: at most four
+safe reconnects within 500 ms of the first disconnect. Backoff, TCP setup,
+session binding and replay share this limit, subject to the request's own
+replay permission and deadline. Brief flaps can recover transparently; exhaustion
+preserves the first connection error and sent/uncertain outcome evidence.
+No URL setting is needed. Ordinary response timeouts remain separate.
+
 Errors map to familiar Python families where possible:
 
 | Error | Also behaves as |

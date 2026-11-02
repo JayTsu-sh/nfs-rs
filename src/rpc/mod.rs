@@ -76,6 +76,49 @@ impl ReplayPolicy {
     }
 }
 
+/// One short budget after definite connection loss. Ordinary operation timeouts
+/// and protocol backpressure retain their own policies. RFC 5531 section 5:
+/// losing the connection does not establish whether a sent request executed.
+struct DisconnectRecovery {
+    first: NfsError,
+    deadline: tokio::time::Instant,
+    reconnects: u32,
+}
+
+impl DisconnectRecovery {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_RECONNECTS: u32 = 4;
+
+    fn new(first: NfsError, operation_deadline: tokio::time::Instant) -> Self {
+        Self {
+            first,
+            deadline: (tokio::time::Instant::now() + Self::BUDGET).min(operation_deadline),
+            reconnects: 0,
+        }
+    }
+
+    fn failure(self, transmission: crate::RequestTransmission) -> NfsError {
+        if transmission == crate::RequestTransmission::Sent
+            && self.first.request_transmission() != Some(crate::RequestTransmission::Sent)
+        {
+            NfsError::transport(transmission, self.first)
+        } else {
+            self.first
+        }
+    }
+
+    fn next_delay(&mut self) -> Option<std::time::Duration> {
+        if self.reconnects >= Self::MAX_RECONNECTS {
+            return None;
+        }
+        let delay = 20u64 << self.reconnects;
+        self.reconnects += 1;
+        Some(std::time::Duration::from_millis(
+            delay + rand::random_range(0..5),
+        ))
+    }
+}
+
 enum PortmapProc2 {
     Null = 0,
     GetPort = 3,
@@ -319,7 +362,6 @@ pub(crate) struct StreamMux {
     reader_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// 标记 shutdown 已调用，阻止后续 reconnect 尝试
     shutdown_flag: AtomicBool,
-    fail_fast: AtomicBool,
     /// Highest closed reader generation plus one; old readers cannot poison a new connection.
     failed_generation: Arc<AtomicU64>,
 }
@@ -355,7 +397,6 @@ impl StreamMux {
             readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
-            fail_fast: AtomicBool::new(false),
             failed_generation,
         }))
     }
@@ -834,13 +875,6 @@ impl std::fmt::Debug for StreamMux {
 }
 
 impl Client {
-    pub(crate) fn set_fail_fast(&self, enabled: bool) {
-        self.nfs_mux.fail_fast.store(enabled, Ordering::Release);
-        if let Some(mux) = &self.mount_mux {
-            mux.fail_fast.store(enabled, Ordering::Release);
-        }
-    }
-
     pub(crate) fn new(nfs_mux: Arc<StreamMux>, mount_mux: Option<Arc<StreamMux>>) -> Self {
         Self { nfs_mux, mount_mux }
     }
@@ -926,6 +960,7 @@ impl Client {
         let max_attempts = replay_policy.max_attempts();
         let mut attempt = 0usize;
         let mut last_error = None;
+        let mut disconnect: Option<DisconnectRecovery> = None;
         let mut logical_transmission = crate::RequestTransmission::NotSent;
         let start = tokio::time::Instant::now();
         // Total replay budget: 3x the per-attempt timeout, so we fail fast instead
@@ -953,8 +988,10 @@ impl Client {
         BigEndian::write_u32(&mut msg_body[8..12], MessageType::Request as u32);
 
         while attempt < max_attempts {
-            // Bail out if total elapsed time exceeds the budget.
-            if tokio::time::Instant::now() >= deadline {
+            let attempt_deadline = disconnect
+                .as_ref()
+                .map_or(deadline, |recovery| recovery.deadline);
+            if tokio::time::Instant::now() >= attempt_deadline {
                 break;
             }
 
@@ -977,7 +1014,9 @@ impl Client {
                     &msg_body,
                     &data,
                     data_pad,
-                    timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    timeout.min(
+                        attempt_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    ),
                     bypass_readiness,
                 )
                 .await;
@@ -1000,47 +1039,35 @@ impl Client {
                     let is_conn_error = e.is_connection_lost();
                     let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
-                        // The socket is known dead. A scan caller owns restart/recovery and
-                        // needs the original typed error, not a later reconnect timeout.
-                        if mux.fail_fast.load(Ordering::Acquire) {
-                            return Err(e);
-                        }
+                        let recovery =
+                            disconnect.get_or_insert_with(|| DisconnectRecovery::new(e, deadline));
                         attempt += 1;
                         if attempt >= max_attempts {
-                            last_error = Some(e);
-                            continue;
+                            break;
                         }
-                        // Connection dead — reconnect then retry.
-                        warn!(
+                        let Some(backoff) = recovery.next_delay() else {
+                            break;
+                        };
+                        debug!(
                             xid,
                             attempt,
                             max_attempts,
-                            error = %e,
-                            "RPC call failed (connection error), reconnecting"
+                            ?backoff,
+                            "brief RPC connection recovery"
                         );
-                        let jitter = rand::random_range(0..50u64);
-                        let backoff = std::cmp::min(100u64 << (attempt - 1), 2000) + jitter;
                         let reconnect = async {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                            tokio::time::sleep(backoff).await;
                             mux.reconnect(r#gen).await
                         };
-                        match tokio::time::timeout_at(deadline, reconnect).await {
+                        match tokio::time::timeout_at(recovery.deadline, reconnect).await {
                             Ok(Ok(())) => {}
-                            Ok(Err(reconn_err)) => {
-                                warn!(error = %reconn_err, "reconnect failed, will retry")
-                            }
-                            Err(_) => {
-                                last_error = Some(NfsError::transport(
-                                    logical_transmission,
-                                    NfsError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "RPC total attempt budget exhausted during reconnect",
-                                    )),
-                                ));
+                            Ok(Err(error)) if error.is_connection_lost() => {}
+                            Ok(Err(error)) => {
+                                debug!(%error, "connection recovery failed; preserving initial disconnect");
                                 break;
                             }
+                            Err(_) => break,
                         }
-                        last_error = Some(e);
                         continue;
                     } else if is_timeout {
                         attempt += 1;
@@ -1073,6 +1100,9 @@ impl Client {
             program,
             "RPC retries exhausted, giving up"
         );
+        if let Some(recovery) = disconnect {
+            return Err(recovery.failure(logical_transmission));
+        }
         Err(last_error.unwrap_or_else(|| {
             NfsError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1123,7 +1153,6 @@ impl Client {
             readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
-            fail_fast: AtomicBool::new(false),
             failed_generation,
         });
         Self {
@@ -1987,60 +2016,178 @@ mod tests {
         client.shutdown().await;
     }
     #[tokio::test]
-    async fn fail_fast_reports_closed_connection_before_any_replay_or_reconnect() {
+    async fn short_recovery_preserves_later_transmission_after_initial_before_send_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_test_record(&mut stream).await.unwrap();
-            drop(stream);
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
-                    .await
-                    .is_err(),
-                "fail-fast must not reconnect"
-            );
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (mut replacement, _) = listener.accept().await.unwrap();
+            read_test_record(&mut replacement).await.unwrap();
+            std::future::pending::<()>().await;
         });
-        let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
-        client.set_fail_fast(true);
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while mux.failed_generation.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = Client::new(mux, None);
         let error = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(750),
             client.call(
                 nfs_test_body(),
-                ReplayPolicy::byte_identical(10),
+                ReplayPolicy::byte_identical(100),
                 std::time::Duration::from_secs(5),
             ),
         )
         .await
-        .expect("definite disconnect must not spend the retry budget")
+        .unwrap()
         .unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::UnexpectedEof
-        ));
+        assert_eq!(
+            error.transport_error_kind(),
+            Some(std::io::ErrorKind::NotConnected)
+        );
         assert_eq!(
             error.request_transmission(),
             Some(crate::RequestTransmission::Sent)
         );
-        let second = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn default_disconnect_recovery_tolerates_brief_flaps() {
+        for flap_ms in [50, 120, 250] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                let mut frames = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let frame = read_test_record(&mut stream).await.unwrap();
+                    if started.elapsed() >= std::time::Duration::from_millis(flap_ms) {
+                        write_test_rpc_reply(
+                            &mut stream,
+                            BigEndian::read_u32(&frame[..4]),
+                            b"recovered",
+                        )
+                        .await
+                        .unwrap();
+                        frames.push(frame);
+                        break;
+                    }
+                    frames.push(frame);
+                }
+                frames
+            });
+            let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                client.call(
+                    nfs_test_body(),
+                    ReplayPolicy::byte_identical(100),
+                    std::time::Duration::from_secs(5),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, Bytes::from_static(b"recovered"));
+            let frames = server.await.unwrap();
+            assert!(
+                (2..=5).contains(&frames.len()),
+                "bounded reconnect attempts: {}",
+                frames.len()
+            );
+            for frame in &frames[1..] {
+                assert_eq!(
+                    &frames[0][4..],
+                    &frame[4..],
+                    "retries preserve the logical request"
+                );
+            }
+            client.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn default_disconnect_budget_includes_connection_rebinding() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_test_record(&mut first).await.unwrap();
+            drop(first);
+            let (_replacement, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        mux.set_reconnect_handler(Arc::new(|_, _| Box::pin(std::future::pending())))
+            .unwrap();
+        let client = Client::new(mux.clone(), None);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
             client.call(
                 nfs_test_body(),
-                ReplayPolicy::byte_identical(10),
+                ReplayPolicy::byte_identical(100),
                 std::time::Duration::from_secs(5),
             ),
         )
         .await
-        .expect("a new request must not wait on an already dead reader")
+        .unwrap()
         .unwrap_err();
-        assert_eq!(second.kind(), std::io::ErrorKind::NotConnected);
-        assert_eq!(
-            second.request_transmission(),
-            Some(crate::RequestTransmission::NotSent)
+        assert!(
+            error.is_connection_lost(),
+            "binding deadline must retain first failure"
         );
+        assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
         client.shutdown().await;
-        server.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn default_disconnect_recovery_is_bounded_and_preserves_first_cause() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_test_record(&mut first).await.unwrap();
+            drop(first);
+            let (replacement, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(replacement);
+        });
+        let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            client.call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(100),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("known disconnect must not spend the ordinary RPC retry budget")
+        .unwrap_err();
+        assert!(
+            error.is_connection_lost(),
+            "first disconnect must survive a stalled retry: {error}"
+        );
+        assert_ne!(
+            error.transport_error_kind(),
+            Some(std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(750));
+        client.shutdown().await;
+        server.abort();
     }
 }

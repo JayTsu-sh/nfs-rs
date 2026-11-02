@@ -237,11 +237,14 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 See [CONTRIBUTING.md](https://github.com/JayTsu-sh/nfs-rs/blob/main/CONTRIBUTING.md).
 
-For read-only scanners that handle recovery themselves, append `fail_fast=true` to
-the NFS URL. Definite connection loss (reset, EOF, broken pipe, or a disconnected
-socket) then returns the original typed transport error without reconnect/replay.
-The default recovery policy is unchanged. Silent packet loss still requires an
-operation deadline; `fail_fast` does not guess that a slow server disconnected.
+Definite connection loss uses a short default recovery budget: at most four
+reconnections within 500 ms of the first disconnect, bounded further by the
+request's existing replay policy and deadline. Backoff, TCP setup, session
+rebinding and replay share that budget. Brief flaps can recover transparently;
+exhaustion returns the first typed disconnect with its transmission and uncertain
+outcome evidence. No URL switch is required. A failed mount may need to be
+replaced by its owner; application-level scan recovery remains the caller's policy.
+Silent packet loss uses the separate operation deadline and remains a timeout.
 
 Server-busy responses use a fixed bounded retry policy across v3, v4.0, v4.1
 and v4.2, including independent pNFS DS reads. Safely reissuable requests have
