@@ -210,3 +210,9 @@ Licensed under the [Apache License 2.0](LICENSE).
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/JayTsu-sh/nfs-rs/blob/main/CONTRIBUTING.md).
+
+For read-only scanners that handle recovery themselves, append `fail_fast=true` to
+the NFS URL. Definite connection loss (reset, EOF, broken pipe, or a disconnected
+socket) then returns the original typed transport error without reconnect/replay.
+The default recovery policy is unchanged. Silent packet loss still requires an
+operation deadline; `fail_fast` does not guess that a slow server disconnected.

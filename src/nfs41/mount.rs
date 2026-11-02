@@ -836,6 +836,7 @@ async fn mount_on_addr(
     // 1. TCP connect
     let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
     let client = rpc::Client::new(nfs_mux, None); // no separate mount connection
+    client.set_fail_fast(args.fail_fast);
 
     // 2. Establish session (EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE)
     // 每个 mount 实例生成唯一的 ClientIdentity，避免 co_ownerid 冲突导致服务端销毁其他 session

@@ -180,6 +180,7 @@ pub(crate) async fn mount(args: &MountArgs) -> Result<Box<dyn Mount>> {
 async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result<Mount40> {
     let mux = rpc::StreamMux::connect(addr, args.noresvport).await?;
     let rpc = rpc::Client::new(mux, None);
+    rpc.set_fail_fast(args.fail_fast);
     let callback = if args.retain_delegations {
         Some(CallbackService::bind_for(addr).await?)
     } else {
@@ -4037,6 +4038,7 @@ mod tests {
             readdir_buffer: None,
             noresvport: true,
             retain_delegations: false,
+            fail_fast: false,
         };
         let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
         assert_eq!(mount.get_max_read_size(), 65536);
@@ -4085,6 +4087,7 @@ mod tests {
                 readdir_buffer,
                 noresvport: true,
                 retain_delegations: false,
+                fail_fast: false,
             };
             let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
             assert_eq!(mount.get_max_read_size(), crate::mount::MAX_IO_SIZE);
@@ -4142,6 +4145,7 @@ mod tests {
             readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: true,
+            fail_fast: false,
         };
 
         let error = mount_on_addr(addr, &args, Auth::new_null())
@@ -4545,6 +4549,7 @@ mod tests {
             readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: false,
+            fail_fast: false,
         };
         let task = tokio::spawn(async move { mount_on_addr(addr, &args, Auth::new_null()).await });
         identity_seen_rx.await.unwrap();

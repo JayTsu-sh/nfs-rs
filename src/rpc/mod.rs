@@ -319,6 +319,9 @@ pub(crate) struct StreamMux {
     reader_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// 标记 shutdown 已调用，阻止后续 reconnect 尝试
     shutdown_flag: AtomicBool,
+    fail_fast: AtomicBool,
+    /// Highest closed reader generation plus one; old readers cannot poison a new connection.
+    failed_generation: Arc<AtomicU64>,
 }
 
 impl StreamMux {
@@ -329,11 +332,14 @@ impl StreamMux {
         let writer = Arc::new(TokioMutex::new(writer));
         let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
         let reader = BufReader::with_capacity(1_048_576, reader);
+        let failed_generation = Arc::new(AtomicU64::new(0));
         let reader_handle = tokio::spawn(reader_loop(
             reader,
             Arc::clone(&pending),
             Arc::clone(&writer),
             Arc::clone(&backchannel),
+            Arc::clone(&failed_generation),
+            0,
         ));
         info!(addr = %addr, "RPC stream mux connected");
         Ok(Arc::new(Self {
@@ -349,6 +355,8 @@ impl StreamMux {
             readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
+            fail_fast: AtomicBool::new(false),
+            failed_generation,
         }))
     }
 
@@ -412,15 +420,29 @@ impl StreamMux {
                 })?;
             }
             let (tx, rx) = oneshot::channel();
-            self.pending
-                .lock()
-                .map_err(|_| {
+            {
+                let mut pending = self.pending.lock().map_err(|_| {
                     NfsError::transport(
                         crate::RequestTransmission::NotSent,
                         NfsError::Rpc("pending map lock poisoned".to_string()),
                     )
-                })?
-                .insert(xid, tx);
+                })?;
+                // Check under the same lock used when the reader fails waiters: a request
+                // is either rejected here or included in that drain, never stranded after it.
+                if !bypass_readiness
+                    && self.failed_generation.load(Ordering::Acquire)
+                        > self.generation.load(Ordering::Acquire)
+                {
+                    return Err(NfsError::transport(
+                        crate::RequestTransmission::NotSent,
+                        NfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "RPC connection reader has stopped",
+                        )),
+                    ));
+                }
+                pending.insert(xid, tx);
+            }
             let _pending_guard = PendingRequestGuard {
                 pending: Arc::clone(&self.pending),
                 xid,
@@ -562,6 +584,8 @@ impl StreamMux {
                 Arc::clone(&self.pending),
                 Arc::clone(&self.writer),
                 Arc::clone(&self.backchannel),
+                Arc::clone(&self.failed_generation),
+                failed_gen.saturating_add(1),
             )));
         }
         drop(writer);
@@ -631,6 +655,8 @@ async fn reader_loop(
     pending: PendingMap,
     writer: Arc<TokioMutex<OwnedWriteHalf>>,
     backchannel: BackchannelSlot,
+    failed_generation: Arc<AtomicU64>,
+    reader_generation: u64,
 ) {
     loop {
         match read_one_response(&mut reader).await {
@@ -667,15 +693,15 @@ async fn reader_loop(
             }
             Err(e) => {
                 warn!(error = %e, "reader loop terminated due to connection error");
+                // Publish before draining. Later requests fail before sending rather than
+                // waiting on a response reader which has already exited.
+                failed_generation.fetch_max(reader_generation.saturating_add(1), Ordering::AcqRel);
                 // Connection broken: fail all pending requests.
                 if let Ok(mut map) = pending.lock() {
                     for (_, tx) in map.drain() {
                         let error = match &e {
                             NfsError::Rpc(message) => NfsError::Rpc(message.clone()),
-                            _ => NfsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                e.to_string(),
-                            )),
+                            _ => NfsError::Io(std::io::Error::new(e.kind(), e.to_string())),
                         };
                         let _ = tx.send(Err(error));
                     }
@@ -808,6 +834,13 @@ impl std::fmt::Debug for StreamMux {
 }
 
 impl Client {
+    pub(crate) fn set_fail_fast(&self, enabled: bool) {
+        self.nfs_mux.fail_fast.store(enabled, Ordering::Release);
+        if let Some(mux) = &self.mount_mux {
+            mux.fail_fast.store(enabled, Ordering::Release);
+        }
+    }
+
     pub(crate) fn new(nfs_mux: Arc<StreamMux>, mount_mux: Option<Arc<StreamMux>>) -> Self {
         Self { nfs_mux, mount_mux }
     }
@@ -969,9 +1002,17 @@ impl Client {
                         std::io::ErrorKind::BrokenPipe
                             | std::io::ErrorKind::ConnectionAborted
                             | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::NotConnected
+                            | std::io::ErrorKind::ConnectionRefused
                     );
                     let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
+                        // The socket is known dead. A scan caller owns restart/recovery and
+                        // needs the original typed error, not a later reconnect timeout.
+                        if mux.fail_fast.load(Ordering::Acquire) {
+                            return Err(e);
+                        }
                         attempt += 1;
                         if attempt >= max_attempts {
                             last_error = Some(e);
@@ -1068,11 +1109,14 @@ impl Client {
         let writer = Arc::new(TokioMutex::new(writer));
         let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
         let reader = BufReader::with_capacity(1_048_576, reader);
+        let failed_generation = Arc::new(AtomicU64::new(0));
         let reader_handle = tokio::spawn(reader_loop(
             reader,
             Arc::clone(&pending),
             Arc::clone(&writer),
             Arc::clone(&backchannel),
+            Arc::clone(&failed_generation),
+            0,
         ));
         let mux = Arc::new(StreamMux {
             writer,
@@ -1087,6 +1131,8 @@ impl Client {
             readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
+            fail_fast: AtomicBool::new(false),
+            failed_generation,
         });
         Self {
             nfs_mux: mux,
@@ -1645,7 +1691,9 @@ mod tests {
         );
         assert!(matches!(
             err.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
         ));
 
         let (first, reconnected) = server.await.unwrap().unwrap();
@@ -1945,5 +1993,62 @@ mod tests {
             Some(crate::RequestTransmission::NotSent)
         );
         client.shutdown().await;
+    }
+    #[tokio::test]
+    async fn fail_fast_reports_closed_connection_before_any_replay_or_reconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_test_record(&mut stream).await.unwrap();
+            drop(stream);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "fail-fast must not reconnect"
+            );
+        });
+        let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
+        client.set_fail_fast(true);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            client.call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(10),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("definite disconnect must not spend the retry budget")
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            client.call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(10),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("a new request must not wait on an already dead reader")
+        .unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(
+            second.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        client.shutdown().await;
+        server.await.unwrap();
     }
 }

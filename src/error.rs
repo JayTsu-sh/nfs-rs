@@ -252,6 +252,34 @@ pub struct FileCloseFailure {
 }
 
 impl NfsError {
+    /// The original transport kind, including through an uncertain-operation wrapper.
+    /// This evidence is separate from whether replaying the logical operation is safe.
+    #[must_use]
+    pub fn transport_error_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io(error) => Some(error.kind()),
+            Self::OperationOutcome(outcome) => outcome.source.transport_error_kind(),
+            _ => None,
+        }
+    }
+
+    /// Whether the transport has explicitly reported an unusable connection.
+    /// A response timeout alone does not establish connection loss.
+    #[must_use]
+    pub fn is_connection_lost(&self) -> bool {
+        matches!(
+            self.transport_error_kind(),
+            Some(
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::ConnectionRefused
+            )
+        )
+    }
+
     pub(crate) fn transport(transmission: RequestTransmission, source: NfsError) -> Self {
         let kind = source.kind();
         Self::Io(std::io::Error::new(
