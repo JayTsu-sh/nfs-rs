@@ -20,6 +20,16 @@ impl Mount41 {
         offset: u64,
         data: Bytes,
     ) -> Option<Result<mount::WriteOutcome>> {
+        // Bound the future's stack size across the nested retry scope.
+        crate::retry::scope(Box::pin(self.write_pnfs_budgeted(fh, offset, data))).await
+    }
+
+    async fn write_pnfs_budgeted(
+        &self,
+        fh: &Bytes,
+        offset: u64,
+        data: Bytes,
+    ) -> Option<Result<mount::WriteOutcome>> {
         for attempt in 0..2 {
             let io_guard = self.layout_manager.read_file_io(fh).await;
             // Recall/refresh commits hold the exclusive I/O gate. Inspect failure

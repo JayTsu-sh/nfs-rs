@@ -903,6 +903,94 @@ pub(crate) fn decode_read_response(buf: Bytes) -> Result<Bytes> {
     crate::mount::read_reply(take_opaque(&mut buf, "READ data")?, eof)
 }
 
+/// RFC 7530 §§13.1.1.3, 15.2: only reissue when no earlier mutation
+/// succeeded. Owner-seqid operations need their owner's state machine to
+/// rebuild the request; replaying their old seqid would replay cached DELAY.
+pub(super) fn retryable_busy_response(mut buf: Bytes, request: &[u8]) -> Result<Option<NfsError>> {
+    let overall = take_u32(&mut buf, "status")?;
+    if !matches!(overall, 10008 | 10013) {
+        return Ok(None);
+    }
+    take_opaque(&mut buf, "tag")?;
+    let count = take_u32(&mut buf, "count")?;
+    // Header::encode emits four u32s. RPC adds XID and message type later.
+    let mut sent = Bytes::copy_from_slice(
+        request
+            .get(16..)
+            .ok_or_else(|| NfsError::Xdr("missing RPC header".into()))?,
+    );
+    for _ in 0..2 {
+        take_u32(&mut sent, "auth flavor")?;
+        take_opaque(&mut sent, "auth body")?;
+    }
+    take_opaque(&mut sent, "request tag")?;
+    let minor = take_u32(&mut sent, "minor version")?;
+    let requested_count = take_u32(&mut sent, "request count")?;
+    if minor != 0 || count == 0 || count > 128 || count > requested_count {
+        return Err(NfsError::Xdr(
+            "invalid busy COMPOUND operation count or minor version".into(),
+        ));
+    }
+    for index in 0..count {
+        let opcode = take_u32(&mut buf, "opcode")?;
+        let status = take_u32(&mut buf, "op status")?;
+        // RFC 7530 §15.2: do not infer a WRITE rejection from a READ reply.
+        if take_u32(&mut sent, "request opcode")? != opcode {
+            return Err(NfsError::Xdr(
+                "busy COMPOUND response opcode differs from request".into(),
+            ));
+        }
+        if status != 0 {
+            if index + 1 != count || status != overall || !buf.is_empty() {
+                return Err(NfsError::Xdr("malformed busy COMPOUND result".into()));
+            }
+            if matches!(opcode, 4 | 12 | 14 | 18 | 20) {
+                return Ok(None);
+            }
+            return Ok(check_status(status).err());
+        }
+        match opcode {
+            15 | 22 => {
+                take_opaque(&mut sent, "request argument")?;
+            }
+            3 => {
+                take_u32(&mut sent, "requested access")?;
+            }
+            9 => {
+                let words = take_u32(&mut sent, "request bitmap")? as usize;
+                if words > sent.remaining() / 4 {
+                    return Err(NfsError::Xdr("truncated request bitmap".into()));
+                }
+                sent.advance(words * 4);
+            }
+            10 | 16 | 23 | 24 | 31 | 32 => {}
+            // An earlier mutation succeeded: the full compound is not replayable.
+            _ => return Ok(None),
+        }
+        match opcode {
+            15 | 16 | 22 | 23 | 24 | 31 | 32 => {}
+            10 => {
+                take_opaque(&mut buf, "GETFH")?;
+            }
+            9 => {
+                let words = take_u32(&mut buf, "bitmap")? as usize;
+                if words > buf.remaining() / 4 {
+                    return Err(NfsError::Xdr("truncated attribute bitmap".into()));
+                }
+                buf.advance(words * 4);
+                take_opaque(&mut buf, "attributes")?;
+            }
+            3 if buf.remaining() >= 8 => {
+                buf.advance(8);
+            }
+            _ => return Err(NfsError::Xdr("truncated busy COMPOUND prefix".into())),
+        }
+    }
+    Err(NfsError::Xdr(
+        "busy COMPOUND has no failed operation".into(),
+    ))
+}
+
 pub(crate) fn decode_write_response(buf: Bytes) -> Result<(u32, u32, [u8; 8])> {
     let (count, mut buf) = response_ops(buf)?;
     if count != 2 {
@@ -1726,5 +1814,30 @@ mod tests {
             wire.extend_from_slice(data);
         }
         Bytes::from(wire)
+    }
+    #[test]
+    fn busy_v40_rejects_a_mismatched_mutation_reply() {
+        let request = CompoundBuilder::new("write")
+            .putfh(b"fh")
+            .write_header(&[0; 16], 0, 2, 3)
+            .encode_with_header(&Auth::new_null());
+        let mut reply = Vec::new();
+        for word in [10008u32, 0, 2, 22, 0, 25, 10008] {
+            xdr_u32(&mut reply, word);
+        }
+        assert!(matches!(
+            retryable_busy_response(Bytes::from(reply.clone()), &request),
+            Err(NfsError::Xdr(_))
+        ));
+        // A correctly matched WRITE rejection is eligible for bounded reissue.
+        let mut reply = Vec::new();
+        for word in [10008u32, 0, 2, 22, 0, 38, 10008] {
+            xdr_u32(&mut reply, word);
+        }
+        assert!(
+            retryable_busy_response(Bytes::from(reply), &request)
+                .unwrap()
+                .is_some()
+        );
     }
 }

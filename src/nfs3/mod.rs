@@ -34,6 +34,8 @@ mod readdirplus;
 mod readlink;
 mod remove;
 mod rename;
+#[cfg(test)]
+mod retry_tests;
 mod rmdir;
 mod setattr;
 mod symlink;
@@ -356,12 +358,7 @@ macro_rules! nfs3_call {
             self.pack_nfs3(procedure, &args, &mut buf);
             tracing::debug!(proc = stringify!($proc), "NFS3 call");
             let mut bytes = self
-                .rpc
-                .call(
-                    buf,
-                    procedure.replay_policy(),
-                    timeout,
-                )
+                .call_with_busy_retry(procedure, buf, Bytes::new(), timeout)
                 .await
                 .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
             let status = nfsstat3::try_from(&mut bytes)
@@ -396,6 +393,42 @@ pub struct Mount {
 }
 
 impl Mount {
+    /// RFC 1813 §2.6: JUKEBOX is an authoritative temporary rejection.
+    /// Reissue with a fresh XID; transport failures retain their existing replay
+    /// classification and are never mistaken for a JUKEBOX response.
+    async fn call_with_busy_retry(
+        &self,
+        procedure: NFSProc3,
+        request: Vec<u8>,
+        data: Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes> {
+        crate::retry::scope(async {
+            let budget = crate::retry::current();
+            loop {
+                let reply = self
+                    .rpc
+                    .call_with_data(
+                        request.clone(),
+                        data.clone(),
+                        procedure.replay_policy(),
+                        timeout,
+                    )
+                    .await?;
+                if reply.get(..4) != Some(10008u32.to_be_bytes().as_slice()) {
+                    return Ok(reply);
+                }
+                budget
+                    .backoff(
+                        procedure.request_context(),
+                        NfsError::Nfs3(nfsstat3::NFS3ERR_JUKEBOX),
+                    )
+                    .await?;
+            }
+        })
+        .await
+    }
+
     fn pack_nfs3(&self, proc: NFSProc3, args: &dyn XdrEncode, buf: &mut Vec<u8>) {
         rpc_header(rpc::NFS_PROG, rpc::NFS3_VERSION, proc as u32, &self.auth).encode(buf);
         args.encode(buf);
@@ -446,8 +479,7 @@ impl Mount {
         self.pack_nfs3(procedure, &args, &mut buf);
         tracing::debug!(proc = "Read", "NFS3 call");
         let mut bytes = self
-            .rpc
-            .call(buf, procedure.replay_policy(), timeout)
+            .call_with_busy_retry(procedure, buf, Bytes::new(), timeout)
             .await
             .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
         let status = nfsstat3::try_from(&mut bytes).map_err(|error| {
@@ -511,8 +543,7 @@ impl Mount {
         self.pack_nfs3(procedure, &args, &mut buf);
         tracing::debug!(proc = "Write", data_len = data.len(), "NFS3 call");
         let mut bytes = self
-            .rpc
-            .call_with_data(buf, data, procedure.replay_policy(), timeout)
+            .call_with_busy_retry(procedure, buf, data, timeout)
             .await
             .map_err(|error| classify_sent_nfs3_error(operation_class, context.clone(), error))?;
         let status = nfsstat3::try_from(&mut bytes).map_err(|error| {

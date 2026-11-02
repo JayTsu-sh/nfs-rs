@@ -16,6 +16,8 @@ pub(crate) mod mount;
 pub(crate) mod pnfs_io;
 mod read;
 mod readdir;
+#[cfg(test)]
+mod retry_tests;
 pub(crate) mod session;
 mod setattr;
 pub(crate) mod state;

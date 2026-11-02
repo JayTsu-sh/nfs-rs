@@ -115,7 +115,7 @@ Connected protocol values. NFSv4.0 is experimental. Construct from a listed stri
 | `Version.NFS_V3` | `'3'` | Named enum value; see this type description for interpretation. |
 | `Version.NFS_V4_0` | `'4.0'` | Named enum value; see this type description for interpretation. |
 | `Version.NFS_V4_1` | `'4.1'` | Named enum value; see this type description for interpretation. |
-| `Version.NFS_V4_2` | `'4.2'` | Existing file APIs over NFSv4.2; optional v4.2 operations are not exposed. |
+| `Version.NFS_V4_2` | `'4.2'` | Existing file APIs over NFSv4.2, plus optional COPY/CLONE, SEEK, ALLOCATE/DEALLOCATE, READ_PLUS and RFC 8276 xattrs; server support is required. |
 
 #### Version.__new__
 
@@ -468,6 +468,9 @@ Immutable structured base for all library NFS failures. Subclasses also preserve
 | `NfsError.errno` | `int \| None` | Mapped OS error number, or None. |
 | `NfsError.filename` | `str \| None` | Path context, or None. |
 | `NfsError.errors` | `tuple[NfsError, ...]` | Tuple of child NfsError values, especially for cleanup aggregation. |
+| `NfsError.retry_count` | `int \| None` | Busy reissues admitted by the shared operation budget; None on other errors. |
+| `NfsError.retry_elapsed_ms` | `int \| None` | Elapsed operation budget in milliseconds. |
+| `NfsError.retry_reason` | `str \| None` | `retry_limit` or `deadline`; None on other errors. |
 
 #### NfsError.__init__
 
@@ -487,6 +490,9 @@ def __init__(
     errno: int | None = None,
     filename: str | None = None,
     errors: tuple[NfsError, ...] = (),
+    retry_count: int | None = None,
+    retry_elapsed_ms: int | None = None,
+    retry_reason: str | None = None,
 ) -> None: ...
 ```
 
@@ -607,6 +613,12 @@ Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
 A protocol failure classified as retryable; consult recovery_action and outcome.
 
 Bases: `NfsProtocolError`. Inherits all documented NfsError fields and methods.
+
+### NfsServerBusyError
+
+A definite JUKEBOX, DELAY or GRACE rejection exhausted the fixed automatic busy retry budget. Inherits NfsError.retry_count, retry_elapsed_ms and retry_reason, retaining the original code/code_name and recovery_action=RETRY. The cause is the original protocol error. Queue the file for later retry instead of immediately restarting the same full budget.
+
+Bases: `NfsRetryableError`. Inherits all documented NfsError fields and methods.
 
 ### NfsBadCookieError
 

@@ -61,11 +61,31 @@ pub(super) async fn serve_v42_with_reply_gate(
     serve_version(handler, Some(gate), |_| {}, super::MinorVersion::V2).await
 }
 
+pub(super) type ObservedSequences = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32, u32)>>>;
+
+pub(super) async fn serve_observed(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+    minor: super::MinorVersion,
+    observed: ObservedSequences,
+) -> (Mount41, JoinHandle<()>) {
+    serve_version_observed(handler, None, |_| {}, minor, Some(observed)).await
+}
+
 async fn serve_version(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+    reply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    after_reply: impl FnMut(&str) + Send + 'static,
+    minor: super::MinorVersion,
+) -> (Mount41, JoinHandle<()>) {
+    serve_version_observed(handler, reply_gate, after_reply, minor, None).await
+}
+
+async fn serve_version_observed(
     mut handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
     mut reply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     mut after_reply: impl FnMut(&str) + Send + 'static,
     minor: super::MinorVersion,
+    observed: Option<ObservedSequences>,
 ) -> (Mount41, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -89,6 +109,11 @@ async fn serve_version(
             let opcode = request.get_u32();
             let sequence = if opcode == 53 {
                 let mut sequence = request.split_to(28).to_vec();
+                if let Some(observed) = &observed {
+                    let seq = u32::from_be_bytes(sequence[16..20].try_into().unwrap());
+                    let slot = u32::from_be_bytes(sequence[20..24].try_into().unwrap());
+                    observed.lock().unwrap().push((xid, seq, slot));
+                }
                 request.advance(4); // cachethis
                 xdr_u32(&mut sequence, 0); // target highest
                 xdr_u32(&mut sequence, 0); // status flags

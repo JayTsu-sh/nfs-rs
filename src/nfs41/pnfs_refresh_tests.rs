@@ -1052,7 +1052,7 @@ async fn layout_waiter_cannot_fetch_in_a_new_session_generation() {
         .unwrap();
     drop(held);
     assert!(
-        lookup.await.is_none(),
+        lookup.await.unwrap().is_none(),
         "old gate must not admit a new-generation LAYOUTGET"
     );
     assert!(case.calls.lock().unwrap().is_empty());
@@ -1060,6 +1060,7 @@ async fn layout_waiter_cannot_fetch_in_a_new_session_generation() {
         case.mount
             .get_or_fetch_layout(&fh, IoMode::ReadWrite, 0)
             .await
+            .unwrap()
             .is_some()
     );
     assert_eq!(
@@ -1084,7 +1085,7 @@ async fn concurrent_layout_misses_share_one_layoutget_and_device_lookup() {
         futures::future::join_all(futures)
             .await
             .iter()
-            .all(Option::is_some)
+            .all(|r| r.as_ref().is_ok_and(Option::is_some))
     );
     assert_eq!(
         *case.calls.lock().unwrap(),
@@ -1737,5 +1738,151 @@ async fn cancelled_directory_next_does_not_keep_an_unpolled_stream_in_flight() {
             Err(NfsError::ClientClosed(_))
         ));
         server.abort();
+    }
+}
+
+// Follow the public READ route: a cold metadata rejection must not disappear
+// into an otherwise successful MDS fallback (RFC 8881 §15.1.1.3).
+#[cfg(feature = "python-bindings")]
+#[tokio::test]
+async fn busy_pnfs_cold_metadata_exhaustion_is_returned() {
+    for device_lookup in [false, true] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let (mut mount, server) = serve(move |tag, _| {
+            seen.lock().unwrap().push(tag.to_owned());
+            match tag {
+                "layoutget" if device_lookup => {
+                    vec![ok(22, vec![]), ok(50, layout_reply(0, u64::MAX, b"ds"))]
+                }
+                "layoutget" => vec![
+                    ok(22, vec![]),
+                    Reply {
+                        opcode: 50,
+                        status: 10008,
+                        data: vec![],
+                    },
+                ],
+                "getdeviceinfo" => vec![
+                    ok(24, vec![]),
+                    Reply {
+                        opcode: 47,
+                        status: 10008,
+                        data: vec![],
+                    },
+                ],
+                other => panic!("exhaustion restarted through {other}"),
+            }
+        })
+        .await;
+        enable_pnfs(&mut mount).await;
+        let result = crate::retry::with_timeout(
+            Some(std::time::Duration::from_millis(250)),
+            mount.read(Bytes::from_static(b"file"), 0, 4),
+        )
+        .await;
+        assert!(matches!(result, Err(NfsError::ServerBusy(_))), "{result:?}");
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| c == "layoutget" || c == "getdeviceinfo")
+        );
+        server.abort();
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+#[tokio::test]
+async fn busy_pnfs_cancelled_ds_backoff_never_refreshes_or_falls_back() {
+    let case = remapping_case(
+        |tag, mut args| {
+            assert_eq!(tag, "ds-read");
+            putfh(&mut args);
+            assert_eq!(args.get_u32(), 25);
+            vec![
+                ok(22, vec![]),
+                Reply {
+                    opcode: 25,
+                    status: 10008,
+                    data: vec![],
+                },
+            ]
+        },
+        false,
+    )
+    .await;
+    let (waiter, work) =
+        crate::retry::read_waiter(true, case.mount.read(Bytes::from_static(b"file"), 0, 4));
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => panic!("read settled before cancellation: {result:?}"),
+        _ = async { while case.calls.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await; } => {}
+    }
+    drop(waiter);
+    let result = work.await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(*case.calls.lock().unwrap(), ["old:ds-read"]);
+}
+
+#[cfg(feature = "python-bindings")]
+#[tokio::test]
+async fn busy_pnfs_write_preserves_exhaustion_but_partial_write_is_uncertain() {
+    for short_success in [false, true] {
+        let mut first = short_success;
+        let mut case = remapping_case(
+            move |tag, mut args| {
+                assert_eq!(tag, "ds-write");
+                if std::mem::take(&mut first) {
+                    return write_reply(&mut args, Some(1));
+                }
+                vec![
+                    ok(22, vec![]),
+                    Reply {
+                        opcode: 38,
+                        status: 10008,
+                        data: vec![],
+                    },
+                ]
+            },
+            false,
+        )
+        .await;
+        // Move the fixture's mount into the public Mount wrapper while keeping
+        // the fixture's unconditional server cleanup guard alive.
+        let (placeholder, placeholder_server) =
+            serve(|tag, _| panic!("unused placeholder {tag}")).await;
+        case.servers.push(placeholder_server);
+        let mount = std::mem::replace(&mut case.mount, placeholder);
+        let wrapper = crate::nfs41::mount::test_wrapper(mount);
+        let result = crate::retry::with_timeout(
+            Some(std::time::Duration::from_millis(250)),
+            crate::Mount::write(
+                &wrapper,
+                Bytes::from_static(b"file"),
+                0,
+                Bytes::from_static(b"data"),
+            ),
+        )
+        .await;
+        let error = result.unwrap_err();
+        if short_success {
+            assert_eq!(
+                error.operation_outcome().unwrap().outcome,
+                crate::OperationOutcome::Uncertain
+            );
+            assert!(!error.is_server_busy());
+        } else {
+            assert!(matches!(error, NfsError::ServerBusy(_)), "{error:?}");
+        }
+        assert!(
+            case.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|tag| tag == "old:ds-write")
+        );
     }
 }

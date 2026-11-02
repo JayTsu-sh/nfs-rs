@@ -263,12 +263,13 @@ mod nfs41;
 pub mod nfs42;
 #[cfg(feature = "python-bindings")]
 mod python_adapter;
+mod retry;
 mod rpc;
 mod shared;
 
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
-    RequestContext, RequestId, RequestTransmission, Result,
+    RequestContext, RequestId, RequestTransmission, Result, RetryExhaustion, ServerBusyError,
 };
 pub use fileio::{BufferedFile, write_all};
 pub use mount::{
@@ -595,6 +596,7 @@ async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
 /// Extract the inner message from an NfsError without the variant prefix.
 fn nfs_error_msg(err: &NfsError) -> String {
     match err {
+        NfsError::ServerBusy(error) => error.to_string(),
         NfsError::Io(e) => e.to_string(),
         NfsError::Nfs3(c) => c.to_string(),
         NfsError::Nfs4(c) => c.to_string(),

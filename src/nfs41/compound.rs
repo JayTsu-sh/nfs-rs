@@ -216,6 +216,30 @@ const MIN_OPERATION_REPLY_SIZE: usize = 8;
 
 #[allow(dead_code)] // Builder offers full NFSv4.1 op set; not all ops used yet
 impl CompoundBuilder {
+    /// RFC 8881 §15.1.1.3: a later DELAY cannot replay an earlier mutation.
+    pub(crate) fn can_retry_busy(&self, response: &CompoundResponse) -> Result<bool> {
+        if response.results.is_empty() || response.results.len() > self.ops.len() {
+            return Err(NfsError::Xdr("invalid busy COMPOUND result count".into()));
+        }
+        let mut safe = true;
+        for (index, (request, reply)) in self.ops.iter().zip(&response.results).enumerate() {
+            if request.opcode as u32 != reply.opcode {
+                return Err(NfsError::Xdr("busy COMPOUND opcode mismatch".into()));
+            }
+            if reply.status != nfsstat4::NFS4_OK {
+                if index + 1 != response.results.len() || reply.status != response.status {
+                    return Err(NfsError::Xdr("busy COMPOUND status mismatch".into()));
+                }
+                return Ok(safe);
+            }
+            if request.opcode.class() == OperationClass::ReplaySensitive {
+                safe = false;
+            }
+        }
+        Err(NfsError::Xdr(
+            "busy COMPOUND omitted its failing operation".into(),
+        ))
+    }
     pub fn new(tag: &str) -> Self {
         Self {
             tag: tag.to_string(),
@@ -1117,7 +1141,7 @@ impl CompoundBuilder {
     // ─── Encode to wire format ───────────────────────────────────────────
 
     /// Encode the COMPOUND4args into a buffer, prefixed with the RPC header.
-    pub fn encode_with_header(self, auth: &Auth, minor_version: MinorVersion, buf: &mut Vec<u8>) {
+    pub fn encode_with_header(&self, auth: &Auth, minor_version: MinorVersion, buf: &mut Vec<u8>) {
         // RPC header: program=100003, version=4, procedure=1 (COMPOUND)
         rpc_header(NFS4_PROGRAM, NFS4_VERSION, NFS4_COMPOUND_PROC, auth).encode(buf);
         self.encode_body_for_version(minor_version, buf);
@@ -1129,7 +1153,7 @@ impl CompoundBuilder {
         self.encode_body_for_version(MinorVersion::V1, buf);
     }
 
-    fn encode_body_for_version(self, minor_version: MinorVersion, buf: &mut Vec<u8>) {
+    fn encode_body_for_version(&self, minor_version: MinorVersion, buf: &mut Vec<u8>) {
         // tag (utf8str_cs)
         xdr_string(buf, &self.tag);
         // minorversion
@@ -1137,7 +1161,7 @@ impl CompoundBuilder {
         // argarray length
         xdr_u32(buf, self.ops.len() as u32);
         // argarray entries
-        for op in self.ops {
+        for op in &self.ops {
             xdr_u32(buf, op.opcode as u32);
             buf.extend_from_slice(&op.args);
         }

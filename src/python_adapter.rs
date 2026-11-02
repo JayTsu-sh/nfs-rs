@@ -1255,6 +1255,9 @@ struct PythonErrorPayload<'a> {
     completed_bytes: Option<u64>,
     errno: Option<i32>,
     filename: Option<&'a str>,
+    retry_count: Option<u32>,
+    retry_elapsed_ms: Option<u64>,
+    retry_reason: Option<&'a str>,
 }
 
 impl Default for PythonErrorPayload<'_> {
@@ -1272,6 +1275,9 @@ impl Default for PythonErrorPayload<'_> {
             completed_bytes: None,
             errno: None,
             filename: None,
+            retry_count: None,
+            retry_elapsed_ms: None,
+            retry_reason: None,
         }
     }
 }
@@ -1291,6 +1297,9 @@ fn structured_error(payload: PythonErrorPayload<'_>) -> PyErr {
         kwargs.set_item("completed_bytes", payload.completed_bytes)?;
         kwargs.set_item("errno", payload.errno)?;
         kwargs.set_item("filename", payload.filename)?;
+        kwargs.set_item("retry_count", payload.retry_count)?;
+        kwargs.set_item("retry_elapsed_ms", payload.retry_elapsed_ms)?;
+        kwargs.set_item("retry_reason", payload.retry_reason)?;
         let instance = module
             .getattr(payload.class_name)?
             .call((), Some(&kwargs))?;
@@ -1559,6 +1568,11 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
         return error_kind(shared.0.as_ref());
     }
     match error {
+        NfsError::ServerBusy(_) => PythonErrorKind {
+            class_name: "NfsServerBusyError",
+            errno: Some(nix::libc::EAGAIN),
+            recovery: Some("retry"),
+        },
         NfsError::Io(io) => PythonErrorKind {
             class_name: match io.kind() {
                 std::io::ErrorKind::TimedOut => "NfsTimeoutError",
@@ -1658,6 +1672,43 @@ fn nfs_error_with_context(
     explicit_protocol: Option<NFSVersion>,
     filename: Option<&str>,
 ) -> PyErr {
+    if let NfsError::ServerBusy(busy) = error {
+        let (code, code_name) = match busy.source.as_ref() {
+            NfsError::Nfs3(status) => (
+                Some(nfs3_python_mapping::descriptor(status).1),
+                Some(format!("{status:?}")),
+            ),
+            NfsError::Nfs4(status) => (Some(*status as i64), Some(format!("{status:?}"))),
+            _ => (None, None),
+        };
+        let result = structured_error(PythonErrorPayload {
+            class_name: "NfsServerBusyError",
+            message: error.to_string(),
+            operation: Some(&busy.context.operation),
+            protocol: Some(protocol_name(busy.context.protocol)),
+            code,
+            code_name: code_name.as_deref(),
+            recovery_action: Some("retry"),
+            outcome: Some("safe_to_retry"),
+            errno: Some(nix::libc::EAGAIN),
+            filename,
+            retry_count: Some(busy.retries),
+            retry_elapsed_ms: Some(busy.elapsed.as_millis().min(u64::MAX as u128) as u64),
+            retry_reason: Some(match busy.reason {
+                crate::RetryExhaustion::RetryLimit => "retry_limit",
+                crate::RetryExhaustion::Deadline => "deadline",
+            }),
+            ..Default::default()
+        });
+        let cause = nfs_error_with_context(
+            &busy.source,
+            Some(&busy.context.operation),
+            Some(busy.context.protocol),
+            filename,
+        );
+        Python::attach(|py| result.set_cause(py, Some(cause)));
+        return result;
+    }
     if let NfsError::FileClose(errors) = error {
         let message = errors.first().map_or_else(
             || "file close completed with errors".to_string(),
@@ -1717,6 +1768,9 @@ fn nfs_error_with_context(
         completed_bytes,
         errno: kind.errno.or(source_kind.errno),
         filename,
+        retry_count: None,
+        retry_elapsed_ms: None,
+        retry_reason: None,
     });
     if matches!(error, NfsError::OperationOutcome(_)) {
         let cause = nfs_error_with_context(source, operation, cause_protocol, filename);
@@ -1965,6 +2019,25 @@ fn test_attr(path: &str) -> Option<Result<Attr>> {
         "__session_lost__" => return Some(Err(NfsError::Nfs4(NFS4ERR_BADSESSION))),
         "__callback_failure__" => return Some(Err(NfsError::Nfs4(NFS4ERR_BACK_CHAN_BUSY))),
         "__retry__" => return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX))),
+        "__busy_exhausted__" | "__busy_deadline__" => {
+            return Some(Err(NfsError::ServerBusy(Box::new(
+                crate::ServerBusyError {
+                    context: crate::RequestContext {
+                        operation: "stat".into(),
+                        protocol: NFSVersion::NFSv3,
+                        request_id: None,
+                    },
+                    retries: 16,
+                    elapsed: Duration::from_secs(45),
+                    reason: if path == "__busy_deadline__" {
+                        crate::RetryExhaustion::Deadline
+                    } else {
+                        crate::RetryExhaustion::RetryLimit
+                    },
+                    source: Box::new(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX)),
+                },
+            ))));
+        }
         "__unsupported__" => {
             return Some(Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTSUPP)));
         }
@@ -2094,6 +2167,15 @@ fn v42_recovery_path(operation: &str, path: &str, other: Option<&str>) -> Option
     }
 }
 
+fn v42_waiter_operation(operation: &str) -> &'static str {
+    match operation {
+        "read_plus" => "read_plus",
+        "seek_content" => "seek_content",
+        "nfs42_attributes" => "nfs42_attributes",
+        _ => "v42",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn v42_operation(
     core: Arc<ClientCore>,
@@ -2204,13 +2286,13 @@ async fn v42_operation(
                         .await
                         .map(|_| V42Value::Unit)
                 };
-                finish_v42_open(result, mount.close(target.fh).await)
+                finish_v42_open(result, crate::retry::cleanup(mount.close(target.fh)).await)
             }
             _ => Err(NfsError::InvalidInput("unknown NFSv4.2 operation".into())),
         }
     }
     .await;
-    finish_v42_open(result, mount.close(opened.fh).await)
+    finish_v42_open(result, crate::retry::cleanup(mount.close(opened.fh)).await)
 }
 
 #[derive(Clone, Copy)]
@@ -3648,6 +3730,14 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T>> + Send + 'static,
 {
+    let (_read_waiter, future) = crate::retry::read_waiter(
+        matches!(
+            operation_name,
+            "read" | "read_at" | "readinto" | "readinto_at"
+        ),
+        future,
+    );
+    let future = crate::retry::with_timeout(timeout, future);
     let operation = core.begin_operation()?;
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let event_core = core.clone();
@@ -3681,8 +3771,16 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T>> + Send + 'static,
 {
+    let (_read_waiter, future) = crate::retry::read_waiter(
+        matches!(
+            operation_name,
+            "read_plus" | "seek_content" | "nfs42_attributes"
+        ),
+        future,
+    );
     // Retain results until acknowledgement, including cancellation after ready
     // was queued. Sending a notification alone does not transfer responsibility.
+    let future = crate::retry::with_timeout(timeout, future);
     let result = Arc::new(Mutex::new(None));
     let slot = result.clone();
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -4701,9 +4799,10 @@ impl SyncClient {
         count: u64,
         value: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let operation_name = v42_waiter_operation(&operation);
         let result = self.run_operation(
             py,
-            "v42",
+            operation_name,
             v42_recovery_path(&operation, &path, other.as_deref()),
             v42_operation(
                 self.core.clone(),
@@ -5300,6 +5399,7 @@ impl AsyncClient {
         count: u64,
         value: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let operation_name = v42_waiter_operation(&operation);
         let core = self.core.clone();
         let work_core = core.clone();
         let mount = self.health_source.clone();
@@ -5309,7 +5409,7 @@ impl AsyncClient {
             let result = cancellation_safe_owned_operation(
                 core,
                 safe_path,
-                "v42",
+                operation_name,
                 timeout,
                 v42_operation(
                     work_core,

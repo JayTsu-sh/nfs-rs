@@ -26,6 +26,10 @@ impl Mount41 {
     }
 
     pub(crate) async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
+        crate::retry::scope(self.read_budgeted(fh, offset, count)).await
+    }
+
+    async fn read_budgeted(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
         if count == 0 {
             return Ok(Bytes::new());
         }
