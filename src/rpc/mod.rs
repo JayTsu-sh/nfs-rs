@@ -997,15 +997,7 @@ impl Client {
                         return Err(e);
                     }
                     let kind = e.kind();
-                    let is_conn_error = matches!(
-                        kind,
-                        std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::ConnectionAborted
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::NotConnected
-                            | std::io::ErrorKind::ConnectionRefused
-                    );
+                    let is_conn_error = e.is_connection_lost();
                     let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
                         // The socket is known dead. A scan caller owns restart/recovery and
