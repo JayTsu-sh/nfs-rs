@@ -1,15 +1,28 @@
 # Changelog
 
-## Unreleased
-
-- Add opt-in `fail_fast=true` for immediate typed transport-loss propagation on NFSv3, v4.0 and v4.1.
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.10.1] - 2026-11-02
+
+### Added
+
+- Opt-in `fail_fast=true` URL policy for scanners that own recovery. Definite
+  transport loss returns immediately without reconnecting or replaying an RPC
+  on NFSv3, v4.0, v4.1 and v4.2. The default recovery policy is unchanged.
+- Rust `NfsError::transport_error_kind()` and `is_connection_lost()` preserve
+  typed transport evidence through uncertain-operation wrappers. A deadline
+  remains distinct from definite connection loss.
+
+### Fixed
+
+- Reject requests admitted after their RPC reader stopped, instead of waiting
+  for a response from a dead reader. Keep the original I/O error kind when
+  failing requests already in flight, and retain transmission/uncertainty evidence.
 
 ## [0.10.0] - 2026-11-02
 
@@ -558,7 +571,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Configurable privileged or ephemeral source-port behavior.
 - Physical-lab end-to-end coverage for NFSv3 and NFSv4.1.
 
-[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/JayTsu-sh/nfs-rs/compare/v0.8.8...v0.9.0
