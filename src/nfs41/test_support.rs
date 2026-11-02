@@ -41,9 +41,31 @@ pub(super) async fn serve(
 }
 
 pub(super) async fn serve_with_reply_hook(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+    reply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    after_reply: impl FnMut(&str) + Send + 'static,
+) -> (Mount41, JoinHandle<()>) {
+    serve_version(handler, reply_gate, after_reply, super::MinorVersion::V1).await
+}
+
+pub(super) async fn serve_v42(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+) -> (Mount41, JoinHandle<()>) {
+    serve_version(handler, None, |_| {}, super::MinorVersion::V2).await
+}
+
+pub(super) async fn serve_v42_with_reply_gate(
+    handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
+    gate: tokio::sync::oneshot::Receiver<()>,
+) -> (Mount41, JoinHandle<()>) {
+    serve_version(handler, Some(gate), |_| {}, super::MinorVersion::V2).await
+}
+
+async fn serve_version(
     mut handler: impl FnMut(&str, Bytes) -> Vec<Reply> + Send + 'static,
     mut reply_gate: Option<tokio::sync::oneshot::Receiver<()>>,
     mut after_reply: impl FnMut(&str) + Send + 'static,
+    minor: super::MinorVersion,
 ) -> (Mount41, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -62,7 +84,7 @@ pub(super) async fn serve_with_reply_hook(
                 take_opaque(&mut request, "auth").unwrap();
             }
             let tag = take_opaque(&mut request, "tag").unwrap();
-            assert_eq!(request.get_u32(), 1);
+            assert_eq!(request.get_u32(), minor as u32);
             let _count = request.get_u32();
             let opcode = request.get_u32();
             let sequence = if opcode == 53 {
@@ -78,6 +100,12 @@ pub(super) async fn serve_with_reply_hook(
                 None
             };
             let replies = handler(std::str::from_utf8(&tag).unwrap(), request);
+            // Fixtures can explicitly return a failed SEQUENCE with no later ops.
+            let sequence = if replies.first().is_some_and(|op| op.opcode == 53) {
+                None
+            } else {
+                sequence
+            };
             let mut reply = Vec::new();
             for word in [xid, 1, 0, 0, 0, 0] {
                 xdr_u32(&mut reply, word);
@@ -110,7 +138,16 @@ pub(super) async fn serve_with_reply_hook(
         }
     });
     let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
-    (test_mount(client, addr), server)
+    let mut mount = test_mount(client, addr);
+    if minor == super::MinorVersion::V2 {
+        mount.client_identity = super::session::ClientIdentity::with_minor_version(minor);
+        mount.session_holder = std::sync::Arc::new(super::session::SessionHolder::new(
+            super::session::Session::for_v42_test(1),
+        ));
+        mount.rsize = 4096;
+        mount.wsize = 4096;
+    }
+    (mount, server)
 }
 
 pub(super) fn directory_page(cookie: Option<u64>, eof: bool, verifier: [u8; 8]) -> Vec<u8> {

@@ -53,15 +53,16 @@ class _AdapterContext:
         operation = "truncate" if name == "truncate_path" else name
 
         def contextual_call(*args: Any, **kwargs: Any) -> Any:
-            filename = self._filename
+            public_operation = args[0] if name == "v42" and args else operation
+            filename = args[1] if name == "v42" and len(args) > 1 else self._filename
             if filename is None and args and isinstance(args[0], str):
                 filename = args[1] if name == "symlink" and len(args) > 1 else args[0]
             try:
                 result = attribute(*args, **kwargs)
             except NfsError as error:
-                raise error.with_context(operation=operation, protocol=self._protocol, filename=filename) from error
+                raise error.with_context(operation=public_operation, protocol=self._protocol, filename=filename) from error
             if inspect.isawaitable(result):
-                return _await_adapter_result(result, operation, self._protocol, filename)
+                return _await_adapter_result(result, public_operation, self._protocol, filename)
             return result
 
         return contextual_call
@@ -71,9 +72,57 @@ class Version(str, Enum):
     NFS_V3 = "3"
     NFS_V4_0 = "4.0"
     NFS_V4_1 = "4.1"
+    NFS_V4_2 = "4.2"
 
     def __str__(self) -> str:
         return self.value
+
+
+class SeekContent(IntEnum):
+    DATA = 0
+    HOLE = 1
+
+
+class XattrSetMode(IntEnum):
+    EITHER = 0
+    CREATE = 1
+    REPLACE = 2
+
+
+# Public enum defaults must identify the same type as the root PEP 561 stub.
+SeekContent.__module__ = "nfs_rs"
+XattrSetMode.__module__ = "nfs_rs"
+
+
+@dataclass(frozen=True, slots=True)
+class SeekResult:
+    eof: bool
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReadPlusExtent:
+    offset: int
+    length: int
+    data: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReadPlusResult:
+    eof: bool
+    contents: tuple[ReadPlusExtent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CopyResult:
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class Nfs42Attributes:
+    supported_attrs: tuple[int, ...]
+    clone_blksize: int | None
+    xattr_support: bool
 
 
 class Lifecycle(str, Enum):
@@ -273,6 +322,20 @@ class Capabilities:
 class IoLimits:
     max_read: int
     max_write: int
+
+
+def _v42_uint(value: int, name: str, bits: int = 64) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < (1 << bits):
+        raise ValueError(f"{name} must be an unsigned {bits}-bit integer")
+    return value
+
+
+def _read_plus_result(values: dict[str, Any]) -> ReadPlusResult:
+    return ReadPlusResult(values["eof"], tuple(ReadPlusExtent(item["offset"], item["length"], item["data"]) for item in values["contents"]))
+
+
+def _nfs42_attributes(values: dict[str, Any]) -> Nfs42Attributes:
+    return Nfs42Attributes(tuple(values["supported_attrs"]), values["clone_blksize"], values["xattr_support"])
 
 
 def _normalize_path(path: os.PathLike[str] | str) -> str:
@@ -475,8 +538,8 @@ def _options(
 ) -> dict[str, Any]:
     if versions is not None:
         versions = tuple(versions)
-        if not versions or any(version not in {"3", "4.0", "4.1"} for version in versions):
-            raise ValueError("versions must be a non-empty sequence containing 3, 4.0, or 4.1")
+        if not versions or any(version not in {"3", "4.0", "4.1", "4.2"} for version in versions):
+            raise ValueError("versions must be a non-empty sequence containing 3, 4.0, 4.1, or 4.2")
     for name, integer_value in (("uid", uid), ("gid", gid)):
         if integer_value is not None and (
             isinstance(integer_value, bool) or not 0 <= integer_value <= 2**32 - 1
@@ -673,11 +736,43 @@ class Client(_ClientOptions):
         flags, aces = _acl41_args(acl)
         self._inner.setsacl(_normalize_path(path), flags, aces)
 
+    def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+        self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+        self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+        if not isinstance(what, SeekContent):
+            raise TypeError("what must be a SeekContent")
+        values = self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
+        return SeekResult(**values)
+
+    def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+        values = self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
+        return _read_plus_result(values)
+
+    def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+        values = self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+        return CopyResult(**values)
+
+    def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+        self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+
+    def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
+        values = self._inner.v42("nfs42_attributes", _normalize_path(path))
+        return _nfs42_attributes(values)
+
     def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
         return bytes(self._inner.getxattr(_normalize_path(path), name))
 
-    def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None:
-        self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+    def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
+        if not isinstance(mode, XattrSetMode):
+            raise TypeError("mode must be an XattrSetMode")
+        if mode is XattrSetMode.EITHER:
+            self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+        else:
+            self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
 
     def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
         return list(self._inner.listxattr(_normalize_path(path)))
@@ -922,13 +1017,52 @@ class AsyncClient(_ClientOptions):
         flags, aces = _acl41_args(acl)
         await self._inner.setsacl(_normalize_path(path), flags, aces)
 
+    async def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+        self._check_loop()
+        await self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    async def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+        self._check_loop()
+        await self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    async def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+        self._check_loop()
+        if not isinstance(what, SeekContent):
+            raise TypeError("what must be a SeekContent")
+        values = await self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
+        return SeekResult(**values)
+
+    async def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+        self._check_loop()
+        values = await self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
+        return _read_plus_result(values)
+
+    async def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+        self._check_loop()
+        values = await self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+        return CopyResult(**values)
+
+    async def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+        self._check_loop()
+        await self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+
+    async def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
+        self._check_loop()
+        values = await self._inner.v42("nfs42_attributes", _normalize_path(path))
+        return _nfs42_attributes(values)
+
     async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
         self._check_loop()
         return bytes(await self._inner.getxattr(_normalize_path(path), name))
 
-    async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None:
+    async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
         self._check_loop()
-        await self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+        if not isinstance(mode, XattrSetMode):
+            raise TypeError("mode must be an XattrSetMode")
+        if mode is XattrSetMode.EITHER:
+            await self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+        else:
+            await self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
 
     async def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
         self._check_loop()

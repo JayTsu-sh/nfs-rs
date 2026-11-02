@@ -23,7 +23,7 @@ def test_pypi_uses_python_specific_readme() -> None:
     assert "from nfs_rs import AsyncClient" in readme
     assert 'versions=["4.1", "4.0", "3"]' in readme
     assert "NFSv3 is the default" in readme
-    assert "NFSv4.2 are rejected" in readme
+    assert "Version.NFS_V4_2" in readme
 
 
 def test_python_documentation_examples_parse() -> None:

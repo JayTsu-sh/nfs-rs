@@ -957,7 +957,87 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         ))
     }
 
-    /// Get a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
+    /// RFC 7862 ALLOCATE. Requires a writable OPEN; may extend EOF.
+    async fn allocate(&self, _fh: Bytes, _offset: u64, _length: u64) -> Result<()> {
+        Err(NfsError::Unsupported("ALLOCATE requires NFSv4.2".into()))
+    }
+
+    /// RFC 7862 DEALLOCATE (hole punching). Requires a writable OPEN; preserves EOF.
+    async fn deallocate(&self, _fh: Bytes, _offset: u64, _length: u64) -> Result<()> {
+        Err(NfsError::Unsupported("DEALLOCATE requires NFSv4.2".into()))
+    }
+
+    /// Locate server-reported data or a hole (RFC 7862 §15.11). Requires a readable OPEN.
+    async fn seek_content(
+        &self,
+        _fh: Bytes,
+        _offset: u64,
+        _what: crate::SeekContent,
+    ) -> Result<crate::SeekResult> {
+        Err(NfsError::Unsupported("SEEK requires NFSv4.2".into()))
+    }
+
+    /// Read data and sparse extents without allocating hole contents. Requires a readable OPEN.
+    /// Replies may be short and are bounded by negotiated READ/session limits;
+    /// at most 4096 extents are accepted per reply.
+    async fn read_plus(
+        &self,
+        _fh: Bytes,
+        _offset: u64,
+        _count: u32,
+    ) -> Result<crate::ReadPlusResult> {
+        Err(NfsError::Unsupported("READ_PLUS requires NFSv4.2".into()))
+    }
+
+    /// Synchronous intra-server COPY (RFC 7862 §15.2), with readable source and writable
+    /// destination OPENs on this mount. Returns a durable, possibly short byte count.
+    /// A zero count copies through source EOF. No software or async fallback is implicit.
+    async fn copy_range(
+        &self,
+        _source: Bytes,
+        _destination: Bytes,
+        _source_offset: u64,
+        _destination_offset: u64,
+        _count: u64,
+    ) -> Result<crate::CopyResult> {
+        Err(NfsError::Unsupported("COPY requires NFSv4.2".into()))
+    }
+
+    /// Atomic server-side CLONE (RFC 7862 §15.13). Requires readable source and writable
+    /// destination OPENs. Server clone_blksize alignment applies; count zero means source EOF.
+    async fn clone_range(
+        &self,
+        _source: Bytes,
+        _destination: Bytes,
+        _source_offset: u64,
+        _destination_offset: u64,
+        _count: u64,
+    ) -> Result<()> {
+        Err(NfsError::Unsupported("CLONE requires NFSv4.2".into()))
+    }
+
+    /// Inspect per-object NFSv4.2 supported_attrs, clone_blksize and RFC 8276 xattr_support.
+    async fn nfs42_attributes(&self, _fh: Bytes) -> Result<crate::Nfs42Attributes> {
+        Err(NfsError::Unsupported(
+            "NFSv4.2 attributes require NFSv4.2".into(),
+        ))
+    }
+
+    /// RFC 8276 SETXATTR with atomic create/replace policy. Distinct from OPENATTR.
+    async fn setxattr_with_mode(
+        &self,
+        _fh: Bytes,
+        _name: &str,
+        _value: Bytes,
+        _mode: crate::XattrSetMode,
+    ) -> Result<()> {
+        Err(NfsError::Unsupported(
+            "xattr create/replace policy requires NFSv4.2 RFC 8276".into(),
+        ))
+    }
+
+    /// Get an xattr value. NFSv4.2 uses RFC 8276, while v4.0/v4.1 retain
+    /// the distinct OPENATTR named-attribute namespace (no implicit fallback).
     /// NFSv4.1 reads to EOF, completing short reads, with a 1 MiB complete-value
     /// ceiling. Oversized values return an error, never a truncated success.
     async fn getxattr(&self, _fh: Bytes, _name: &str) -> Result<Bytes> {
@@ -972,7 +1052,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.getxattr(res.fh, name).await
     }
 
-    /// Set a named attribute (xattr) value (NFSv4 only; returns Unsupported on NFSv3).
+    /// Set an xattr value. NFSv4.2 uses atomic RFC 8276 SETXATTR (EITHER),
+    /// bounded by the 4 MiB client ceiling and negotiated channel/server limits.
     /// NFSv4.1 replaces the complete value (at most 1 MiB), including truncating
     /// shorter/empty replacements. This is not atomic across clients; errors after
     /// truncation carry an uncertain outcome and require verification.
@@ -988,7 +1069,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.setxattr(res.fh, name, value).await
     }
 
-    /// List named attribute (xattr) names (NFSv4 only; returns Unsupported on NFSv3).
+    /// List xattr names. NFSv4.2 uses RFC 8276, with at most 65536 names and
+    /// progress-checked cookies; v4.0/v4.1 retain the separate OPENATTR namespace.
     async fn listxattr(&self, _fh: Bytes) -> Result<Vec<String>> {
         Err(NfsError::Unsupported(
             "Named attributes require NFSv4".to_string(),
@@ -1996,6 +2078,8 @@ pub enum NFSVersion {
     #[deprecated(note = "use NFSVersion::NFSv4p0 and the exact URL selector version=4.0")]
     NFSv4,
     NFSv4p1,
+    /// File APIs over NFSv4.2 (RFC 7862 §2), including optional operations
+    /// such as COPY, SEEK and ALLOCATE when supported by the server.
     NFSv4p2,
 }
 

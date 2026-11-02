@@ -1539,7 +1539,7 @@ mod tests {
             .apply_sequence_cache_policy(4096)
             .unwrap();
         let mut body = Vec::new();
-        builder.encode_with_header(&Auth::new_null(), &mut body);
+        builder.encode_with_header(&Auth::new_null(), crate::nfs41::MinorVersion::V1, &mut body);
         let response = client
             .call_with_data(
                 body,

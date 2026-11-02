@@ -120,6 +120,17 @@ impl std::fmt::Display for Nfs4ErrorCode {
             Nfs4ErrorCode::NFS4ERR_REJECT_DELEG => write!(f, "delegation rejected"),
             Nfs4ErrorCode::NFS4ERR_RETURNCONFLICT => write!(f, "return conflict"),
             Nfs4ErrorCode::NFS4ERR_DELEG_REVOKED => write!(f, "delegation revoked"),
+            Nfs4ErrorCode::NFS4ERR_PARTNER_NOTSUPP => write!(f, "copy partner unsupported"),
+            Nfs4ErrorCode::NFS4ERR_PARTNER_NO_AUTH => {
+                write!(f, "copy partner authentication unavailable")
+            }
+            Nfs4ErrorCode::NFS4ERR_UNION_NOTSUPP => write!(f, "union content unsupported"),
+            Nfs4ErrorCode::NFS4ERR_OFFLOAD_DENIED => write!(f, "offload denied"),
+            Nfs4ErrorCode::NFS4ERR_WRONG_LFS => write!(f, "wrong labeled file system"),
+            Nfs4ErrorCode::NFS4ERR_BADLABEL => write!(f, "bad security label"),
+            Nfs4ErrorCode::NFS4ERR_OFFLOAD_NO_REQS => write!(f, "copy requirements unsupported"),
+            Nfs4ErrorCode::NFS4ERR_NOXATTR => write!(f, "extended attribute does not exist"),
+            Nfs4ErrorCode::NFS4ERR_XATTR2BIG => write!(f, "extended attribute too large"),
         }
     }
 }

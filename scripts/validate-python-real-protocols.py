@@ -40,7 +40,7 @@ class Case:
 
 def parse_case(value: str) -> Case:
     parts = value.split("|", 3)
-    if len(parts) != 4 or parts[1] not in {"3", "4.0", "4.1"}:
+    if len(parts) != 4 or parts[1] not in {"3", "4.0", "4.1", "4.2"}:
         raise argparse.ArgumentTypeError("case must be NAME|VERSION|URL|REQUIRE_PNFS")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", parts[0]):
         raise argparse.ArgumentTypeError("unsafe case name")

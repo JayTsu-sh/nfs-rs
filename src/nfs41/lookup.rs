@@ -29,7 +29,10 @@ impl Mount41 {
     }
 
     pub(crate) async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
-        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let components: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
         if components.is_empty() {
             return Ok(mount::ObjRes {
                 fh: self.root_fh.clone(),

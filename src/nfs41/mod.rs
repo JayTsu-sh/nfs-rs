@@ -1,4 +1,4 @@
-//! NFSv4.1 client implementation (RFC 5661).
+//! Shared NFSv4.1/v4.2 client implementation (RFC 8881, RFC 7862 §2).
 //!
 //! Two-layer design matching NFSv3:
 //! - Inner `Mount41`: protocol-specific implementation
@@ -21,6 +21,12 @@ mod setattr;
 pub(crate) mod state;
 #[cfg(test)]
 mod test_support;
+pub(crate) mod v42_ops;
+#[cfg(test)]
+mod v42_tests;
+pub(crate) mod v42_xattr;
+#[cfg(test)]
+mod version_tests;
 mod write;
 mod write_owner;
 mod xattr;
@@ -32,8 +38,24 @@ pub use crate::nfs4::Nfs4ErrorCode;
 pub(crate) const NFS4_PROGRAM: u32 = 100003;
 /// NFSv4 RPC version
 pub(crate) const NFS4_VERSION: u32 = 4;
-/// NFSv4.1 minor version (used in COMPOUND args)
-pub(crate) const NFS41_MINOR_VERSION: u32 = 1;
+
+/// A client ID and its sessions belong to one minor version (RFC 8178 §8.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum MinorVersion {
+    #[default]
+    V1 = 1,
+    V2 = 2,
+}
+
+impl MinorVersion {
+    pub(crate) fn version(self) -> crate::NFSVersion {
+        match self {
+            Self::V1 => crate::NFSVersion::NFSv4p1,
+            Self::V2 => crate::NFSVersion::NFSv4p2,
+        }
+    }
+}
 /// COMPOUND procedure number (the only procedure in NFSv4)
 pub(crate) const NFS4_COMPOUND_PROC: u32 = 1;
 /// NULL procedure number
@@ -146,7 +168,7 @@ mod tests {
     fn nfs4_constants() {
         assert_eq!(super::NFS4_PROGRAM, 100003);
         assert_eq!(super::NFS4_VERSION, 4);
-        assert_eq!(super::NFS41_MINOR_VERSION, 1);
+        assert_eq!(super::MinorVersion::V1 as u32, 1);
         assert_eq!(super::NFS4_COMPOUND_PROC, 1);
         assert_eq!(super::NFS4_NULL_PROC, 0);
         assert_eq!(super::NFS4_DEFAULT_PORT, 2049);
