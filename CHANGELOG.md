@@ -7,6 +7,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-02
+
+### Fixed
+
+- Preserve the initial typed disconnect when a connection reset during NFSv4.1
+  binding leaves the replacement transport unready. Its later admission error
+  must not replace the logical request's network cause or cumulative send evidence.
+  Waiting callers also receive typed `NotConnected` for an unusable rebound
+  connection instead of an unclassified RPC error.
+
 ## [0.11.0] - 2026-11-02
 
 ### Changed

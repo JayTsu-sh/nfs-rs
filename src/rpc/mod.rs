@@ -428,9 +428,10 @@ impl StreamMux {
             match self.readiness.load(Ordering::Acquire) {
                 CONNECTION_READY => return Ok(()),
                 CONNECTION_FAILED => {
-                    return Err(NfsError::Rpc(
-                        "NFSv4.1 connection rebind failed; connection is not ready".to_string(),
-                    ));
+                    return Err(NfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "NFSv4.1 connection rebind failed; connection is not ready",
+                    )));
                 }
                 _ => {
                     let notified = self.readiness_notify.notified();
@@ -1087,6 +1088,10 @@ impl Client {
                         last_error = Some(e);
                         continue;
                     } else {
+                        if disconnect.is_some() {
+                            debug!(xid, error = %e, "retry state failed; preserving initial disconnect");
+                            break;
+                        }
                         error!(xid, error = %e, "RPC call failed with non-retryable error");
                         return Err(e);
                     }
@@ -1474,7 +1479,13 @@ mod tests {
 
         assert!(mux.reconnect(0).await.is_err());
         assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
-        assert!(mux.wait_until_ready().await.is_err());
+        assert_eq!(
+            mux.wait_until_ready()
+                .await
+                .unwrap_err()
+                .transport_error_kind(),
+            Some(std::io::ErrorKind::NotConnected)
+        );
         let error = mux
             .send_and_receive_inner(
                 7,
@@ -1521,7 +1532,13 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(mux.readiness.load(Ordering::Acquire), CONNECTION_FAILED);
-        assert!(mux.wait_until_ready().await.is_err());
+        assert_eq!(
+            mux.wait_until_ready()
+                .await
+                .unwrap_err()
+                .transport_error_kind(),
+            Some(std::io::ErrorKind::NotConnected)
+        );
         server.abort();
     }
 
@@ -2112,6 +2129,56 @@ mod tests {
             }
             client.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn lost_rebind_connection_cannot_replace_the_initial_disconnect_with_rpc_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_test_record(&mut first).await.unwrap();
+            drop(first);
+            let (_replacement, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mux = StreamMux::connect(addr, true).await.unwrap();
+        mux.set_reconnect_handler(Arc::new(|_, _| {
+            Box::pin(async {
+                Err(NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "binding connection reset",
+                )))
+            })
+        }))
+        .unwrap();
+        let client = Client::new(mux, None);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            client.call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(100),
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.is_connection_lost(),
+            "binding state must retain the initial transport cause: {error:?}"
+        );
+        assert_ne!(
+            error.transport_error_kind(),
+            Some(std::io::ErrorKind::NotConnected),
+            "the later readiness failure must not replace the first socket failure"
+        );
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        client.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
