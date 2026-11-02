@@ -347,6 +347,8 @@ struct MountArgs {
     readdir_buffer: Option<(u32, u32)>,
     noresvport: bool,
     retain_delegations: bool,
+    /// Return definite transport loss without reconnecting or replaying the RPC.
+    fail_fast: bool,
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -533,6 +535,12 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         readdir_buffer,
         noresvport,
         retain_delegations,
+        fail_fast: get_url_query_param(
+            &parsed_url,
+            "fail_fast",
+            false,
+            "fail_fast must be true or false",
+        )?,
     })
 }
 
@@ -1034,6 +1042,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            fail_fast: false,
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1054,6 +1063,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            fail_fast: false,
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1074,6 +1084,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            fail_fast: false,
         };
         let res = mount(args).await;
         assert!(res.is_err());
