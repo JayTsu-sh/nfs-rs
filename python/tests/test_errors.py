@@ -81,3 +81,17 @@ def test_every_public_exception_is_pickle_stable(error_type):
     restored = pickle.loads(pickle.dumps(error))
     assert type(restored) is error_type
     assert restored.__reduce__()[1][1] == error.__reduce__()[1][1]
+
+
+def test_server_busy_metadata_survives_pickle_and_context():
+    error = nfs_rs.NfsServerBusyError(
+        message="busy", protocol="3", code=10008, code_name="NFS3ERR_JUKEBOX",
+        recovery_action="retry", retry_count=16, retry_elapsed_ms=45000,
+        retry_reason="retry_limit",
+    )
+    assert isinstance(error, nfs_rs.NfsRetryableError)
+    restored = pickle.loads(pickle.dumps(error)).with_context(filename="file")
+    assert (restored.retry_count, restored.retry_elapsed_ms, restored.retry_reason) == (16, 45000, "retry_limit")
+    assert restored.code == 10008 and restored.filename == "file"
+    with pytest.raises(AttributeError):
+        restored.retry_count = 0

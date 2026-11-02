@@ -39,16 +39,9 @@ static NEXT_MOUNT_ISSUER: AtomicU64 = AtomicU64::new(1);
 // Retry counts
 const NFS_RETRIES: usize = 10;
 const NFS_REPLAY: crate::rpc::ReplayPolicy = crate::rpc::ReplayPolicy::byte_identical(NFS_RETRIES);
-// Equal-jitter exponential backoff for NFS4ERR_DELAY/GRACE retries.
-// Without jitter, concurrent workers (e.g. integrity-check parallel LOOKUPs)
-// resync to the same retry instant and sustain the thundering-herd that
-// triggered the error. Total expected DELAY wait across 17 attempts ≈ 46s
-// (max < 61s), covering observed 60+ s server-busy windows.
-pub(super) const DELAY_RETRY_MAX: usize = 16;
-const DELAY_RETRY_BASE_MS: u64 = 200;
-const DELAY_RETRY_CAP_MS: u64 = 5000;
-const GRACE_RETRY_BASE_MS: u64 = 1000;
-const GRACE_RETRY_CAP_MS: u64 = 8000;
+// Session recovery has an independent iteration bound; busy reissues also
+// consume the shared operation retry/time budget.
+pub(super) const DELAY_RETRY_MAX: usize = crate::retry::MAX_RETRIES as usize;
 const RPC_CALL_PREFIX_SIZE: usize = 8; // XID + message type; record marker is transport framing.
 const MIN_RPC_REPLY_ENVELOPE_SIZE: usize = 24;
 
@@ -183,25 +176,6 @@ fn sent_error(
     error: NfsError,
 ) -> NfsError {
     classify_sent_nfs41_error(operation_class, context.clone(), error)
-}
-
-fn backoff_jitter_ms(attempt: usize, base_ms: u64, cap_ms: u64) -> u64 {
-    let base = base_ms
-        .saturating_mul(1u64.checked_shl(attempt as u32).unwrap_or(u64::MAX))
-        .min(cap_ms);
-    let half = base / 2;
-    if half == 0 {
-        return base;
-    }
-    rand::random_range(half..base)
-}
-
-pub(super) fn delay_with_jitter_ms(attempt: usize) -> u64 {
-    backoff_jitter_ms(attempt, DELAY_RETRY_BASE_MS, DELAY_RETRY_CAP_MS)
-}
-
-pub(super) fn grace_with_jitter_ms(attempt: usize) -> u64 {
-    backoff_jitter_ms(attempt, GRACE_RETRY_BASE_MS, GRACE_RETRY_CAP_MS)
 }
 
 // SEQ4_STATUS flag constants (RFC 5661 §2.10.6.2)
@@ -445,7 +419,27 @@ impl Mount41 {
         progress_index: Option<usize>,
         build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
     ) -> Result<CompoundResponse> {
-        for attempt in 0..=DELAY_RETRY_MAX {
+        crate::retry::scope(self.compound_budgeted(
+            tag,
+            timeout,
+            write_data,
+            progress_index,
+            build_ops,
+        ))
+        .await
+    }
+
+    async fn compound_budgeted(
+        &self,
+        tag: &str,
+        timeout: std::time::Duration,
+        write_data: Option<bytes::Bytes>,
+        progress_index: Option<usize>,
+        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+    ) -> Result<CompoundResponse> {
+        let budget = crate::retry::current();
+        let mut attempt = 0;
+        loop {
             let sess = self.session_holder.get().await;
             let mut slot = sess.acquire_slot().await?;
 
@@ -487,20 +481,40 @@ impl Mount41 {
                 slot.fence_on_drop();
             }
 
-            let response_bytes = if let Some(ref data) = write_data {
-                self.rpc
-                    .call_with_data(buf, data.clone(), NFS_REPLAY, timeout)
-                    .await
-            } else {
-                self.rpc.call(buf, NFS_REPLAY, timeout).await
-            }
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-            enforce_response_size(&sess, response_bytes.len())
+            let mut resp = loop {
+                if operation_class != OperationClass::ReadOnly {
+                    slot.fence_on_drop();
+                }
+                let response_bytes = if let Some(ref data) = write_data {
+                    self.rpc
+                        .call_with_data(buf.clone(), data.clone(), NFS_REPLAY, timeout)
+                        .await
+                } else {
+                    self.rpc.call(buf.clone(), NFS_REPLAY, timeout).await
+                }
                 .map_err(|error| sent_error(operation_class, &context, error))?;
-            let mut resp = CompoundResponse::decode(response_bytes)
-                .map_err(|error| sent_error(operation_class, &context, error))?;
-            enforce_response_operations(&sess, &resp, request_op_count)
-                .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_size(&sess, response_bytes.len())
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                let decoded = CompoundResponse::decode(response_bytes)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_operations(&sess, &decoded, request_op_count)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                if decoded.results.len() == 1
+                    && decoded.results[0].opcode == super::compound::OpNum::Sequence as u32
+                    && matches!(
+                        decoded.results[0].status,
+                        nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE
+                    )
+                    && decoded.status == decoded.results[0].status
+                {
+                    slot.resolve();
+                    budget
+                        .backoff(context.clone(), NfsError::Nfs4(decoded.status))
+                        .await?;
+                    continue;
+                }
+                break decoded;
+            };
             resp.session_generation = sess.generation();
             // Validate the wire identity before advancing or changing slot limits.
             let sequence_result = if let Some(sequence_op) = resp.results.first()
@@ -536,20 +550,16 @@ impl Mount41 {
                 return Ok(resp);
             }
             match resp.check_status() {
-                Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = delay_with_jitter_ms(attempt);
-                    warn!(tag, attempt, delay_ms, "NFS4ERR_DELAY, retrying with jitter");
+                Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE)) => {
                     slot.resolve();
+                    if !builder.can_retry_busy(&resp).map_err(|e| sent_error(operation_class, &context, e))? {
+                        return Err(NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+                            OperationOutcome::Uncertain, operation_class,
+                            RecoveryAction::VerifyThenResume, context, error,
+                        ))));
+                    }
                     drop(slot);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    continue;
-                }
-                Err(NfsError::Nfs4(nfsstat4::NFS4ERR_GRACE)) if attempt < DELAY_RETRY_MAX => {
-                    let delay_ms = grace_with_jitter_ms(attempt);
-                    warn!(tag, attempt, delay_ms, "NFS4ERR_GRACE, waiting for server grace period");
-                    slot.resolve();
-                    drop(slot);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    budget.backoff(context, error).await?;
                     continue;
                 }
                 Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION | nfsstat4::NFS4ERR_DEADSESSION | nfsstat4::NFS4ERR_SEQ_MISORDERED))
@@ -568,6 +578,7 @@ impl Mount41 {
                 | Err(NfsError::Nfs4(nfsstat4::NFS4ERR_SEQ_MISORDERED))
                     if attempt < DELAY_RETRY_MAX =>
                 {
+                    attempt += 1;
                     warn!(tag, attempt, "session invalid — re-establishing");
                     let expected_generation = sess.generation();
                     slot.resolve();
@@ -630,9 +641,6 @@ impl Mount41 {
             slot.resolve();
             return Ok(resp);
         }
-        Err(NfsError::Rpc(
-            "NFS4ERR_DELAY/GRACE retry exhausted".to_string(),
-        ))
     }
 
     /// Send a COMPOUND to a pNFS data server with SEQUENCE on the DS's own
@@ -642,155 +650,161 @@ impl Mount41 {
         auth: &Auth,
         tag: &str,
         data_size: usize,
-        build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        let mut slot = ds.session.acquire_slot().await?;
-        let builder = CompoundBuilder::new(tag).sequence(
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-            ds.session.highest_slot_id(),
-        );
-        let builder = build_ops(builder)
-            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
-        builder.enforce_max_operations(ds.session.max_operations())?;
-        let request_op_count = builder.op_count();
-        let operation_class = builder.operation_class();
-        let context = request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
-        if operation_class != OperationClass::ReadOnly {
-            slot.fence_on_drop();
-        }
-        let mut buf = Vec::new();
-        builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
-        enforce_request_size(&ds.session, buf.len(), 0)?;
-        let timeout = data_timeout(data_size);
-        let response_bytes = ds
-            .client
-            .call(buf, NFS_REPLAY, timeout)
-            .await
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_size(&ds.session, response_bytes.len())
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        let mut resp = CompoundResponse::decode(response_bytes)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_operations(&ds.session, &resp, request_op_count)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        resp.session_generation = ds.session.generation();
-        // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
-        if let Err(error) = resp.op_ok(0) {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
-            }
-            return Err(error);
-        }
-        let sequence = match validate_sequence_result(
-            &resp.results[0],
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-        ) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                slot.fence_on_drop();
-                return Err(sent_error(operation_class, &context, error));
-            }
-        };
-        if let Err(error) = ds
-            .session
-            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
-        {
-            slot.fence_on_drop();
-            return Err(sent_error(operation_class, &context, error));
-        }
-        slot.advance();
-        if let Err(error) = resp.check_status() {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
-            }
-            return Err(error);
-        }
-        slot.resolve();
-        Ok(resp)
+        crate::retry::scope(Self::compound_ds_budgeted(
+            ds, auth, tag, data_size, None, &build_ops,
+        ))
+        .await
     }
 
-    /// Send a COMPOUND to a DS with zero-copy write data (SEQUENCE on DS session).
+    /// DS writes retain the same session replay identity and the same bounded
+    /// backpressure policy as reads; transport failure is not a busy response.
     pub(crate) async fn compound_ds_write(
         ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data: Bytes,
-        build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
     ) -> Result<CompoundResponse> {
-        let mut slot = ds.session.acquire_slot().await?;
-        let builder = CompoundBuilder::new(tag).sequence(
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-            ds.session.highest_slot_id(),
-        );
-        let builder = build_ops(builder)
-            .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
-        builder.enforce_max_operations(ds.session.max_operations())?;
-        let request_op_count = builder.op_count();
-        let operation_class = builder.operation_class();
-        let context = request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
-        if operation_class != OperationClass::ReadOnly {
-            slot.fence_on_drop();
-        }
-        let mut buf = Vec::new();
-        builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
-        enforce_request_size(&ds.session, buf.len(), data.len())?;
-        let timeout = data_timeout(data.len());
-        let response_bytes = ds
-            .client
-            .call_with_data(buf, data, NFS_REPLAY, timeout)
-            .await
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_size(&ds.session, response_bytes.len())
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        let mut resp = CompoundResponse::decode(response_bytes)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        enforce_response_operations(&ds.session, &resp, request_op_count)
-            .map_err(|error| sent_error(operation_class, &context, error))?;
-        resp.session_generation = ds.session.generation();
-        if let Err(error) = resp.op_ok(0) {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
+        crate::retry::scope(Self::compound_ds_budgeted(
+            ds,
+            auth,
+            tag,
+            data.len(),
+            Some(data),
+            &build_ops,
+        ))
+        .await
+    }
+
+    async fn compound_ds_budgeted(
+        ds: &DsConnection,
+        auth: &Auth,
+        tag: &str,
+        data_size: usize,
+        write_data: Option<Bytes>,
+        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+    ) -> Result<CompoundResponse> {
+        let budget = crate::retry::current();
+        loop {
+            let mut slot = ds.session.acquire_slot().await?;
+            let builder = CompoundBuilder::new(tag).sequence(
+                ds.session.id(),
+                slot.current_sequence_id(),
+                slot.slot_id,
+                ds.session.highest_slot_id(),
+            );
+            let builder = build_ops(builder)
+                .apply_sequence_cache_policy(ds.session.max_cached_response_size())?;
+            builder.enforce_max_operations(ds.session.max_operations())?;
+            let request_op_count = builder.op_count();
+            let operation_class = builder.operation_class();
+            let context =
+                request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
+            let mut buf = Vec::new();
+            builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
+            enforce_request_size(
+                &ds.session,
+                buf.len(),
+                write_data.as_ref().map_or(0, Bytes::len),
+            )?;
+            let timeout = data_timeout(data_size);
+            let mut resp = loop {
+                if operation_class != OperationClass::ReadOnly {
+                    slot.fence_on_drop();
+                }
+                let response_bytes = ds
+                    .client
+                    .call_with_data(
+                        buf.clone(),
+                        write_data.clone().unwrap_or_default(),
+                        NFS_REPLAY,
+                        timeout,
+                    )
+                    .await
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_size(&ds.session, response_bytes.len())
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                let decoded = CompoundResponse::decode(response_bytes)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                enforce_response_operations(&ds.session, &decoded, request_op_count)
+                    .map_err(|error| sent_error(operation_class, &context, error))?;
+                if decoded.results.len() == 1
+                    && decoded.results[0].opcode == 53
+                    && matches!(
+                        decoded.results[0].status,
+                        nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE
+                    )
+                    && decoded.status == decoded.results[0].status
+                {
+                    slot.resolve();
+                    budget
+                        .backoff(context.clone(), NfsError::Nfs4(decoded.status))
+                        .await?;
+                    continue;
+                }
+                break decoded;
+            };
+            resp.session_generation = ds.session.generation();
+            // RFC 5661 §2.10.6.1: advance sequence ID whenever SEQUENCE succeeded.
+            if let Err(error) = resp.op_ok(0) {
+                let error = sent_error(operation_class, &context, error);
+                if error.operation_outcome().is_none() {
+                    slot.resolve();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        let sequence = match validate_sequence_result(
-            &resp.results[0],
-            ds.session.id(),
-            slot.current_sequence_id(),
-            slot.slot_id,
-        ) {
-            Ok(sequence) => sequence,
-            Err(error) => {
+            let sequence = match validate_sequence_result(
+                &resp.results[0],
+                ds.session.id(),
+                slot.current_sequence_id(),
+                slot.slot_id,
+            ) {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    slot.fence_on_drop();
+                    return Err(sent_error(operation_class, &context, error));
+                }
+            };
+            if let Err(error) = ds.session.update_sequence_slot_limits(
+                sequence.highest_slot_id,
+                sequence.target_highest_slot_id,
+            ) {
                 slot.fence_on_drop();
                 return Err(sent_error(operation_class, &context, error));
             }
-        };
-        if let Err(error) = ds
-            .session
-            .update_sequence_slot_limits(sequence.highest_slot_id, sequence.target_highest_slot_id)
-        {
-            slot.fence_on_drop();
-            return Err(sent_error(operation_class, &context, error));
-        }
-        slot.advance();
-        if let Err(error) = resp.check_status() {
-            let error = sent_error(operation_class, &context, error);
-            if error.operation_outcome().is_none() {
-                slot.resolve();
+            slot.advance();
+            if let Err(error) = resp.check_status() {
+                if error.is_server_busy() {
+                    slot.resolve();
+                    if !builder
+                        .can_retry_busy(&resp)
+                        .map_err(|e| sent_error(operation_class, &context, e))?
+                    {
+                        return Err(NfsError::OperationOutcome(Box::new(
+                            OperationOutcomeError::new(
+                                OperationOutcome::Uncertain,
+                                operation_class,
+                                RecoveryAction::VerifyThenResume,
+                                context,
+                                error,
+                            ),
+                        )));
+                    }
+                    drop(slot);
+                    budget.backoff(context, error).await?;
+                    continue;
+                }
+                let error = sent_error(operation_class, &context, error);
+                if error.operation_outcome().is_none() {
+                    slot.resolve();
+                }
+                return Err(error);
             }
-            return Err(error);
+            slot.resolve();
+            return Ok(resp);
         }
-        slot.resolve();
-        Ok(resp)
     }
 }
 
@@ -837,11 +851,15 @@ impl Mount41 {
         offset: u64,
         data: Bytes,
     ) -> Result<crate::WriteOutcome> {
-        if let Some(result) = self.write_pnfs(&fh, offset, data.clone()).await {
-            return result;
-        }
-        self.write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
-            .await
+        // Keep the nested pNFS state machine off the runtime worker stack.
+        crate::retry::scope(Box::pin(async {
+            if let Some(result) = self.write_pnfs(&fh, offset, data.clone()).await {
+                return result;
+            }
+            self.write_how(fh, offset, data, crate::mount::WriteStability::Unstable)
+                .await
+        }))
+        .await
     }
 
     async fn commit_write_batch_inner(
@@ -2896,31 +2914,6 @@ mod tests {
         assert!(usize::MAX.checked_add(1).is_none());
     }
 
-    #[test]
-    fn jitter_lands_in_half_to_full_range() {
-        for _ in 0..200 {
-            let d = backoff_jitter_ms(0, 200, 5000);
-            assert!((100..200).contains(&d), "attempt=0 produced {} ms", d);
-        }
-    }
-
-    #[test]
-    fn jitter_caps_at_cap_ms() {
-        for _ in 0..200 {
-            let d = backoff_jitter_ms(20, 200, 5000);
-            assert!((2500..5000).contains(&d), "attempt=20 produced {} ms", d);
-        }
-    }
-
-    #[test]
-    fn jitter_does_not_panic_on_huge_attempt() {
-        // checked_shl + saturating_mul + min(cap) must absorb shifts past 63.
-        for attempt in [32usize, 63, 64, 100, usize::MAX] {
-            let d = backoff_jitter_ms(attempt, 200, 5000);
-            assert!(d > 0 && d < 5000, "attempt={} produced {}", attempt, d);
-        }
-    }
-
     /// 构造 extract_stateid 之后的 OPEN4resok 剩余字节。
     fn open_resok_tail(delegation_type: u32, deleg_sid: Option<[u8; 16]>) -> Bytes {
         let mut buf = Vec::new();
@@ -3001,5 +2994,55 @@ mod teardown_response_tests {
                     .is_err()
             );
         }
+    }
+    #[tokio::test]
+    async fn busy_session_recovery_does_not_consume_busy_retry_count() {
+        use crate::nfs41::test_support::{Reply, ok, serve_observed};
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let mut first = true;
+        let (mount, server) = serve_observed(
+            move |_, _| {
+                if std::mem::take(&mut first) {
+                    vec![Reply {
+                        opcode: 53,
+                        status: 10052,
+                        data: vec![],
+                    }]
+                } else {
+                    vec![
+                        ok(22, vec![]),
+                        Reply {
+                            opcode: 25,
+                            status: 10008,
+                            data: vec![],
+                        },
+                    ]
+                }
+            },
+            super::super::MinorVersion::V1,
+            observed,
+        )
+        .await;
+        let held = mount.recovery_lock.lock().await;
+        let work = mount.read(Bytes::from_static(b"fh"), 0, 4);
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => panic!("read settled before recovery: {result:?}"),
+            _ = async { while calls.lock().unwrap().is_empty() { tokio::task::yield_now().await; } } => {}
+        }
+        // Model another request winning recovery while this request waits for
+        // recovery_lock, then exhaust DELAY using the same logical budget.
+        assert!(
+            mount
+                .session_holder
+                .replace_if_current(1, Session::for_test(2))
+                .await
+        );
+        drop(held);
+        let error = work.await.unwrap_err();
+        assert!(matches!(error, NfsError::ServerBusy(_)), "{error:?}");
+        assert!(calls.lock().unwrap().len() >= 17);
+        server.abort();
     }
 }

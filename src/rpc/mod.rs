@@ -898,7 +898,7 @@ impl Client {
         // Total replay budget: 3x the per-attempt timeout, so we fail fast instead
         // of accumulating max_attempts * timeout worth of delay.
         let max_total = timeout.saturating_mul(3);
-        let deadline = start + max_total;
+        let deadline = crate::retry::cap_deadline(start + max_total);
 
         // Determine mux from the program field in msg_body (offset 4, big-endian u32).
         let program = if msg_body.len() >= 8 {

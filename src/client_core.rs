@@ -309,6 +309,7 @@ impl ClientCore {
             return Err(error);
         }
         let core = Arc::clone(self);
+        let future = crate::retry::inherit(future);
         tokio::spawn(async move {
             let _guard = OwnedTaskGuard { core };
             future.await;

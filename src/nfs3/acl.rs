@@ -116,10 +116,28 @@ impl Client {
         } else {
             NFS_REPLAY
         };
-        self.rpc
-            .call(request, replay, METADATA_TIMEOUT)
-            .await
-            .map_err(|error| classify_sent_nfs3_error(class, context(write), error))
+        // The extension carries the same nfsstat3 status as RFC 1813 §2.6.
+        // JUKEBOX is authoritative even for SETACL; transport ambiguity is not.
+        crate::retry::scope(async {
+            let budget = crate::retry::current();
+            loop {
+                let reply = self
+                    .rpc
+                    .call(request.clone(), replay, METADATA_TIMEOUT)
+                    .await
+                    .map_err(|error| classify_sent_nfs3_error(class, context(write), error))?;
+                if reply.get(..4) != Some(10008u32.to_be_bytes().as_slice()) {
+                    return Ok(reply);
+                }
+                budget
+                    .backoff(
+                        context(write),
+                        NfsError::Nfs3(super::nfsstat3::NFS3ERR_JUKEBOX),
+                    )
+                    .await?;
+            }
+        })
+        .await
     }
 
     pub(super) async fn get(&self, fh: Bytes) -> Result<PosixAcl> {
@@ -558,6 +576,56 @@ mod tests {
                     Some(&expected)
                 );
             }
+        }
+    }
+    #[tokio::test]
+    async fn busy_v3_acl_get_and_set_retry_with_fresh_xids() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for write in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut previous_xid = None;
+                for status in [10008u32, 0] {
+                    let marker = stream.read_u32().await.unwrap();
+                    let mut request = vec![0; (marker & 0x7fff_ffff) as usize];
+                    stream.read_exact(&mut request).await.unwrap();
+                    let xid = u32::from_be_bytes(request[..4].try_into().unwrap());
+                    assert_ne!(previous_xid, Some(xid));
+                    previous_xid = Some(xid);
+                    assert_eq!(
+                        u32::from_be_bytes(request[12..16].try_into().unwrap()),
+                        PROGRAM
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(request[20..24].try_into().unwrap()),
+                        if write { 2 } else { 1 }
+                    );
+                    let mut reply = request[..4].to_vec();
+                    reply.extend(words(&[1, 0, 0, 0, 0, status, 0]));
+                    if status == 0 && !write {
+                        reply.extend(words(&[15, 0, 0, 0, 0]));
+                    }
+                    stream
+                        .write_u32(0x8000_0000 | reply.len() as u32)
+                        .await
+                        .unwrap();
+                    stream.write_all(&reply).await.unwrap();
+                }
+            });
+            let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
+            let client = Client {
+                rpc: rpc::Client::new(mux, None),
+                auth: Auth::new_null(),
+            };
+            let fh = Bytes::from_static(b"fh");
+            if write {
+                client.set(fh, &PosixAcl::default()).await.unwrap();
+            } else {
+                assert_eq!(client.get(fh).await.unwrap(), PosixAcl::default());
+            }
+            server.await.unwrap();
         }
     }
 }

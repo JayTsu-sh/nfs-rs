@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.9.1/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -22,9 +22,12 @@ NFSv4.0 uses an experimental interoperability profile. Server capabilities such
 as named attributes, ACLs, callbacks, locks, delegation retention, and pNFS are
 negotiated and exposed through `client.capabilities`.
 
-These protocol claims are exercised by the release pipeline using the final
+The release pipeline exercises NFSv3, NFSv4.0 and NFSv4.1 using the final
 x86_64 wheel and a wheel rebuilt from the final source distribution against
-real NFSv3, NFSv4.0, NFSv4.1, and NFSv4.1 pNFS environments.
+real NFSv3, NFSv4.0, NFSv4.1, and NFSv4.1 pNFS environments. NFSv4.2
+was separately validated on all four AFX data LIFs with the relevant server
+features enabled; see the [AFX report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-review-2026-11-02.md).
+Optional operations remain dependent on the server, as described below.
 
 Read and write RPC sizes are determined automatically during mount from server limits, bounded by the client payload ceiling (4 MiB) and negotiated NFSv4.1 session capacities. URL and Python `rsize`/`wsize` options are no longer accepted. Python `io_limits` reports the effective mount limits; pNFS data servers may require smaller chunks.
 
@@ -474,9 +477,9 @@ with Client.connect("nfs://server/export?version=4.1") as client:
         print(error.code_name, error.recovery_action, error.outcome)
 ```
 
-## NFSv4.1 DACL and SACL
+## NFSv4.1/v4.2 DACL and SACL
 
-NFSv4.1 clients expose `getdacl`, `setdacl`, `getsacl`, and `setsacl` on both
+NFSv4.1 and NFSv4.2 clients expose `getdacl`, `setdacl`, `getsacl`, and `setsacl` on both
 `Client` and `AsyncClient`. Values are immutable `NfsAcl41` objects containing
 the ACL flags and an ordered tuple of `NfsAce` entries. A set operation replaces
 the complete DACL or SACL attribute; it is not an ACE-level patch.
@@ -595,4 +598,24 @@ repository's validation notes and do not define other servers' capabilities.
 On the tested AFX export, enabled sparse operations support whole-file
 deallocation; partial punching returns NFS4ERR_IO, also reproduced with the
 Linux kernel client. See the
-[enabled-feature validation](validation/nfsv42-afx-enabled-2026-11-02.md).
+[enabled-feature validation](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
+
+
+## Temporary server-busy responses
+
+NFSv3, NFSv4.0, NFSv4.1 and NFSv4.2 use fixed bounded retries for safely
+reissuable JUKEBOX/DELAY/GRACE responses: at most 16 busy reissues, equal-jitter
+exponential delays with 200 ms base and 5 s cap, within a shared 60 s budget.
+There is no off mode or retry connection option. Shorter RPC limits and explicit
+operation_timeout remain effective. Independent pNFS DS calls share the policy;
+exhausted backpressure does not restart through layout refresh/MDS fallback.
+A large file transfer does not share one global 60 s limit across all chunks.
+
+Exhaustion raises NfsServerBusyError (also an NfsRetryableError) with the original
+code/code_name and cause, retry_count, retry_elapsed_ms and retry_reason
+("retry_limit" or "deadline"). Queue that work for later instead of immediately
+starting another full retry budget. Permanent errors are returned immediately.
+Owner-seqid state transitions and already successful modifications are not
+blindly replayed; uncertain mutations still require verification. Cancellation
+stops read backoff, while admitted mutations retain settlement responsibility.
+Details and protocol boundaries are in the repository's bounded-retry notes.

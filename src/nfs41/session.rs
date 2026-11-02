@@ -15,7 +15,6 @@ use tracing::info;
 
 use super::MinorVersion;
 use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse};
-use super::mount::{DELAY_RETRY_MAX, delay_with_jitter_ms, grace_with_jitter_ms};
 use crate::error::{NfsError, Result};
 use crate::rpc;
 use crate::rpc::auth::Auth;
@@ -468,6 +467,15 @@ impl Session {
         auth: &Auth,
         client_identity: &ClientIdentity,
     ) -> Result<Self> {
+        crate::retry::scope(Self::establish_budgeted(rpc, auth, client_identity)).await
+    }
+
+    async fn establish_budgeted(
+        rpc: &rpc::Client,
+        auth: &Auth,
+        client_identity: &ClientIdentity,
+    ) -> Result<Self> {
+        let budget = crate::retry::current();
         // ─── Step 1: EXCHANGE_ID ─────────────────────────────────────────
         let (client_id, create_seq_id, eir_flags) =
             exchange_id_step(rpc, auth, client_identity, EXCHGID4_FLAG_USE_PNFS_MDS).await?;
@@ -507,7 +515,7 @@ impl Session {
         // 服务端可能处于 grace period，需要更长超时和 DELAY 重试。
         {
             let slot = session.acquire_slot().await?;
-            for attempt in 0..=DELAY_RETRY_MAX {
+            loop {
                 let builder = CompoundBuilder::new("reclaim_complete")
                     .sequence(
                         &session.session_id,
@@ -541,38 +549,21 @@ impl Session {
                         info!("RECLAIM_COMPLETE successful, session ready");
                         return Ok(session);
                     }
-                    Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_DELAY))
-                        if attempt < DELAY_RETRY_MAX =>
-                    {
-                        let delay_ms = delay_with_jitter_ms(attempt);
-                        tracing::warn!(
-                            attempt,
-                            delay_ms,
-                            "RECLAIM_COMPLETE got NFS4ERR_DELAY, retrying with jitter"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        continue;
-                    }
-                    Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_GRACE))
-                        if attempt < DELAY_RETRY_MAX =>
-                    {
-                        // RFC 5661 §8.4.2.1: server is in grace period, wait and retry
-                        let delay_ms = grace_with_jitter_ms(attempt);
-                        tracing::warn!(
-                            attempt,
-                            delay_ms,
-                            "RECLAIM_COMPLETE got NFS4ERR_GRACE, waiting for server grace period"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        continue;
+                    Err(error) if error.is_server_busy() => {
+                        budget
+                            .backoff(
+                                crate::RequestContext {
+                                    operation: "reclaim_complete".into(),
+                                    protocol: client_identity.minor_version.version(),
+                                    request_id: None,
+                                },
+                                error,
+                            )
+                            .await?;
                     }
                     Err(e) => return Err(e),
                 }
             }
-            drop(slot);
-            Err(NfsError::Rpc(
-                "RECLAIM_COMPLETE NFS4ERR_DELAY/GRACE retry exhausted".to_string(),
-            ))
         }
     }
 

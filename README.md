@@ -26,13 +26,22 @@ kernel-mounted filesystem.
 - The library uses Tokio and communicates with the server over TCP.
 - Linux is exercised by CI and by the physical NFS integration lab.
 
+NFSv4.2 support is available in 0.10.0. Select it explicitly with
+`version=4.2`; this does not silently downgrade to another minor version.
+AFX validation with the related server features enabled confirmed ordinary
+file APIs, ACLs, RFC 8276 xattrs, ALLOCATE, SEEK and whole-file DEALLOCATE.
+The tested AFX export rejects COPY, CLONE and READ_PLUS as unsupported;
+partial DEALLOCATE returns a server IO error. Optional operations therefore
+still require support from the selected server. See the
+[AFX validation report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
+
 The public API is still evolving while the crate is below version 1.0.
 
 ## Installation
 
 ```toml
 [dependencies]
-nfs-rs = "0.9.1"
+nfs-rs = "0.10.0"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -227,3 +236,11 @@ Licensed under the [Apache License 2.0](LICENSE).
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/JayTsu-sh/nfs-rs/blob/main/CONTRIBUTING.md).
+
+
+Server-busy responses use a fixed bounded retry policy across v3, v4.0, v4.1
+and v4.2, including independent pNFS DS reads. Safely reissuable requests have
+at most 16 busy reissues within 60 s, using equal-jitter exponential backoff
+(200 ms base, 5 s cap). Exhaustion preserves the original protocol status in a
+structured ServerBusy error. See [retry behavior](docs/bounded-retries.md) for
+stateful-operation safety, deadlines and application recovery.

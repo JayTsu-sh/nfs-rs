@@ -46,6 +46,26 @@ pub enum RecoveryAction {
     DoNotRetry,
 }
 
+/// The fixed bound that ended automatic server-busy retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryExhaustion {
+    RetryLimit,
+    Deadline,
+}
+
+/// A definite temporary server rejection after bounded protocol retries.
+/// The original JUKEBOX, DELAY or GRACE status remains available in `source`.
+#[derive(Error, Debug)]
+#[error("NFS server busy after {retries} retries ({elapsed:?}); limit={reason:?}: {source}")]
+pub struct ServerBusyError {
+    pub context: RequestContext,
+    pub retries: u32,
+    pub elapsed: std::time::Duration,
+    pub reason: RetryExhaustion,
+    #[source]
+    pub source: Box<NfsError>,
+}
+
 /// Whether the request crossed the transport send boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestTransmission {
@@ -168,6 +188,9 @@ impl OperationOutcomeError {
 /// preserving NFS protocol error codes for programmatic matching.
 #[derive(Error, Debug)]
 pub enum NfsError {
+    /// A temporary protocol rejection exhausted the automatic retry budget.
+    #[error(transparent)]
+    ServerBusy(Box<ServerBusyError>),
     /// Underlying I/O or network error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -252,6 +275,41 @@ pub struct FileCloseFailure {
 }
 
 impl NfsError {
+    /// Whether this error represents server-busy backpressure, including its
+    /// original status before exhaustion. Uncertain mutations take precedence
+    /// over their nested status: they require verification, not blind retry.
+    pub fn is_server_busy(&self) -> bool {
+        if self.contains_uncertain_outcome() {
+            return false;
+        }
+        match self {
+            Self::ServerBusy(_) => true,
+            Self::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX) => true,
+            Self::Nfs4(code) => matches!(*code as u32, 10008 | 10013),
+            Self::OperationOutcome(details) => {
+                details.outcome != OperationOutcome::Uncertain && details.source.is_server_busy()
+            }
+            Self::FileClose(failures) => {
+                !self.contains_uncertain_outcome()
+                    && failures.iter().any(|f| f.error.is_server_busy())
+            }
+            _ => false,
+        }
+    }
+    fn contains_uncertain_outcome(&self) -> bool {
+        match self {
+            Self::OperationOutcome(details) => {
+                details.outcome == OperationOutcome::Uncertain
+                    || details.source.contains_uncertain_outcome()
+            }
+            Self::FileClose(failures) => failures
+                .iter()
+                .any(|f| f.error.contains_uncertain_outcome()),
+            Self::ServerBusy(details) => details.source.contains_uncertain_outcome(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn transport(transmission: RequestTransmission, source: NfsError) -> Self {
         let kind = source.kind();
         Self::Io(std::io::Error::new(
@@ -346,6 +404,7 @@ impl NfsError {
     /// with code that matches on error kinds.
     pub fn kind(&self) -> std::io::ErrorKind {
         match self {
+            NfsError::ServerBusy(_) => std::io::ErrorKind::WouldBlock,
             NfsError::Io(io) => io.kind(),
             NfsError::Nfs3(_) => std::io::ErrorKind::Other,
             NfsError::Nfs4(_) => std::io::ErrorKind::Other,
@@ -439,6 +498,9 @@ pub type Result<T> = std::result::Result<T, NfsError>;
 impl From<NfsError> for std::io::Error {
     fn from(e: NfsError) -> Self {
         match e {
+            error @ NfsError::ServerBusy(_) => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, error)
+            }
             NfsError::Io(io) => io,
             NfsError::Nfs3(code) => std::io::Error::other(code),
             NfsError::Nfs4(code) => std::io::Error::other(code),
@@ -846,5 +908,36 @@ mod tests {
         assert_eq!(outcome.outcome, OperationOutcome::DefiniteFailure);
         assert_eq!(outcome.transmission, RequestTransmission::NotSent);
         assert_eq!(outcome.recovery, RecoveryAction::Retry);
+    }
+    #[test]
+    fn busy_nested_close_uncertainty_takes_precedence() {
+        let outcome = |outcome| {
+            NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+                outcome,
+                OperationClass::ReplaySensitive,
+                RecoveryAction::VerifyThenResume,
+                context(),
+                NfsError::Rpc("original".into()),
+            )))
+        };
+        let close = |errors: Vec<NfsError>| {
+            NfsError::FileClose(
+                errors
+                    .into_iter()
+                    .map(|error| FileCloseFailure {
+                        operation: "close",
+                        error: std::sync::Arc::new(error),
+                    })
+                    .collect(),
+            )
+        };
+        let error = close(vec![
+            close(vec![
+                outcome(OperationOutcome::SafeToRetry),
+                outcome(OperationOutcome::Uncertain),
+            ]),
+            NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_JUKEBOX),
+        ]);
+        assert!(!error.is_server_busy());
     }
 }
