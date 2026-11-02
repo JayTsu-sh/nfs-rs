@@ -90,7 +90,7 @@ Each NFSv3 procedure (access, read, write, lookup, etc.) has its own file in `sr
 
 `rpc::Client` owns an NFS `Arc<StreamMux>` and an optional separate MOUNT mux. Each mux has one TCP reader task, a mutex-protected writer and a pending-XID map. There is no global stream-ID registry.
 
-Protocol engines choose `ReplayPolicy`; only explicitly replayable logical requests may be retransmitted. Retries use fresh transport XIDs, unchanged request bodies and jittered backoff. Each attempt bounds readiness, writer admission, transmission and response waiting. The overall RPC replay budget is three attempt timeouts, including reconnect; TCP connect itself is bounded to five seconds. These are RPC bounds, not a whole multi-RPC operation deadline.
+Protocol engines choose `ReplayPolicy`; only explicitly replayable logical requests may be retransmitted. Retries use fresh transport XIDs and unchanged request bodies. Definite connection loss has a 500 ms total recovery budget with at most four reconnects and short jittered backoff; setup, session binding and replay share this budget, and exhaustion preserves the first typed disconnect. Each attempt bounds readiness, writer admission, transmission and response waiting. The overall RPC replay budget is three attempt timeouts, including reconnect; TCP connect itself is bounded to five seconds. These are RPC bounds, not a whole multi-RPC operation deadline.
 
 A cancelled or failed partial frame shuts down its socket before the writer lock is released. Do not reuse a partially transmitted record stream. NFSv4.1 reconnect must complete session binding before normal requests resume.
 

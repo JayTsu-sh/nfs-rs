@@ -341,7 +341,6 @@ async fn mount_on_addr(
         None
     };
     let client = rpc::Client::new(nfs_mux, mount_mux);
-    client.set_fail_fast(args.fail_fast);
 
     // MOUNT MNT — encode dirpath, decode mountres3.
     // MOUNT NULL is skipped: RFC 1813 does not require it before MNT.
@@ -573,7 +572,6 @@ mod tests {
                 readdir_buffer,
                 noresvport: true,
                 retain_delegations: false,
-                fail_fast: false,
             };
             let auth = crate::Auth::new_null();
             let mount = mount_on_addr(&addr, &args, &auth, addr.port())

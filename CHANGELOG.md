@@ -7,6 +7,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-02
+
+### Changed
+
+- Definite transport loss now uses a short default recovery policy, without a
+  URL switch: at most four reconnects in a shared 500 ms budget, subject to the
+  original request's replay permission and deadline. Backoff, TCP setup, NFSv4.1
+  connection binding and replay all count. Exhaustion preserves the first typed
+  disconnect and sent/uncertain outcome evidence. Ordinary response deadlines and
+  server-busy retry policies remain separate. The `fail_fast` URL setting is removed.
+
 ## [0.10.1] - 2026-11-02
 
 ### Added
