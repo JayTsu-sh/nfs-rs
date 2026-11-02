@@ -21,8 +21,8 @@ written `%2520` in the URL.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,
@@ -90,7 +90,7 @@ file APIs, ACLs, RFC 8276 xattrs, ALLOCATE, SEEK and whole-file DEALLOCATE.
 The tested AFX export rejects COPY, CLONE and READ_PLUS as unsupported;
 partial DEALLOCATE returns a server IO error. Optional operations therefore
 still require support from the selected server. See the
-[AFX validation report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.0/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
+[AFX validation report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
 
 ## Install
 
