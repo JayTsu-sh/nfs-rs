@@ -58,6 +58,7 @@ struct CallbackSlot {
 }
 
 struct CallbackSession {
+    minor_version: super::MinorVersion,
     session_id: [u8; 16],
     generation: u64,
     max_request_size: usize,
@@ -78,7 +79,14 @@ pub(crate) struct CallbackState {
 impl CallbackState {
     #[cfg(test)]
     pub(crate) fn new(session_id: [u8; 16], generation: u64, max_requests: u32) -> Arc<Self> {
-        Self::new_negotiated(session_id, generation, max_requests, 4096, MAX_CB_OPS)
+        Self::new_negotiated(
+            session_id,
+            generation,
+            max_requests,
+            4096,
+            MAX_CB_OPS,
+            super::MinorVersion::V1,
+        )
     }
 
     pub(crate) fn new_negotiated(
@@ -87,9 +95,11 @@ impl CallbackState {
         max_requests: u32,
         max_request_size: u32,
         max_operations: u32,
+        minor_version: super::MinorVersion,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(CallbackSession {
+                minor_version,
                 session_id,
                 generation,
                 max_request_size: max_request_size.max(1) as usize,
@@ -246,7 +256,8 @@ fn parse_compound(
     let minor_version = buf.get_u32();
     let _callback_ident = buf.get_u32();
     let num_ops = buf.get_u32();
-    if minor_version != 1 {
+    // RFC 8881 §19.2.3: callbacks use the session creation minor version.
+    if minor_version != session.minor_version as u32 {
         return Ok(compound_error_body(&tag, NFS4ERR_MINOR_VERS_MISMATCH).into());
     }
     if request.len() > session.max_request_size || num_ops > session.max_operations {
@@ -901,6 +912,27 @@ mod tests {
     }
 
     #[test]
+    fn v42_callbacks_validate_session_minor_version_and_replay_after_recovery() {
+        let session = [6; 16];
+        let state =
+            CallbackState::new_negotiated(session, 1, 1, 4096, 2, super::super::MinorVersion::V2);
+        let (tx, _) = mpsc::channel(1);
+        let wrong = frame(1, session, 1, 0, b"", None);
+        let reply = handle_cb_rpc(wrong.clone(), &state, &tx).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4ERR_MINOR_VERS_MISMATCH);
+        let mut valid = wrong.to_vec();
+        valid[44..48].copy_from_slice(&be(2));
+        let reply = handle_cb_rpc(valid.clone().into(), &state, &tx).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4_OK);
+        assert_eq!(handle_cb_rpc(valid.into(), &state, &tx).unwrap(), reply);
+        state.update_session([7; 16], 2, 1, 4096, 2).unwrap();
+        let mut recovered = frame(2, [7; 16], 1, 0, b"", None).to_vec();
+        recovered[44..48].copy_from_slice(&be(2));
+        let reply = handle_cb_rpc(recovered.into(), &state, &tx).unwrap();
+        assert_eq!(u32_at(&reply, 24), NFS4_OK);
+    }
+
+    #[test]
     fn zero_ops_minor_version_excessive_ops_and_sequence_position_are_validated() {
         let session = [6; 16];
         let state = CallbackState::new(session, 1, 1);
@@ -961,12 +993,19 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         let request = frame(1, session, 1, 0, b"", Some(1));
 
-        let operation_limited = CallbackState::new_negotiated(session, 1, 1, 4096, 1);
+        let operation_limited =
+            CallbackState::new_negotiated(session, 1, 1, 4096, 1, super::super::MinorVersion::V1);
         let reply = handle_cb_rpc(request.clone(), &operation_limited, &tx).unwrap();
         assert_eq!(u32_at(&reply, 24), NFS4ERR_BADXDR);
 
-        let size_limited =
-            CallbackState::new_negotiated(session, 1, 1, request.len() as u32 - 41, 2);
+        let size_limited = CallbackState::new_negotiated(
+            session,
+            1,
+            1,
+            request.len() as u32 - 41,
+            2,
+            super::super::MinorVersion::V1,
+        );
         let reply = handle_cb_rpc(request, &size_limited, &tx).unwrap();
         assert_eq!(u32_at(&reply, 24), NFS4ERR_BADXDR);
         assert!(rx.try_recv().is_err());

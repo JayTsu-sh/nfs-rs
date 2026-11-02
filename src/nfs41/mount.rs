@@ -13,6 +13,7 @@ use bytes::{Buf, Bytes};
 use futures::TryStreamExt as _;
 use tracing::{debug, info, warn};
 
+use super::MinorVersion;
 use super::callback::{CallbackState, RecallNotification};
 use super::compound::{CompoundBuilder, CompoundResponse};
 use super::layout::{DsConnection, LayoutManager};
@@ -107,11 +108,15 @@ fn enforce_response_operations(
     Ok(())
 }
 
-fn bind_connection_request(auth: &Auth, session_id: &[u8; 16]) -> Vec<u8> {
+fn bind_connection_request(
+    auth: &Auth,
+    session_id: &[u8; 16],
+    minor_version: MinorVersion,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     CompoundBuilder::new("bind_conn")
         .bind_conn_to_session(session_id, 3, false)
-        .encode_with_header(auth, &mut buf);
+        .encode_with_header(auth, minor_version, &mut buf);
     buf
 }
 
@@ -145,8 +150,9 @@ async fn bind_connection(
     auth: &Auth,
     session_id: &[u8; 16],
     during_reconnect: bool,
+    minor_version: MinorVersion,
 ) -> Result<u32> {
-    let request = bind_connection_request(auth, session_id);
+    let request = bind_connection_request(auth, session_id, minor_version);
     let response = if during_reconnect {
         client
             .call_during_reconnect(request, METADATA_TIMEOUT)
@@ -159,17 +165,12 @@ async fn bind_connection(
     validate_bound_connection(response, session_id)
 }
 
-fn request_context(
-    tag: &str,
-    session_id: &[u8; 16],
-    slot_id: u32,
-    sequence_id: u32,
-) -> RequestContext {
+fn request_context(tag: &str, session: &Session, slot_id: u32, sequence_id: u32) -> RequestContext {
     RequestContext {
         operation: tag.chars().take(64).collect(),
-        protocol: NFSVersion::NFSv4p1,
+        protocol: session.minor_version().version(),
         request_id: Some(crate::error::RequestId::nfs41(
-            *session_id,
+            *session.id(),
             slot_id,
             sequence_id,
         )),
@@ -265,6 +266,10 @@ pub(crate) struct Mount41 {
 }
 
 impl Mount41 {
+    pub(super) fn protocol_version(&self) -> NFSVersion {
+        self.client_identity.minor_version.version()
+    }
+
     /// Check SEQ4_STATUS flags from SEQUENCE result and take corrective action.
     ///
     /// RFC 5661 §2.10.6.2: the server reports session/state conditions via
@@ -331,7 +336,7 @@ impl Mount41 {
                             .sequence(&sess_id, seq_id, slot_id, highest)
                             .reclaim_complete(false);
                         let mut buf = Vec::new();
-                        builder.encode_with_header(&auth, &mut buf);
+                        builder.encode_with_header(&auth, sess.minor_version(), &mut buf);
                         slot.fence_on_drop();
                         let response = rpc
                             .call(buf, super::ONE_ATTEMPT, std::time::Duration::from_secs(10))
@@ -460,7 +465,7 @@ impl Mount41 {
                         OperationOutcome::DefiniteFailure,
                         builder.operation_class(),
                         RecoveryAction::Reopen,
-                        request_context(tag, sess.id(), slot.slot_id, seq_id),
+                        request_context(tag, &sess, slot.slot_id, seq_id),
                         NfsError::Rpc(format!(
                             "stale session generation {required}, active {}",
                             sess.generation()
@@ -472,13 +477,15 @@ impl Mount41 {
             builder.enforce_max_operations(sess.max_operations())?;
             let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
-            let context = request_context(tag, sess.id(), slot.slot_id, seq_id);
+            let original_session_only = builder.requires_original_session();
+            let context = request_context(tag, &sess, slot.slot_id, seq_id);
+            let mut buf = Vec::new();
+            builder.encode_with_header(&self.auth, sess.minor_version(), &mut buf);
+            enforce_request_size(&sess, buf.len(), write_data.as_ref().map_or(0, Bytes::len))?;
+
             if operation_class != OperationClass::ReadOnly {
                 slot.fence_on_drop();
             }
-            let mut buf = Vec::new();
-            builder.encode_with_header(&self.auth, &mut buf);
-            enforce_request_size(&sess, buf.len(), write_data.as_ref().map_or(0, Bytes::len))?;
 
             let response_bytes = if let Some(ref data) = write_data {
                 self.rpc
@@ -545,6 +552,15 @@ impl Mount41 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
+                Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION | nfsstat4::NFS4ERR_DEADSESSION | nfsstat4::NFS4ERR_SEQ_MISORDERED))
+                    if original_session_only => {
+                        // RFC 8881 §2.10.13: do not repeat a possibly completed
+                        // mutation using a fresh session/slot/sequence identity.
+                        return Err(NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+                            OperationOutcome::Uncertain, operation_class,
+                            RecoveryAction::VerifyThenResume, context, error,
+                        ))));
+                    }
                 Err(NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION))
                 | Err(NfsError::Nfs4(nfsstat4::NFS4ERR_DEADSESSION))
                 // RFC 5661 §2.10.6.1: SEQ_MISORDERED — RPC retransmit after server
@@ -640,17 +656,12 @@ impl Mount41 {
         builder.enforce_max_operations(ds.session.max_operations())?;
         let request_op_count = builder.op_count();
         let operation_class = builder.operation_class();
-        let context = request_context(
-            tag,
-            ds.session.id(),
-            slot.slot_id,
-            slot.current_sequence_id(),
-        );
+        let context = request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
         if operation_class != OperationClass::ReadOnly {
             slot.fence_on_drop();
         }
         let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
+        builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
         enforce_request_size(&ds.session, buf.len(), 0)?;
         let timeout = data_timeout(data_size);
         let response_bytes = ds
@@ -724,17 +735,12 @@ impl Mount41 {
         builder.enforce_max_operations(ds.session.max_operations())?;
         let request_op_count = builder.op_count();
         let operation_class = builder.operation_class();
-        let context = request_context(
-            tag,
-            ds.session.id(),
-            slot.slot_id,
-            slot.current_sequence_id(),
-        );
+        let context = request_context(tag, &ds.session, slot.slot_id, slot.current_sequence_id());
         if operation_class != OperationClass::ReadOnly {
             slot.fence_on_drop();
         }
         let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
+        builder.encode_with_header(auth, ds.session.minor_version(), &mut buf);
         enforce_request_size(&ds.session, buf.len(), data.len())?;
         let timeout = data_timeout(data.len());
         let response_bytes = ds
@@ -856,7 +862,7 @@ impl Mount41 {
             .any(|w| w.committed != crate::WriteCommitted::FileSync)
         {
             let actual = self.commit_with_verifier(fh.clone(), offset, count).await?;
-            crate::mount::verify_write_batch(crate::NFSVersion::NFSv4p1, &ordinary, actual)?;
+            crate::mount::verify_write_batch(self.protocol_version(), &ordinary, actual)?;
         }
         let pending: Vec<_> = writes.iter().filter_map(|w| w.pnfs.clone()).collect();
         self.commit_pending_writes(&fh, &pending).await
@@ -901,7 +907,7 @@ impl Mount41 {
             let builder =
                 CompoundBuilder::new("destroy_session").destroy_session(current_sess.id());
             let mut buf = Vec::new();
-            builder.encode_with_header(&self.auth, &mut buf);
+            builder.encode_with_header(&self.auth, current_sess.minor_version(), &mut buf);
             if let Err(e) = self
                 .rpc
                 .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
@@ -915,7 +921,7 @@ impl Mount41 {
         // DESTROY_CLIENTID (no session needed)
         let builder = CompoundBuilder::new("destroy_clientid").destroy_client_id(client_id);
         let mut buf = Vec::new();
-        builder.encode_with_header(&self.auth, &mut buf);
+        builder.encode_with_header(&self.auth, current_sess.minor_version(), &mut buf);
         if let Err(error) = self
             .rpc
             .call(buf, super::ONE_ATTEMPT, METADATA_TIMEOUT)
@@ -966,7 +972,10 @@ impl std::fmt::Debug for Mount41 {
 
 // ─── Mount entry point ──────────────────────────────────────────────────────
 
-pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
+pub(crate) async fn mount(
+    args: &crate::MountArgs,
+    minor_version: MinorVersion,
+) -> Result<Box<dyn crate::Mount>> {
     let nfsport = if args.nfsport != 0 {
         args.nfsport
     } else {
@@ -984,7 +993,7 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
 
     let mut last_error = None;
     for addr in &addrs {
-        match mount_on_addr(addr, args, &auth).await {
+        match mount_on_addr(addr, args, &auth, minor_version).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "NFSv4.1 mount attempt failed");
@@ -999,6 +1008,7 @@ async fn mount_on_addr(
     addr: &std::net::SocketAddr,
     args: &crate::MountArgs,
     auth: &Auth,
+    minor_version: MinorVersion,
 ) -> Result<Box<dyn crate::Mount>> {
     info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
 
@@ -1008,7 +1018,7 @@ async fn mount_on_addr(
 
     // 2. Establish session (EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE)
     // 每个 mount 实例生成唯一的 ClientIdentity，避免 co_ownerid 冲突导致服务端销毁其他 session
-    let client_identity = ClientIdentity::new();
+    let client_identity = ClientIdentity::with_minor_version(minor_version);
     let raw_session = Session::establish(&client, auth, &client_identity).await?;
     let session_holder = Arc::new(SessionHolder::new(raw_session));
     let session = session_holder.get().await;
@@ -1050,6 +1060,7 @@ async fn mount_on_addr(
         session.backchannel_max_requests(),
         session.backchannel_max_request_size(),
         session.backchannel_max_operations(),
+        session.minor_version(),
     );
     client.enable_backchannel(super::callback::make_backchannel_handler(
         Arc::clone(&callback_state),
@@ -1058,7 +1069,8 @@ async fn mount_on_addr(
     ));
 
     // A connection is not NFSv4.1-ready until BOTH has been confirmed.
-    let direction = bind_connection(&client, auth, session.id(), false).await?;
+    let direction =
+        bind_connection(&client, auth, session.id(), false, session.minor_version()).await?;
     info!(direction, "backchannel bound via BIND_CONN_TO_SESSION");
     let reconnect_auth = auth.clone();
     let reconnect_sessions = Arc::clone(&session_holder);
@@ -1068,7 +1080,9 @@ async fn mount_on_addr(
         async move {
             let session = sessions.get().await;
             let session_generation = session.generation();
-            let direction = bind_connection(&client, &auth, session.id(), true).await?;
+            let direction =
+                bind_connection(&client, &auth, session.id(), true, session.minor_version())
+                    .await?;
             info!(
                 connection_generation,
                 session_generation, direction, "NFSv4.1 connection rebound and ready"
@@ -1117,7 +1131,7 @@ async fn mount_on_addr(
         rsize,
         wsize,
         acl_supported,
-        writes: Arc::default(),
+        writes: Arc::new(super::write_owner::WriteOwner::new(minor_version)),
     };
 
     Ok(Box::new(Mount41Wrapper::new(m)))
@@ -1308,14 +1322,10 @@ async fn send_recall_return(
             }
             let request_op_count = builder.op_count();
             let operation_class = builder.operation_class();
-            let context = request_context(
-                "recall_return",
-                session.id(),
-                slot.slot_id,
-                slot.sequence_id,
-            );
+            let context =
+                request_context("recall_return", &session, slot.slot_id, slot.sequence_id);
             let mut buf = Vec::new();
-            builder.encode_with_header(auth, &mut buf);
+            builder.encode_with_header(auth, session.minor_version(), &mut buf);
             if let Err(e) = enforce_request_size(&session, buf.len(), 0) {
                 warn!(error = %e, "recall return request limit rejected");
                 return false;
@@ -1431,7 +1441,7 @@ async fn navigate_to_export(
     let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, session.minor_version(), &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc
         .call(
@@ -1505,7 +1515,7 @@ async fn get_fs_limits(
     let request_op_count = builder.op_count();
 
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, session.minor_version(), &mut buf);
     enforce_request_size(session, buf.len(), 0)?;
     let response_bytes = rpc
         .call(
@@ -1708,7 +1718,7 @@ impl crate::Mount for Mount41Wrapper {
     }
 
     fn version(&self) -> NFSVersion {
-        NFSVersion::NFSv4p1
+        self.m.protocol_version()
     }
 
     async fn getfh(&self) -> Bytes {
@@ -1906,7 +1916,7 @@ impl crate::Mount for Mount41Wrapper {
                 super::pnfs_io::uncertain_pnfs_write(
                     RequestContext {
                         operation: "write".into(),
-                        protocol: NFSVersion::NFSv4p1,
+                        protocol: self.m.protocol_version(),
                         request_id: None,
                     },
                     NfsError::Rpc("WRITE task ended without a result".into()),
@@ -2139,7 +2149,7 @@ impl crate::Mount for Mount41Wrapper {
                     RecoveryAction::Reopen,
                     RequestContext {
                         operation: "lock".to_string(),
-                        protocol: NFSVersion::NFSv4p1,
+                        protocol: self.m.protocol_version(),
                         request_id: None,
                     },
                     NfsError::Rpc("session generation changed while acquiring lock".to_string()),
@@ -2187,6 +2197,120 @@ impl crate::Mount for Mount41Wrapper {
             .locku(fh, lock_stateid, lock_type, offset, length)
             .await
     }
+    async fn allocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_space(fh, offset, length, true).await },
+        )
+        .await
+    }
+    async fn deallocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_space(fh, offset, length, false).await },
+        )
+        .await
+    }
+    async fn seek_content(
+        &self,
+        fh: Bytes,
+        offset: u64,
+        what: crate::SeekContent,
+    ) -> Result<crate::SeekResult> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_seek(fh, offset, what).await
+    }
+    async fn read_plus(&self, fh: Bytes, offset: u64, count: u32) -> Result<crate::ReadPlusResult> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_read_plus(fh, offset, count).await
+    }
+    async fn copy_range(
+        &self,
+        source: Bytes,
+        destination: Bytes,
+        source_offset: u64,
+        destination_offset: u64,
+        count: u64,
+    ) -> Result<crate::CopyResult> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            Some(source.clone()),
+            destination.clone(),
+            move |m| async move {
+                m.v42_copy(
+                    source,
+                    destination,
+                    source_offset,
+                    destination_offset,
+                    count,
+                    false,
+                )
+                .await
+            },
+        )
+        .await
+    }
+    async fn clone_range(
+        &self,
+        source: Bytes,
+        destination: Bytes,
+        source_offset: u64,
+        destination_offset: u64,
+        count: u64,
+    ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            Some(source.clone()),
+            destination.clone(),
+            move |m| async move {
+                m.v42_copy(
+                    source,
+                    destination,
+                    source_offset,
+                    destination_offset,
+                    count,
+                    true,
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await
+    }
+    async fn nfs42_attributes(&self, fh: Bytes) -> Result<crate::Nfs42Attributes> {
+        let _operation = self.core.begin_operation()?;
+        self.m.v42_attributes(fh).await
+    }
+    async fn setxattr_with_mode(
+        &self,
+        fh: Bytes,
+        name: &str,
+        value: Bytes,
+        mode: crate::XattrSetMode,
+    ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        let name = name.to_owned();
+        super::v42_ops::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            move |m| async move { m.v42_setxattr(fh, &name, value, mode).await },
+        )
+        .await
+    }
     async fn getacl(&self, fh: Bytes) -> Result<mount::Acl> {
         let _operation = self.core.begin_operation()?;
         self.m.getacl(fh).await
@@ -2217,18 +2341,49 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn getxattr(&self, fh: Bytes, name: &str) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            return self.m.v42_getxattr(fh, name).await;
+        }
         self.m.getxattr(fh, name).await
     }
     async fn setxattr(&self, fh: Bytes, name: &str, value: Bytes) -> Result<()> {
         let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            let name = name.to_owned();
+            return super::v42_ops::run_owned(
+                self.m.clone(),
+                self.core.clone(),
+                None,
+                fh.clone(),
+                move |m| async move {
+                    m.v42_setxattr(fh, &name, value, crate::XattrSetMode::Either)
+                        .await
+                },
+            )
+            .await;
+        }
         self.m.setxattr(fh, name, value).await
     }
     async fn listxattr(&self, fh: Bytes) -> Result<Vec<String>> {
         let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            return self.m.v42_listxattrs(fh).await;
+        }
         self.m.listxattr(fh).await
     }
     async fn removexattr(&self, fh: Bytes, name: &str) -> Result<()> {
         let _operation = self.core.begin_operation()?;
+        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
+            let name = name.to_owned();
+            return super::v42_ops::run_owned(
+                self.m.clone(),
+                self.core.clone(),
+                None,
+                fh.clone(),
+                move |m| async move { m.v42_removexattr(fh, &name).await },
+            )
+            .await;
+        }
         self.m.removexattr(fh, name).await
     }
 
@@ -2599,7 +2754,7 @@ pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mou
         auth,
         root_fh: Bytes::from_static(b"root"),
         session_holder,
-        callback_state: CallbackState::new_negotiated([1; 16], 1, 1, 4096, 2),
+        callback_state: CallbackState::new_negotiated([1; 16], 1, 1, 4096, 2, MinorVersion::V1),
         recovery_lock: tokio::sync::Mutex::new(()),
         client_identity: ClientIdentity::new(),
         state: StateManager::new(),
@@ -2812,7 +2967,7 @@ mod tests {
             "nfs://127.0.0.1/export?version=4.1&nfsport={port}&noresvport=true"
         ))
         .unwrap();
-        let error = mount(&args).await.unwrap_err();
+        let error = mount(&args, MinorVersion::V1).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 }

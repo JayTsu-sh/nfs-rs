@@ -175,7 +175,7 @@ impl DsConnection {
     pub async fn destroy(&self, auth: &Auth) {
         let builder = CompoundBuilder::new("ds_destroy_session").destroy_session(self.session.id());
         let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
+        builder.encode_with_header(auth, self.session.minor_version(), &mut buf);
         if let Err(e) = self
             .client
             .call(buf, super::ONE_ATTEMPT, DS_TEARDOWN_TIMEOUT)
@@ -186,7 +186,7 @@ impl DsConnection {
         let builder =
             CompoundBuilder::new("ds_destroy_clientid").destroy_client_id(self.session.client_id());
         let mut buf = Vec::new();
-        builder.encode_with_header(auth, &mut buf);
+        builder.encode_with_header(auth, self.session.minor_version(), &mut buf);
         let _ = self
             .client
             .call(buf, super::ONE_ATTEMPT, DS_TEARDOWN_TIMEOUT)

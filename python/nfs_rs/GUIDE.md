@@ -14,9 +14,9 @@ contains matching synchronous and `asyncio` APIs with PEP 561 type information.
 |---|---|
 | Python | CPython 3.11+ via the stable ABI |
 | Platform | Linux/glibc x86_64 |
-| Protocols | NFSv3, NFSv4.1, experimental NFSv4.0 |
+| Protocols | NFSv3, NFSv4.1, NFSv4.2, experimental NFSv4.0 |
 | Authentication | AUTH_SYS |
-| Not supported | NFSv4.2, Kerberos/RPCSEC_GSS, Windows, macOS, musl, PyPy, free-threaded CPython |
+| Not supported | NFSv4.2 cross-server/async offload, Kerberos/RPCSEC_GSS, Windows, macOS, musl, PyPy, free-threaded CPython |
 
 NFSv4.0 uses an experimental interoperability profile. Server capabilities such
 as named attributes, ACLs, callbacks, locks, delegation retention, and pNFS are
@@ -64,6 +64,7 @@ Common options:
 | `version=3` | Use NFSv3 |
 | `version=4.0` | Use experimental NFSv4.0 |
 | `version=4.1` | Use NFSv4.1 |
+| `version=4.2` | Use NFSv4.2 for existing file APIs; exact selectors do not silently downgrade |
 | `version=4.1,4.0,3` | Try an explicit fallback order |
 | `uid=`, `gid=` | AUTH_SYS numeric identity |
 | `nfsport=`, `mountport=` | Override service ports |
@@ -117,8 +118,11 @@ client.close()
 `versions=["4.1", "4.0", "3"]` provides a programmatic fallback list and
 overrides a version already present in the URL. The client tries entries in
 order and `client.version` reports the connected protocol. The Python facade
-accepts only `"3"`, `"4.0"`, and `"4.1"`; ambiguous `"4"`, NFSv4.2, empty
+accepts only `"3"`, `"4.0"`, `"4.1"`, and `"4.2"`; ambiguous `"4"`, empty
 lists, and unknown values are rejected before connecting.
+`versions=["4.2", "4.1"]` allows fallback and `Version.NFS_V4_2` reports v4.2.
+Session recovery, callbacks, locks, and negotiated pNFS file layouts reuse the
+v4.1 engine; data servers can independently negotiate v4.1.
 
 ## Discover exports
 
@@ -368,8 +372,15 @@ Pass `-1` to one side of `chown` when that identity should remain unchanged.
 
 ### Extended attributes and ACL capability
 
-Named attributes use the optional NFSv4.1 OPENATTR file interface, not the
-NFSv4.2 GETXATTR/SETXATTR extension or a portable mapping of Linux POSIX xattrs.
+On NFSv4.0/v4.1, the xattr methods use the optional OPENATTR named-attribute
+file interface. On NFSv4.2 they use RFC 8276 GETXATTR/SETXATTR/LISTXATTRS/
+REMOVEXATTR after checking the target filesystem's xattr_support attribute.
+These are distinct namespaces; no fallback between them is implicit. Keys are
+sent unchanged (including a supplied `user.` prefix). SETXATTR is atomic and
+accepts `mode=XattrSetMode.CREATE` or `REPLACE`; EITHER is the default. Empty
+and binary values are supported within server and negotiated channel limits.
+The existing `capabilities.named_attributes` flag describes OPENATTR, not the
+RFC 8276 extension; inspect `client.nfs42_attributes(path).xattr_support`.
 There is no fixed client limit on the complete value size; server and file system
 limits still apply. Negotiated read/write sizes limit individual requests.
 `getxattr` continues short reads to EOF and buffers the complete value in memory.
@@ -552,3 +563,36 @@ The stable facade exports:
 
 The native `nfs_rs._internal` module is private. Applications should import
 only from `nfs_rs`.
+
+
+## NFSv4.2 file operations
+
+`allocate(path, offset, length)` reserves space; `deallocate` punches a hole
+without changing EOF. `seek_content(path, offset, SeekContent.DATA/HOLE)`
+queries sparse content boundaries; ordinary `File.seek` still moves only the
+local cursor. `read_plus(path, offset, count)` returns `ReadPlusResult` whose
+extents contain bytes or `data=None` for holes, clipped to the requested range.
+Counts are bounded by the negotiated READ/session limit and can be short.
+The client accepts at most 4096 extents per reply and 65536 names per xattr
+listing. Xattr values are bounded by the 4 MiB client ceiling as well as
+negotiated channel and server limits; oversized results are errors, not
+truncated successes.
+
+`copy_range(source, destination, count=0)` performs synchronous intra-server
+COPY and returns the durable `CopyResult.count`. Both paths must already exist;
+a zero count means source EOF. `clone_range` performs atomic CLONE with the
+server's alignment rules. COPY/CLONE have no software fallback and can be
+unsupported even when v4.2 mounts succeed. Cross-server and asynchronous
+copy offload are not exposed.
+
+All these methods are available on Client and AsyncClient. Temporary OPENs
+and file barriers remain held until admitted work and CLOSEs settle, including
+a caller timeout or cancellation. An uncertain mutation requires verifying
+the target before resuming. Inspect `nfs42_attributes(path)` for per-filesystem
+xattr support and optional CLONE block alignment; operation availability must
+be tested separately. AFX's configured outcomes are documented in the
+repository's validation notes and do not define other servers' capabilities.
+On the tested AFX export, enabled sparse operations support whole-file
+deallocation; partial punching returns NFS4ERR_IO, also reproduced with the
+Linux kernel client. See the
+[enabled-feature validation](validation/nfsv42-afx-enabled-2026-11-02.md).

@@ -320,7 +320,10 @@ impl NfsError {
         matches!(
             self,
             NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOENT)
-                | NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOENT)
+                | NfsError::Nfs4(
+                    crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOENT
+                        | crate::nfs4::Nfs4ErrorCode::NFS4ERR_NOXATTR
+                )
         )
     }
 

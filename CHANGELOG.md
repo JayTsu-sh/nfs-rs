@@ -7,7 +7,37 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- NFSv4.2 support for the existing Rust/Python file APIs through exact
+  `version=4.2`, ordered fallback lists, and Python `Version.NFS_V4_2`.
+  Sessions, recovery, lease renewal, callbacks and teardown retain the selected
+  minor version; pNFS data servers independently negotiate v4.2/v4.1.
+  Optional synchronous intra-server COPY, CLONE, SEEK, ALLOCATE/DEALLOCATE,
+  READ_PLUS and RFC 8276 extended attributes are exposed in Rust and Python.
+  Server rejections remain explicit; no client-side or async-copy fallback is
+  implicit. Mutations retain OPENs/barriers through cancellation and COPY
+  commits its returned verifier before reporting durable bytes.
+- NFSv4.2 xattrs use the separate RFC 8276 namespace, including atomic
+  create/replace policy and bounded cookie-checked LISTXATTRS pagination.
+  v4.0/v4.1 retain OPENATTR named attributes. Missing RFC 8276 keys preserve
+  NOXATTR (mapped to Python FileNotFoundError); XATTR2BIG maps to E2BIG.
+- NFSv4.2 ACL calls distinguish per-filesystem unsupported attributes from
+  malformed XDR responses.
+- Isolated AFX NFSv4.2 lab runner covering all four data LIFs, with shared
+  locking, kernel-client preparation and unconditional cleanup.
+  Enabled-feature validation covers ordinary ACLs, xattrs, ALLOCATE, SEEK and
+  whole-file DEALLOCATE. Partial DEALLOCATE remains an explicit server IO
+  failure; COPY/CLONE/READ_PLUS remain unsupported on the tested AFX export.
+
 ### Fixed
+
+- NFSv4.2 mutations retain uncertain results when cancellation happens after
+  result readiness, and publish task failure before releasing file barriers.
+  Python retains nested operation/CLOSE recovery failures and identifies the
+  COPY/CLONE destination as the file requiring verification.
+- NFSv4.1/v4.2 resolve `.` path components locally, allowing default mount-root
+  attribute queries without sending an invalid LOOKUP name.
 
 - NFSv4.1 retains admitted WRITE tasks after caller cancellation, settles
   unclaimed successful receipts, and preserves unclaimed uncertain outcomes

@@ -34,7 +34,7 @@ impl Mount41 {
                 return Some(Err(super::pnfs_io::uncertain_pnfs_write(
                     crate::error::RequestContext {
                         operation: "pnfs_write".into(),
-                        protocol: crate::NFSVersion::NFSv4p1,
+                        protocol: self.protocol_version(),
                         request_id: None,
                     },
                     crate::NfsError::Rpc(

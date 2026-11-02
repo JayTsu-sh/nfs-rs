@@ -273,6 +273,7 @@ fn plan_commit_batch(pending: &[&Arc<PendingWrite>], replies: &[Vec<DsWriteReply
 
 #[async_trait::async_trait]
 trait CommitIo: Sync {
+    fn protocol(&self) -> NFSVersion;
     async fn mds_commit(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]>;
     async fn ds_commit(
         &self,
@@ -287,6 +288,9 @@ trait CommitIo: Sync {
 
 #[async_trait::async_trait]
 impl CommitIo for Mount41 {
+    fn protocol(&self) -> NFSVersion {
+        self.protocol_version()
+    }
     async fn mds_commit(&self, fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
         self.commit_with_verifier(fh.clone(), offset, count)
             .await?
@@ -320,13 +324,13 @@ async fn execute_commit_plan(
 ) -> Result<()> {
     if let Some(target) = &plan.mds {
         let actual = io.mds_commit(fh, target.offset, target.count).await?;
-        check_commit_verifier(target.expected.iter(), actual)?;
+        check_commit_verifier(target.expected.iter(), actual, io.protocol())?;
     }
     for (addr, ds_fh, target) in &plan.ds {
         let actual = io
             .ds_commit(*addr, ds_fh, generation, target.offset, target.count)
             .await?;
-        check_commit_verifier(target.expected.iter(), actual)?;
+        check_commit_verifier(target.expected.iter(), actual, io.protocol())?;
     }
     if let Some((start, end)) = plan.layout {
         io.layout_commit(fh, generation, start, end).await?;
@@ -339,9 +343,10 @@ async fn execute_commit_plan(
 fn check_commit_verifier<'a>(
     written: impl IntoIterator<Item = &'a [u8; 8]>,
     committed: [u8; 8],
+    protocol: NFSVersion,
 ) -> Result<()> {
     if written.into_iter().any(|verifier| *verifier != committed) {
-        return Err(write_verifier_changed(NFSVersion::NFSv4p1));
+        return Err(write_verifier_changed(protocol));
     }
     Ok(())
 }
@@ -377,13 +382,13 @@ fn ds_batch_rejected_without_write<T>(completions: &[DsWriteCompletion<T>]) -> b
         })
 }
 
-fn ds_error_after_progress(error: NfsError, confirmed: u32) -> NfsError {
+fn ds_error_after_progress(error: NfsError, confirmed: u32, protocol: NFSVersion) -> NfsError {
     if confirmed > 0 && matches!(error, NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE)) {
         // A later rejected WRITE does not undo earlier short WRITE successes.
         uncertain_pnfs_write(
             RequestContext {
                 operation: "pnfs_write".into(),
-                protocol: NFSVersion::NFSv4p1,
+                protocol,
                 request_id: None,
             },
             error,
@@ -1111,7 +1116,7 @@ impl Mount41 {
                 let active_session = self.session_holder.get().await;
                 let context = RequestContext {
                     operation: "pnfs_write".to_string(),
-                    protocol: crate::NFSVersion::NFSv4p1,
+                    protocol: self.protocol_version(),
                     request_id: Some(crate::error::RequestId::nfs41(*active_session.id(), 0, 0)),
                 };
                 return PnfsWriteOutcome::Attempted(Err(uncertain_pnfs_write(
@@ -1184,7 +1189,7 @@ impl Mount41 {
             let active_session = self.session_holder.get().await;
             let context = RequestContext {
                 operation: "pnfs_write".to_string(),
-                protocol: crate::NFSVersion::NFSv4p1,
+                protocol: self.protocol_version(),
                 request_id: Some(crate::error::RequestId::nfs41(*active_session.id(), 0, 0)),
             };
             debug!(
@@ -1217,8 +1222,13 @@ impl Mount41 {
                     continue;
                 }
                 result => {
-                    return result
-                        .map_err(|error| ds_error_after_progress(error, u32::from(attempt > 0)));
+                    return result.map_err(|error| {
+                        ds_error_after_progress(
+                            error,
+                            u32::from(attempt > 0),
+                            self.protocol_version(),
+                        )
+                    });
                 }
             }
         }
@@ -1245,12 +1255,17 @@ impl Mount41 {
                     write.data.slice(done..),
                 )
                 .await
-                .map_err(|error| ds_error_after_progress(error, done as u32))?;
-            resp.op_ok(1)
-                .map_err(|error| ds_error_after_progress(error, done as u32))?;
+                .map_err(|error| {
+                    ds_error_after_progress(error, done as u32, self.protocol_version())
+                })?;
+            resp.op_ok(1).map_err(|error| {
+                ds_error_after_progress(error, done as u32, self.protocol_version())
+            })?;
             let mut d = resp
                 .op_ok(2)
-                .map_err(|error| ds_error_after_progress(error, done as u32))?
+                .map_err(|error| {
+                    ds_error_after_progress(error, done as u32, self.protocol_version())
+                })?
                 .data
                 .clone();
             if d.remaining() < 16 {
@@ -1264,7 +1279,7 @@ impl Mount41 {
             let mut current = [0; 8];
             d.copy_to_slice(&mut current);
             if verifier.is_some_and(|v| v != current) {
-                return Err(write_verifier_changed(NFSVersion::NFSv4p1));
+                return Err(write_verifier_changed(self.protocol_version()));
             }
             verifier = Some(current);
             level = level.min(committed);
@@ -1356,7 +1371,7 @@ impl Mount41 {
                                     uncertain_pnfs_write(
                                         RequestContext {
                                             operation: "pnfs_commit".into(),
-                                            protocol: NFSVersion::NFSv4p1,
+                                            protocol: self.protocol_version(),
                                             request_id: None,
                                         },
                                         e,
@@ -1424,7 +1439,7 @@ impl Mount41 {
         let active_session = self.session_holder.get().await;
         let context = RequestContext {
             operation: "pnfs_write".to_string(),
-            protocol: NFSVersion::NFSv4p1,
+            protocol: self.protocol_version(),
             request_id: Some(crate::error::RequestId::nfs41(*active_session.id(), 0, 0)),
         };
         uncertain_pnfs_write(context, source)
@@ -1703,6 +1718,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl CommitIo for FakeCommit {
+        fn protocol(&self) -> NFSVersion {
+            NFSVersion::NFSv4p1
+        }
         async fn mds_commit(&self, _fh: &Bytes, offset: u64, count: u32) -> Result<[u8; 8]> {
             self.calls
                 .lock()
@@ -1954,14 +1972,15 @@ mod tests {
     #[test]
     fn commit_verifier_matching_every_write_verifier_is_durable() {
         let written = [[1u8; 8], [1u8; 8]];
-        assert!(check_commit_verifier(written.iter(), [1u8; 8]).is_ok());
-        assert!(check_commit_verifier(std::iter::empty(), [9u8; 8]).is_ok());
+        assert!(check_commit_verifier(written.iter(), [1u8; 8], NFSVersion::NFSv4p1).is_ok());
+        assert!(check_commit_verifier(std::iter::empty(), [9u8; 8], NFSVersion::NFSv4p1).is_ok());
     }
 
     #[test]
     fn commit_verifier_mismatch_is_an_uncertain_write() {
         let written = [[1u8; 8], [2u8; 8]];
-        let error = check_commit_verifier(written.iter(), [1u8; 8]).unwrap_err();
+        let error =
+            check_commit_verifier(written.iter(), [1u8; 8], NFSVersion::NFSv4p1).unwrap_err();
         let outcome = error
             .operation_outcome()
             .expect("verifier mismatch must carry structured guidance");

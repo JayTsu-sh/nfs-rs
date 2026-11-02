@@ -13,6 +13,7 @@ use crate::error::{
 
 #[derive(Default)]
 pub(super) struct WriteOwner {
+    minor_version: super::MinorVersion,
     gates: Mutex<HashMap<Bytes, Weak<RwLock<()>>>>,
     // An abandoned error cannot be acknowledged by evicting a layout or OPEN.
     // Recovery uses a new mount after file-level verification (RFC 8881 §13.7).
@@ -36,6 +37,13 @@ impl std::fmt::Debug for WriteOwner {
 }
 
 impl WriteOwner {
+    pub(super) fn new(minor_version: super::MinorVersion) -> Self {
+        Self {
+            minor_version,
+            ..Self::default()
+        }
+    }
+
     fn gate(&self, fh: &Bytes) -> Arc<RwLock<()>> {
         let mut gates = self
             .gates
@@ -114,7 +122,7 @@ impl WriteOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(fh)
-            .map(shared_uncertainty)
+            .map(|error| shared_uncertainty(error, self.minor_version.version()))
     }
 
     pub(super) fn any_error(&self) -> Option<NfsError> {
@@ -123,17 +131,17 @@ impl WriteOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .next()
-            .map(shared_uncertainty)
+            .map(|error| shared_uncertainty(error, self.minor_version.version()))
     }
 }
 
-fn shared_uncertainty(error: &Arc<NfsError>) -> NfsError {
+fn shared_uncertainty(error: &Arc<NfsError>, protocol: crate::NFSVersion) -> NfsError {
     let context = error
         .operation_outcome()
         .map(|o| o.context().clone())
         .unwrap_or_else(|| RequestContext {
             operation: "abandoned_write".into(),
-            protocol: crate::NFSVersion::NFSv4p1,
+            protocol,
             request_id: None,
         });
     NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
@@ -151,14 +159,24 @@ pub(super) struct WriteTaskGuard {
     fh: Bytes,
     settled: bool,
     abandoned: Arc<AtomicBool>,
+    operation: &'static str,
 }
 impl WriteTaskGuard {
     pub(super) fn new(owner: Arc<WriteOwner>, fh: Bytes, abandoned: Arc<AtomicBool>) -> Self {
+        Self::for_operation(owner, fh, abandoned, "WRITE")
+    }
+    pub(super) fn for_operation(
+        owner: Arc<WriteOwner>,
+        fh: Bytes,
+        abandoned: Arc<AtomicBool>,
+        operation: &'static str,
+    ) -> Self {
         Self {
             owner,
             fh,
             settled: false,
             abandoned,
+            operation,
         }
     }
     pub(super) fn settled(&mut self) {
@@ -173,7 +191,10 @@ impl Drop for WriteTaskGuard {
         if !self.settled {
             self.owner.record(
                 self.fh.clone(),
-                NfsError::Rpc("admitted WRITE task ended without settlement".into()),
+                NfsError::Rpc(format!(
+                    "admitted {} task ended without settlement",
+                    self.operation
+                )),
             );
             if self.abandoned.swap(false, Ordering::AcqRel) {
                 self.owner.finish_abandoned(&self.fh);

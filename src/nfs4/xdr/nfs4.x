@@ -209,7 +209,17 @@ enum nfsstat4 {
     NFS4ERR_DIRDELEG_UNAVAIL            = 10084,
     NFS4ERR_REJECT_DELEG                = 10085,
     NFS4ERR_RETURNCONFLICT              = 10086,
-    NFS4ERR_DELEG_REVOKED               = 10087
+    NFS4ERR_DELEG_REVOKED               = 10087,
+    /* NFSv4.2 (RFC 7863) and extended attributes (RFC 8276). */
+    NFS4ERR_PARTNER_NOTSUPP             = 10088,
+    NFS4ERR_PARTNER_NO_AUTH             = 10089,
+    NFS4ERR_UNION_NOTSUPP               = 10090,
+    NFS4ERR_OFFLOAD_DENIED              = 10091,
+    NFS4ERR_WRONG_LFS                   = 10092,
+    NFS4ERR_BADLABEL                    = 10093,
+    NFS4ERR_OFFLOAD_NO_REQS             = 10094,
+    NFS4ERR_NOXATTR                     = 10095,
+    NFS4ERR_XATTR2BIG                   = 10096
 };
 
 /* ================================================================

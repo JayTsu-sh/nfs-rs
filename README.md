@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/nfs-rs/badge.svg)](https://docs.rs/nfs-rs)
 [![license](https://img.shields.io/crates/l/nfs-rs.svg)](LICENSE)
 
-An asynchronous, pure Rust client library for NFSv3, NFSv4.0, and NFSv4.1.
+An asynchronous, pure Rust client library for NFSv3, NFSv4.0, NFSv4.1, and NFSv4.2.
 
 `nfs-rs` implements the NFS client protocol without linking to a C NFS
 implementation. It is intended for applications that need to access NFS
@@ -19,7 +19,10 @@ kernel-mounted filesystem.
   AUTH_SYS interoperability profile. RPCSEC_GSS/Kerberos is not implemented,
   so this release does not claim unconditional RFC 7530 conformance.
 - NFSv4.1 client operations are supported.
-- NFSv4.2 may be accepted in a URL preference list but is not implemented.
+- NFSv4.2 runs the existing file APIs over minor version 2, including sessions,
+  locks, callbacks, and negotiated pNFS file layouts. Optional synchronous
+  intra-server COPY, CLONE, SEEK, ALLOCATE/DEALLOCATE, READ_PLUS and RFC 8276
+  xattrs are exposed; server support is required and rejection is explicit.
 - The library uses Tokio and communicates with the server over TCP.
 - Linux is exercised by CI and by the physical NFS integration lab.
 
@@ -95,7 +98,8 @@ Supported arguments:
 - `version=<3|4.0|4.1|4.2>` — preferred protocol version or a comma-separated
   preference list such as `4.1,4.0,3`. The default is `3`. The exact `4.0`
   selector selects the experimental NFSv4.0 engine; ambiguous `4` is rejected.
-  Version 4.2 is not currently implemented.
+  Exact `version=4.2` requires v4.2; `version=4.2,4.1` explicitly allows fallback.
+  pNFS data servers negotiate their version independently (v4.2 or v4.1).
 - `retain-delegations=true` — opt into automatic delegation retention. It is
   disabled by default; NFSv4.0 publishes a separately reachable callback
   listener when enabled.

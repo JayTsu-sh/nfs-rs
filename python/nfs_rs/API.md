@@ -25,8 +25,8 @@ completed_bytes as a resume offset. File readinto buffers cannot be modified by
 abandoned background work after the public call returns. Context managers
 preserve a body exception and attach cleanup failures rather than replacing it.
 
-Supported deployment: CPython 3.11+ on Linux/glibc x86_64, NFSv3 and NFSv4.1,
-experimental NFSv4.0, AUTH_SYS only. No NFSv4.2, Kerberos or RPCSEC_GSS.
+Supported deployment: CPython 3.11+ on Linux/glibc x86_64, NFSv3, NFSv4.1, and NFSv4.2,
+experimental NFSv4.0, AUTH_SYS only. Synchronous intra-server COPY/CLONE, sparse operations and RFC 8276 xattrs are optional server capabilities. No cross-server/async offload, Kerberos or RPCSEC_GSS.
 
 ## Connection options
 
@@ -37,7 +37,7 @@ options. Transfer sizes are negotiated; concurrency is capped at eight.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| versions | None | Nonempty ordered list/tuple containing "3", "4.0", "4.1". Overrides URL version. Without either, use NFSv3. |
+| versions | None | Nonempty ordered list/tuple containing "3", "4.0", "4.1", "4.2". Overrides URL version. Without either, use NFSv3. |
 | uid, gid | None | AUTH_SYS unsigned 32-bit numeric identity; default comes from the process/platform. |
 | nfs_port | None | NFS service port, 1–65535; URL spelling nfsport. |
 | mount_port | None | NFSv3 MOUNT service port, 1–65535; URL spelling mountport. |
@@ -115,6 +115,7 @@ Connected protocol values. NFSv4.0 is experimental. Construct from a listed stri
 | `Version.NFS_V3` | `'3'` | Named enum value; see this type description for interpretation. |
 | `Version.NFS_V4_0` | `'4.0'` | Named enum value; see this type description for interpretation. |
 | `Version.NFS_V4_1` | `'4.1'` | Named enum value; see this type description for interpretation. |
+| `Version.NFS_V4_2` | `'4.2'` | Existing file APIs over NFSv4.2; optional v4.2 operations are not exposed. |
 
 #### Version.__new__
 
@@ -904,7 +905,8 @@ Read a named extended attribute and return its value as bytes. name is a string.
 #### Client.setxattr
 
 ```python
-def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None: ...
+def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
+    ...
 ```
 
 Set a named extended attribute from a bytes-like value. The input is snapshotted before native I/O; returns None. No create-only/replace-only flag is exposed. Requires named-attribute support.
@@ -1281,7 +1283,8 @@ Read a named extended attribute and return its value as bytes. name is a string.
 #### AsyncClient.setxattr
 
 ```python
-async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any) -> None: ...
+async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
+    ...
 ```
 
 Set a named extended attribute from a bytes-like value. The input is snapshotted before native I/O; returns None. No create-only/replace-only flag is exposed. Requires named-attribute support.
@@ -1806,3 +1809,188 @@ api = files("nfs_rs").joinpath("API.md").read_text(encoding="utf-8")
 guide = files("nfs_rs").joinpath("GUIDE.md").read_text(encoding="utf-8")
 print(api)
 ```
+
+
+## NFSv4.2 result and option types
+
+### SeekContent
+
+Content kind for server-side SEEK. DATA locates data and HOLE locates sparse space; this does not change a File cursor.
+
+- `SeekContent.DATA`: `0`.
+- `SeekContent.HOLE`: `1`.
+
+### XattrSetMode
+
+Atomic RFC 8276 SETXATTR policy: EITHER creates or replaces, CREATE requires a missing key, REPLACE requires an existing key. Unavailable on the older OPENATTR namespace.
+
+- `XattrSetMode.EITHER`: `0`.
+- `XattrSetMode.CREATE`: `1`.
+- `XattrSetMode.REPLACE`: `2`.
+
+### SeekResult
+
+Server-selected content boundary. eof reports that no later matching content exists; offset is the server-returned boundary. An offset beyond EOF can raise ENXIO.
+
+- `SeekResult.eof`: `bool`.
+- `SeekResult.offset`: `int`.
+
+### ReadPlusExtent
+
+One extent clipped to the requested interval. data is bytes for data and None for a hole; length describes the logical range without allocating zeros for holes.
+
+- `ReadPlusExtent.offset`: `int`.
+- `ReadPlusExtent.length`: `int`.
+- `ReadPlusExtent.data`: `bytes | None`.
+
+### ReadPlusResult
+
+A bounded, possibly short sparse read. contents preserves contiguous server extent order; eof describes whether the returned logical data reaches EOF.
+
+- `ReadPlusResult.eof`: `bool`.
+- `ReadPlusResult.contents`: `tuple[ReadPlusExtent, ...]`.
+
+### CopyResult
+
+Durable byte count returned by synchronous intra-server COPY. A short positive count is valid; no software copy or hidden retry completes the remainder.
+
+- `CopyResult.count`: `int`.
+
+### Nfs42Attributes
+
+Per-object filesystem attributes. supported_attrs is a bitmap, clone_blksize is the optional CLONE alignment in bytes, and xattr_support advertises RFC 8276 support. These values do not imply COPY/SEEK support.
+
+- `Nfs42Attributes.supported_attrs`: `tuple[int, ...]`.
+- `Nfs42Attributes.clone_blksize`: `int | None`.
+- `Nfs42Attributes.xattr_support`: `bool`.
+
+
+## NFSv4.2 client operations
+
+All methods below require exact negotiated v4.2; optional server rejection remains an explicit exception. Mutation deadlines/cancellation do not roll back server work: admitted operations retain their OPENs until settled, and uncertain results require verification.
+
+#### Client.allocate
+
+```python
+def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    ...
+```
+
+Reserve a nonempty range and possibly extend EOF. Requires NFSv4.2 and a server implementing ALLOCATE. This path API retains its temporary writable OPEN until the operation and CLOSE settle.
+
+#### Client.deallocate
+
+```python
+def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    ...
+```
+
+Punch a hole without changing EOF; reads of the deallocated range return zeros. Requires server support. Earlier pNFS writes are settled before changing the range.
+
+#### Client.seek_content
+
+```python
+def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    ...
+```
+
+Locate DATA or HOLE using server-side SEEK. Returns a typed boundary and EOF flag. This is independent of ordinary File.seek cursor positioning and requires server support.
+
+#### Client.read_plus
+
+```python
+def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+    ...
+```
+
+Return data/hole extents without materializing holes. count is at most u32 and the effective reply is bounded by negotiated READ/session limits. Short results are valid; loop for larger logical ranges.
+
+#### Client.copy_range
+
+```python
+def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
+    ...
+```
+
+Copy a range between existing files on this mounted server, using synchronous COPY. count zero means source EOF. The returned count is committed before success; source and destination must differ. An ambiguous failure requires verifying the target.
+
+#### Client.clone_range
+
+```python
+def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
+    ...
+```
+
+Atomically clone between existing files using server CLONE. count zero means source EOF; clone_blksize alignment applies. Source and destination OPENs and pNFS barriers remain held through completion. No userspace fallback is implicit.
+
+#### Client.nfs42_attributes
+
+```python
+def nfs42_attributes(self, path: os.PathLike[str] | str='.') -> Nfs42Attributes:
+    ...
+```
+
+Inspect supported_attrs, optional clone_blksize and RFC 8276 xattr_support on the requested file or directory. Values are filesystem-specific and are not a list of supported operations.
+
+#### AsyncClient.allocate
+
+```python
+async def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    ...
+```
+
+Reserve a nonempty range and possibly extend EOF. Requires NFSv4.2 and a server implementing ALLOCATE. This path API retains its temporary writable OPEN until the operation and CLOSE settle.
+
+#### AsyncClient.deallocate
+
+```python
+async def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    ...
+```
+
+Punch a hole without changing EOF; reads of the deallocated range return zeros. Requires server support. Earlier pNFS writes are settled before changing the range.
+
+#### AsyncClient.seek_content
+
+```python
+async def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    ...
+```
+
+Locate DATA or HOLE using server-side SEEK. Returns a typed boundary and EOF flag. This is independent of ordinary File.seek cursor positioning and requires server support.
+
+#### AsyncClient.read_plus
+
+```python
+async def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+    ...
+```
+
+Return data/hole extents without materializing holes. count is at most u32 and the effective reply is bounded by negotiated READ/session limits. Short results are valid; loop for larger logical ranges.
+
+#### AsyncClient.copy_range
+
+```python
+async def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
+    ...
+```
+
+Copy a range between existing files on this mounted server, using synchronous COPY. count zero means source EOF. The returned count is committed before success; source and destination must differ. An ambiguous failure requires verifying the target.
+
+#### AsyncClient.clone_range
+
+```python
+async def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
+    ...
+```
+
+Atomically clone between existing files using server CLONE. count zero means source EOF; clone_blksize alignment applies. Source and destination OPENs and pNFS barriers remain held through completion. No userspace fallback is implicit.
+
+#### AsyncClient.nfs42_attributes
+
+```python
+async def nfs42_attributes(self, path: os.PathLike[str] | str='.') -> Nfs42Attributes:
+    ...
+```
+
+Inspect supported_attrs, optional clone_blksize and RFC 8276 xattr_support on the requested file or directory. Values are filesystem-specific and are not a list of supported operations.

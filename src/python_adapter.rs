@@ -1431,7 +1431,7 @@ mod nfs3_python_mapping {
 
 fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
     let (class_name, errno, recovery) = match code {
-        NFS4ERR_NOENT => ("NfsNotFoundError", Some(nix::libc::ENOENT), None),
+        NFS4ERR_NOENT | NFS4ERR_NOXATTR => ("NfsNotFoundError", Some(nix::libc::ENOENT), None),
         NFS4ERR_EXIST => ("NfsAlreadyExistsError", Some(nix::libc::EEXIST), None),
         NFS4ERR_PERM | NFS4ERR_ACCESS => ("NfsPermissionError", Some(nix::libc::EACCES), None),
         NFS4ERR_NOTDIR => ("NfsNotADirectoryError", Some(nix::libc::ENOTDIR), None),
@@ -1466,7 +1466,10 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_LAYOUTTRYLATER
         | NFS4ERR_RECALLCONFLICT
         | NFS4ERR_BACK_CHAN_BUSY => ("NfsRetryableError", Some(nix::libc::EAGAIN), Some("retry")),
-        NFS4ERR_NOTSUPP
+        NFS4ERR_PARTNER_NOTSUPP
+        | NFS4ERR_UNION_NOTSUPP
+        | NFS4ERR_OFFLOAD_NO_REQS
+        | NFS4ERR_NOTSUPP
         | NFS4ERR_ATTRNOTSUPP
         | NFS4ERR_LOCK_NOTSUPP
         | NFS4ERR_OP_ILLEGAL
@@ -1474,7 +1477,12 @@ fn nfs4_error_kind(code: crate::nfs4::Nfs4ErrorCode) -> PythonErrorKind {
         | NFS4ERR_LAYOUTUNAVAILABLE
         | NFS4ERR_ENCR_ALG_UNSUPP
         | NFS4ERR_HASH_ALG_UNSUPP => ("NfsUnsupportedError", Some(nix::libc::ENOTSUP), None),
+        NFS4ERR_XATTR2BIG => ("NfsOSError", Some(nix::libc::E2BIG), None),
         NFS4_OK
+        | NFS4ERR_PARTNER_NO_AUTH
+        | NFS4ERR_OFFLOAD_DENIED
+        | NFS4ERR_WRONG_LFS
+        | NFS4ERR_BADLABEL
         | NFS4ERR_IO
         | NFS4ERR_INVAL
         | NFS4ERR_SAME
@@ -2013,6 +2021,196 @@ async fn stat_attr(
         NfsError::Unsupported("stat requires a connected protocol engine".to_string())
     })?;
     mount.getattr_path(&path).await
+}
+
+enum V42Value {
+    Unit,
+    Seek(crate::SeekResult),
+    ReadPlus(crate::ReadPlusResult),
+    Copy(crate::CopyResult),
+    Attributes(crate::Nfs42Attributes),
+}
+
+fn v42_dict<'py>(py: Python<'py>, value: V42Value) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new(py);
+    match value {
+        V42Value::Unit => {}
+        V42Value::Copy(result) => values.set_item("count", result.count)?,
+        V42Value::Seek(result) => {
+            values.set_item("eof", result.eof)?;
+            values.set_item("offset", result.offset)?;
+        }
+        V42Value::Attributes(result) => {
+            values.set_item("supported_attrs", result.supported_attrs)?;
+            values.set_item("clone_blksize", result.clone_blksize)?;
+            values.set_item("xattr_support", result.xattr_support)?;
+        }
+        V42Value::ReadPlus(result) => {
+            values.set_item("eof", result.eof)?;
+            let mut contents = Vec::new();
+            for extent in result.contents {
+                let entry = PyDict::new(py);
+                match extent {
+                    crate::ReadPlusContent::Data { offset, data } => {
+                        entry.set_item("offset", offset)?;
+                        entry.set_item("length", data.len())?;
+                        entry.set_item("data", PyBytes::new(py, &data))?;
+                    }
+                    crate::ReadPlusContent::Hole { offset, length } => {
+                        entry.set_item("offset", offset)?;
+                        entry.set_item("length", length)?;
+                        entry.set_item("data", py.None())?;
+                    }
+                }
+                contents.push(entry.unbind());
+            }
+            values.set_item("contents", contents)?;
+        }
+    }
+    Ok(values)
+}
+
+fn finish_v42_open<T>(result: Result<T>, close: Result<()>) -> Result<T> {
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(close)) => Err(NfsError::FileClose(vec![
+            crate::error::FileCloseFailure {
+                operation: "v42",
+                error: Arc::new(error),
+            },
+            crate::error::FileCloseFailure {
+                operation: "close",
+                error: Arc::new(close),
+            },
+        ])),
+    }
+}
+
+fn v42_recovery_path(operation: &str, path: &str, other: Option<&str>) -> Option<String> {
+    match operation {
+        "copy_range" | "clone_range" => other.map(str::to_owned),
+        _ => Some(path.to_owned()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn v42_operation(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    operation: String,
+    path: String,
+    other: Option<String>,
+    offset: u64,
+    second_offset: u64,
+    count: u64,
+    value: Option<Vec<u8>>,
+) -> Result<V42Value> {
+    let _guard = core.begin_operation()?;
+    let mount = mount.ok_or_else(|| {
+        NfsError::Unsupported("operation requires a connected NFSv4.2 server".into())
+    })?;
+    if mount.version() != NFSVersion::NFSv4p2 {
+        return Err(NfsError::Unsupported("operation requires NFSv4.2".into()));
+    }
+    if operation == "nfs42_attributes" {
+        let object = mount.lookup_path(&path).await?;
+        return mount
+            .nfs42_attributes(object.fh)
+            .await
+            .map(V42Value::Attributes);
+    }
+    if operation == "setxattr" {
+        let object = mount.lookup_path(&path).await?;
+        let mode = match offset {
+            0 => crate::XattrSetMode::Either,
+            1 => crate::XattrSetMode::Create,
+            2 => crate::XattrSetMode::Replace,
+            _ => return Err(NfsError::InvalidInput("invalid xattr set mode".into())),
+        };
+        mount
+            .setxattr_with_mode(
+                object.fh,
+                other
+                    .as_deref()
+                    .ok_or_else(|| NfsError::InvalidInput("xattr name required".into()))?,
+                Bytes::from(value.unwrap_or_default()),
+                mode,
+            )
+            .await?;
+        return Ok(V42Value::Unit);
+    }
+    let access = match operation.as_str() {
+        "allocate" | "deallocate" => crate::OPEN_WRITE,
+        "copy_range" | "clone_range" | "seek_content" | "read_plus" => crate::OPEN_READ,
+        _ => return Err(NfsError::InvalidInput("unknown NFSv4.2 operation".into())),
+    };
+    // This entire future is owned by ClientCore. Cancellation and operation
+    // deadlines never drop these OPENs before the RPC and both CLOSEs settle.
+    let opened = mount.open_path(&path, access).await?;
+    let result = async {
+        match operation.as_str() {
+            "allocate" => mount
+                .allocate(opened.fh.clone(), offset, count)
+                .await
+                .map(|_| V42Value::Unit),
+            "deallocate" => mount
+                .deallocate(opened.fh.clone(), offset, count)
+                .await
+                .map(|_| V42Value::Unit),
+            "seek_content" => {
+                let what = match second_offset {
+                    0 => crate::SeekContent::Data,
+                    1 => crate::SeekContent::Hole,
+                    _ => return Err(NfsError::InvalidInput("invalid SEEK content kind".into())),
+                };
+                mount
+                    .seek_content(opened.fh.clone(), offset, what)
+                    .await
+                    .map(V42Value::Seek)
+            }
+            "read_plus" => {
+                let count = u32::try_from(count)
+                    .map_err(|_| NfsError::InvalidInput("READ_PLUS count exceeds u32".into()))?;
+                mount
+                    .read_plus(opened.fh.clone(), offset, count)
+                    .await
+                    .map(V42Value::ReadPlus)
+            }
+            "copy_range" | "clone_range" => {
+                let destination = other
+                    .ok_or_else(|| NfsError::InvalidInput("copy destination required".into()))?;
+                let target = mount.open_path(&destination, crate::OPEN_WRITE).await?;
+                let result = if operation == "copy_range" {
+                    mount
+                        .copy_range(
+                            opened.fh.clone(),
+                            target.fh.clone(),
+                            offset,
+                            second_offset,
+                            count,
+                        )
+                        .await
+                        .map(V42Value::Copy)
+                } else {
+                    mount
+                        .clone_range(
+                            opened.fh.clone(),
+                            target.fh.clone(),
+                            offset,
+                            second_offset,
+                            count,
+                        )
+                        .await
+                        .map(|_| V42Value::Unit)
+                };
+                finish_v42_open(result, mount.close(target.fh).await)
+            }
+            _ => Err(NfsError::InvalidInput("unknown NFSv4.2 operation".into())),
+        }
+    }
+    .await;
+    finish_v42_open(result, mount.close(opened.fh).await)
 }
 
 #[derive(Clone, Copy)]
@@ -2861,6 +3059,7 @@ fn version_tuple(version: NFSVersion) -> (u8, Option<u8>) {
         NFSVersion::NFSv3 => (3, None),
         NFSVersion::NFSv4p0 => (4, Some(0)),
         NFSVersion::NFSv4p1 => (4, Some(1)),
+        NFSVersion::NFSv4p2 => (4, Some(2)),
         _ => (0, None),
     }
 }
@@ -3361,6 +3560,12 @@ async fn cancellation_safe_open_file(
 }
 
 fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &NfsError) {
+    if let NfsError::FileClose(failures) = error {
+        for failure in failures {
+            record_abandoned_error(core, safe_path.clone(), &failure.error);
+        }
+        return;
+    }
     let event = match error {
         NfsError::OperationOutcome(details)
             if matches!(
@@ -3476,21 +3681,44 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T>> + Send + 'static,
 {
+    // Retain results until acknowledgement, including cancellation after ready
+    // was queued. Sending a notification alone does not transfer responsibility.
+    let result = Arc::new(Mutex::new(None));
+    let slot = result.clone();
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let event_core = core.clone();
     core.spawn_owned(async move {
-        let result = future.await;
-        if let Err(result) = sender.send(result)
-            && let Err(error) = result
-        {
-            record_abandoned_error(&event_core, safe_path, &error);
+        let completed = future.await;
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completed);
+        let _ = sender.send(());
+        if ack_rx.await.is_err() {
+            let unclaimed = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(Err(error)) = unclaimed {
+                record_abandoned_error(&event_core, safe_path, &error);
+            }
         }
         notify_operation_test_settled(operation_name);
     })?;
-    with_operation_timeout(timeout, operation_name, async {
-        receiver
-            .await
-            .map_err(|_| NfsError::Rpc("owned operation task ended without a result".to_string()))?
+    with_operation_timeout(timeout, operation_name, async move {
+        receiver.await.map_err(|_| {
+            NfsError::Rpc("owned operation task ended without a result".to_string())
+        })?;
+        let value = result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let _ = ack_tx.send(());
+        value.unwrap_or_else(|| {
+            Err(NfsError::Rpc(
+                "owned operation result already consumed".into(),
+            ))
+        })
     })
     .await
 }
@@ -4460,6 +4688,38 @@ impl SyncClient {
         )
     }
 
+    #[pyo3(signature = (operation, path, other=None, offset=0, second_offset=0, count=0, value=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn v42<'py>(
+        &self,
+        py: Python<'py>,
+        operation: String,
+        path: String,
+        other: Option<String>,
+        offset: u64,
+        second_offset: u64,
+        count: u64,
+        value: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let result = self.run_operation(
+            py,
+            "v42",
+            v42_recovery_path(&operation, &path, other.as_deref()),
+            v42_operation(
+                self.core.clone(),
+                self.health_source.clone(),
+                operation,
+                path,
+                other,
+                offset,
+                second_offset,
+                count,
+                value,
+            ),
+        )?;
+        v42_dict(py, result)
+    }
+
     fn getxattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<Vec<u8>> {
         self.run_operation(
             py,
@@ -5027,6 +5287,48 @@ impl AsyncClient {
         })
     }
 
+    #[pyo3(signature = (operation, path, other=None, offset=0, second_offset=0, count=0, value=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn v42<'py>(
+        &self,
+        py: Python<'py>,
+        operation: String,
+        path: String,
+        other: Option<String>,
+        offset: u64,
+        second_offset: u64,
+        count: u64,
+        value: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let work_core = core.clone();
+        let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
+        let safe_path = v42_recovery_path(&operation, &path, other.as_deref());
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = cancellation_safe_owned_operation(
+                core,
+                safe_path,
+                "v42",
+                timeout,
+                v42_operation(
+                    work_core,
+                    mount,
+                    operation,
+                    path,
+                    other,
+                    offset,
+                    second_offset,
+                    count,
+                    value,
+                ),
+            )
+            .await
+            .map_err(nfs_error)?;
+            Python::attach(|py| v42_dict(py, result).map(Bound::unbind))
+        })
+    }
+
     fn getxattr<'py>(
         &self,
         py: Python<'py>,
@@ -5577,6 +5879,67 @@ mod directory_batch_tests {
             mount: tokio::sync::Mutex::new(None),
             resources: Arc::new(AdapterResources::default()),
         }))
+    }
+
+    #[test]
+    fn v42_copy_and_clone_recovery_targets_destination() {
+        for operation in ["copy_range", "clone_range"] {
+            assert_eq!(
+                v42_recovery_path(operation, "source", Some("destination")),
+                Some("destination".into())
+            );
+            assert_eq!(v42_recovery_path(operation, "source", None), None);
+        }
+        assert_eq!(
+            v42_recovery_path("allocate", "file", None),
+            Some("file".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_abandoned_copy_keeps_uncertainty_inside_close_failures() {
+        let core = core();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let error = NfsError::OperationOutcome(Box::new(crate::OperationOutcomeError::new(
+            crate::OperationOutcome::Uncertain,
+            crate::OperationClass::ReplaySensitive,
+            crate::RecoveryAction::VerifyThenResume,
+            crate::RequestContext {
+                operation: "copy".into(),
+                protocol: NFSVersion::NFSv4p2,
+                request_id: None,
+            },
+            NfsError::Rpc("lost COPY reply".into()),
+        )));
+        let error = finish_v42_open::<()>(
+            Err(error),
+            Err(NfsError::Rpc("destination CLOSE failed".into())),
+        );
+        let mut operation = Box::pin(cancellation_safe_owned_operation(
+            core.clone(),
+            Some("destination".into()),
+            "v42",
+            None,
+            async move {
+                let _ = ready_tx.send(());
+                finish_v42_open(error, Err(NfsError::Rpc("source CLOSE failed".into())))
+            },
+        ));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        ready_rx.await.unwrap();
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while core.owned_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let events = core.recovery_events().unwrap();
+        assert_eq!(events.len(), 1, "lost nested abandoned COPY error");
+        assert_eq!(events[0].operation, "copy");
+        assert_eq!(events[0].safe_path.as_deref(), Some("destination"));
+        assert_eq!(events[0].outcome, crate::OperationOutcome::Uncertain);
     }
 
     fn entry(i: usize) -> Result<DirectoryEntry> {

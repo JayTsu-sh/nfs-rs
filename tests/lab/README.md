@@ -161,3 +161,54 @@ machine-local JSON dumps outside the checkout (for example in a private local
 evidence directory or `$RUNNER_TEMP`). They are not repository changes or release
 acceptance baselines. Commit only reusable tests and deliberately redacted,
 reviewed documentation; retain raw investigation data locally for reproduction.
+
+
+## AFX NFSv4.2
+
+Run `run-afx-v42-e2e.sh` on the AFX data-network executor, with a unique
+`nightly-*` or `release-*` ID. This profile uses `svm2`'s existing `/pnfs_test2`
+export and four LIFs `192.168.9.101`–`.104`. It does not contact the unrelated
+Terrasync `.12`/`.13`/`.14` hosts. Credentials remain in the local CICD notes.
+
+Build the Rust lab test binary from the current checkout (a static musl
+binary works on the AFX executor's glibc 2.34 host). Build a separate ordinary
+Python wheel **without** `python-test-support`, compatible with the executor,
+and install it in a dedicated CPython 3.11+ virtual environment. The runner
+rejects test-support wheels because their metadata/directory fixtures are
+unsuitable for physical validation. Test-support wheels are only for the
+local installed-adapter unit suite and must never be published.
+
+```bash
+NFS_RS_LAB_TEST_BINARY=/path/to/lab_e2e \
+NFS_RS_LAB_PYTHON=/path/to/venv/bin/python \
+NFS_RS_LAB_EVIDENCE_DIR=/path/outside/checkout/evidence \
+  tests/lab/run-afx-v42-e2e.sh nightly-v42-unique-id
+```
+
+The runner holds `/tmp/nfsrs-svm2-issue40.lock`, calls `prepare-run.sh` with
+`LAB_PROFILE=afx`, tests exact v4.2 on every LIF, and unconditionally calls
+`cleanup-run.sh` for its successfully prepared directory. Preparation fails
+on an existing run ID; that failure never authorizes deleting the directory.
+Preparation/cleanup use a temporary kernel NFSv4.2 mount as an independent
+oracle and only mutate the run's own leaf. `LAB_AFX_DATA`, `LAB_AFX_EXPORT`
+and whitespace-separated `LAB_AFX_LIFS` can select a different AFX fixture.
+
+Rust covers file/namespace operations, full read-back integrity, stateful
+locks, directory enumeration and negotiated I/O limits. Unsupported ACL
+capability is reported explicitly. With `NFS_RS_LAB_PYTHON` supplied, the
+runner also executes both installed-wheel Python validators, including sync
+and async public APIs, capability errors and repeated payload integrity
+checks. Omitting it prints a Python skip. These are functional/capability
+checks, not release performance acceptance or proof of physical multi-DS
+routing, callback recall, or fault recovery.
+
+
+The AFX runner also writes `rust-v42-operations.json`, separately recording
+COPY, CLONE, SEEK DATA/HOLE, ALLOCATE, DEALLOCATE, READ_PLUS, ACL attributes and
+RFC 8276 xattrs on every LIF. Xattr validation includes files and directories,
+binary/empty values, CREATE/REPLACE semantics, NOXATTR and listing 49 keys
+across the 4096-byte page budget. Unsupported operations are explicit JSON
+outcomes, not successful feature checks. The Python validator invokes the new
+APIs on sync and async clients and records their optional rejections. No SVM
+feature switch is changed by this runner; inspect current configuration and
+wire outcomes before claiming positive physical support.

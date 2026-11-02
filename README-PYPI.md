@@ -5,7 +5,7 @@ exports directly from Python without a kernel mount or a C NFS library.
 
 - NFSv3 (the default when no version is selected)
 - experimental NFSv4.0, selected explicitly as `4.0`
-- NFSv4.1, including negotiated file-layout pNFS
+- NFSv4.1 and NFSv4.2, including negotiated file-layout pNFS
 - synchronous and native async APIs
 - file, directory, metadata, link, and extended-attribute operations
 - directory scans with reusable file handles and file attributes
@@ -35,8 +35,9 @@ print(files("nfs_rs").joinpath("API.md").read_text(encoding="utf-8"))
 print(files("nfs_rs").joinpath("GUIDE.md").read_text(encoding="utf-8"))
 ```
 
-Named attributes use the optional NFSv4.1 OPENATTR file interface, not the
-NFSv4.2 GETXATTR/SETXATTR extension or a portable mapping of Linux POSIX xattrs.
+The xattr methods use OPENATTR named attributes on v4.0/v4.1 and RFC 8276
+extended attributes on v4.2. These are distinct namespaces with no implicit
+fallback. Inspect `client.nfs42_attributes(path).xattr_support` on v4.2.
 There is no fixed client limit on the complete value size; server and file system
 limits still apply. Negotiated read/write sizes limit individual requests.
 `getxattr` continues short reads to EOF and buffers the complete value in memory.
@@ -48,7 +49,7 @@ write and cleanup failures remain available in the error source chain.
 
 ## Select a protocol version
 
-The Python API accepts exactly `"3"`, `"4.0"`, and `"4.1"`. Select one in the
+The Python API accepts exactly `"3"`, `"4.0"`, `"4.1"`, and `"4.2"`. Select one in the
 URL or pass an ordered fallback list to `versions`:
 
 ```python
@@ -73,7 +74,11 @@ with Client.connect(
     print("negotiated", client.version)
 ```
 
-The ambiguous selector `"4"` and unimplemented NFSv4.2 are rejected. NFSv4.0
+NFSv4.2 runs the existing file APIs with `version=4.2` or `Version.NFS_V4_2`.
+`versions=["4.2", "4.1"]` explicitly allows fallback. Optional server-side
+COPY/CLONE, SEEK, ALLOCATE/DEALLOCATE, READ_PLUS and RFC 8276 xattrs are exposed.
+COPY is synchronous and intra-server; cross-server/async offload is not exposed.
+The ambiguous selector `"4"` is rejected. NFSv4.0
 is experimental and requires the exact `"4.0"` selector.
 
 ## Install

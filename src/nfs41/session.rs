@@ -13,6 +13,7 @@ use bytes::{Buf, Bytes};
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
+use super::MinorVersion;
 use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse};
 use super::mount::{DELAY_RETRY_MAX, delay_with_jitter_ms, grace_with_jitter_ms};
 use crate::error::{NfsError, Result};
@@ -39,6 +40,7 @@ pub(crate) const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
 /// - verifier 使用进程级常量，仅进程重启时变化（通知服务端回收旧状态）
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
+    pub minor_version: MinorVersion,
     /// 唯一的 co_ownerid，格式："nfs-rs-{random_hex}"
     pub owner_id: String,
     /// 进程级 verifier，所有 mount 实例共享，仅进程重启时变化
@@ -47,10 +49,16 @@ pub(crate) struct ClientIdentity {
 
 impl ClientIdentity {
     /// 创建一个新的唯一客户端身份（owner_id 唯一，verifier 进程共享）
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_minor_version(MinorVersion::V1)
+    }
+
+    pub fn with_minor_version(minor_version: MinorVersion) -> Self {
         let unique_id = rand::random::<u64>();
         Self {
-            owner_id: format!("nfs-rs-{unique_id:016x}"),
+            owner_id: format!("nfs-rs-{unique_id:016x}-v4.{}", minor_version as u32),
+            minor_version,
             verifier: *PROCESS_VERIFIER,
         }
     }
@@ -58,6 +66,7 @@ impl ClientIdentity {
 
 /// NFSv4.1 session state.
 pub(crate) struct Session {
+    minor_version: MinorVersion,
     /// Monotonic local generation assigned when published by SessionHolder.
     generation: u64,
     /// 16-byte session ID from CREATE_SESSION.
@@ -339,6 +348,7 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn for_test(marker: u8) -> Session {
         Session {
+            minor_version: MinorVersion::V1,
             generation: 0,
             session_id: [marker; 16],
             client_id: marker as u64,
@@ -352,6 +362,17 @@ impl Session {
             backchannel_max_operations: 2,
             pnfs_mds: false,
         }
+    }
+
+    pub fn minor_version(&self) -> MinorVersion {
+        self.minor_version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_v42_test(marker: u8) -> Session {
+        let mut session = Self::for_test(marker);
+        session.minor_version = MinorVersion::V2;
+        session
     }
 
     /// Session ID (16 bytes).
@@ -461,11 +482,13 @@ impl Session {
             auth,
             client_id,
             create_seq_id,
+            client_identity.minor_version,
             0x00000002, // CREATE_SESSION4_FLAG_CONN_BACK_CHAN
         )
         .await?;
 
         let session = Session {
+            minor_version: client_identity.minor_version,
             generation: 1,
             session_id,
             client_id,
@@ -564,17 +587,38 @@ impl Session {
         auth: &Auth,
         client_identity: &ClientIdentity,
     ) -> Result<Self> {
+        // RFC 7862 §§3.2–3.3: a v4.2 MDS may advertise v4.1 data servers.
+        // Only a definite minor-version rejection permits DS downgrade.
+        let mut identity = client_identity.clone();
         let (client_id, create_seq_id, eir_flags) =
-            exchange_id_step(rpc, auth, client_identity, EXCHGID4_FLAG_USE_PNFS_DS).await?;
+            match exchange_id_step(rpc, auth, &identity, EXCHGID4_FLAG_USE_PNFS_DS).await {
+                Err(NfsError::Nfs4(
+                    crate::nfs4::fastxdr::nfsstat4::NFS4ERR_MINOR_VERS_MISMATCH,
+                )) if identity.minor_version == MinorVersion::V2 => {
+                    identity.minor_version = MinorVersion::V1;
+                    // A clientid is scoped to one minor version (RFC 8178 §8.1).
+                    identity.owner_id.push_str("-ds-v4.1");
+                    exchange_id_step(rpc, auth, &identity, EXCHGID4_FLAG_USE_PNFS_DS).await?
+                }
+                result => result?,
+            };
         info!(
             client_id,
             create_seq_id, eir_flags, "DS EXCHANGE_ID successful"
         );
 
-        let (session_id, fore_channel, _back_channel) =
-            create_session_step(rpc, auth, client_id, create_seq_id, 0).await?;
+        let (session_id, fore_channel, _back_channel) = create_session_step(
+            rpc,
+            auth,
+            client_id,
+            create_seq_id,
+            identity.minor_version,
+            0,
+        )
+        .await?;
 
         Ok(Session {
+            minor_version: identity.minor_version,
             generation: 1,
             session_id,
             client_id,
@@ -599,6 +643,14 @@ async fn exchange_id_step(
     client_identity: &ClientIdentity,
     flags: u32,
 ) -> Result<(u64, u32, u32)> {
+    // RFC 7862 §14.1: request fencing support; uncertainty semantics stay
+    // conservative because we do not rely on the server's returned fence flag.
+    let flags = flags
+        | if client_identity.minor_version == MinorVersion::V2 {
+            0x4
+        } else {
+            0
+        };
     let verifier = &client_identity.verifier;
     let owner_id = client_identity.owner_id.as_bytes();
 
@@ -607,10 +659,10 @@ async fn exchange_id_step(
         owner_id,
         flags,
         "nfs-rs",
-        "nfs-rs NFSv4.1 client",
+        "nfs-rs NFSv4.1/v4.2 client",
     );
 
-    let resp = send_compound_no_session(rpc, auth, builder).await?;
+    let resp = send_compound_no_session(rpc, auth, builder, client_identity.minor_version).await?;
     resp.check_status()?;
     let op = resp.op_ok(0)?;
     let mut data = op.data.clone();
@@ -631,6 +683,7 @@ async fn create_session_step(
     auth: &Auth,
     client_id: u64,
     create_seq_id: u32,
+    minor_version: MinorVersion,
     csa_flags: u32,
 ) -> Result<([u8; 16], ChannelAttrs, ChannelAttrs)> {
     let fore_attrs = ChannelAttrsArgs {
@@ -659,7 +712,7 @@ async fn create_session_step(
         super::callback::CB_PROGRAM,
     );
 
-    let resp = send_compound_no_session(rpc, auth, builder).await?;
+    let resp = send_compound_no_session(rpc, auth, builder, minor_version).await?;
     resp.check_status()?;
     let op = resp.op_ok(0)?;
     let mut data = op.data.clone();
@@ -694,8 +747,16 @@ async fn send_compound_no_session(
     rpc: &rpc::Client,
     auth: &Auth,
     builder: CompoundBuilder,
+    minor_version: MinorVersion,
 ) -> Result<CompoundResponse> {
-    send_compound(rpc, auth, builder, std::time::Duration::from_secs(10)).await
+    send_compound(
+        rpc,
+        auth,
+        builder,
+        minor_version,
+        std::time::Duration::from_secs(10),
+    )
+    .await
 }
 
 /// Send a COMPOUND with custom timeout.
@@ -703,10 +764,11 @@ async fn send_compound(
     rpc: &rpc::Client,
     auth: &Auth,
     builder: CompoundBuilder,
+    minor_version: MinorVersion,
     timeout: std::time::Duration,
 ) -> Result<CompoundResponse> {
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, minor_version, &mut buf);
     let response_bytes = rpc.call(buf, super::BOOTSTRAP_REPLAY, timeout).await?;
     CompoundResponse::decode(response_bytes)
 }
@@ -721,7 +783,7 @@ async fn send_compound_on_session(
     builder.enforce_max_operations(session.max_operations())?;
     let requested_ops = builder.op_count();
     let mut buf = Vec::new();
-    builder.encode_with_header(auth, &mut buf);
+    builder.encode_with_header(auth, session.minor_version(), &mut buf);
     let request_size = buf
         .len()
         .checked_add(8)
