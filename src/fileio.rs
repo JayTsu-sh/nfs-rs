@@ -326,6 +326,7 @@ pub(crate) const READ_CONCURRENCY: usize = 8;
 /// Fill only the requested range. Consume responses in offset order so EOF
 /// or an error cannot leave a reported byte count that skips a hole.
 /// Short non-empty responses are continued rather than treated as EOF.
+#[cfg(any(test, feature = "python-bindings"))]
 pub(crate) async fn read_into_with<I, F>(
     io: &I,
     fh: Bytes,
@@ -454,22 +455,37 @@ impl BufferedFile {
         }
     }
 
+    /// Read the requested range, reusing a single owned response without a copy.
+    /// Multiple response pieces are joined only when contiguous output needs it.
     pub async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes> {
         let guard = self.writes.read().await;
         guard.require_open()?;
-        let mut data = BytesMut::new();
-        read_into_with(
+        let mut first: Option<Bytes> = None;
+        let mut joined: Option<BytesMut> = None;
+        read_chunks_with(
             self.io.as_ref(),
             self.fh.clone(),
             offset,
             len as usize,
             |_, piece| {
-                data.extend_from_slice(piece);
+                if let Some(data) = &mut joined {
+                    data.extend_from_slice(&piece);
+                } else if let Some(previous) = first.take() {
+                    let mut data = BytesMut::with_capacity(previous.len() + piece.len());
+                    data.extend_from_slice(&previous);
+                    data.extend_from_slice(&piece);
+                    joined = Some(data);
+                } else {
+                    first = Some(piece);
+                }
                 Ok(())
             },
         )
         .await?;
-        Ok(data.freeze())
+        Ok(match joined {
+            Some(data) => data.freeze(),
+            None => first.unwrap_or_default(),
+        })
     }
 
     pub async fn write_at(&self, offset: u64, data: Bytes) -> Result<()> {
@@ -516,6 +532,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         data: AsyncMutex<Vec<u8>>,
+        read_backing: Option<Bytes>,
         reads: AtomicUsize,
         unstable_writes: AtomicUsize,
         commits: AtomicUsize,
@@ -562,6 +579,12 @@ mod tests {
             } else {
                 count
             };
+            if let Some(data) = &self.read_backing {
+                let start = (offset as usize).min(data.len());
+                let end = (start + count as usize).min(data.len());
+                self.concurrent_reads.fetch_sub(1, Ordering::SeqCst);
+                return Ok(data.slice(start..end));
+            }
             let data = self.data.lock().await;
             let start = (offset as usize).min(data.len());
             let end = (start + count as usize).min(data.len());
@@ -781,6 +804,72 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn single_reply_read_reuses_owned_response_bytes() {
+        let backing = Bytes::from(b"abcdefgh".to_vec());
+        let expected = backing.slice(1..4);
+        let fake = Arc::new(Fake {
+            read_backing: Some(backing),
+            ..Default::default()
+        });
+        let result = file(fake).read_at(1, 3).await.unwrap();
+        assert_eq!(result.as_ref(), b"bcd");
+        assert_eq!(result.as_ptr(), expected.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn one_piece_before_eof_survives_close_without_a_copy() {
+        let backing = Bytes::from(b"abc".to_vec());
+        let address = backing.as_ptr();
+        let f = file(Arc::new(Fake {
+            read_backing: Some(backing),
+            ..Default::default()
+        }));
+        let result = f.read_at(0, 12).await.unwrap();
+        f.close().await.unwrap();
+        drop(f);
+        assert_eq!(result.as_ref(), b"abc");
+        assert_eq!(result.as_ptr(), address);
+    }
+
+    #[tokio::test]
+    async fn buffered_short_reads_join_in_order_and_propagate_later_errors() {
+        let backing = Bytes::from(b"abcdefghij".to_vec());
+        let fake = Arc::new(Fake {
+            read_backing: Some(backing.clone()),
+            short_read: 2,
+            read_delay: Some(|offset| if offset == 0 { 20 } else { 1 }),
+            ..Default::default()
+        });
+        let result = file(fake).read_at(0, 16).await.unwrap();
+        assert_eq!(result.as_ref(), b"abcdefghij");
+        assert_ne!(result.as_ptr(), backing.as_ptr());
+        let fake = Arc::new(Fake {
+            read_backing: Some(backing),
+            short_read: 2,
+            fail_read_at: Some(2),
+            ..Default::default()
+        });
+        assert!(file(fake).read_at(0, 4).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_read_releases_an_already_received_piece() {
+        let fake = Arc::new(Fake {
+            read_backing: Some(Bytes::from(b"abcdefgh".to_vec())),
+            read_delay: Some(|offset| if offset == 0 { 1 } else { 60_000 }),
+            ..Default::default()
+        });
+        let f = file(fake.clone());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), f.read_at(0, 8))
+                .await
+                .is_err()
+        );
+        assert!(fake.read_backing.as_ref().unwrap().is_unique());
+        f.close().await.unwrap();
     }
 
     #[tokio::test]

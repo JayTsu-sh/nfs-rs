@@ -130,6 +130,9 @@ Read and write RPC sizes are determined automatically during mount from server l
 and `BufferedFile::write_at` send at most 8 concurrent UNSTABLE chunks sized by
 negotiated `max_write`, complete short writes, then finish a batch commit
 before returning. There is no writeback mode or automatic byte threshold.
+`BufferedFile::read_at` returns a single owned response without copying its
+payload; it allocates a contiguous output buffer only when joining multiple
+response pieces. Returned bytes remain valid after the file is closed.
 `Mount::write` is the low-level UNSTABLE primitive. Its `WriteOutcome` exposes
 `count`, `committed: WriteCommitted` (`Unstable`, `DataSync`, or `FileSync`),
 and `verifier`. `committed` is the server's response, not the requested level;
@@ -155,6 +158,11 @@ need separate opens even when their file handles are equal. Successful `close`
 is idempotent and subsequent reads, writes and flushes return `ClosedResource`.
 A failed or cancelled close keeps the wrapper unusable; release remaining protocol
 state with `Mount::umount` before discarding the mount.
+
+The opt-in [memory regression benchmark](docs/benchmarks/memory-regression.md)
+separates live Rust allocations from RSS and uses the same shared payload pattern
+for every protocol. Its physical diagnostics supplement the existing release
+performance gate.
 
 RPC deadlines include waiting for readiness, the writer lock, socket transmission
 and the reply. Dropping a Rust future during a partial send shuts down that TCP

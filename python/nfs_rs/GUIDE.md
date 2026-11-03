@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.2/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -26,7 +26,7 @@ The release pipeline exercises NFSv3, NFSv4.0 and NFSv4.1 using the final
 x86_64 wheel and a wheel rebuilt from the final source distribution against
 real NFSv3, NFSv4.0, NFSv4.1, and NFSv4.1 pNFS environments. NFSv4.2
 was separately validated on all four AFX data LIFs with the relevant server
-features enabled; see the [AFX report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/docs/validation/nfsv42-review-2026-11-02.md).
+features enabled; see the [AFX report](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.2/docs/validation/nfsv42-review-2026-11-02.md).
 Optional operations remain dependent on the server, as described below.
 
 Read and write RPC sizes are determined automatically during mount from server limits, bounded by the client payload ceiling (4 MiB) and negotiated NFSv4.1 session capacities. URL and Python `rsize`/`wsize` options are no longer accepted. Python `io_limits` reports the effective mount limits; pNFS data servers may require smaller chunks.
@@ -622,7 +622,7 @@ repository's validation notes and do not define other servers' capabilities.
 On the tested AFX export, enabled sparse operations support whole-file
 deallocation; partial punching returns NFS4ERR_IO, also reproduced with the
 Linux kernel client. See the
-[enabled-feature validation](https://github.com/JayTsu-sh/nfs-rs/blob/v0.10.1/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
+[enabled-feature validation](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.2/docs/validation/nfsv42-afx-enabled-2026-11-02.md).
 
 
 ## Temporary server-busy responses
