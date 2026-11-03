@@ -30,19 +30,44 @@ impl Mount {
     }
 
     pub async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes> {
+        self.create_with_guard(dir_fh, filename, mode, false).await
+    }
+
+    pub(crate) async fn create_guarded(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
+    ) -> Result<ObjRes> {
+        self.create_with_guard(dir_fh, filename, mode, true).await
+    }
+
+    async fn create_with_guard(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
+        guarded: bool,
+    ) -> Result<ObjRes> {
+        let attributes = sattr3 {
+            mode: mode.map_or(set_mode3::default, set_mode3::TRUE),
+            uid: set_uid3::default,
+            gid: set_gid3::default,
+            size: set_size3::default,
+            atime: set_atime::default,
+            mtime: set_mtime::default,
+        };
         let args = CREATE3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
                 name: filename3(filename.to_string()),
             },
-            how: createhow3::UNCHECKED(sattr3 {
-                mode: mode.map_or(set_mode3::default, set_mode3::TRUE),
-                uid: set_uid3::default,
-                gid: set_gid3::default,
-                size: set_size3::default,
-                atime: set_atime::default,
-                mtime: set_mtime::default,
-            }),
+            // RFC 1813 §3.3.8: only GUARDED success proves fresh creation.
+            how: if guarded {
+                createhow3::GUARDED(attributes)
+            } else {
+                createhow3::UNCHECKED(attributes)
+            },
         };
         self._create(args).await?.into()
     }

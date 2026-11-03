@@ -16,9 +16,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Python creating opens reuse the resolved parent directory. Built-in NFS
+  engines use guarded creation, omit size-zero SETATTR only after confirmed
+  fresh creation, and send NFSv4 creation permissions with OPEN when supported.
+  Existing and concurrently created files retain their permissions and still
+  truncate for `wb`/`w+b`; append modes preserve contents.
+
 - Python sync and async `listdir` use name-only READDIR rather than
   `scandir`/READDIRPLUS. They no longer require full directory-entry attributes;
   use `scandir` when metadata or file handles are needed.
+
+### Added
+
+- Rust `OpenOptions` and `Mount::open_path_with_options` express access,
+  optional creation permissions, and truncation through one stateful API.
+  Close the returned resource with `Mount::close_stateful`.
 
 ## [0.11.1] - 2026-11-02
 

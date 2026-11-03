@@ -287,6 +287,16 @@ with Client.connect("nfs://server/export?version=4.1") as client:
 
 Supported binary modes are `rb`, `wb`, `ab`, `r+b`, `w+b`, and `a+b`.
 
+`wb` and `w+b` create a missing file or truncate an existing file before
+returning. `ab` and `a+b` create if needed and preserve existing contents.
+Creation requests permissions `0666`; existing-file permissions are preserved,
+including when another client creates the name concurrently. Creating opens
+reuse the resolved parent directory. A confirmed fresh create needs no extra
+truncate; NFSv4 also sends permissions with OPEN, with a separate SETATTR
+fallback if the server rejects those creation attributes. Creating/truncating
+opens are non-transactional: a later error can leave the file created or
+truncated. These rules also apply to `AsyncClient.open()`.
+
 ```python
 from nfs_rs import Client
 

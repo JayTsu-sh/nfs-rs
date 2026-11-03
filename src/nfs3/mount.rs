@@ -87,6 +87,20 @@ impl crate::Mount for Mount3 {
         self.m.create_path(path, mode).await
     }
 
+    async fn open_path_with_options(
+        &self,
+        path: &str,
+        options: crate::OpenOptions,
+    ) -> Result<crate::OpenFile> {
+        crate::mount::open_path_guarded(self, path, options, |parent, name| async move {
+            self.m
+                .create_guarded(parent, &name, options.create_mode)
+                .await
+                .map(crate::OpenFile::from_object)
+        })
+        .await
+    }
+
     async fn fsinfo(&self) -> Result<crate::mount::FSInfo> {
         self.m.fsinfo().await
     }
@@ -462,6 +476,120 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn guarded_open_options_reuse_parent_and_preserve_raced_file_attributes() {
+        use crate::Mount as _;
+        use crate::nfs4::compound::{take_opaque, xdr_opaque};
+        use bytes::Buf;
+        for raced in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rpc = rpc::Client::new(
+                rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+                    .await
+                    .unwrap(),
+                None,
+            );
+            let mount = Mount3 {
+                m: Mount {
+                    rpc,
+                    auth: crate::Auth::new_null(),
+                    fh: Bytes::from_static(b"root"),
+                    dir: "/".into(),
+                    dircount: 8192,
+                    maxcount: 8192,
+                    rsize: 4096,
+                    wsize: 4096,
+                },
+                posix_acl: None,
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let expected = if raced {
+                    vec![3, 3, 8, 3, 2]
+                } else {
+                    vec![3, 3, 8]
+                };
+                for (index, procedure) in expected.iter().enumerate() {
+                    let request = read_record(&mut stream).await.unwrap();
+                    assert_eq!(
+                        u32::from_be_bytes(request[20..24].try_into().unwrap()),
+                        *procedure
+                    );
+                    let mut args = Bytes::copy_from_slice(&request[40..]); // AUTH_NULL RPC header
+                    let fh = take_opaque(&mut args, "fh").unwrap();
+                    assert_eq!(
+                        fh.as_ref(),
+                        if index == 0 {
+                            b"root".as_slice()
+                        } else if *procedure == 2 {
+                            b"file".as_slice()
+                        } else {
+                            b"parent".as_slice()
+                        }
+                    );
+                    let mut payload = vec![];
+                    if *procedure == 3 {
+                        let name = take_opaque(&mut args, "name").unwrap();
+                        assert_eq!(
+                            name.as_ref(),
+                            if index == 0 {
+                                b"parent".as_slice()
+                            } else {
+                                b"new"
+                            }
+                        );
+                        if index == 1 {
+                            payload.extend_from_slice(&2u32.to_be_bytes());
+                            payload.extend_from_slice(&0u32.to_be_bytes());
+                        } else {
+                            payload.extend_from_slice(&0u32.to_be_bytes());
+                            xdr_opaque(&mut payload, if index == 0 { b"parent" } else { b"file" });
+                            payload.extend_from_slice(&[0; 8]); // object + directory attributes absent
+                        }
+                    } else if *procedure == 8 {
+                        assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"new");
+                        assert_eq!(args.get_u32(), 1, "RFC 1813 GUARDED creation");
+                        assert_eq!(args.get_u32(), 1);
+                        assert_eq!(args.get_u32(), 0o666);
+                        assert_eq!(args.as_ref(), &[0; 20]); // uid/gid/size/atime/mtime unset
+                        if raced {
+                            payload.extend_from_slice(&17u32.to_be_bytes());
+                            payload.extend_from_slice(&[0; 8]);
+                        } else {
+                            payload.extend_from_slice(&[0; 4]);
+                            payload.extend_from_slice(&1u32.to_be_bytes());
+                            xdr_opaque(&mut payload, b"file");
+                            payload.extend_from_slice(&[0; 12]); // attributes + wcc absent
+                        }
+                    } else {
+                        // Only SIZE=0, never reset the concurrent creator's mode.
+                        assert_eq!(args.split_to(12).as_ref(), &[0; 12]);
+                        assert_eq!(args.get_u32(), 1);
+                        assert_eq!(args.get_u64(), 0);
+                        assert_eq!(args.as_ref(), &[0; 12]);
+                        payload.extend_from_slice(&[0; 12]);
+                    }
+                    reply(&mut stream, &request, &payload).await.unwrap();
+                }
+                // Keep the fixture connected through the caller's local CLOSE.
+                let _ = read_record(&mut stream).await;
+            });
+            let file = mount
+                .open_path_with_options(
+                    "parent/new",
+                    crate::OpenOptions {
+                        access: crate::OPEN_WRITE,
+                        create_mode: Some(0o666),
+                        truncate: true,
+                    },
+                )
+                .await
+                .unwrap();
+            mount.close_stateful(file).await.unwrap();
+            server.abort();
+        }
+    }
 
     async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;

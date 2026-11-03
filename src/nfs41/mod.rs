@@ -13,6 +13,8 @@ pub(crate) mod layout;
 pub(crate) mod lease;
 mod lookup;
 pub(crate) mod mount;
+#[cfg(test)]
+mod open_options_tests;
 pub(crate) mod pnfs_io;
 mod read;
 mod readdir;

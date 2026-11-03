@@ -698,6 +698,17 @@ impl CompoundBuilder {
         self
     }
 
+    /// RFC 8881 §18.16.3: a successful GUARDED4 OPEN proves fresh creation.
+    pub fn open_guarded(mut self, open_args: &OpenArgs) -> Self {
+        let mut args = Vec::new();
+        open_args.encode_create(&mut args, true);
+        self.ops.push(EncodedOp {
+            opcode: OpNum::Open,
+            args,
+        });
+        self
+    }
+
     pub fn close(mut self, seqid: u32, stateid: &[u8; 16]) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, seqid);
@@ -1215,6 +1226,10 @@ pub(crate) struct OpenArgs {
 
 impl OpenArgs {
     fn encode(&self, buf: &mut Vec<u8>) {
+        self.encode_create(buf, false);
+    }
+
+    fn encode_create(&self, buf: &mut Vec<u8>, guarded: bool) {
         xdr_u32(buf, self.seqid);
         // 统一附加 WANT_NO_DELEG：合规服务器（knfsd/ONTAP）将不再授予 delegation
         let share_access = if self.want_no_delegation {
@@ -1230,7 +1245,7 @@ impl OpenArgs {
         // openflag4
         if self.create {
             xdr_u32(buf, 1); // OPEN4_CREATE
-            xdr_u32(buf, 0); // UNCHECKED4
+            xdr_u32(buf, u32::from(guarded)); // UNCHECKED4 / GUARDED4
             // fattr4: createattrs
             xdr_bitmap(buf, &self.create_attrs_mask);
             xdr_var_bytes(buf, &self.create_attrs_vals);

@@ -3357,43 +3357,16 @@ async fn open_file(
         return Err(error);
     }
     let resource = if let Some(mount) = mount {
-        let file = match mount.open_path_stateful(&path, mode.access()).await {
-            Ok(file) => file,
-            Err(error) if mode.create && error.is_not_found() => {
-                match mount
-                    .create_path_stateful_with_access(
-                        &path,
-                        mode.create_permissions(),
-                        mode.access(),
-                    )
-                    .await
-                {
-                    Ok(file) => file,
-                    Err(error) if error.is_exist() => {
-                        mount.open_path_stateful(&path, mode.access()).await?
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        if mode.truncate
-            && let Err(error) = mount
-                .setattr(
-                    file.file_handle(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(0),
-                    None,
-                    None,
-                )
-                .await
-        {
-            let _ = mount.close_stateful(file).await;
-            return Err(error);
-        }
+        let file = mount
+            .open_path_with_options(
+                &path,
+                crate::OpenOptions {
+                    access: mode.access(),
+                    create_mode: mode.create_permissions(),
+                    truncate: mode.truncate,
+                },
+            )
+            .await?;
         let position = if mode.append {
             match mount.getattr(file.file_handle()).await {
                 Ok(attr) => attr.filesize,

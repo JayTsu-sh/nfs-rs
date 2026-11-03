@@ -1981,6 +1981,19 @@ impl crate::Mount for Mount41Wrapper {
             self.m.create_path_with_access(path, mode, access).await?,
         ))
     }
+    async fn open_path_with_options(
+        &self,
+        path: &str,
+        options: mount::OpenOptions,
+    ) -> Result<mount::OpenFile> {
+        let _operation = self.core.begin_operation()?;
+        mount::open_path_guarded(self, path, options, |parent, name| async move {
+            self.m
+                .create_guarded(parent, &name, options.create_mode, options.access)
+                .await
+        })
+        .await
+    }
     async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.mkdir(dir_fh, dirname, mode).await

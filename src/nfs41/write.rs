@@ -329,6 +329,125 @@ impl Mount41 {
             .await
     }
 
+    pub(crate) async fn create_guarded(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        mode: Option<u32>,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
+        let access_mode = match access {
+            crate::OPEN_READ => AccessMode::Read,
+            crate::OPEN_WRITE => AccessMode::Write,
+            crate::OPEN_BOTH => AccessMode::Both,
+            _ => {
+                return Err(NfsError::InvalidInput(format!(
+                    "invalid OPEN access {access}"
+                )));
+            }
+        };
+        let bitmap = standard_getattr_bitmap();
+        let mut with_attributes = true;
+        let resp = loop {
+            let (mask, values) = encode_setattr(
+                if with_attributes { mode } else { None },
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let args = OpenArgs {
+                seqid: 0,
+                share_access: access_mode.share_access(),
+                share_deny: 0,
+                client_id: self.session_holder.get().await.client_id(),
+                owner: Bytes::from_static(b"nfs-rs-create"),
+                create: true,
+                create_attrs_mask: mask,
+                create_attrs_vals: values,
+                claim_file: filename.to_string(),
+                want_no_delegation: !self.retain_delegations,
+            };
+            // Preserve OPEN progress: a failure in GETFH/GETATTR cannot authorize
+            // another guarded create or a modifying DELAY/GRACE retry.
+            let result = self
+                .compound_preserving_progress("create_guarded", 2, |b| {
+                    b.putfh(&dir_fh)
+                        .open_guarded(&args)
+                        .getfh()
+                        .getattr(&bitmap)
+                })
+                .await;
+            match result {
+                Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_ATTRNOTSUPP))
+                    if with_attributes && mode.is_some() =>
+                {
+                    // Definite OPEN rejection only; retain GUARDED on the
+                    // retry so a competing client cannot have its mode changed.
+                    with_attributes = false;
+                }
+                result => break result?,
+            }
+        };
+        resp.op_ok(1)?;
+        let open = resp.op_ok(2)?;
+        let mut open_data = open.data.clone();
+        let state_and_handle = (|| {
+            let stateid = extract_stateid(&mut open_data)?;
+            let fh = decode_fh(&mut resp.op_ok(3)?.data.clone())?;
+            Ok((stateid, fh))
+        })()
+        .map_err(|error| {
+            NfsError::OperationOutcome(Box::new(crate::error::OperationOutcomeError::new(
+                crate::OperationOutcome::Uncertain,
+                crate::OperationClass::ReplaySensitive,
+                crate::RecoveryAction::VerifyThenResume,
+                crate::RequestContext {
+                    operation: "create_guarded".into(),
+                    protocol: self.protocol_version(),
+                    request_id: None,
+                },
+                error,
+            )))
+        })?;
+        let (stateid, fh) = state_and_handle;
+        self.state
+            .register_open(
+                &fh,
+                StateId::from_bytes_at(&stateid, resp.session_generation),
+                access_mode,
+            )
+            .await?;
+        if !self.retain_delegations {
+            self.return_unsolicited_delegation(extract_open_delegation(&mut open_data), &fh);
+        }
+        let result: Result<_> = async {
+            let mut attr = decode_getattr_response(&mut resp.op_ok(4)?.data.clone())?;
+            if !with_attributes {
+                self.setattr(fh.clone(), None, mode, None, None, None, None, None)
+                    .await?;
+                if let Some(mode) = mode {
+                    attr.file_mode = mode;
+                }
+            }
+            Ok(attr)
+        }
+        .await;
+        match result {
+            Ok(attr) => Ok(mount::OpenFile::from_object(mount::ObjRes {
+                fh,
+                attr: Some(attr),
+            })),
+            Err(error) => {
+                // The file belongs to this successful guarded create. Keep the
+                // namespace entry, but release this operation's OPEN reference.
+                let _ = self.close_file(fh).await;
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) async fn create_path_with_access(
         &self,
         path: &str,
