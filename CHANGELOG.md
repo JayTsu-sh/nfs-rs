@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Fence Python async completion notifications before resuming awaiters, so
+  interpreter shutdown cannot race a bridge thread still returning from
+  `call_soon_threadsafe`. The fence releases the GIL while draining and also
+  handles cancelled futures after their cancellation callback runs.
+
+### Changed
+
+- Python sync and async `listdir` use name-only READDIR rather than
+  `scandir`/READDIRPLUS. They no longer require full directory-entry attributes;
+  use `scandir` when metadata or file handles are needed.
+
 ## [0.11.1] - 2026-11-02
 
 ### Fixed

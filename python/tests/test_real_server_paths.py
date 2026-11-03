@@ -1,6 +1,8 @@
 import asyncio
 import os
 import time
+import subprocess
+import sys
 
 import pytest
 
@@ -9,6 +11,36 @@ if not REAL_URL:
     pytest.skip("requires NFS_RS_PYTHON_REAL_URL", allow_module_level=True)
 
 from nfs_rs import AsyncClient, Client, DirectoryCookie, FileType, NfsBadCookieError
+
+
+def test_mixed_clients_exit_after_async_completion():
+    script = '''
+import asyncio
+import sys
+from nfs_rs import Client, AsyncClient
+
+client = Client.connect(sys.argv[1])
+try:
+    list(client.scandir(sys.argv[2]))
+finally:
+    client.close()
+
+async def main():
+    client = await AsyncClient.connect(sys.argv[1])
+    try:
+        await client.stat(sys.argv[2])
+    finally:
+        await client.close()
+
+asyncio.run(main())
+'''
+    for _ in range(10):
+        completed = subprocess.run(
+            [sys.executable, "-c", script, REAL_URL,
+             os.environ.get("NFS_RS_PYTHON_REAL_PARENT", ".")],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
 
 
 def test_real_server_sync_root_metadata_and_streaming_directory():
@@ -109,6 +141,7 @@ def test_real_server_scandir_page_resumes_on_a_new_client():
             assert sorted(listed) == sorted(expected)
             assert len(pages) > 2
             assert [entry.name for entry in client.scandir(path)] == listed
+            assert sorted(client.listdir(path)) == sorted(expected)
 
             middle = len(pages) // 2
             skipped = sum(len(names) for _, names in pages[:middle])
@@ -125,6 +158,7 @@ def test_real_server_scandir_page_resumes_on_a_new_client():
                 async with await AsyncClient.connect(REAL_URL) as async_client:
                     page = await async_client.scandir_page(path, pages[middle][0])
                     assert [entry.name for entry in page.entries] == pages[middle][1]
+                    assert sorted(await async_client.listdir(path)) == sorted(expected)
 
             asyncio.run(scenario())
         finally:

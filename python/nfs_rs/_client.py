@@ -701,7 +701,7 @@ class Client(_ClientOptions):
         return _directory_page(normalized, self._inner.scandir_page(normalized, fh, cookie, verifier))
 
     def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
-        return [entry.name for entry in self.scandir(path)]
+        return self._inner.listdir(_normalize_path(path))
 
     def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
         self._inner.chmod(_normalize_path(path), mode)
@@ -973,7 +973,8 @@ class AsyncClient(_ClientOptions):
         return _directory_page(normalized, await self._inner.scandir_page(normalized, fh, cookie, verifier))
 
     async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
-        return [entry.name async for entry in self.scandir(path)]
+        self._check_loop()
+        return await self._inner.listdir(_normalize_path(path))
 
     async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
         self._check_loop()

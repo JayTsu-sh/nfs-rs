@@ -832,7 +832,7 @@ Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir att
 def listdir(self, path: os.PathLike[str] | str='.') -> list[str]: ...
 ```
 
-Materialize scandir names into a list, without metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot.
+Read names using Mount.readdir and return them as a list, without requesting full per-entry metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
 
 #### Client.chmod
 
@@ -1210,7 +1210,7 @@ Await one directory page starting after position; the semantics, errors and resu
 async def listdir(self, path: os.PathLike[str] | str='.') -> list[str]: ...
 ```
 
-Materialize scandir names into a list, without metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot.
+Read names using Mount.readdir and return them as a list, without requesting full per-entry metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
 
 #### AsyncClient.chmod
 

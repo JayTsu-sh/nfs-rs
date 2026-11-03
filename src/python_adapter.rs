@@ -1,3 +1,5 @@
+mod completion;
+
 use crate::client_core::{
     ClientCore, ClientDriver, CoreOperation, CoreRecoveryEvent, OperationGuard, ResourceKey,
 };
@@ -2839,6 +2841,51 @@ fn test_directory_fails(_path: &str) -> bool {
     false
 }
 
+async fn directory_names(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>> {
+    let _operation = core.begin_operation()?;
+    let work = async {
+        if test_directory_blocks(&path) {
+            return with_operation_timeout(timeout, "listdir", std::future::pending()).await;
+        }
+        if test_directory_fails(&path) {
+            return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM));
+        }
+        if let Some(entries) = test_directory_entries(&path) {
+            return Ok(entries.into_iter().map(|(name, _)| name).collect());
+        }
+        let mount = mount.ok_or_else(|| {
+            NfsError::Unsupported("listdir requires a connected protocol engine".to_string())
+        })?;
+        let fh = with_operation_timeout(timeout, "listdir", mount.lookup_path(&path))
+            .await?
+            .fh;
+        // RFC 1813 §3.3.16, RFC 7530 §16.24, RFC 5661 §18.23: the
+        // protocol stream advances the directory cookie and verifier.
+        let mut entries = mount.readdir(fh).await;
+        let mut names = Vec::new();
+        while let Some(entry) = with_operation_timeout(timeout, "listdir", async {
+            entries.next().await.transpose()
+        })
+        .await?
+        {
+            names.push(entry.file_name);
+        }
+        Ok(names)
+    };
+    tokio::select! {
+        result = work => result,
+        () = core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => {
+            core.ensure_ready()?;
+            Err(NfsError::ClientClosed("client is closing".into()))
+        }
+    }
+}
+
 /// Test-support directory "paged": seven entries served three per page. Cookie
 /// of entry `i` is `i + 1`; any position other than a page boundary or the end
 /// with the fixture verifier (zero at the start) is a stale cookie. Directory
@@ -3121,7 +3168,7 @@ impl AsyncDirectoryCursor {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let item = with_operation_timeout(timeout, "scandir", async {
                 Ok(receiver.lock().await.recv().await)
             })
@@ -3455,7 +3502,7 @@ fn current_open_test_barrier() -> PyResult<Arc<OpenTestBarrier>> {
 #[pyfunction]
 fn _wait_open_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_open_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         barrier.entered.notified().await;
         Ok(())
     })
@@ -3472,7 +3519,7 @@ fn _release_open_test_barrier() -> PyResult<()> {
 #[pyfunction]
 fn _wait_open_test_registered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_open_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         barrier.registered.notified().await;
         Ok(())
     })
@@ -3482,7 +3529,7 @@ fn _wait_open_test_registered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 #[pyfunction]
 fn _wait_open_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_open_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         barrier.settled.notified().await;
         Ok(())
     })
@@ -3522,7 +3569,7 @@ fn current_operation_test_barrier() -> PyResult<Arc<OperationTestBarrier>> {
 #[pyfunction]
 fn _wait_operation_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_operation_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         loop {
             let entered = barrier.entered.notified();
             if barrier.entry_count.load(Ordering::Acquire) >= barrier.expected_entries {
@@ -3547,7 +3594,7 @@ fn _release_operation_test_barrier() -> PyResult<()> {
 #[pyfunction]
 fn _wait_operation_test_settled(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_operation_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         barrier.settled.notified().await;
         Ok(())
     })
@@ -3588,7 +3635,7 @@ fn current_fault_test_barrier() -> PyResult<Arc<FaultTestBarrier>> {
 #[pyfunction]
 fn _wait_fault_test_entered(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let barrier = current_fault_test_barrier()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         barrier.entered.notified().await;
         Ok(())
     })
@@ -4094,7 +4141,7 @@ impl AsyncFile {
     #[cfg(feature = "python-test-support")]
     fn _wait_closing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let resource = self.resource.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             if !resource.closed() {
                 resource.close_started.notified().await;
             }
@@ -4108,7 +4155,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let data =
                 cancellation_safe_file_operation(core, resource, "read", timeout, async move {
                     let _file_operation = work_resource.begin_operation().await?;
@@ -4126,7 +4173,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let data =
                 cancellation_safe_file_operation(core, resource, "read_at", timeout, async move {
                     let _file_operation = work_resource.begin_operation().await?;
@@ -4148,7 +4195,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "readinto", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.read_into(&target).await
@@ -4169,7 +4216,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "readinto_at", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.read_into_at(&target, offset).await
@@ -4185,7 +4232,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "seek", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.seek(offset, whence).await
@@ -4204,7 +4251,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "write", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.write(Bytes::from(data)).await
@@ -4224,7 +4271,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "write_at", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.write_at(offset, Bytes::from(data)).await
@@ -4240,7 +4287,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "truncate", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.truncate(size).await
@@ -4255,7 +4302,7 @@ impl AsyncFile {
         let work_resource = resource.clone();
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_file_operation(core, resource, "flush", timeout, async move {
                 let _file_operation = work_resource.begin_operation().await?;
                 work_resource.flush_inner().await
@@ -4271,7 +4318,7 @@ impl AsyncFile {
         let key = self.key;
         let resource = self.resource.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_close_file(core, resources, key, resource, timeout)
                 .await
                 .map_err(|error| nfs_error_ref(&error))
@@ -4334,10 +4381,10 @@ fn python_async_list_exports<'py>(
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if let Some(values) = test_export_values(&host) {
-        return pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(values) });
+        return completion::future_into_py(py, async move { Ok(values) });
     }
     let timeout = timeout_option(options, "connect_timeout")?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    completion::future_into_py(py, async move {
         export_values(&host, timeout).await.map_err(nfs_error)
     })
 }
@@ -4899,6 +4946,18 @@ impl SyncClient {
         fs_stat_dict(py, info)
     }
 
+    fn listdir(&self, py: Python<'_>, path: String) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            self.runtime.block_on(directory_names(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                self.operation_timeout,
+            ))
+        })
+        .map_err(nfs_error)
+    }
+
     #[pyo3(signature = (path, fh = None))]
     fn scandir(
         &self,
@@ -4999,7 +5058,7 @@ impl AsyncClient {
         let safe_path = operation.recovery_path(&first, second.as_deref());
         let operation_name = operation.name();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 safe_path,
@@ -5024,7 +5083,7 @@ impl AsyncClient {
         let safe_path = path.clone();
         let operation_name = operation.name();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
@@ -5060,7 +5119,7 @@ impl AsyncClient {
                 health_source,
                 resources,
             } = parts;
-            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            return completion::future_into_py(py, async move {
                 with_operation_timeout(connect_timeout, "connection", async {
                     if url.ends_with("/delay") {
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5078,7 +5137,7 @@ impl AsyncClient {
                 .map_err(nfs_error)
             });
         }
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let mount = connect_mount(&url, connect_timeout)
                 .await
                 .map_err(nfs_error)?;
@@ -5138,7 +5197,7 @@ impl AsyncClient {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let report = with_operation_timeout(timeout, "close", async { Ok(core.close().await) })
                 .await
                 .map_err(nfs_error)?;
@@ -5184,7 +5243,7 @@ impl AsyncClient {
     #[cfg(feature = "python-test-support")]
     fn _wait_closing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
                 .await;
             Ok(())
@@ -5195,7 +5254,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let attr = with_operation_timeout(timeout, "stat", stat_attr(core, mount, path))
                 .await
                 .map_err(nfs_error)?;
@@ -5247,7 +5306,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             with_operation_timeout(timeout, "readlink", readlink_path(core, mount, path))
                 .await
                 .map_err(nfs_error)
@@ -5295,7 +5354,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             with_operation_timeout(timeout, "access", access_path(core, mount, path, mode))
                 .await
                 .map_err(nfs_error)
@@ -5306,7 +5365,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let value = with_operation_timeout(
                 timeout,
                 "getdacl",
@@ -5331,7 +5390,7 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let safe_path = path.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
@@ -5348,7 +5407,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let value = with_operation_timeout(
                 timeout,
                 "getsacl",
@@ -5373,7 +5432,7 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let safe_path = path.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
@@ -5405,7 +5464,7 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
         let safe_path = v42_recovery_path(&operation, &path, other.as_deref());
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let result = cancellation_safe_owned_operation(
                 core,
                 safe_path,
@@ -5439,7 +5498,7 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             with_operation_timeout(
                 timeout,
                 "getxattr",
@@ -5463,7 +5522,7 @@ impl AsyncClient {
         let resources = self.resources.clone();
         let safe_path = path.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
@@ -5481,7 +5540,7 @@ impl AsyncClient {
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             with_operation_timeout(
                 timeout,
                 "listxattr",
@@ -5504,7 +5563,7 @@ impl AsyncClient {
         let resources = self.resources.clone();
         let safe_path = path.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             cancellation_safe_owned_operation(
                 core,
                 Some(safe_path),
@@ -5521,7 +5580,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let info = with_operation_timeout(timeout, "fs_info", fs_info_values(core, mount))
                 .await
                 .map_err(nfs_error)?;
@@ -5533,11 +5592,22 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let info = with_operation_timeout(timeout, "fs_stat", fs_stat_values(core, mount))
                 .await
                 .map_err(nfs_error)?;
             Python::attach(|py| fs_stat_dict(py, info).map(Bound::unbind))
+        })
+    }
+
+    fn listdir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
+        completion::future_into_py(py, async move {
+            directory_names(core, mount, path, timeout)
+                .await
+                .map_err(nfs_error)
         })
     }
 
@@ -5551,7 +5621,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let receiver = with_operation_timeout(
                 timeout,
                 "scandir",
@@ -5579,7 +5649,7 @@ impl AsyncClient {
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let page = with_operation_timeout(
                 timeout,
                 "scandir_page",
@@ -5599,7 +5669,7 @@ impl AsyncClient {
         let resources = self.resources.clone();
         let mode = mode.to_string();
         let timeout = self.operation_timeout;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        completion::future_into_py(py, async move {
             let (key, resource) = cancellation_safe_open_file(
                 core.clone(),
                 mount,
@@ -5633,6 +5703,7 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(python_async_list_exports, module)?)?;
     #[cfg(feature = "python-test-support")]
     {
+        completion::test_support::register(module)?;
         module.add_function(wrap_pyfunction!(_arm_open_test_barrier, module)?)?;
         module.add_function(wrap_pyfunction!(_wait_open_test_entered, module)?)?;
         module.add_function(wrap_pyfunction!(_release_open_test_barrier, module)?)?;
