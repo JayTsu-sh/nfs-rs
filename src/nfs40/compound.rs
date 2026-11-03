@@ -163,7 +163,20 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn open(mut self, open: OpenArgs<'_>) -> Self {
+    pub(crate) fn open(self, open: OpenArgs<'_>) -> Self {
+        self.open_with_create_attributes(open, false, None)
+    }
+
+    pub(crate) fn open_guarded(self, open: OpenArgs<'_>, mode: Option<u32>) -> Self {
+        self.open_with_create_attributes(open, true, mode)
+    }
+
+    fn open_with_create_attributes(
+        mut self,
+        open: OpenArgs<'_>,
+        guarded: bool,
+        mode: Option<u32>,
+    ) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, open.seqid);
         xdr_u32(&mut args, open.share_access);
@@ -172,9 +185,15 @@ impl CompoundBuilder {
         xdr_opaque(&mut args, open.owner);
         if open.create {
             xdr_u32(&mut args, 1); // OPEN4_CREATE
-            xdr_u32(&mut args, 0); // UNCHECKED4
-            xdr_u32(&mut args, 0); // empty createattrs bitmap
-            xdr_opaque(&mut args, &[]);
+            // RFC 7530 §16.16.5: GUARDED4 never changes an existing target.
+            xdr_u32(&mut args, u32::from(guarded));
+            let (mask, values) =
+                crate::nfs4::attrs::encode_setattr(mode, None, None, None, None, None);
+            xdr_u32(&mut args, mask.len() as u32);
+            for word in mask {
+                xdr_u32(&mut args, word);
+            }
+            xdr_opaque(&mut args, &values);
         } else {
             xdr_u32(&mut args, 0); // OPEN4_NOCREATE
         }

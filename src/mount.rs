@@ -393,6 +393,93 @@ pub struct OpenFile {
     state: Option<Bytes>,
 }
 
+/// Intent for a stateful open, shared by all protocol engines.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenOptions {
+    /// One of [`OPEN_READ`], [`OPEN_WRITE`], or [`OPEN_BOTH`].
+    pub access: u32,
+    /// Create a missing file with these permissions; `None` requires an existing file.
+    pub create_mode: Option<u32>,
+    /// Truncate an existing file to zero before returning the open resource.
+    pub truncate: bool,
+}
+
+impl OpenOptions {
+    pub(crate) fn validate(self) -> Result<()> {
+        if !matches!(self.access, OPEN_READ | OPEN_WRITE | OPEN_BOTH)
+            || (self.truncate && self.access == OPEN_READ)
+        {
+            return Err(NfsError::InvalidInput(
+                "invalid stateful open options".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn finish_open<M: Mount + ?Sized>(
+    mount: &M,
+    file: OpenFile,
+    truncate: bool,
+) -> Result<OpenFile> {
+    if truncate
+        && let Err(error) = mount
+            .setattr(
+                file.file_handle(),
+                None,
+                None,
+                None,
+                None,
+                Some(0),
+                None,
+                None,
+            )
+            .await
+    {
+        let _ = mount.close_stateful(file).await;
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Protocol engines supply a GUARDED create; only its success proves a new file.
+/// RFC 1813 §3.3.8 / RFC 7530 §16.16.5. Reuse the resolved parent even if a
+/// competing creator wins, and retain normal SETATTR ordering for existing files.
+pub(crate) async fn open_path_guarded<M, F, Fut>(
+    mount: &M,
+    path: &str,
+    options: OpenOptions,
+    create: F,
+) -> Result<OpenFile>
+where
+    M: Mount + ?Sized,
+    F: FnOnce(Bytes, String) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<OpenFile>> + Send,
+{
+    options.validate()?;
+    if options.create_mode.is_none() {
+        let file = mount.open_path_stateful(path, options.access).await?;
+        return finish_open(mount, file, options.truncate).await;
+    }
+    let (dir, name) = crate::split_path(path)?;
+    let parent = mount.lookup_path(&dir).await?.fh;
+    let file = match mount
+        .open_stateful(parent.clone(), &name, options.access)
+        .await
+    {
+        Ok(file) => file,
+        Err(error) if error.is_not_found() => match create(parent.clone(), name.clone()).await {
+            Ok(file) => return Ok(file),
+            Err(error) if error.is_exist() => {
+                mount.open_stateful(parent, &name, options.access).await?
+            }
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    finish_open(mount, file, options.truncate).await
+}
+
 impl OpenFile {
     pub(crate) fn from_object(object: ObjRes) -> Self {
         Self {
@@ -597,6 +684,49 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
             object: self.open_path(path, access).await?,
             state: None,
         })
+    }
+
+    /// Open, optionally create, and optionally truncate a file before returning
+    /// its owned state. Close it with [`Mount::close_stateful`]. Existing-file
+    /// permissions are preserved. These operations are non-transactional: a
+    /// created/truncated file can remain when a later step fails.
+    ///
+    /// The default preserves compatibility for external implementations using
+    /// unchecked creation. Built-in engines use guarded creation to omit the
+    /// redundant truncate only when creation is confirmed.
+    ///
+    /// ```no_run
+    /// # use nfs_rs::{Mount, OpenOptions, OPEN_WRITE, Result};
+    /// # async fn example(mount: &dyn Mount) -> Result<()> {
+    /// let file = mount.open_path_with_options("output.bin", OpenOptions {
+    ///     access: OPEN_WRITE,
+    ///     create_mode: Some(0o666),
+    ///     truncate: true,
+    /// }).await?;
+    /// // Use file.file_handle() for I/O, then release the owned OPEN state.
+    /// mount.close_stateful(file).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn open_path_with_options(&self, path: &str, options: OpenOptions) -> Result<OpenFile> {
+        options.validate()?;
+        let file = match self.open_path_stateful(path, options.access).await {
+            Ok(file) => file,
+            Err(error) if options.create_mode.is_some() && error.is_not_found() => {
+                match self
+                    .create_path_stateful_with_access(path, options.create_mode, options.access)
+                    .await
+                {
+                    Ok(file) => file,
+                    Err(error) if error.is_exist() => {
+                        self.open_path_stateful(path, options.access).await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        finish_open(self, file, options.truncate).await
     }
 
     /// Procedure CLOSE releases share reservations for a file (NFSv4).

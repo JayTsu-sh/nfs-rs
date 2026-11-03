@@ -709,6 +709,52 @@ impl Mount40 {
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
+        self.open_file_with_create(dir_fh, filename, access, create, false, None)
+            .await
+    }
+
+    async fn open_guarded(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        access: u32,
+        mode: Option<u32>,
+    ) -> Result<mount::OpenFile> {
+        match self
+            .open_file_with_create(dir_fh.clone(), filename, access, true, true, mode)
+            .await
+        {
+            // A definite OPEN attribute rejection has not created a file.
+            // A new owner is allocated on retry. Partial OPEN success is wrapped
+            // as uncertain below and must never take this compatibility fallback.
+            Err(NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_ATTRNOTSUPP))
+                if mode.is_some() =>
+            {
+                let file = self
+                    .open_file_with_create(dir_fh, filename, access, true, true, None)
+                    .await?;
+                if let Err(error) = self
+                    .setattr(file.file_handle(), None, mode, None, None, None, None, None)
+                    .await
+                {
+                    let _ = self.close_stateful(file).await;
+                    return Err(error);
+                }
+                Ok(file)
+            }
+            result => result,
+        }
+    }
+
+    async fn open_file_with_create(
+        &self,
+        dir_fh: Bytes,
+        filename: &str,
+        access: u32,
+        create: bool,
+        guarded: bool,
+        mode: Option<u32>,
+    ) -> Result<mount::OpenFile> {
         let expected_generation = self.lease.begin_stateful("open")?;
         if !matches!(
             access,
@@ -732,18 +778,28 @@ impl Mount40 {
             .as_ref()
             .map(|state| state.begin_open_publication());
         let opened = tokio::spawn(async move {
-            let request = CompoundBuilder::new(if create { "create" } else { "open" })
-                .putfh(&dir_fh)
-                .open(OpenArgs {
-                    seqid: 0,
-                    share_access: access,
-                    client_id,
-                    owner: owner_wire.as_bytes(),
-                    filename: &filename,
-                    create,
-                })
-                .getfh()
-                .encode_with_header(&auth);
+            let tag = if guarded {
+                "create_guarded"
+            } else if create {
+                "create"
+            } else {
+                "open"
+            };
+            let builder = CompoundBuilder::new(tag).putfh(&dir_fh);
+            let args = OpenArgs {
+                seqid: 0,
+                share_access: access,
+                client_id,
+                owner: owner_wire.as_bytes(),
+                filename: &filename,
+                create,
+            };
+            let builder = if guarded {
+                builder.open_guarded(args, mode)
+            } else {
+                builder.open(args)
+            };
+            let request = builder.getfh().encode_with_header(&auth);
             let operation = if create { "create" } else { "open" };
             let (class, ctx) = context(operation, owner, 0, OperationClass::ReplaySensitive);
             let response = rpc
@@ -1558,6 +1614,17 @@ impl Mount for Mount40 {
         let (dir, name) = crate::split_path(path)?;
         let directory = self.lookup_path(&dir).await?;
         self.open_stateful(directory.fh, &name, access).await
+    }
+    async fn open_path_with_options(
+        &self,
+        path: &str,
+        options: mount::OpenOptions,
+    ) -> Result<mount::OpenFile> {
+        mount::open_path_guarded(self, path, options, |parent, name| async move {
+            self.open_guarded(parent, &name, options.access, options.create_mode)
+                .await
+        })
+        .await
     }
     async fn close(&self, fh: Bytes) -> Result<()> {
         if self.locks.has_fh(&fh).await {
@@ -5350,6 +5417,183 @@ mod tests {
         assert!(mount.state.for_fh(&fh, crate::OPEN_READ).await.is_none());
         mount.close_stateful(opened).await.unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn guarded_open_options_preserve_access_confirm_and_race_cleanup() {
+        use crate::nfs4::compound::take_opaque;
+        use bytes::Buf;
+        // New wb / w+b, attribute fallback, concurrent creation, OPEN_CONFIRM,
+        // lost create reply, and partial OPEN success followed by GETFH failure.
+        for (access, case) in [(2, 0), (3, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mount = connected_direct_mount(&listener).await;
+            let seen = Arc::new(std::sync::Mutex::new(vec![]));
+            let recorded = seen.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut opens = 0;
+                let mut creates = 0;
+                loop {
+                    let request = read_record(&mut stream).await.unwrap();
+                    let mut args = Bytes::copy_from_slice(&request[40..]);
+                    let tag =
+                        String::from_utf8(take_opaque(&mut args, "tag").unwrap().to_vec()).unwrap();
+                    recorded.lock().unwrap().push(tag.clone());
+                    assert_eq!(args.get_u32(), 0);
+                    args.advance(4); // opcount
+                    assert_eq!(args.get_u32(), 22);
+                    let fh = take_opaque(&mut args, "fh").unwrap();
+                    let opcode = args.get_u32();
+                    let response = match tag.as_str() {
+                        "lookup" => {
+                            assert_eq!(recorded.lock().unwrap().len(), 1, "parent resolved twice");
+                            assert_eq!(opcode, 15);
+                            assert_eq!(fh.as_ref(), b"root");
+                            assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"parent");
+                            let mut parent = vec![];
+                            xdr_opaque(&mut parent, b"parent");
+                            compound_result(
+                                "lookup",
+                                &[(22, &[]), (15, &[]), (10, &parent), (9, &[0; 8])],
+                            )
+                        }
+                        "open" | "create_guarded" => {
+                            assert_eq!(fh.as_ref(), b"parent");
+                            assert_eq!(opcode, 18);
+                            assert_eq!(args.get_u32(), 0);
+                            assert_eq!(args.get_u32(), access);
+                            assert_eq!(args.get_u32(), 0);
+                            args.advance(8);
+                            take_opaque(&mut args, "owner").unwrap();
+                            let create = args.get_u32();
+                            if tag == "open" {
+                                opens += 1;
+                                assert_eq!(create, 0);
+                                if opens == 1 {
+                                    failed_lock_result("open", 18, 2)
+                                } else {
+                                    open_result(0, [7; 16], b"file")
+                                }
+                            } else {
+                                creates += 1;
+                                assert_eq!(create, 1);
+                                assert_eq!(args.get_u32(), 1, "RFC 7530 GUARDED4");
+                                if creates == 1 {
+                                    assert_eq!(args.get_u32(), 2);
+                                    assert_eq!(args.get_u32(), 0);
+                                    assert_eq!(args.get_u32(), 2);
+                                    assert_eq!(
+                                        take_opaque(&mut args, "mode").unwrap().as_ref(),
+                                        &0o666u32.to_be_bytes()
+                                    );
+                                } else {
+                                    assert_eq!(args.get_u32(), 0);
+                                    assert!(take_opaque(&mut args, "attrs").unwrap().is_empty());
+                                }
+                                match case {
+                                    1 if creates == 1 => {
+                                        failed_lock_result("create_guarded", 18, 10032)
+                                    }
+                                    2 => failed_lock_result("create_guarded", 18, 17),
+                                    4 => return,
+                                    5 => {
+                                        let mut result = open_result(0, [7; 16], b"file");
+                                        // Preserve successful OPEN but replace GETFH success with failure.
+                                        result.truncate(result.len() - 8);
+                                        let last = result.len() - 4;
+                                        result[last..].copy_from_slice(&10032u32.to_be_bytes());
+                                        result[..4].copy_from_slice(&10032u32.to_be_bytes());
+                                        result
+                                    }
+                                    _ => {
+                                        open_result(if case == 3 { 2 } else { 0 }, [7; 16], b"file")
+                                    }
+                                }
+                            }
+                        }
+                        "open_confirm" => {
+                            assert_eq!(case, 3);
+                            assert_eq!(opcode, 20);
+                            compound_result("open_confirm", &[(22, &[]), (20, &[8; 16])])
+                        }
+                        "setattr" => {
+                            assert_eq!(opcode, 34);
+                            args.advance(16);
+                            if case == 1 {
+                                assert_eq!(args.get_u32(), 2);
+                                assert_eq!(args.get_u32(), 0);
+                                assert_eq!(args.get_u32(), 2);
+                                assert_eq!(
+                                    take_opaque(&mut args, "mode").unwrap().as_ref(),
+                                    &0o666u32.to_be_bytes()
+                                );
+                            } else {
+                                assert_eq!(case, 2);
+                                assert_eq!(args.get_u32(), 1);
+                                assert_eq!(args.get_u32(), 1 << 4);
+                                assert_eq!(
+                                    take_opaque(&mut args, "size").unwrap().as_ref(),
+                                    &[0; 8]
+                                );
+                            }
+                            compound_result("setattr", &[(22, &[]), (34, &[0; 4])])
+                        }
+                        "close" => {
+                            assert_eq!(opcode, 4);
+                            compound_result("close", &[(22, &[]), (4, &[9; 16])])
+                        }
+                        _ => panic!("unexpected RPC {tag}"),
+                    };
+                    reply(&mut stream, &request, &response).await.unwrap();
+                    if tag == "close" || (case == 5 && tag == "create_guarded") {
+                        return;
+                    }
+                }
+            });
+            let result = mount
+                .open_path_with_options(
+                    "parent/new",
+                    crate::OpenOptions {
+                        access,
+                        create_mode: Some(0o666),
+                        truncate: true,
+                    },
+                )
+                .await;
+            if case >= 4 {
+                assert_eq!(
+                    result.unwrap_err().operation_outcome().unwrap().outcome,
+                    crate::OperationOutcome::Uncertain
+                );
+                assert_eq!(
+                    seen.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|tag| *tag == "create_guarded")
+                        .count(),
+                    1
+                );
+            } else {
+                mount.close_stateful(result.unwrap()).await.unwrap();
+                assert_eq!(seen.lock().unwrap().last().unwrap(), "close");
+                if case == 0 {
+                    assert_eq!(seen.lock().unwrap().len(), 4);
+                }
+                if case == 3 {
+                    assert_eq!(seen.lock().unwrap().len(), 5);
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "scripted server did not finish: access={access}, case={case}, requests={:?}",
+                        seen.lock().unwrap()
+                    )
+                })
+                .unwrap();
+        }
     }
 
     async fn register_scripted_open(mount: &Mount40, owner: u64, fh: &'static [u8]) {
