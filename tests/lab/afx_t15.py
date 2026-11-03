@@ -119,13 +119,12 @@ def delete_fault(workspace, state):
             capture_output=True,
             timeout=10,
         )
-        if (
-            subprocess.run(
-                ["nft", "list", "table", "inet", table_for(workspace)],
-                capture_output=True,
-                timeout=10,
-            ).returncode
-            == 0
+        # A failed query is not proof of absence (permissions/netlink errors).
+        tables = json.loads(command(["nft", "-j", "list", "tables"]).stdout)
+        if any(
+            item.get("table", {}).get("family") == "inet"
+            and item["table"].get("name") == table_for(workspace)
+            for item in tables["nftables"]
         ):
             raise EvidenceError("owned fault table remains present")
 
@@ -452,12 +451,26 @@ class Runner:
             raise EvidenceError("packet capture failed to start")
         probe = Probe(self, "probe", "fault")
         probe.wait({"ready"})
+        plan = None
         for offset in [0] + [g * 1024**3 - 32768 for g in range(1, 20)]:
             event = probe.send(f"warm {offset}", {"write_done", "write_error"})
             if event.get("count") != 65536:
                 raise EvidenceError("warmup was not a full committed write")
-        time.sleep(1)
-        plan = choose_plan(rows(pcap), probe.events, self.args.mds, set(self.args.ds))
+            time.sleep(1)
+            try:
+                plan = choose_plan(
+                    rows(pcap), probe.events, self.args.mds, set(self.args.ds)
+                )
+                # Further warmups can grow the TCP congestion window enough to
+                # deliver the whole bad stripe before its first suppressed ACK.
+                break
+            except EvidenceError as error:
+                if not str(error).startswith("BLOCKED_CAPABILITY"):
+                    raise
+        if plan is None:
+            raise EvidenceError(
+                "BLOCKED_CAPABILITY: no same-WRITE independent-DS stripe evidence"
+            )
         self.report["plan"] = plan
         self.report["dropped_packets"] = self.fault(probe, plan, source)
         probe.send("close", {"umount"})

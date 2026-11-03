@@ -284,6 +284,33 @@ class CleanupTests(unittest.TestCase):
                 controller.cleanup(Path(root), state)
                 run.assert_not_called()
 
+    def test_fault_restoration_requires_successful_absence_query(self):
+        root = Path("/tmp/nfsrs-afx-t15-nightly-test.fixture")
+        state = {"fault_reserved": True}
+
+        def result(code, tables=None):
+            return subprocess.CompletedProcess(
+                [], code, json.dumps({"nftables": tables or []}), ""
+            )
+
+        with patch.object(
+            controller.subprocess,
+            "run",
+            side_effect=[result(0), subprocess.CalledProcessError(1, ["nft"])],
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                controller.delete_fault(root, state)
+        owned = {"table": {"family": "inet", "name": controller.table_for(root)}}
+        with patch.object(
+            controller.subprocess, "run", side_effect=[result(1), result(0, [owned])]
+        ):
+            with self.assertRaisesRegex(EvidenceError, "remains present"):
+                controller.delete_fault(root, state)
+        with patch.object(
+            controller.subprocess, "run", side_effect=[result(1), result(0)]
+        ):
+            controller.delete_fault(root, state)
+
     def test_fault_cleanup_failure_does_not_skip_remaining_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             state = {
