@@ -860,3 +860,17 @@ fn negotiated_channel_limit_contract_is_wired() {
     assert!(rust_test.contains("nfs41-channel-limits request="));
     assert!(rust_test.contains("effective_highest_slot_id"));
 }
+
+#[test]
+fn afx_t15_controller_contracts() {
+    let output = Command::new("python3")
+        .arg(workspace_path("tests/lab/test_afx_t15.py"))
+        .output()
+        .expect("run AFX T15 negative-evidence and cleanup regressions");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

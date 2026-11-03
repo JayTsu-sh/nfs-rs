@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 120
     env:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
+      NFS_RS_AFX_T15_EVIDENCE_DIR: ${{ runner.temp }}/afx-t15-${{ github.run_id }}-${{ github.run_attempt }}
+      NFS_RS_AFX_T15_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v5
       - name: Allocate unique NFSv4.0 evidence directory
@@ -123,6 +125,23 @@ jobs:
       - name: NetApp pNFS layout recall during WRITE/CLOSE E2E
         if: steps.pnfs.outputs.independent_ds_observed == 'true'
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-pnfs-layout-recall-e2e.sh "$RUN_ID"
+      - name: Build the AFX T15 probe from this exact checkout
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl --example pnfs_partial_failure
+          target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          echo "NFS_RS_AFX_T15_BINARY=$target_dir/x86_64-unknown-linux-musl/release/examples/pnfs_partial_failure" >> "$GITHUB_ENV"
+      - name: AFX T15 same-WRITE independent-DS partial failure
+        run: tests/lab/run-afx-t15-e2e.sh run "$RUN_ID"
+      - name: Restore and clean the owned AFX T15 run
+        if: always()
+        run: tests/lab/run-afx-t15-e2e.sh cleanup "$RUN_ID"
+      - name: Upload redacted AFX T15 acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afx-t15-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.NFS_RS_AFX_T15_EVIDENCE_DIR }}/public/
+          if-no-files-found: warn
       - name: NFSv4.1 session recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"
       - name: NFSv4.1 TCP rebind E2E
