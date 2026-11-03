@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-03
+
 ### Fixed
 
 - Fence Python async completion notifications before resuming awaiters, so
@@ -15,6 +17,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   handles cancelled futures after their cancellation callback runs.
 
 ### Changed
+
+- Rust `BufferedFile::read_at` reuses a single owned READ response instead of
+  copying its payload. Multiple responses and short reads still produce ordered,
+  contiguous output with the same EOF and error semantics.
 
 - Python creating opens reuse the resolved parent directory. Built-in NFS
   engines use guarded creation, omit size-zero SETATTR only after confirmed
@@ -27,6 +33,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   use `scandir` when metadata or file handles are needed.
 
 ### Added
+
+- Opt-in Linux memory benchmark with shared protocol-independent pattern data,
+  separate WRITE/READ measurements, repeated reads, synchronized reader processes,
+  and checks for retained large allocations. These diagnostics do not replace
+  the accepted per-environment release performance baselines.
 
 - Rust `OpenOptions` and `Mount::open_path_with_options` express access,
   optional creation permissions, and truncation through one stateful API.
