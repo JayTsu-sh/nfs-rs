@@ -220,7 +220,9 @@ producer queues at most one batch; it does not collect the entire directory or
 acquire the Python GIL to produce entries. Valid entries preceding a protocol
 error are yielded before that error is raised.
 
-`scandir()` streams entries and avoids constructing a complete list. Consume or
+`listdir()` collects names using READDIR without fetching full per-entry metadata.
+Use `scandir()` for metadata and file handles. `scandir()` streams entries and
+avoids constructing a complete list. Consume or
 close the client before discarding a partially consumed iterator.
 
 ### Resumable directory pages
@@ -523,6 +525,11 @@ RPC timeouts cover admission, sending and response waiting. A Python
 operation may continue settling after that timeout. It is not a rollback or
 proof that the server did nothing. Close the client to drain owned operations,
 and inspect recovery events before retrying uncertain mutations.
+
+Awaited native operations also drain their Python completion notification before
+resuming the caller. This prevents a result-notification thread from racing
+interpreter shutdown after `await client.close()`. Synchronous and asynchronous
+clients may be used in the same process; close each client before exiting.
 
 ## Cancellation and recovery events
 

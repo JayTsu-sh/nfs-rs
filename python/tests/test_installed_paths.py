@@ -86,6 +86,41 @@ def test_installed_async_paths_match_sync_values():
     asyncio.run(scenario())
 
 
+def test_listdir_names_cover_large_directories_errors_and_deadlines():
+    expected = [f"entry-{i}" for i in range(128 * 4 + 7)]
+    client = Client.connect("nfs-test://fixture/export", operation_timeout=0.01)
+    assert client.listdir("large") == expected
+    with pytest.raises(PermissionError):
+        client.listdir("denied-directory")
+    with pytest.raises(NfsTimeoutError, match="listdir deadline exceeded"):
+        client.listdir("blocked")
+    client.close()
+
+    async def scenario():
+        client = await AsyncClient.connect("nfs-test://fixture/export", operation_timeout=0.01)
+        assert await client.listdir("large") == expected
+        with pytest.raises(PermissionError):
+            await client.listdir("denied-directory")
+        with pytest.raises(NfsTimeoutError, match="listdir deadline exceeded"):
+            await client.listdir("blocked")
+        await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_async_listdir_cancellation_releases_operation_for_close():
+    async def scenario():
+        client = await AsyncClient.connect("nfs-test://fixture/export")
+        pending = asyncio.create_task(client.listdir("blocked"))
+        await asyncio.sleep(0.01)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await asyncio.wait_for(client.close(), timeout=1)
+
+    asyncio.run(scenario())
+
+
 def test_installed_sync_and_async_permission_families_and_stream_errors_match():
     sync_client = Client.connect("nfs-test://fixture/export")
     for path in ("denied", "forbidden"):

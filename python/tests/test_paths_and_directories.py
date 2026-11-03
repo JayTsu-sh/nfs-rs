@@ -48,6 +48,12 @@ class SyncInner:
             raise PermissionError(_path)
         yield [{"name": "second", "info": {**INFO, "fileid": 10}}]
 
+    def listdir(self, path):
+        self.last_listdir = path
+        if path == "denied-directory":
+            raise PermissionError(path)
+        return ["first", "second"]
+
     def scandir_page(self, path, fh, cookie, verifier):
         self.last_page = (path, fh, cookie, verifier)
         return {
@@ -68,6 +74,9 @@ class AsyncInner(SyncInner):
 
     async def stat(self, path):
         return super().stat(path)
+
+    async def listdir(self, path):
+        return super().listdir(path)
 
     async def scandir_page(self, path, fh, cookie, verifier):
         return super().scandir_page(path, fh, cookie, verifier)
@@ -144,6 +153,25 @@ def test_async_operations_match_sync_contract():
         assert not await client.exists("missing")
         assert [entry.name async for entry in client.scandir("folder")] == ["first", "second"]
         assert await client.listdir("folder") == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
+def test_listdir_uses_name_only_adapter_and_normalizes_paths():
+    client = Client.connect("nfs://server/export")
+    assert client.listdir(Path("a/./b")) == ["first", "second"]
+    assert client._inner.last_listdir == "a/b"
+    assert not hasattr(client._inner, "last_scan")
+    with pytest.raises(PermissionError):
+        client.listdir("denied-directory")
+
+    async def scenario():
+        client = await AsyncClient.connect("nfs://server/export")
+        assert await client.listdir(Path("a/./b")) == ["first", "second"]
+        assert client._inner.last_listdir == "a/b"
+        assert not hasattr(client._inner, "last_scan")
+        with pytest.raises(PermissionError):
+            await client.listdir("denied-directory")
 
     asyncio.run(scenario())
 
