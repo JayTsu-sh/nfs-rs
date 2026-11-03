@@ -21,10 +21,11 @@ jobs:
     timeout-minutes: 120
     env:
       RUN_ID: nightly-${{ github.run_id }}-${{ github.run_attempt }}
-      NFS_RS_AFX_T15_EVIDENCE_DIR: ${{ runner.temp }}/afx-t15-${{ github.run_id }}-${{ github.run_attempt }}
       NFS_RS_AFX_T15_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v5
+      - name: Allocate private AFX T15 evidence directory
+        run: echo "NFS_RS_AFX_T15_EVIDENCE_DIR=$RUNNER_TEMP/afx-t15-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - name: Allocate unique NFSv4.0 evidence directory
         run: echo "NFS_RS_LAB_V40_EVIDENCE_DIR=$RUNNER_TEMP/nfsv40-evidence-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
       - run: tests/lab/health-check.sh
