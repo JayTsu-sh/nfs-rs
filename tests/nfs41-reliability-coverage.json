@@ -180,15 +180,16 @@
     },
     {
       "id": "T15",
-      "ci": "partial:pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write;blocked-capability:real-multi-ds-stripe-plan",
-      "nightly": "blocked-capability:ontap-single-ds-isolation-while-sibling-ds-remains-reachable;additional-evidence:lab_e2e::nfs_v41_pnfs_multifile_sparse_io",
+      "ci": "pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write+afx_t15_controller_contracts",
+      "nightly": "tests/lab/run-afx-t15-e2e.sh (AFX independent-DS same-WRITE partial failure; fail-closed capability gate)",
       "required": true,
       "ci_tests": [
         "nfs41::pnfs_io::tests::ds_batch_waits_for_success_when_failure_completes_first",
         "nfs41::pnfs_io::tests::ds_batch_waits_for_failure_when_success_completes_first",
-        "nfs41::pnfs_io::tests::cancelling_ds_batch_drops_every_pending_write"
+        "nfs41::pnfs_io::tests::cancelling_ds_batch_drops_every_pending_write",
+        "afx_t15_controller_contracts"
       ],
-      "ci_status": "partial"
+      "ci_status": "mapped"
     },
     {
       "id": "T16",

@@ -212,3 +212,51 @@ outcomes, not successful feature checks. The Python validator invokes the new
 APIs on sync and async clients and records their optional rejections. No SVM
 feature switch is changed by this runner; inspect current configuration and
 wire outcomes before claiming positive physical support.
+
+## AFX T15 same-WRITE partial failure
+
+`run-afx-t15-e2e.sh` is a separate AFX executor path in the nightly workflow.
+It requires a pre-provisioned Rust 1.95.0 musl target on the controller, a static
+`pnfs_partial_failure` example built from the checked-out commit, and SSH access
+to the AFX data-network executor. It does not inherit a legacy-cluster pNFS skip.
+A missing independent-DS stripe plan reports `blocked-capability` and fails.
+
+The controller uses `LAB_AFX_SSH_HOST` (default `10.128.56.17`),
+`LAB_AFX_SSH_USER` (`root`), `LAB_AFX_SSH_KEY`
+(`/home/github-runner/.ssh/nfsrs_afx_t15`), and `LAB_AFX_KNOWN_HOSTS`
+(`/home/github-runner/.ssh/known_hosts_afx_t15`). Keys remain on the runner,
+known-host verification is mandatory, and no password is stored in the repo.
+The dedicated executor key is restricted to the controller's source address.
+The executor needs Python 3.9+, nftables, tcpdump with immediate mode, tshark,
+coreutils, and kernel NFS mount tools. Provision dependencies ahead of a run.
+
+```sh
+cargo build --release --locked --target x86_64-unknown-linux-musl \
+  --example pnfs_partial_failure
+NFS_RS_AFX_T15_BINARY=/path/to/pnfs_partial_failure \
+NFS_RS_AFX_T15_COMMIT="$(git rev-parse HEAD)" \
+NFS_RS_AFX_T15_EVIDENCE_DIR=/path/outside/checkout/new-private-evidence \
+  tests/lab/run-afx-t15-e2e.sh run nightly-<unique-id>
+```
+
+The executor holds `/tmp/nfsrs-svm2-issue40.lock`, prepares its unique directory
+on `192.168.9.101:/pnfs_test2`, writes 20 GiB of patterned data, and observes
+successful 32 KiB stripes of ONE 64 KiB API call on two distinct DS endpoints.
+It then drops only the failing DS's response packets to this probe's specific
+TCP socket, backed by an independent 180-second restore watchdog. Acceptance
+requires successful sibling acknowledgement, Uncertain/VerifyThenResume, zero
+MDS replay, an actually partially mutated range after reconnect, complete
+resume/commit, and a new-mount 20 GiB byte comparison plus SHA-256. Packet counts
+must agree with zero kernel drops. DS targets come from actual traffic and must
+remain within the four AFX fixture LIFs; no server configuration is changed.
+
+Cancellation restores the owned fault before stopping children and cleaning the
+owned directory. Preparation collisions never authorize fixture deletion. The
+workflow has a second `cleanup` invocation in an `always()` step. The controller
+saves raw packet/diagnostic evidence in a private local archive and uploads only
+`public/result.json`, containing the exact commit, probe and capture hashes,
+redacted acceptance results and cleanup status. A cleanup failure makes the run
+fail even when content checks passed. This is a correctness gate, not a new
+performance acceptance baseline. Nightly keeps the private evidence under
+`$HOME/.local/state/nfs-rs-lab/afx-t15-<run>-<attempt>` with restrictive permissions,
+outside both the checkout and the automatically cleared `$RUNNER_TEMP` directory.
