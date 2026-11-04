@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- pNFS READ reuses a single owned data-server response, allocating stripe and
+  final assembly buffers only when multiple nonempty pieces need joining.
+  Short reads, EOF prefixes, layout generations and fallback semantics remain
+  unchanged; this reduces copying without changing session replay protection.
+
 ## [0.11.2] - 2026-11-03
 
 ### Fixed
