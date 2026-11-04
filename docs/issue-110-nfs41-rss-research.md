@@ -274,3 +274,180 @@ A 入口还测了原生成器 QD8 的 单 arena 17.23 MiB、单 Tokio worker 17.
 RSS 与存活分配，固定 executor/worker/QD，并重复采样。库侧后续优化应针对
 已量化的缓冲区 owner/副本和并发预算；不要为降低客户端 RSS 删除服务端重放
 保护，也不要在库中擅自修改进程级 glibc 参数或给每次 READ 加 `malloc_trim`。
+
+## 2026-11-04：当前主分支与剩余问题复核
+
+复核提交：`01209c958087c6124a94e899c64955c9a359c7d2`。本节保留上文历史
+调研及其样本边界；以下单独列出本轮重现，未将既有 520 份报告改称本轮
+重跑结果。本轮已通过私有插桩和同文件强制 MDS 对照，确认 A 的额外 READ
+分配主要来自 pNFS 读取路径的两层复制；默认 RSS 的稳定改善仍待后续验证。
+
+单段响应复用和公平内存基准已经随
+[PR #145 / `806dcfa`](https://github.com/JayTsu-sh/nfs-rs/pull/145) 合入。
+该提交与本轮主分支的 `src` tree 均为
+`15f61267e822269f35c3372881efa2f9ac451995`，`Cargo.toml` / `Cargo.lock`
+也无差异。因此已有[实施验证报告](validation/issue-110-memory.md)针对的是
+当前生产实现，不应再次提出同一项输出复制修复。GitHub #110 仍打开、没有
+评论；原 issue 中的 slot/reply-cache 猜测尚未同步更正。
+
+### 已确认与尚未解决的边界
+
+| 问题 | 已有证据 | 本轮判断 |
+| --- | --- | --- |
+| 前向 slot 是否永久持有 READ payload | 上述源码生命周期与历史实现检查；正常读完后存活大块回落 | 原归因已被否定，不能继续以“清空 slot reply”作为方案。 |
+| 单段输出复制是否删除 | 指针共享回归；每读 64 MiB 的累计分配减少约 64 MiB | 已实施且已验证。 |
+| 默认 RSS 差异是否消除 | 1 GiB QD8 的 A/v4.1 修改后仍为 41.16 MiB，B/v4.1 为 16.70 MiB；A 的 32 轮峰值仍为 76.58 MiB | 未消除；不能把复制优化或全部诊断通过等同于 issue 症状解决。 |
+| A/B 分配成本为何不同 | 1 GiB READ 累计分配 A/v4.1 为 3137.37 MiB，B 为 1051.59 MiB | 本轮同源码的路径计数及强制 MDS 对照确认，主要额外分配来自 pNFS 的中间和最终复制；见下。 |
+| 是否持续保留 payload | 既有 32 轮案例尾段大块范围为 0；全部 520 份报告的整体存活堆尾段范围最大 5128 bytes | 已测负载未显示持续增长；不覆盖数小时、物理故障、取消和全部 pNFS 路径。 |
+
+这些数值来自既有实施验证报告。64 MiB 矩阵每配置重复三次；1 GiB、八进程
+和 32 轮扩展各只有一组样本。A/B 是同一 SVM 的不同入口，不能当作独立设备
+重复，也不能将其 RSS 混合建立统一 baseline。
+
+### 当前提交的物理重现
+
+本轮先用公平 backing 的现有诊断工具执行 64 MiB READ-only / QD8：每配置
+一个新进程，完整读取三轮。累计分配取第二轮 READ（`read-1`，零起始编号），RSS 为进程阶段峰值，
+单位 MiB。这是复现信号，尚不是多进程重复的稳定提升或发布验收。
+未修改基线二进制 SHA-256 为
+`a7157bf29a870278e1e48c6c7640a6368da86cc0f6a3cd7dde59516bf1675686`。
+
+| 入口 / 协议 | 峰值 RSS | 第二轮 READ 累计分配（`read-1`） |
+| --- | --- | --- |
+| A / v3 | 15.473 | 64.313 |
+| A / v4.1 | 34.063 | 195.469 |
+| B / v4.1 | 20.254 | 65.773 |
+
+A/v4.1 的峰值 RSS 约为同入口 v3 的 2.20 倍，本轮不是原 issue 的固定
+三倍；A/B 的 v4.1 累计 READ 分配比为 2.972。两个 v4.1 入口协商的最大
+READ/WRITE 均为 1044480 bytes，因此剩余差异不能仅由这两个协商上限的
+不同解释；协商上限相同仍不能证明实际 DS 路由、分片和拷贝路径相同。
+
+三个配置的内容、EOF 和释放检查均通过，准备/清理最终状态为 0。
+idle 时 A/v4.1 的存活堆为 4.116 MiB（其中大块 4 MiB），B/v4.1 为
+3.112 MiB（其中大块 3 MiB），仍包含模式 backing 和运行时对象。UMOUNT
+后新增大块全部释放。这再次重现较高 RSS 和累计分配，没有提供持续 payload
+泄漏证据。
+
+将文件缩小至 8 MiB 后，同样的两个 v4.1 入口仍重现差异：A 的累计 READ
+分配为 23.631 MiB、峰值 RSS 19.5625 MiB；B 为 8.273 MiB、16.6211 MiB。
+内容、释放和清理检查仍通过，说明无需 1 GiB 文件就能观察额外分配。
+
+### 因果对照：pNFS READ 的两层复制
+
+在 checkout 外从当前提交导出源码，仅为诊断 binary 加入分阶段路径、复制
+字节和 RPC record 计数，并提供私有强制 MDS READ 对照开关。所有配置使用
+同一插桩 binary、同一已准备文件和新的独立进程；对同一入口只改变该诊断
+开关。它不属于公开 URL/API，也没有写入产品源码。
+插桩 binary SHA-256：
+`d4b6215e4e86a87523ccc1ce0a44a7baccc036d72073f130d0a3b86dd923167c`。
+执行器确认仍为 Linux `6.8.0-142-generic`、glibc 2.39、24 个可用 CPU。
+这组对照的 malloc arena、mmap 阈值和 Tokio worker 环境变量均未设置；没有
+通过 allocator 调参制造差值。
+
+以下为 64 MiB READ-only / QD8 的第二轮 READ（`read-1`），单位 MiB；每配置一个新进程。
+
+| 配置 | 累计分配 | 峰值 RSS | stripe 合并分配 / 复制 | 最终拼接分配 / 复制 | MDS READ payload |
+| --- | --- | --- | --- | --- | --- |
+| A / 默认路径 | 195.469 | 36.871 | 64.000001 / 64.000000 | 62.753906 / 62.753906 | 0 |
+| A / 强制 MDS READ | 65.757 | 18.020 | 0 / 0 | 0 / 0 | 64 |
+| B / 默认路径 | 65.773 | 18.711 | 0 / 0 | 0 / 0 | 64 |
+| B / 强制 MDS READ | 65.757 | 15.793 | 0 / 0 | 0 / 0 | 64 |
+
+A 默认实际进入 pNFS 读取路径，计数 129 个 stripe；B 默认已走 MDS READ。
+所以“同为 v4.1、协商大小相同”没有使两个入口的客户端分配路径相同。
+这项证据来自客户端实际路径计数，不将其扩展成已抓包证明独立 DS 拓扑。
+
+已确认的复制链如下：
+
+1. [pnfs_read_layout](../src/nfs41/pnfs_io.rs) 约 920、943 行：为每个 stripe
+   分配 `combined`，将 DS 响应复制进去。本轮分配 67108865 bytes（含 EOF
+   路径的 1-byte reserve），实际复制 67108864 bytes。
+2. 同函数约 969–971 行：多个 stripe chunk 再分配最终连续结果并复制，
+   本轮分配与复制各为 65802240 bytes。
+3. 普通 [MDS READ](../src/nfs41/read.rs) 约 76 行：直接返回响应 `Bytes`
+   切片，避开上述两层 pNFS 合并。现有 `BufferedFile::read_at` 单段复用
+   已在上层生效，未消除下层 `pnfs_read_layout` 的复制。
+
+这两层额外 payload 分配共约 126.754 MiB，解释了 A 默认相对同文件 MDS
+对照约 129.712 MiB 累计分配增量的大部分；剩余约 2.958 MiB 尚未逐项归属。
+所有配置的内容、EOF、释放检查和清理均通过。较高复制/并发分配会增加瞬时
+内存压力，既有 allocator 对照也说明释放后的页可以继续驻留；不能把累计
+分配或 RSS 峰值等同于仍存活的同等大小 payload。
+
+A 默认三轮 READ 累计分配约为 196.487、195.469、195.469 MiB，强制 MDS
+为 65.758、65.757、65.757 MiB，差异在重复轮次中保持。所有案例 UMOUNT 后
+新增存活大块均为 0。插桩报告自身会将每阶段计数 JSON 保存在报告向量中，
+整体 live 因此每轮增加约 5.6 KiB；不能将其说成整体堆增长严格为零，或把
+这部分工具元数据直接归为库的 payload 泄漏。未重新执行 32 轮长期案例。
+
+RPC record 增长假设在该负载中被否定：A 默认为 129 records / 129 fragments，
+MDS 对照为 66 / 66，所有配置的 record 增长分配均为 0。A 初次 record
+分配总量为 67123312 bytes，MDS 为 67115992 bytes，均接近实际 payload
+加协议头；这里没有多片 record 扩容造成额外约 128 MiB 的现象。
+
+原始诊断 binary 与插桩 binary 的 A 累计分配同为约 195.469 MiB，但峰值 RSS
+分别为 34.063 和 36.871 MiB；B 默认和强制 MDS 的分配接近，RSS 也不同。
+这说明不能把本轮单样本 RSS 差值换算成可复现的优化百分比。本轮三次矩阵
+（64 MiB 重现、8 MiB 最小化、64 MiB 因果对照）准备/清理最终状态均为 0。
+逐份核对报告 JSON：三次矩阵分别有 39、26、28 个进程报告，合计 93 个；
+全部 `status=pass` 且 `large_allocations_released=true`。这 93 个报告与既有
+520 个修改前后验证报告分开统计。
+
+| 候选解释 | 本轮结论 |
+| --- | --- |
+| pNFS 与 MDS 路径不同、pNFS 中间及最终复制 | 实际计数和同文件单变量对照确认，是累计分配差异的主要来源。 |
+| RPC 多片接收增长 | 本轮每条 record 一片、增长分配为 0，不解释此案例。 |
+| allocator / 调度历史导致驻留 | 既有单变量实测支持；本轮 RSS 变化再次提示其影响，尚未重新量化全部驻留页。 |
+| 前向 slot 持久缓存 READ reply | 原源码追踪不支持；本轮也没有持续存活大块增长证据。 |
+
+### 一手资料再次核对
+
+RFC 8881 将缓存责任放在请求的 **replier**：前向 READ 的 replier 是服务端；
+客户端在反向 CB_COMPOUND 中才是 replier。`sa_cachethis` 控制是否要求对方
+缓存完整结果，不能由协商的缓存上限推导客户端已分配等额 payload。
+该语义也不支持削弱 WRITE 重放保护来压低客户端 RSS。
+[RFC 8881 §2.10.6.1](https://www.rfc-editor.org/rfc/rfc8881.html#section-2.10.6.1)、
+[§2.10.6.1.3](https://www.rfc-editor.org/rfc/rfc8881.html#section-2.10.6.1.3)
+
+`Bytes::slice` 共享底层分配并增加引用计数；可见长度缩短不表示 backing
+等量缩小。因此需要同时记录 payload 长度、实际 backing 分配和最后一个 owner
+的释放时点。[bytes 1.11.1 官方文档](https://docs.rs/bytes/1.11.1/bytes/struct.Bytes.html#method.slice)
+
+以实测执行器的 glibc 2.39 为准：默认 mmap 阈值会动态调整；显式设置阈值
+会禁用该调整。64 位平台默认 arena 上限与在线 CPU 数相关；默认 tcache
+服务的最大请求仅为 1032 bytes，不能将 1 MiB READ backing 的驻留直接叫作
+“tcache 缓存”。arena、碎片和动态 mmap 分配历史应分别调查。
+[glibc 2.39 官方手册](https://sourceware.org/glibc/manual/2.39/html_node/Memory-Allocation-Tunables.html)
+
+`VmHWM` 是驻留峰值，`VmRSS` 是当前驻留；Linux 的可扩展 RSS 计数存在近似性。
+区分实际存活量与驻留页时，应同时保留 Rust 分配计数和 `smaps_rollup`/`smaps`
+采样。`malloc_trim` 只尝试返还空闲页，其诊断收益不证明此前仍有 payload owner。
+[Linux 内核 proc 文档](https://www.kernel.org/doc/html/latest/filesystems/proc.html#process-specific-subdirectories)、
+[malloc_trim(3)](https://man7.org/linux/man-pages/man3/malloc_trim.3.html)
+
+### 后续验收目标
+
+建议的最小库侧改动是让 pNFS 的单次 DS 响应保留 owned `Bytes`，只有确实
+需要合并多个短读片段时才分配 stripe 缓冲区；保留单 chunk 直接移交结果、
+多个 chunk 最终只拼接一次的逻辑。该方案优先去掉本例约 64 MiB 的冗余
+stripe 复制，须由回归和相同计数对照验证，尚未实施。
+
+公开 READ 接口要求返回连续 `Bytes`。多个独立 DS backing 通常仍需一次
+最终拼接，不能承诺所有 pNFS READ 都做到 MDS 的零复制或将累计分配从三倍
+降到一倍。应覆盖单响应指针复用、多片/短读、EOF、顺序、错误和取消释放，
+并检查共享 backing 的最后一个 owner 生命周期。私有强制 MDS 开关只是
+因果对照工具，不建议作为绕开 pNFS 的产品方案；会话和 WRITE 重放语义不变。
+
+实现后应保持同一 executor、导出、精确协议、运行时线程数和公平 payload，
+分别重复默认配置的 QD1/QD8、全新进程 READ-only、完整写读及八进程读取。
+按阶段比较累计分配、同时存活峰值、idle 后存活量和 RSS，并补充足够轮次的
+稳态检查。allocator 参数只作单变量诊断对照，不能据其结果宣称默认应用
+行为已经改善。当前计数尚未逐项归属的约 2.958 MiB 增量可随后单独跟踪。
+
+现有 issue 没有给出明确 RSS 预算；诊断工具的 1 MiB 尾段噪声预算也不是 RSS
+验收阈值。在默认配置症状、路径归属和可重复的改善目标明确前，应保持 issue
+打开并更新其错误归因。内存专项数据仍不能替代已有发布性能基线和门禁。
+
+后续 pNFS READ 中间复制优化已实施，FAS 前后对照和 AFX 回归见
+[实施验证报告](validation/issue-110-pnfs-read-reuse-2026-11-04.md)。

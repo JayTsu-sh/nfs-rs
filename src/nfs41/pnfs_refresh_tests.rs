@@ -800,6 +800,88 @@ async fn mixed_success_and_stale_does_not_refresh_or_replay() {
     );
 }
 
+// RFC 8881 §18.25: a short READ without EOF must continue at the actual
+// returned offset. EOF ends the ordered prefix even if later stripes succeed.
+#[tokio::test]
+async fn pnfs_read_assembles_short_replies_until_eof() {
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let observed = requested.clone();
+    let case = remapping_case(
+        move |tag, mut args| {
+            assert_eq!(tag, "ds-read");
+            putfh(&mut args);
+            assert_eq!(args.get_u32(), 25);
+            args.advance(16);
+            let offset = args.get_u64();
+            let count = args.get_u32();
+            observed.lock().unwrap().push((offset, count));
+            let (data, eof): (&[u8], bool) = match offset {
+                0 => (b"ab", false),
+                2 => (b"cd", false),
+                4 => (b"", true),
+                other => panic!("unexpected short-read offset {other}"),
+            };
+            let mut reply = Vec::new();
+            xdr_u32(&mut reply, u32::from(eof));
+            xdr_opaque(&mut reply, data);
+            vec![ok(22, vec![]), ok(25, reply)]
+        },
+        false,
+    )
+    .await;
+    let result = case
+        .mount
+        .read(Bytes::from_static(b"file"), 0, 8)
+        .await
+        .unwrap();
+    assert_eq!(result.as_ref(), b"abcd");
+    // The fixture negotiates four-byte DS reads, including short-read retries.
+    assert_eq!(*requested.lock().unwrap(), [(0, 4), (2, 4), (4, 4)]);
+    assert!(
+        case.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|tag| tag == "old:ds-read")
+    );
+}
+
+#[tokio::test]
+async fn pnfs_read_eof_truncates_successful_later_stripes() {
+    let case = remapping_case(
+        |tag, _| {
+            assert_eq!(tag, "ds-read");
+            let mut reply = Vec::new();
+            xdr_u32(&mut reply, 1);
+            xdr_opaque(&mut reply, b"ab");
+            vec![ok(22, vec![]), ok(25, reply)]
+        },
+        false,
+    )
+    .await;
+    let fh = Bytes::from_static(b"file");
+    let mut granted = layout(0, u64::MAX, b"shared");
+    if let LayoutContent::FilesLayout { stripe_unit, .. } = &mut granted.segments[0].content {
+        *stripe_unit = 4;
+    }
+    case.mount.layout_manager.store_layout(&fh, granted).await;
+    case.mount
+        .layout_manager
+        .store_device(
+            DEVICE,
+            DeviceInfo {
+                stripe_indices: vec![0, 1],
+                ds_addrs: vec![vec![case.old], vec![case.new]],
+            },
+        )
+        .await;
+    let result = case.mount.read(fh, 0, 8).await.unwrap();
+    assert_eq!(result.as_ref(), b"ab");
+    let mut calls = case.calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(calls, ["new:ds-read", "old:ds-read"]);
+}
+
 #[tokio::test]
 async fn read_retries_on_new_ds_before_mds_fallback() {
     let case = remapping_case(

@@ -130,6 +130,10 @@ Read and write RPC sizes are determined automatically during mount from server l
 and `BufferedFile::write_at` send at most 8 concurrent UNSTABLE chunks sized by
 negotiated `max_write`, complete short writes, then finish a batch commit
 before returning. There is no writeback mode or automatic byte threshold.
+pNFS READ also reuses a single owned data-server response. Short replies and
+multiple stripes are assembled only when contiguous output needs joining;
+returned slices can keep their complete RPC backing alive until dropped.
+
 `BufferedFile::read_at` returns a single owned response without copying its
 payload; it allocates a contiguous output buffer only when joining multiple
 response pieces. Returned bytes remain valid after the file is closed.

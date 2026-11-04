@@ -449,6 +449,57 @@ fn stop_pnfs_fallback(error: &NfsError) -> bool {
             && error.request_transmission() == Some(crate::RequestTransmission::NotSent))
 }
 
+// Owned READ pieces have one contiguous result. Keep assembly local to pNFS;
+// both short DS replies and stripe results use the same ownership rules.
+struct ReadAssembly {
+    first: Bytes,
+    joined: Option<BytesMut>,
+    capacity: usize,
+}
+
+impl ReadAssembly {
+    fn new(capacity: usize) -> Self {
+        Self {
+            first: Bytes::new(),
+            joined: None,
+            capacity,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.joined {
+            Some(data) => data.len(),
+            None => self.first.len(),
+        }
+    }
+
+    fn push(&mut self, piece: Bytes) {
+        if piece.is_empty() {
+            return;
+        }
+        if let Some(data) = &mut self.joined {
+            data.extend_from_slice(&piece);
+        } else if self.first.is_empty() {
+            self.first = piece;
+        } else {
+            // Independent RPC backings need a contiguous result only after a
+            // second nonempty piece. A lone reply keeps its original owner.
+            let mut data = BytesMut::with_capacity(self.capacity);
+            data.extend_from_slice(&self.first);
+            data.extend_from_slice(&piece);
+            self.first = Bytes::new();
+            self.joined = Some(data);
+        }
+    }
+
+    fn freeze(self) -> Bytes {
+        match self.joined {
+            Some(data) => data.freeze(),
+            None => self.first,
+        }
+    }
+}
+
 impl Mount41 {
     async fn preflight_write_data_servers(
         &self,
@@ -917,7 +968,7 @@ impl Mount41 {
                 let chunk_ds_offset = chunk.ds_offset;
                 async move {
                     let (ds_fh, ds_addr) = target?;
-                    let mut combined = BytesMut::with_capacity(chunk_len as usize);
+                    let mut combined = ReadAssembly::new(chunk_len as usize);
                     while combined.len() < chunk_len as usize {
                         let remaining = chunk_len as usize - combined.len();
                         let resp = self
@@ -940,7 +991,7 @@ impl Mount41 {
                         if data_len > remaining || data.remaining() < data_len {
                             return Err(NfsError::Xdr("invalid DS READ data length".into()));
                         }
-                        combined.extend_from_slice(&data[..data_len]);
+                        combined.push(data.slice(..data_len));
                         if eof {
                             break;
                         }
@@ -966,9 +1017,9 @@ impl Mount41 {
                 } else {
                     // Concatenate stripe results in order
                     let total_len: usize = results.iter().map(|(b, _)| b.len()).sum();
-                    let mut combined = BytesMut::with_capacity(total_len);
+                    let mut combined = ReadAssembly::new(total_len);
                     for (chunk_data, short) in results {
-                        combined.extend_from_slice(&chunk_data);
+                        combined.push(chunk_data);
                         if short {
                             break;
                         }
@@ -1659,6 +1710,74 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pnfs_single_read_piece_reuses_response_backing() {
+        let response = Bytes::from(vec![0x5a; 8192]);
+        let piece = response.slice(64..4160);
+        let pointer = piece.as_ptr();
+        let mut assembly = ReadAssembly::new(4096);
+        assembly.push(piece);
+        let result = assembly.freeze();
+        assert_eq!(result.as_ref(), &[0x5a; 4096]);
+        assert_eq!(
+            result.as_ptr(),
+            pointer,
+            "one DS response must not be copied"
+        );
+        drop(response);
+        assert_eq!(result.as_ref(), &[0x5a; 4096]);
+    }
+
+    #[test]
+    fn pnfs_read_assembly_skips_empty_pieces_and_joins_in_order() {
+        let first = Bytes::from_static(b"ab");
+        let mut assembly = ReadAssembly::new(8);
+        assembly.push(Bytes::new());
+        assembly.push(first.clone());
+        assembly.push(Bytes::new());
+        assert_eq!(assembly.len(), 2);
+        assembly.push(Bytes::from_static(b"cd"));
+        assembly.push(Bytes::new());
+        assembly.push(Bytes::from_static(b"ef"));
+        assert_eq!(assembly.len(), 6);
+        assert_eq!(assembly.freeze().as_ref(), b"abcdef");
+        let mut assembly = ReadAssembly::new(8);
+        assembly.push(first.clone());
+        assembly.push(Bytes::new());
+        assert_eq!(assembly.freeze().as_ptr(), first.as_ptr());
+    }
+
+    #[test]
+    fn pnfs_read_assembly_releases_owner_on_drop_or_caller_release() {
+        struct Owner(Arc<AtomicUsize>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                b"data"
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for finish in [false, true] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut assembly = ReadAssembly::new(8);
+            assembly.push(Bytes::from_owner(Owner(drops.clone())));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            if finish {
+                let result = assembly.freeze();
+                assert_eq!(result.as_ref(), b"data");
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                drop(result);
+            } else {
+                // Error/cancellation drops an incomplete stripe assembly.
+                drop(assembly);
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
 
     type TestDsFuture = Pin<Box<dyn Future<Output = Result<u32>> + Send>>;
 
