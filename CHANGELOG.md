@@ -7,12 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-11-04
+
 ### Changed
 
 - pNFS READ reuses a single owned data-server response, allocating stripe and
   final assembly buffers only when multiple nonempty pieces need joining.
   Short reads, EOF prefixes, layout generations and fallback semantics remain
   unchanged; this reduces copying without changing session replay protection.
+
+### Added
+
+- Nightly AFX acceptance for one WRITE spanning independent pNFS data servers,
+  requiring actual partial mutation, uncertain-outcome reporting, restored
+  connectivity, reopen/resume and full-file verification with owned cleanup.
 
 ## [0.11.2] - 2026-11-03
 
