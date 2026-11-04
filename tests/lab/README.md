@@ -257,4 +257,6 @@ saves raw packet/diagnostic evidence in a private local archive and uploads only
 `public/result.json`, containing the exact commit, probe and capture hashes,
 redacted acceptance results and cleanup status. A cleanup failure makes the run
 fail even when content checks passed. This is a correctness gate, not a new
-performance acceptance baseline.
+performance acceptance baseline. Nightly keeps the private evidence under
+`$HOME/.local/state/nfs-rs-lab/afx-t15-<run>-<attempt>` with restrictive permissions,
+outside both the checkout and the automatically cleared `$RUNNER_TEMP` directory.
