@@ -37,3 +37,12 @@ AI 工作流程、外部环境异常、验证与发布约束以 [AGENTS.md](../A
 | 真实服务验证 | [实验室约束](../tests/lab/README.md)，按实际协议和环境提供证据 |
 | 性能 | tests/benchmarks/baselines/ 及现有 benchmark 清单／门禁，保持对应环境基线与阈值 |
 | 发布 | [发布工作流](../.github/workflows/release.yml) 及 AGENTS.md 的不可变产物约束 |
+
+## 验证、review 和发布
+
+- 按影响范围执行固定工具链的 fmt、clippy、Rust 回归与文档测试。修改 Python／PyO3 时，用当前源码构建并安装独立 wheel，以 NFS_RS_TEST_INSTALLED=1 验证真实 Rust 适配层，并执行现有类型／stub 检查。仅修改指引文档时检查文档、链接及 diff，不要求无关运行时测试。
+- 真实服务测试遵守 [tests/lab/README.md](../tests/lab/README.md) 的允许范围、独立运行身份、共享锁和无条件清理；凭据及本机证据保留在仓库外。分别报告确定性测试与实际运行的物理环境。
+- 性能变更使用现有 benchmark 清单及对应环境基线，报告吞吐、延迟和内存；保持验收阈值，不能复用不同端点／协议的基线或用补充测量替代正式验收。
+- review 关注协议正确性、数据完整性、重试／取消安全、状态清理、Rust／Python 契约一致及外部异常的验证证据。对外行为变化同步更新文档与 changelog。
+- 发布依照 [.github/workflows/release.yml](../.github/workflows/release.yml) 和现有发布流程，保持 crate、Python 元数据、changelog 与 tag 版本一致；发布准确验证过的同一份产物。测试支持 wheel 不得发布，tag 和已发布版本保持不可变。只有发布工作流成功且 crates.io／PyPI 可见后才能宣告完成。
+- 完成报告说明改动、职责归属、实际验证、未测环境及剩余风险；不能把跳过项或能力缺失写成通过。
