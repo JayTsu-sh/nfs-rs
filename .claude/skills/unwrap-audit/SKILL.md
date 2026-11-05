@@ -1,6 +1,6 @@
 ---
 name: unwrap-audit
-description: Scan all production Rust code for unwrap()/expect() violations per CLAUDE.md rules
+description: Scan all production Rust code for unwrap()/expect() violations per AGENTS.md and docs/development.md
 ---
 
 Scan all `.rs` files under `src/` for `.unwrap()` and `.expect(` calls in production code.
