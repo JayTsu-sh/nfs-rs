@@ -68,7 +68,7 @@ struct OpenState {
 /// share a single OPEN stateid with ref_count tracking.
 pub(crate) struct StateManager {
     /// Map from file handle → open state.
-    /// Uses `tokio::sync::RwLock` per CLAUDE.md (async context, not Mutex).
+    /// Uses an async read/write lock so concurrent readers can share OPEN state.
     /// Keys are `Bytes` (zero-copy, ref-counted) instead of `Vec<u8>`.
     open_files: RwLock<HashMap<Bytes, OpenState>>,
     active_generation: AtomicU64,
