@@ -240,6 +240,19 @@ impl CompoundBuilder {
             "busy COMPOUND omitted its failing operation".into(),
         ))
     }
+    /// RFC 8881 §2.10.6.1.3: an uncached reply says nothing about the
+    /// original operations' completion. Only a wholly read-only COMPOUND may
+    /// be queried anew, after validating the successful SEQUENCE and failure.
+    pub(crate) fn can_requery_uncached(&self, response: &CompoundResponse) -> Result<bool> {
+        if response.status != nfsstat4::NFS4ERR_RETRY_UNCACHED_REP
+            || self.operation_class() != crate::error::OperationClass::ReadOnly
+            || response.op_ok(0).is_err()
+        {
+            return Ok(false);
+        }
+        self.can_retry_busy(response)
+    }
+
     pub fn new(tag: &str) -> Self {
         Self {
             tag: tag.to_string(),

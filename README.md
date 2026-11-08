@@ -258,6 +258,11 @@ outcome evidence. No URL switch is required. A failed mount may need to be
 replaced by its owner; application-level scan recovery remains the caller's policy.
 Silent packet loss uses the separate operation deadline and remains a timeout.
 
+For NFSv4.1/v4.2, an uncached read-only reply (`NFS4ERR_RETRY_UNCACHED_REP`)
+is queried once with a fresh sequence, within the same operation deadline.
+This applies to MDS and DS requests. Repeated uncached replies remain typed
+errors; modifying requests are never reissued through this recovery path.
+
 Server-busy responses use a fixed bounded retry policy across v3, v4.0, v4.1
 and v4.2, including independent pNFS DS reads. Safely reissuable requests have
 at most 16 busy reissues within 60 s, using equal-jitter exponential backoff

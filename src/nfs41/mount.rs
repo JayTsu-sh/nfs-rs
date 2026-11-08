@@ -439,6 +439,7 @@ impl Mount41 {
     ) -> Result<CompoundResponse> {
         let budget = crate::retry::current();
         let mut attempt = 0;
+        let mut requeried_uncached = false;
         loop {
             let sess = self.session_holder.get().await;
             let mut slot = sess.acquire_slot().await?;
@@ -548,6 +549,27 @@ impl Mount41 {
                 self.handle_seq_status(sequence.status_flags).await;
                 slot.resolve();
                 return Ok(resp);
+            }
+            if !requeried_uncached
+                && sequence_result.is_some()
+                && builder
+                    .can_requery_uncached(&resp)
+                    .map_err(|error| sent_error(operation_class, &context, error))?
+            {
+                // A fresh sequence queries current state; it must not replay
+                // the uncached identity. Keep the existing operation deadline
+                // and allow only one such requery, even across busy retries.
+                requeried_uncached = true;
+                if let Some(sequence) = sequence_result {
+                    self.handle_seq_status(sequence.status_flags).await;
+                }
+                slot.resolve();
+                drop(slot);
+                warn!(
+                    tag,
+                    "uncached read reply; querying again with a fresh sequence"
+                );
+                continue;
             }
             match resp.check_status() {
                 Err(error @ NfsError::Nfs4(nfsstat4::NFS4ERR_DELAY | nfsstat4::NFS4ERR_GRACE)) => {
@@ -687,6 +709,7 @@ impl Mount41 {
         build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
     ) -> Result<CompoundResponse> {
         let budget = crate::retry::current();
+        let mut requeried_uncached = false;
         loop {
             let mut slot = ds.session.acquire_slot().await?;
             let builder = CompoundBuilder::new(tag).sequence(
@@ -775,6 +798,20 @@ impl Mount41 {
                 return Err(sent_error(operation_class, &context, error));
             }
             slot.advance();
+            if !requeried_uncached
+                && builder
+                    .can_requery_uncached(&resp)
+                    .map_err(|error| sent_error(operation_class, &context, error))?
+            {
+                requeried_uncached = true;
+                slot.resolve();
+                drop(slot);
+                warn!(
+                    tag,
+                    "uncached DS read reply; querying again with a fresh sequence"
+                );
+                continue;
+            }
             if let Err(error) = resp.check_status() {
                 if error.is_server_busy() {
                     slot.resolve();

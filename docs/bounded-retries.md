@@ -56,6 +56,24 @@ These are shared scheduling and error semantics; protocol request identities
 and stateful replay rules remain version-specific. GRACE retains its original
 status and denotes server recovery rather than ordinary load.
 
+## Uncached read replies
+
+RFC 8881 [section 2.10.6.1.3](https://www.rfc-editor.org/rfc/rfc8881.html#section-2.10.6.1.3)
+permits a server to cache only SEQUENCE for an idempotent request. After losing
+that response, replay can return `NFS4ERR_RETRY_UNCACHED_REP`. NFSv4.1/v4.2 MDS
+and DS execution validate the reply and requery a wholly read-only COMPOUND once
+with a fresh sequence. This uses the current operation deadline without opening
+another budget or treating the response as server busy. Repeated uncached replies
+remain typed errors; mutations and malformed replies are never reissued by this
+path. A recovered reply loss is logged.
+
+Deterministic TCP tests cover both minor versions and MDS/DS identities, repeated
+failure, malformed replies, mutation uncertainty, cancellation during subsequent
+backoff and slot reuse. Real Linux NFSv4.1 `lookup_path` response-loss tests through
+data-mover also verified directory and broken-symlink observations without file
+COMMITs; flash, disconnect, silent loss and cancellation were checked separately.
+This is not physical pNFS DS, NFSv4.2, Python wheel or performance certification.
+
 ## Errors and application recovery
 
 A definite temporary rejection that exhausts the policy returns

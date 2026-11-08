@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- NFSv4.1/v4.2 read-only MDS and data-server requests requery once with a
+  fresh sequence when a lost reply was not cached. The existing operation
+  deadline is retained; repeated failures remain typed errors and modifying
+  requests retain their uncertain outcome without being reissued.
+
 ## [0.11.3] - 2026-11-04
 
 ### Changed
