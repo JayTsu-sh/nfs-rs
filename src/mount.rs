@@ -2228,6 +2228,11 @@ impl From<&str> for NFSVersion {
 /// Struct describing attributes for an NFS entry.
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct Attr {
+    /// Returned NFSv4 attribute bits 0–63, covering all fields represented here.
+    /// A clear bit means its field was omitted, even if the decoded value is zero.
+    /// `Some([0, 0])` represents an empty v4 attribute set; `None` is the fixed
+    /// NFSv3 fattr3 layout (or an explicitly constructed synthetic attribute set).
+    pub nfs4_attributes: Option<[u32; 2]>,
     pub type_: u32,
     pub file_mode: u32,
     pub nlink: u32,

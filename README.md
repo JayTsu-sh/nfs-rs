@@ -37,6 +37,13 @@ still require support from the selected server. See the
 
 The public API is still evolving while the crate is below version 1.0.
 
+Rust `Attr::nfs4_attributes` records the returned NFSv4 bitmap for common
+attributes 0–63. Check the corresponding bit before treating mode, size or a
+timestamp as available: an omitted field retains its default value, which is
+also a valid value for present metadata. An empty v4 response is `Some([0, 0])`;
+NFSv3's fixed `fattr3` layout uses `None`. This fixed-size field needs no extra
+heap allocation or metadata RPC. The Python stat shape is unchanged.
+
 ## Installation
 
 ```toml

@@ -1133,6 +1133,7 @@ impl From<nfstime3> for Time {
 impl From<fattr3> for crate::mount::Attr {
     fn from(attr: fattr3) -> Self {
         Self {
+            nfs4_attributes: None,
             type_: attr.type_v as u32,
             file_mode: attr.mode.0,
             nlink: attr.nlink,

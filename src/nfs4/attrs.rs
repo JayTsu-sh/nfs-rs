@@ -261,7 +261,15 @@ fn skip_fs_locations(vals: &mut Bytes) -> Result<()> {
 /// Uses common NFSv4 attribute numbering (RFC 7530): FILEHANDLE=19, fileid=20,
 /// mode=33, numlinks=35, owner=36, etc.
 pub(crate) fn decode_fattr4_to_attr(bitmap: &[u32], vals: &mut Bytes) -> Result<Attr> {
-    let mut attr = Attr::default();
+    // RFC 8881 §5.2: a server may omit unsupported attributes. Retain the
+    // returned common-field mask so missing evidence is not confused with zero.
+    let mut attr = Attr {
+        nfs4_attributes: Some([
+            bitmap.first().copied().unwrap_or(0),
+            bitmap.get(1).copied().unwrap_or(0),
+        ]),
+        ..Attr::default()
+    };
 
     // ── Word 0 attributes (0-31) in strict numeric order ──
 
@@ -767,6 +775,23 @@ mod tests {
     }
 
     #[test]
+    fn returned_mask_distinguishes_missing_fields_from_valid_zero_values() {
+        let mut omitted = Bytes::from(build_fattr4_type_only(1));
+        let omitted = decode_getattr_response(&mut omitted).unwrap();
+        let mask = [(1 << 1) | (1 << 4), (1 << 1) | (1 << 20) | (1 << 21)];
+        let mut values = Bytes::from(vec![0; 4 + 8 + 4 + 12 + 12]);
+        let present = decode_fattr4_to_attr(&mask, &mut values).unwrap();
+        assert_eq!(omitted.filesize, present.filesize);
+        assert_eq!(omitted.file_mode, present.file_mode);
+        assert_eq!(omitted.ctime, present.ctime);
+        assert_eq!(omitted.mtime, present.mtime);
+        assert_eq!(omitted.nfs4_attributes, Some([1 << 1, 0]));
+        assert_eq!(present.nfs4_attributes, Some(mask));
+        assert!(values.is_empty());
+        assert_eq!(Attr::default().nfs4_attributes, None);
+    }
+
+    #[test]
     fn decode_getattr_type_directory() {
         let buf = build_fattr4_type_only(2); // NF4DIR
         let mut bytes = Bytes::from(buf);
@@ -819,7 +844,13 @@ mod tests {
         buf.extend_from_slice(&0u32.to_be_bytes()); // attr_vals len = 0
         let mut bytes = Bytes::from(buf);
         let attr = decode_getattr_response(&mut bytes).unwrap();
-        assert_eq!(attr, Attr::default());
+        assert_eq!(
+            attr,
+            Attr {
+                nfs4_attributes: Some([0, 0]),
+                ..Attr::default()
+            }
+        );
     }
 
     #[test]
