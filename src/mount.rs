@@ -1251,6 +1251,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn fsstat(&self) -> Result<FSStat>;
 
     /// Procedure GETATTR retrieves the attributes for a specified file system object.
+    /// Ordinary NFSv4 GETATTR/LOOKUP/READDIR observations exclude ACLs; use
+    /// [`Mount::get_acl`] explicitly when the caller requires ACL metadata.
     ///
     /// # Example
     ///
@@ -2247,6 +2249,7 @@ pub struct Attr {
     pub mtime: Time,
     pub ctime: Time,
     /// NFSv4 ACL decoded from FATTR4_ACL (attr #12). `None` for NFSv3 or if not requested.
+    /// Ordinary observations do not request it; use [`Mount::get_acl`] for ACL reads.
     pub acl: Option<Acl>,
     /// NFSv4 raw owner string (attr #35), e.g. "root@localdomain" or "0".
     /// Empty string for NFSv3 or if not present.

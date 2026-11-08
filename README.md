@@ -43,6 +43,10 @@ timestamp as available: an omitted field retains its default value, which is
 also a valid value for present metadata. An empty v4 response is `Some([0, 0])`;
 NFSv3's fixed `fattr3` layout uses `None`. This fixed-size field needs no extra
 heap allocation or metadata RPC. The Python stat shape is unchanged.
+Ordinary NFSv4 attribute queries, including lookups and directory enumeration,
+exclude ACLs. Call the existing `Mount::get_acl` only when the metadata plan
+requires it. This avoids repeated ACL reads and keeps an unrelated ACL permission
+refusal from hiding ordinary file attributes; explicit ACL failures are preserved.
 
 ## Installation
 

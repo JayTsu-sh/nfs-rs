@@ -96,6 +96,34 @@ response recovered; disconnect (323 ms), silent loss (15.0 s) and cancellation
 three-second application fault budget, physical server restart, v4.2 service,
 Python wheel or throughput/RSS certification.
 
+## Explicit ACL acquisition
+
+Ordinary NFSv4 GETATTR, LOOKUP and directory observations request common attributes
+without ACL. Callers select the existing `Mount::get_acl` when their metadata plan
+requires it. `Attr::acl == None` in an ordinary observation is not evidence that
+the server lacks ACL support. This avoids both repeated ACL acquisition and an
+unrelated ACL refusal hiding the whole attribute result
+([RFC 8881 section 18.7.3](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.7.3)).
+No public method, request type or retry policy was added.
+
+The Rust 1.95 regression first reproduced ACCESS from an ordinary GETATTR when ACL
+was denied, then confirmed basic fields remain available while an explicit ACL
+query retains ACCESS. Against real Linux NFSv4.1, a private relay audited 118
+GETATTR/LOOKUP/READDIR attribute requests: zero implicit ACL requests, three explicit
+ACL requests and two injected ACCESS replies. The omitted phase made no ACL query.
+The application retained the complete copied payload and typed ACL acquisition
+failure; source removal was refused. The successful selected raw ACL survived
+snapshot roundtrip and copying. Independent reads confirmed all three source and
+target payloads and no transfer artifacts. The object-destination case projects
+S3 target capabilities; its actual data destination was NFS, not an S3 service.
+
+The new request bitmap also passed NFSv3/v4.1 flash, persistent disconnect, silent
+loss, cancellation and lost REMOVE response regressions, plus the v4.1 synthetic
+BADSESSION guard. V3 silent loss remained 5.0 seconds, v4.1 15.0 seconds and
+cancellation about 252 ms; no new application-wide recovery budget is claimed.
+These checks do not certify server restart, power-cut durability, physical v4.0/
+v4.2/pNFS, an installed Python wheel, full CLI/database/callback or throughput/RSS.
+
 ## Errors and application recovery
 
 A definite temporary rejection that exhausts the policy returns

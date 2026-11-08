@@ -9,6 +9,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Ordinary NFSv4 attribute queries no longer request ACLs implicitly. Callers
+  use the existing `Mount::get_acl` for required ACL metadata, avoiding repeated
+  reads and unrelated ACL permission failures in LOOKUP/GETATTR/READDIR.
 - Common Rust `Attr` retains the returned NFSv4 attribute mask in
   `nfs4_attributes`, distinguishing omitted metadata from valid zero values.
 - NFSv4.1/v4.2 CREATE, REMOVE, RENAME and LINK retain an uncertain outcome

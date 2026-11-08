@@ -31,10 +31,10 @@ use crate::mount::Attr;
 //   49=time_backup, 50=time_create, 51=time_delta, 52=time_metadata,
 //   53=time_modify, 54=time_modify_set, 55=mounted_on_fileid
 
-/// Standard bitmap for GETATTR to populate crate::Attr fields.
+/// Base bitmap for common attributes. ACLs use the explicit ACL accessor.
 ///
 /// Common NFSv4 attribute numbers (RFC 7530 §5.8):
-///   type(1), size(4), fsid(8), ACL(12), filehandle(19), fileid(20),
+///   type(1), size(4), fsid(8), filehandle(19), fileid(20),
 ///   mode(33), numlinks(35), owner(36), owner_group(37),
 ///   rawdev(41), space_used(45), time_access(47),
 ///   time_metadata(52), time_modify(53)
@@ -42,7 +42,6 @@ pub(crate) fn standard_getattr_bitmap() -> [u32; 2] {
     let word0: u32 = (1 << 1)  | // type
         (1 << 4)  | // size
         (1 << 8)  | // fsid
-        (1 << attrnum::ACL) | // ACL
         (1 << attrnum::FILEHANDLE) | // filehandle
         (1 << attrnum::FILEID); // fileid
 
@@ -690,7 +689,7 @@ mod tests {
         assert!(bitmap_has(&bm, 1)); // type
         assert!(bitmap_has(&bm, 4)); // size
         assert!(bitmap_has(&bm, 8)); // fsid
-        assert!(bitmap_has(&bm, 12)); // ACL
+        assert!(!bitmap_has(&bm, 12)); // ACL is explicitly acquired when requested
         assert!(bitmap_has(&bm, 19)); // filehandle
         assert!(bitmap_has(&bm, 20)); // fileid
         // Word 1 (common RFC 7530 numbering)

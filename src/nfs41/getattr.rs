@@ -22,3 +22,7 @@ impl Mount41 {
         self.getattr(obj.fh).await
     }
 }
+
+#[cfg(test)]
+#[path = "getattr_tests.rs"]
+mod tests;
