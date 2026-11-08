@@ -416,3 +416,61 @@ async fn uncached_read_cancellation_stops_reissues_and_leaves_the_slot_reusable(
         server.abort();
     }
 }
+
+// RFC 8881 §2.10.13.1.4: losing the reply cache cannot prove that a
+// non-idempotent namespace operation did not run. Do not acquire a fresh
+// replay identity without returning to the caller's source verification.
+#[tokio::test]
+async fn namespace_session_loss_preserves_uncertainty_without_reestablishing() {
+    for minor in [MinorVersion::V1, MinorVersion::V2] {
+        for operation in 0..4 {
+            for status in [10052, 10078, 10063] {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let count = calls.clone();
+                let observed = Arc::new(Mutex::new(vec![]));
+                let (mount, server) = serve_observed(
+                    move |tag, _| {
+                        count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        if tag == "namespace_mutation" {
+                            vec![Reply {
+                                opcode: 53,
+                                status,
+                                data: vec![],
+                            }]
+                        } else {
+                            // Fail forbidden recovery immediately rather than waiting
+                            // for a transport timeout in the red regression.
+                            vec![Reply {
+                                opcode: 42,
+                                status: 10006,
+                                data: vec![],
+                            }]
+                        }
+                    },
+                    minor,
+                    observed,
+                )
+                .await;
+                let result = mount
+                    .compound("namespace_mutation", |b| {
+                        let b = b.putfh(b"parent");
+                        match operation {
+                            0 => b.remove("original"),
+                            1 => b.savefh().putfh(b"other").rename("original", "renamed"),
+                            2 => b.savefh().putfh(b"other").link("linked"),
+                            _ => b.create(2, "directory", &[], &[]),
+                        }
+                    })
+                    .await;
+                let error = result.err().expect("lost session must not become success");
+                let outcome = error
+                    .operation_outcome()
+                    .expect("namespace session loss must retain execution uncertainty");
+                assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
+                assert_eq!(outcome.recovery, crate::RecoveryAction::VerifyThenResume);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::Acquire), 1);
+                server.abort();
+            }
+        }
+    }
+}

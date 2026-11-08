@@ -74,6 +74,28 @@ data-mover also verified directory and broken-symlink observations without file
 COMMITs; flash, disconnect, silent loss and cancellation were checked separately.
 This is not physical pNFS DS, NFSv4.2, Python wheel or performance certification.
 
+## Namespace session loss
+
+For NFSv4.1/v4.2 CREATE, REMOVE (including directory removal), RENAME and LINK,
+BADSESSION, DEADSESSION or SEQ_MISORDERED do not start a new session and repeat
+the mutation. They return `Uncertain/VerifyThenResume` with the original request
+context. Losing the reply cache cannot establish whether the mutation ran
+([RFC 8881 section 2.10.13.1.4](https://www.rfc-editor.org/rfc/rfc8881.html#section-2.10.13.1.4)).
+The caller must observe the affected names and identities before starting a new
+operation. Live-session transport replay retains the existing exactly-once policy.
+This extends the existing v4.2 mutation guard without adding a public API.
+
+The 2026-11-08 Rust 1.95 regression covers both minor versions, four namespace
+mutations and BADSESSION/DEADSESSION/SEQ_MISORDERED. In a private relay connected
+to the real Linux NFSv4.1 server, an armed REMOVE received a synthetic BADSESSION:
+the adapter retained `Connectivity/Unknown`, and the relay observed zero fresh
+EXCHANGE_ID requests. Independent reads confirmed the original backup and a
+subsequent same-name replacement were intact. Transport flash and lost REMOVE
+response recovered; disconnect (323 ms), silent loss (15.0 s) and cancellation
+(253 ms) preserved uncertainty. These are storage-operation measurements, not a
+three-second application fault budget, physical server restart, v4.2 service,
+Python wheel or throughput/RSS certification.
+
 ## Errors and application recovery
 
 A definite temporary rejection that exhausts the policy returns

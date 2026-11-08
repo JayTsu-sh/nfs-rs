@@ -9,6 +9,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- NFSv4.1/v4.2 CREATE, REMOVE, RENAME and LINK retain an uncertain outcome
+  when their session/replay identity is lost. They no longer establish a fresh
+  session and repeat a possibly completed namespace mutation automatically.
 - NFSv4.1/v4.2 read-only MDS and data-server requests requery once with a
   fresh sequence when a lost reply was not cached. The existing operation
   deadline is retained; repeated failures remain typed errors and modifying

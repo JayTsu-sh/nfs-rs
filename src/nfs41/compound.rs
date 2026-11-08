@@ -287,13 +287,18 @@ impl CompoundBuilder {
             .into()
     }
 
-    /// These v4.2 mutations may only replay within the original session's
-    /// exactly-once context. Session loss does not prove the first attempt failed.
+    /// Namespace and v4.2 non-idempotent mutations may only replay within
+    /// their original exactly-once context (RFC 8881 §2.10.13.1.4). Losing
+    /// the session does not prove that the first attempt failed.
     pub(crate) fn requires_original_session(&self) -> bool {
         self.ops.iter().any(|op| {
             matches!(
                 op.opcode,
-                OpNum::Allocate
+                OpNum::Create
+                    | OpNum::Link
+                    | OpNum::Remove
+                    | OpNum::Rename
+                    | OpNum::Allocate
                     | OpNum::Deallocate
                     | OpNum::Copy
                     | OpNum::Clone
