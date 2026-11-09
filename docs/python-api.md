@@ -271,6 +271,8 @@ equivalent file-removal operations.
 
 `readlink(path)` returns the stored target text. `stat(path)` and `exists(path)`
 inspect the link itself; a dangling link can therefore pass `exists`.
+The String-based interface raises `NfsEncodingError` for a non-UTF-8 target;
+it never replaces undecodable bytes with a different filename.
 Use `resolve(path)` to follow intermediate and final links and inspect the target:
 
 ```python

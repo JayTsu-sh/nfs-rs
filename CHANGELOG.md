@@ -17,6 +17,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- READLINK rejects non-UTF-8 targets with a typed encoding error instead of
+  replacing bytes and potentially resolving a different file. This applies to
+  the String-based Rust and Python interfaces across all supported protocols.
+
 - Ordinary NFSv4 attribute queries no longer request ACLs implicitly. Callers
   use the existing `Mount::get_acl` for required ACL metadata, avoiding repeated
   reads and unrelated ACL permission failures in LOOKUP/GETATTR/READDIR.

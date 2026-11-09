@@ -1043,7 +1043,7 @@ Create link_path containing target. link_path is normalized relative to the expo
 def readlink(self, path: os.PathLike[str] | str) -> str: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error.
+Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
 
 #### Client.touch
 
@@ -1444,7 +1444,7 @@ Create link_path containing target. link_path is normalized relative to the expo
 async def readlink(self, path: os.PathLike[str] | str) -> str: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error.
+Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
 
 #### AsyncClient.touch
 

@@ -64,7 +64,7 @@ impl Namespace for FixtureNamespace {
             "file" | "nested/file" | "nested/peer" => Ok(self.node(&path, 1)),
             "link" | "dangling" | "absolute" | "outside" | "cycle" | "cycle-a" | "cycle-b"
             | "alias" | "deep-alias" | "nested/up" | "nested/back" | "empty" | "nul" | "long"
-            | "many" | "slow" | "readlink-error" => Ok(self.node(&path, 5)),
+            | "many" | "slow" | "readlink-error" | "encoding-error" => Ok(self.node(&path, 5)),
             _ if path.starts_with("chain-") => Ok(self.node(&path, 5)),
             _ => Err(if self.v4 {
                 NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_NOENT)
@@ -95,6 +95,7 @@ impl Namespace for FixtureNamespace {
             "many" => "./".repeat(MAX_COMPONENTS),
             "slow" => std::future::pending().await,
             "readlink-error" => return Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_IO)),
+            "encoding-error" => return Err(NfsError::Xdr("READLINK target is not UTF-8".into())),
             _ => {
                 let number = path
                     .strip_prefix("chain-")

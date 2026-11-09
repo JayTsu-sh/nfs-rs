@@ -61,10 +61,11 @@ def test_native_sync_and_async_resolution(path, status, exists, target):
 
 
 def test_native_resolution_preserves_errors_and_context():
-    from nfs_rs import AsyncClient, Client, NfsConnectionError, NfsPermissionError, NfsProtocolError, NfsStateLostError
+    from nfs_rs import AsyncClient, Client, NfsConnectionError, NfsEncodingError, NfsPermissionError, NfsProtocolError, NfsStateLostError
 
     cases = [("denied", NfsPermissionError), ("disconnected", NfsConnectionError),
-             ("stale", NfsStateLostError), ("readlink-error", NfsProtocolError)]
+             ("stale", NfsStateLostError), ("readlink-error", NfsProtocolError),
+             ("encoding-error", NfsEncodingError)]
     with Client.connect("nfs-test://fixture/export") as client:
         for path, error in cases:
             with pytest.raises(error) as caught:
