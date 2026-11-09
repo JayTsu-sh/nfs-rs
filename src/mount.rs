@@ -1496,6 +1496,21 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     async fn lookup_path(&self, path: &str) -> Result<ObjRes>;
 
+    /// Resolve an export-relative path, following intermediate and final symlinks.
+    /// Relative targets are interpreted from the link's directory; absolute targets
+    /// and parent traversal beyond the mounted root return `OutsideMount`.
+    /// At most 40 links, 4096 cumulative components and 64 KiB of cumulative path
+    /// text are accepted. Permission/connection/stale errors propagate unchanged.
+    /// This read-only observation does not guarantee later access or namespace stability.
+    async fn resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+        crate::path_resolution::resolve(self, path).await
+    }
+
+    /// Blocking version of [`Mount::resolve_path`].
+    fn sync_resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+        block_on_compat(self.resolve_path(path))
+    }
+
     /// Procedure PATHCONF retrieves the pathconf information for a file or directory.
     ///
     /// # Example

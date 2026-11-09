@@ -261,6 +261,7 @@ mod nfs4;
 mod nfs40;
 mod nfs41;
 pub mod nfs42;
+mod path_resolution;
 #[cfg(feature = "python-bindings")]
 mod python_adapter;
 mod retry;
@@ -284,6 +285,7 @@ pub use nfs42::{
     CopyResult, Nfs42Attributes, ReadPlusContent, ReadPlusResult, SeekContent, SeekResult,
     XattrSetMode,
 };
+pub use path_resolution::{PathResolution, PathResolutionStatus};
 pub use shared::Time;
 // 公开 NFS 错误码类型，供外部 crate 进行错误匹配
 pub use nfs3::ErrorCode as Nfs3ErrorCode;

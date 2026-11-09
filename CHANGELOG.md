@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Rust `Mount::resolve_path` / `sync_resolve_path` and Python `Client.resolve` /
+  `AsyncClient.resolve` follow symbolic links within the mounted namespace.
+  `PathResolution` returns final path/metadata and distinguishes missing targets,
+  non-directory components, mount-boundary limitations and the 40-link limit.
+  Permission, connection and stale-handle failures remain typed errors.
+
 ### Fixed
 
 - Ordinary NFSv4 attribute queries no longer request ACLs implicitly. Callers
