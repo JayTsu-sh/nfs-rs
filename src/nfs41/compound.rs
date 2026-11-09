@@ -240,6 +240,19 @@ impl CompoundBuilder {
             "busy COMPOUND omitted its failing operation".into(),
         ))
     }
+    /// RFC 8881 §2.10.6.1.3: an uncached reply says nothing about the
+    /// original operations' completion. Only a wholly read-only COMPOUND may
+    /// be queried anew, after validating the successful SEQUENCE and failure.
+    pub(crate) fn can_requery_uncached(&self, response: &CompoundResponse) -> Result<bool> {
+        if response.status != nfsstat4::NFS4ERR_RETRY_UNCACHED_REP
+            || self.operation_class() != crate::error::OperationClass::ReadOnly
+            || response.op_ok(0).is_err()
+        {
+            return Ok(false);
+        }
+        self.can_retry_busy(response)
+    }
+
     pub fn new(tag: &str) -> Self {
         Self {
             tag: tag.to_string(),
@@ -274,13 +287,18 @@ impl CompoundBuilder {
             .into()
     }
 
-    /// These v4.2 mutations may only replay within the original session's
-    /// exactly-once context. Session loss does not prove the first attempt failed.
+    /// Namespace and v4.2 non-idempotent mutations may only replay within
+    /// their original exactly-once context (RFC 8881 §2.10.13.1.4). Losing
+    /// the session does not prove that the first attempt failed.
     pub(crate) fn requires_original_session(&self) -> bool {
         self.ops.iter().any(|op| {
             matches!(
                 op.opcode,
-                OpNum::Allocate
+                OpNum::Create
+                    | OpNum::Link
+                    | OpNum::Remove
+                    | OpNum::Rename
+                    | OpNum::Allocate
                     | OpNum::Deallocate
                     | OpNum::Copy
                     | OpNum::Clone

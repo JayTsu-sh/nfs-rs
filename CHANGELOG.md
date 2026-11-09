@@ -7,6 +7,41 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-09
+
+### Changed
+
+- Rust callers constructing exhaustive `Attr` struct literals must initialize
+  the new `nfs4_attributes` field or use `..Attr::default()`. The Python
+  `FileInfo` shape is unchanged.
+
+### Added
+
+- Rust `Mount::resolve_path` / `sync_resolve_path` and Python `Client.resolve` /
+  `AsyncClient.resolve` follow symbolic links within the mounted namespace.
+  `PathResolution` returns final path/metadata and distinguishes missing targets,
+  non-directory components, mount-boundary limitations and the 40-link limit.
+  Permission, connection and stale-handle failures remain typed errors.
+
+### Fixed
+
+- READLINK rejects non-UTF-8 targets with a typed encoding error instead of
+  replacing bytes and potentially resolving a different file. This applies to
+  the String-based Rust and Python interfaces across all supported protocols.
+
+- Ordinary NFSv4 attribute queries no longer request ACLs implicitly. Callers
+  use the existing `Mount::get_acl` for required ACL metadata, avoiding repeated
+  reads and unrelated ACL permission failures in LOOKUP/GETATTR/READDIR.
+- Common Rust `Attr` retains the returned NFSv4 attribute mask in
+  `nfs4_attributes`, distinguishing omitted metadata from valid zero values.
+- NFSv4.1/v4.2 CREATE, REMOVE, RENAME and LINK retain an uncertain outcome
+  when their session/replay identity is lost. They no longer establish a fresh
+  session and repeat a possibly completed namespace mutation automatically.
+- NFSv4.1/v4.2 read-only MDS and data-server requests requery once with a
+  fresh sequence when a lost reply was not cached. The existing operation
+  deadline is retained; repeated failures remain typed errors and modifying
+  requests retain their uncertain outcome without being reissued.
+
 ## [0.11.3] - 2026-11-04
 
 ### Changed

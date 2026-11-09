@@ -78,6 +78,14 @@ class Version(str, Enum):
         return self.value
 
 
+class PathResolutionStatus(str, Enum):
+    RESOLVED = "resolved"
+    MISSING = "missing"
+    NOT_DIRECTORY = "not_directory"
+    OUTSIDE_MOUNT = "outside_mount"
+    TOO_MANY_SYMLINKS = "too_many_symlinks"
+
+
 class SeekContent(IntEnum):
     DATA = 0
     HOLE = 1
@@ -247,6 +255,21 @@ class FileInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class PathResolution:
+    status: PathResolutionStatus
+    path: str | None
+    info: FileInfo | None
+
+    @property
+    def exists(self) -> bool | None:
+        if self.status is PathResolutionStatus.RESOLVED:
+            return True
+        if self.status in (PathResolutionStatus.MISSING, PathResolutionStatus.NOT_DIRECTORY):
+            return False
+        return None
+
+
+@dataclass(frozen=True, slots=True)
 class DirectoryRef:
     path: os.PathLike[str] | str
     fh: bytes | None = None
@@ -374,6 +397,24 @@ def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
         ctime=values["ctime_ns"],
         owner=values.get("owner") or None,
         group=values.get("group") or None,
+    )
+
+
+def _resolution_path(path: os.PathLike[str] | str) -> str:
+    raw = os.fspath(path)
+    if isinstance(raw, bytes):
+        raise TypeError("NFS paths must be strings, not bytes")
+    if "\0" in raw or raw.startswith("/"):
+        raise ValueError("resolve requires an export-relative path without NUL")
+    # Preserve .., dots and trailing slashes: their meaning depends on symlinks.
+    return raw
+
+
+def _path_resolution(values: dict[str, Any]) -> PathResolution:
+    path = values["path"]
+    return PathResolution(
+        PathResolutionStatus(values["status"]), path,
+        _file_info(path, values["info"]) if path is not None and values["info"] is not None else None,
     )
 
 
@@ -679,6 +720,9 @@ class Client(_ClientOptions):
             return False
         return True
 
+    def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+        return _path_resolution(self._inner.resolve(_resolution_path(path)))
+
     def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
         normalized, fh = _scandir_target(path)
         cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
@@ -948,6 +992,10 @@ class AsyncClient(_ClientOptions):
         except FileNotFoundError:
             return False
         return True
+
+    async def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+        self._check_loop()
+        return _path_resolution(await self._inner.resolve(_resolution_path(path)))
 
     async def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
         self._check_loop()

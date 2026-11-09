@@ -2098,6 +2098,56 @@ async fn stat_attr(
     mount.getattr_path(&path).await
 }
 
+async fn resolve_path(
+    core: Arc<ClientCore>,
+    mount: Option<Arc<dyn Mount>>,
+    path: String,
+) -> Result<crate::PathResolution> {
+    let _operation = core.begin_operation()?;
+    #[cfg(feature = "python-test-support")]
+    if mount.is_none() {
+        return crate::path_resolution::resolve(
+            &crate::path_resolution::fixture::FixtureNamespace {
+                v4: true,
+                ..Default::default()
+            },
+            &path,
+        )
+        .await;
+    }
+    mount
+        .ok_or_else(|| {
+            NfsError::Unsupported("resolve requires a connected protocol engine".into())
+        })?
+        .resolve_path(&path)
+        .await
+}
+
+fn resolution_dict<'py>(
+    py: Python<'py>,
+    result: crate::PathResolution,
+) -> PyResult<Bound<'py, PyDict>> {
+    use crate::PathResolutionStatus;
+
+    let values = PyDict::new(py);
+    values.set_item(
+        "status",
+        match result.status {
+            PathResolutionStatus::Resolved => "resolved",
+            PathResolutionStatus::Missing => "missing",
+            PathResolutionStatus::NotDirectory => "not_directory",
+            PathResolutionStatus::OutsideMount => "outside_mount",
+            PathResolutionStatus::TooManySymlinks => "too_many_symlinks",
+        },
+    )?;
+    values.set_item("path", result.path)?;
+    match result.object.and_then(|object| object.attr) {
+        Some(attr) => values.set_item("info", attr_dict(py, &attr)?)?,
+        None => values.set_item("info", py.None())?,
+    }
+    Ok(values)
+}
+
 enum V42Value {
     Unit,
     Seek(crate::SeekResult),
@@ -4565,6 +4615,25 @@ impl SyncClient {
         attr_dict(py, &attr)
     }
 
+    fn resolve<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+        // Resolution owns no mutation or OPEN state. Drop the traversal itself
+        // on timeout, so no detached namespace walk can hold client.close open.
+        let future = crate::retry::with_timeout(
+            self.operation_timeout,
+            resolve_path(self.core.clone(), self.health_source.clone(), path),
+        );
+        let result = py
+            .detach(|| {
+                self.runtime.block_on(with_operation_timeout(
+                    self.operation_timeout,
+                    "resolve",
+                    future,
+                ))
+            })
+            .map_err(nfs_error)?;
+        resolution_dict(py, result)
+    }
+
     #[pyo3(signature = (path, mode = 0o777))]
     fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
         self.run_operation(
@@ -5232,6 +5301,22 @@ impl AsyncClient {
                 .await
                 .map_err(nfs_error)?;
             Python::attach(|py| attr_dict(py, &attr).map(Bound::unbind))
+        })
+    }
+
+    fn resolve<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let core = self.core.clone();
+        let mount = self.health_source.clone();
+        let timeout = self.operation_timeout;
+        completion::future_into_py(py, async move {
+            let result = with_operation_timeout(
+                timeout,
+                "resolve",
+                crate::retry::with_timeout(timeout, resolve_path(core, mount, path)),
+            )
+            .await
+            .map_err(nfs_error)?;
+            Python::attach(|py| resolution_dict(py, result).map(Bound::unbind))
         })
     }
 

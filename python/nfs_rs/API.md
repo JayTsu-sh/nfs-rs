@@ -10,6 +10,8 @@ are private. `__version__` is the installed distribution version string.
 Paths accept `str` or `os.PathLike[str]` and are relative to the mounted export.
 Absolute paths, escaping `..`, NULs and byte-string paths are rejected. Symlink
 target strings are the explicit exception: their stored text is preserved.
+`resolve` evaluates `..` during traversal and reports OUTSIDE_MOUNT when it
+would leave the root, rather than lexically normalizing the path first.
 Offsets and sizes are byte counts. File reads require a readable binary mode;
 writes and truncation require a writable mode. Read sizes accept -1 for EOF or
 non-negative values; other negative sizes and invalid ranges are rejected.
@@ -803,6 +805,24 @@ def exists(self, path: os.PathLike[str] | str) -> bool: ...
 
 Return False only when stat raises FileNotFoundError; permission, connection and other errors propagate. Return True when stat succeeds.
 
+#### Client.resolve
+
+```python
+def resolve(self, path: os.PathLike[str] | str) -> PathResolution: ...
+```
+
+Available in 0.12.0. Accept ordinary files/directories or links without a preliminary
+type check. Follow intermediate and final symbolic links and return PathResolution. Relative
+targets start at the link's directory; .. is evaluated during traversal and a
+trailing slash requires a directory. Input must be export-relative. Absolute link
+targets or traversal above the mounted root return OUTSIDE_MOUNT, not MISSING.
+At most 40 links, 4096 cumulative components and 64 KiB of cumulative UTF-8 path
+text are accepted; oversized or NUL-containing text raises ValueError. The complete
+resolution shares operation_timeout. Permission, connection, timeout, stale-handle
+and other errors propagate. The observation neither checks read/write permission
+nor guarantees the result of a subsequent open. stat/exists continue to inspect
+the link itself; readlink returns the original target text.
+
 #### Client.scandir
 
 ```python
@@ -1024,7 +1044,7 @@ Create link_path containing target. link_path is normalized relative to the expo
 def readlink(self, path: os.PathLike[str] | str) -> str: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error.
+Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
 
 #### Client.touch
 
@@ -1180,6 +1200,17 @@ async def exists(self, path: os.PathLike[str] | str) -> bool: ...
 ```
 
 Return False only when stat raises FileNotFoundError; permission, connection and other errors propagate. Return True when stat succeeds.
+
+#### AsyncClient.resolve
+
+```python
+async def resolve(self, path: os.PathLike[str] | str) -> PathResolution: ...
+```
+
+Await the same bounded, mount-relative resolution as Client.resolve. Returns the
+same PathResolution states and final metadata. Must run on the creating event loop;
+operation_timeout covers the entire traversal. Cancellation stops this read-only
+traversal, and permission/connection/timeout/stale-handle errors remain errors.
 
 #### AsyncClient.scandir
 
@@ -1414,7 +1445,7 @@ Create link_path containing target. link_path is normalized relative to the expo
 async def readlink(self, path: os.PathLike[str] | str) -> str: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error.
+Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
 
 #### AsyncClient.touch
 
@@ -2006,3 +2037,46 @@ async def nfs42_attributes(self, path: os.PathLike[str] | str='.') -> Nfs42Attri
 ```
 
 Inspect supported_attrs, optional clone_blksize and RFC 8276 xattr_support on the requested file or directory. Values are filesystem-specific and are not a list of supported operations.
+
+
+### PathResolutionStatus
+
+Resolution status enum. A limitation does not prove that the target is missing.
+
+| Member | Meaning |
+|---|---|
+| `PathResolutionStatus.RESOLVED` | Final object and attributes obtained. |
+| `PathResolutionStatus.MISSING` | A path component or link target does not exist. |
+| `PathResolutionStatus.NOT_DIRECTORY` | A component requiring a directory is another object type. |
+| `PathResolutionStatus.OUTSIDE_MOUNT` | An absolute target or parent traversal requires a namespace outside this mount. |
+| `PathResolutionStatus.TOO_MANY_SYMLINKS` | More than 40 links would be followed, possibly a cycle. |
+
+#### PathResolutionStatus.__new__
+
+```python
+def __new__(cls, value: str) -> PathResolutionStatus: ...
+```
+
+Construct the resolution status enum from its string value, such as "resolved"
+or "outside_mount". Unknown values raise ValueError.
+
+### PathResolution
+
+Frozen namespace observation returned by resolve; permission and transport failures
+are raised instead of being represented as an absent target.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `PathResolution.status` | `PathResolutionStatus` | The resolution outcome. |
+| `PathResolution.path` | `str \| None` | Canonical export-relative final path, or None unless resolved; root is '.'. |
+| `PathResolution.info` | `FileInfo \| None` | Final object metadata with the resolved path, or None unless resolved. |
+
+#### PathResolution.exists
+
+```python
+def exists(self) -> bool | None: ...
+```
+
+Read as a property. True for RESOLVED, False for MISSING or NOT_DIRECTORY, and
+None for OUTSIDE_MOUNT or TOO_MANY_SYMLINKS. Compare with `is True` / `is False`
+to preserve the unknown state. Existence does not imply read/write access.

@@ -1251,6 +1251,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn fsstat(&self) -> Result<FSStat>;
 
     /// Procedure GETATTR retrieves the attributes for a specified file system object.
+    /// Ordinary NFSv4 GETATTR/LOOKUP/READDIR observations exclude ACLs; use
+    /// [`Mount::get_acl`] explicitly when the caller requires ACL metadata.
     ///
     /// # Example
     ///
@@ -1493,6 +1495,21 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// }
     /// ```
     async fn lookup_path(&self, path: &str) -> Result<ObjRes>;
+
+    /// Resolve an export-relative path, following intermediate and final symlinks.
+    /// Relative targets are interpreted from the link's directory; absolute targets
+    /// and parent traversal beyond the mounted root return `OutsideMount`.
+    /// At most 40 links, 4096 cumulative components and 64 KiB of cumulative path
+    /// text are accepted. Permission/connection/stale errors propagate unchanged.
+    /// This read-only observation does not guarantee later access or namespace stability.
+    async fn resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+        crate::path_resolution::resolve(self, path).await
+    }
+
+    /// Blocking version of [`Mount::resolve_path`].
+    fn sync_resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+        block_on_compat(self.resolve_path(path))
+    }
 
     /// Procedure PATHCONF retrieves the pathconf information for a file or directory.
     ///
@@ -2228,6 +2245,11 @@ impl From<&str> for NFSVersion {
 /// Struct describing attributes for an NFS entry.
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct Attr {
+    /// Returned NFSv4 attribute bits 0–63, covering all fields represented here.
+    /// A clear bit means its field was omitted, even if the decoded value is zero.
+    /// `Some([0, 0])` represents an empty v4 attribute set; `None` is the fixed
+    /// NFSv3 fattr3 layout (or an explicitly constructed synthetic attribute set).
+    pub nfs4_attributes: Option<[u32; 2]>,
     pub type_: u32,
     pub file_mode: u32,
     pub nlink: u32,
@@ -2242,6 +2264,7 @@ pub struct Attr {
     pub mtime: Time,
     pub ctime: Time,
     /// NFSv4 ACL decoded from FATTR4_ACL (attr #12). `None` for NFSv3 or if not requested.
+    /// Ordinary observations do not request it; use [`Mount::get_acl`] for ACL reads.
     pub acl: Option<Acl>,
     /// NFSv4 raw owner string (attr #35), e.g. "root@localdomain" or "0".
     /// Empty string for NFSv3 or if not present.

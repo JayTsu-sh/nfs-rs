@@ -1,8 +1,9 @@
 use bytes::{Buf, Bytes};
 
-use super::mount::{Mount41, decode_string_from_bytes};
+use super::mount::Mount41;
 use super::state::{AccessMode, StateId};
 use crate::error::{NfsError, Result};
+use crate::nfs4::compound::take_opaque;
 
 impl Mount41 {
     pub(crate) async fn access(&self, fh: Bytes, mode: u32) -> Result<u32> {
@@ -88,12 +89,58 @@ impl Mount41 {
         resp.op_ok(1)?; // PUTFH
         let readlink_op = resp.op_ok(2)?;
         let mut data = readlink_op.data.clone();
-        // READLINK4resok: link (utf8string = opaque<>)
-        decode_string_from_bytes(&mut data)
+        // RFC 8881 §18.24: preserve target identity; the String interface
+        // rejects unrepresentable bytes instead of following a replacement name.
+        let link = take_opaque(&mut data, "READLINK target")?;
+        std::str::from_utf8(&link)
+            .map(str::to_owned)
+            .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
     }
 
     pub(crate) async fn readlink_path(&self, path: &str) -> Result<String> {
         let obj = self.lookup_path(path).await?;
         self.readlink(obj.fh).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nfs41::MinorVersion;
+    use crate::nfs41::test_support::{ok, opaque, putfh, serve_observed};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn readlink_preserves_utf8_identity_v41_v42() {
+        // RFC 8881 §18.24: READLINK text is interpreted by the client;
+        // replacing invalid bytes would silently change the target identity.
+        for minor in [MinorVersion::V1, MinorVersion::V2] {
+            for target in [
+                b"../target".as_slice(),
+                "目录/target".as_bytes(),
+                "�".as_bytes(),
+                b"\xff",
+                b"\xc0\xaf",
+            ] {
+                let wire_target = target.to_vec();
+                let (mount, server) = serve_observed(
+                    move |tag, mut args| {
+                        assert_eq!(tag, "readlink");
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 27);
+                        vec![ok(22, vec![]), ok(27, opaque(&wire_target))]
+                    },
+                    minor,
+                    Arc::new(Mutex::new(vec![])),
+                )
+                .await;
+                let result = mount.readlink(Bytes::from_static(b"link")).await;
+                match std::str::from_utf8(target) {
+                    Ok(expected) => assert_eq!(result.unwrap(), expected),
+                    Err(_) => assert!(matches!(result, Err(NfsError::Xdr(_))), "{result:?}"),
+                }
+                server.abort();
+            }
+        }
     }
 }

@@ -20,7 +20,7 @@ PUBLIC_API_COVERAGE = {
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
-        "mkdir", "open", "readlink", "recovery_events", "remove",
+        "mkdir", "open", "readlink", "resolve", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "scandir_page", "setdacl", "setsacl", "setxattr", "stat", "symlink",
         "touch", "truncate", "unlink", "utime", "version", "allocate", "deallocate", "seek_content", "read_plus", "copy_range", "clone_range", "nfs42_attributes", "__enter__",
         "__exit__",
@@ -29,7 +29,7 @@ PUBLIC_API_COVERAGE = {
         "access", "capabilities", "chmod", "chown", "close", "closed", "connect",
         "drain_recovery_events", "dropped_recovery_event_count", "exists", "fs_info",
         "fs_stat", "getdacl", "getsacl", "getxattr", "health", "io_limits", "link", "listdir", "listxattr",
-        "mkdir", "open", "readlink", "recovery_events", "remove",
+        "mkdir", "open", "readlink", "resolve", "recovery_events", "remove",
         "removexattr", "rename", "rmdir", "scandir", "scandir_page", "setdacl", "setsacl", "setxattr", "stat", "symlink",
         "touch", "truncate", "unlink", "utime", "version", "allocate", "deallocate", "seek_content", "read_plus", "copy_range", "clone_range", "nfs42_attributes", "__aenter__",
         "__aexit__",
@@ -403,6 +403,22 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
             check(file.read() == b"payl", "Client.link", checks)
         client.symlink("renamed.bin", symbolic_link)
         check(client.readlink(symbolic_link) == "renamed.bin", "Client.symlink/readlink", checks)
+        resolved = client.resolve(symbolic_link)
+        check(resolved.exists is True and resolved.path == renamed
+              and resolved.info.type is nfs_rs.FileType.FILE, "Client.resolve", checks)
+        for name, target, suffix, expected in (
+            ("resolution-broken", "missing", "", nfs_rs.PathResolutionStatus.MISSING),
+            ("resolution-cycle", "resolution-cycle", "", nfs_rs.PathResolutionStatus.TOO_MANY_SYMLINKS),
+            ("resolution-absolute", "/renamed.bin", "", nfs_rs.PathResolutionStatus.OUTSIDE_MOUNT),
+            ("resolution-directory", "nested", "/child", nfs_rs.PathResolutionStatus.RESOLVED),
+            ("resolution-notdir", "renamed.bin", "/..", nfs_rs.PathResolutionStatus.NOT_DIRECTORY),
+        ):
+            link = f"{root}/{name}"
+            client.symlink(target, link)
+            try:
+                check(client.resolve(link + suffix).status is expected, f"Client.resolve:{name}", checks)
+            finally:
+                client.unlink(link)
         client.touch(touched)
         check(client.exists(touched), "Client.touch", checks)
         sync_file_scenario(client, root, checks)
@@ -598,6 +614,22 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             check(await file.read() == b"payl", "AsyncClient.link", checks)
         await client.symlink("async-renamed.bin", symbolic_link)
         check(await client.readlink(symbolic_link) == "async-renamed.bin", "AsyncClient.symlink/readlink", checks)
+        resolved = await client.resolve(symbolic_link)
+        check(resolved.exists is True and resolved.path == renamed
+              and resolved.info.type is nfs_rs.FileType.FILE, "AsyncClient.resolve", checks)
+        for name, target, suffix, expected in (
+            ("async-resolution-broken", "missing", "", nfs_rs.PathResolutionStatus.MISSING),
+            ("async-resolution-cycle", "async-resolution-cycle", "", nfs_rs.PathResolutionStatus.TOO_MANY_SYMLINKS),
+            ("async-resolution-absolute", "/async-renamed.bin", "", nfs_rs.PathResolutionStatus.OUTSIDE_MOUNT),
+            ("async-resolution-directory", "async-nested", "/child", nfs_rs.PathResolutionStatus.RESOLVED),
+            ("async-resolution-notdir", "async-renamed.bin", "/..", nfs_rs.PathResolutionStatus.NOT_DIRECTORY),
+        ):
+            link = f"{root}/{name}"
+            await client.symlink(target, link)
+            try:
+                check((await client.resolve(link + suffix)).status is expected, f"AsyncClient.resolve:{name}", checks)
+            finally:
+                await client.unlink(link)
         await client.touch(touched)
         check(await client.exists(touched), "AsyncClient.touch", checks)
         await async_file_scenario(client, root, checks)

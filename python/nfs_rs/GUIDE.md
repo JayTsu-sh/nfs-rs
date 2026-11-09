@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.3/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -266,6 +266,57 @@ page forever.
 Namespace operations include `mkdir`, `touch`, `remove`/`unlink`, `rmdir`,
 `rename`, hard `link`, `symlink`, and `readlink`. `remove` and `unlink` are
 equivalent file-removal operations.
+
+### Checking symbolic-link targets
+
+Available in 0.12.0. `resolve` accepts ordinary file and directory paths as well
+as symbolic links, so no preliminary type check is needed.
+
+`readlink(path)` returns the stored target text. `stat(path)` and `exists(path)`
+inspect the link itself; a dangling link can therefore pass `exists`.
+The String-based interface raises `NfsEncodingError` for a non-UTF-8 target;
+it never replaces undecodable bytes with a different filename.
+Use `resolve(path)` to follow intermediate and final links and inspect the target:
+
+```python
+from nfs_rs import PathResolutionStatus
+
+result = client.resolve("jobs/latest")  # await client.resolve(...) for AsyncClient
+if result.exists is True:
+    print(result.path, result.info.type, result.info.size)
+elif result.exists is False:
+    print("Target is missing or a path component is not a directory", result.status)
+elif result.status is PathResolutionStatus.OUTSIDE_MOUNT:
+    print("Target requires a namespace outside this mount")
+else:
+    print("Resolution exceeded the 40-link limit (possibly a cycle)")
+```
+
+`PathResolution.status` is `RESOLVED`, `MISSING`, `NOT_DIRECTORY`, `OUTSIDE_MOUNT`
+or `TOO_MANY_SYMLINKS`. `path` and `info` are present only for `RESOLVED`;
+`path` is export-relative (`.` for root). `exists` is `True` for `RESOLVED`,
+`False` for `MISSING`/`NOT_DIRECTORY`, and `None` for the other two states.
+Check with `is True` / `is False` to preserve that distinction.
+
+For example, if `links/latest` stores `../data/report.csv`, a successful
+`client.resolve("links/latest").path` is `data/report.csv`. The original stored
+text remains available through `client.readlink("links/latest")`. Multilevel
+links resolve to the final target. A non-link path returns its own information.
+
+Relative targets start at the link's directory. `..` is evaluated after following
+preceding links, and trailing slashes require a directory. Unlike the ordinary
+path helpers, `resolve` preserves those components for traversal and reports
+`OUTSIDE_MOUNT` if they leave the mounted root. Input paths must be relative;
+absolute link targets also return `OUTSIDE_MOUNT`, because the library cannot map
+the client's root namespace to this export. This does not mean the target is broken.
+
+The resolver follows at most 40 links and accepts at most 4096 cumulative path
+components / 64 KiB of cumulative UTF-8 path text, including link expansions.
+Oversized or NUL-containing text raises `ValueError`. Permission, connection,
+timeout, stale-handle and other errors propagate instead of becoming a missing
+target. `operation_timeout` covers the complete Python resolution. This is an
+observation of the namespace; it neither checks read/write permissions nor
+guarantees that a later open will see the same object.
 
 ### Reading and writing whole files
 
@@ -583,9 +634,9 @@ The stable facade exports:
 - files: `File`, `AsyncFile`
 - export discovery: `list_exports`, `list_exports_async`
 - information values: `FileInfo`, `DirectoryRef`, `DirEntry`, `ExportEntry`, `FsInfo`, `FsStat`,
-  `Capabilities`, `IoLimits`, `Health`, `RecoveryEvent`, `NfsAce`, `NfsAcl41`
+  `Capabilities`, `IoLimits`, `Health`, `RecoveryEvent`, `NfsAce`, `NfsAcl41`, `PathResolution`
 - enums: `Version`, `FileType`, `Lifecycle`, `OperationOutcome`,
-  `OperationClass`, `RecoveryAction`, `AceFlags`, `AceMask`, `AceType`, `Acl41Flags`
+  `OperationClass`, `RecoveryAction`, `AceFlags`, `AceMask`, `AceType`, `Acl41Flags`, `PathResolutionStatus`
 - typed `NfsError` subclasses
 
 The native `nfs_rs._internal` module is private. Applications should import
