@@ -43,6 +43,8 @@ timestamp as available: an omitted field retains its default value, which is
 also a valid value for present metadata. An empty v4 response is `Some([0, 0])`;
 NFSv3's fixed `fattr3` layout uses `None`. This fixed-size field needs no extra
 heap allocation or metadata RPC. The Python stat shape is unchanged.
+When upgrading to 0.12.0, exhaustive Rust `Attr` struct literals must initialize
+the new `nfs4_attributes` field (or use `..Attr::default()`).
 Ordinary NFSv4 attribute queries, including lookups and directory enumeration,
 exclude ACLs. Call the existing `Mount::get_acl` only when the metadata plan
 requires it. This avoids repeated ACL reads and keeps an unrelated ACL permission
@@ -52,7 +54,7 @@ refusal from hiding ordinary file attributes; explicit ACL failures are preserve
 
 ```toml
 [dependencies]
-nfs-rs = "0.10.1"
+nfs-rs = "0.12.0"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -102,6 +104,43 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## Resolve paths and symbolic-link targets
+
+`Mount::resolve_path` follows intermediate and final symlinks for files or
+directories; callers do not need to identify the entry type first.
+`sync_resolve_path` provides the blocking equivalent.
+
+```rust,no_run
+async fn example(mount: &dyn nfs_rs::Mount) -> nfs_rs::Result<()> {
+    let result = mount.resolve_path("links/latest").await?;
+    match result.exists() {
+        Some(true) => {
+            // Final export-relative path and final handle/attributes.
+            println!("{:?} {:?}", result.path, result.object);
+        }
+        Some(false) => println!("missing target or non-directory component"),
+        None => println!("resolution could not determine existence: {:?}", result.status),
+    }
+    Ok(())
+}
+```
+
+`PathResolutionStatus` distinguishes `Resolved`, `Missing`, `NotDirectory`,
+`OutsideMount` and `TooManySymlinks`. Only `Resolved` includes the final path
+(`.` for root) and object. For example, `links/latest -> ../data/report.csv`
+resolves to `data/report.csv`; `readlink_path` instead returns the original
+`../data/report.csv` text. Ordinary file and directory paths resolve to themselves.
+
+Relative targets start at the link's directory, and `..` is evaluated after
+preceding links. Absolute targets and traversal above the mounted root return
+`OutsideMount`; this does not prove a target is broken. Resolution follows at most
+40 links and accepts 4096 cumulative components / 64 KiB of cumulative UTF-8 path
+text. Permission, transport, stale-handle and encoding errors propagate. The
+String interface rejects non-UTF-8 targets instead of changing their identity.
+Existence is an advisory namespace observation, not an access check or a guarantee
+about a later open. Rust callers can bound the complete walk with a Tokio timeout;
+Python's `operation_timeout` covers its complete `resolve` call.
 
 ## URL format
 

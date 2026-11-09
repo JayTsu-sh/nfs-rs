@@ -1,6 +1,6 @@
 # Python user guide
 
-See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.3/python/nfs_rs/API.md)
+See the [complete API reference](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/API.md)
 for every public method, property, type, field and exception. Both documents ship
 inside the installed package as `nfs_rs/API.md` and `nfs_rs/GUIDE.md`.
 
@@ -269,6 +269,9 @@ equivalent file-removal operations.
 
 ### Checking symbolic-link targets
 
+Available in 0.12.0. `resolve` accepts ordinary file and directory paths as well
+as symbolic links, so no preliminary type check is needed.
+
 `readlink(path)` returns the stored target text. `stat(path)` and `exists(path)`
 inspect the link itself; a dangling link can therefore pass `exists`.
 The String-based interface raises `NfsEncodingError` for a non-UTF-8 target;
@@ -294,6 +297,11 @@ or `TOO_MANY_SYMLINKS`. `path` and `info` are present only for `RESOLVED`;
 `path` is export-relative (`.` for root). `exists` is `True` for `RESOLVED`,
 `False` for `MISSING`/`NOT_DIRECTORY`, and `None` for the other two states.
 Check with `is True` / `is False` to preserve that distinction.
+
+For example, if `links/latest` stores `../data/report.csv`, a successful
+`client.resolve("links/latest").path` is `data/report.csv`. The original stored
+text remains available through `client.readlink("links/latest")`. Multilevel
+links resolve to the final target. A non-link path returns its own information.
 
 Relative targets start at the link's directory. `..` is evaluated after following
 preceding links, and trailing slashes require a directory. Unlike the ordinary

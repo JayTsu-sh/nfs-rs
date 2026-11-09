@@ -811,7 +811,8 @@ Return False only when stat raises FileNotFoundError; permission, connection and
 def resolve(self, path: os.PathLike[str] | str) -> PathResolution: ...
 ```
 
-Follow intermediate and final symbolic links and return PathResolution. Relative
+Available in 0.12.0. Accept ordinary files/directories or links without a preliminary
+type check. Follow intermediate and final symbolic links and return PathResolution. Relative
 targets start at the link's directory; .. is evaluated during traversal and a
 trailing slash requires a directory. Input must be export-relative. Absolute link
 targets or traversal above the mounted root return OUTSIDE_MOUNT, not MISSING.
@@ -2050,6 +2051,15 @@ Resolution status enum. A limitation does not prove that the target is missing.
 | `PathResolutionStatus.OUTSIDE_MOUNT` | An absolute target or parent traversal requires a namespace outside this mount. |
 | `PathResolutionStatus.TOO_MANY_SYMLINKS` | More than 40 links would be followed, possibly a cycle. |
 
+#### PathResolutionStatus.__new__
+
+```python
+def __new__(cls, value: str) -> PathResolutionStatus: ...
+```
+
+Construct the resolution status enum from its string value, such as "resolved"
+or "outside_mount". Unknown values raise ValueError.
+
 ### PathResolution
 
 Frozen namespace observation returned by resolve; permission and transport failures
@@ -2060,15 +2070,6 @@ are raised instead of being represented as an absent target.
 | `PathResolution.status` | `PathResolutionStatus` | The resolution outcome. |
 | `PathResolution.path` | `str \| None` | Canonical export-relative final path, or None unless resolved; root is '.'. |
 | `PathResolution.info` | `FileInfo \| None` | Final object metadata with the resolved path, or None unless resolved. |
-
-#### PathResolutionStatus.__new__
-
-```python
-def __new__(cls, value: str) -> PathResolutionStatus: ...
-```
-
-Construct the resolution status enum from its string value, such as "resolved"
-or "outside_mount". Unknown values raise ValueError.
 
 #### PathResolution.exists
 

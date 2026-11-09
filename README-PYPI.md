@@ -21,8 +21,8 @@ written `%2520` in the URL.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.3/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.11.3/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,
@@ -132,6 +132,51 @@ and byte-string paths are rejected. File modes are binary: `rb`, `wb`, `ab`,
 `FileInfo.atime`, `mtime`, and `ctime` are integer nanoseconds since the Unix
 epoch. The attribute names have no `_ns` suffix; `ctime` is the metadata change
 time, not the file creation time.
+
+## Resolve paths and check symbolic-link targets
+
+Available in 0.12.0. Call `resolve()` on any entry without checking its type first.
+It follows intermediate and final symlinks and returns information about the
+final object; ordinary files and directories return their own information.
+
+```python
+from nfs_rs import Client
+
+with Client.connect("nfs://server/export?version=4.1", operation_timeout=10) as client:
+    result = client.resolve("links/latest")
+    if result.exists is True:
+        print(result.path, result.info.type, result.info.size)
+    elif result.exists is False:
+        print("Target missing or a path component is not a directory", result.status)
+    else:
+        print("Existence could not be determined", result.status)
+```
+
+Use `await client.resolve(path)` with `AsyncClient`. `PathResolution` exposes
+`status`, `path`, `info`, and the tri-state `exists` property:
+
+| Status | `exists` | `path` and `info` |
+|---|---|---|
+| `RESOLVED` | `True` | Final export-relative path and final `FileInfo` |
+| `MISSING` | `False` | `None` |
+| `NOT_DIRECTORY` | `False` | `None` |
+| `OUTSIDE_MOUNT` | `None` | `None` |
+| `TOO_MANY_SYMLINKS` | `None` | `None` |
+
+For `links/latest -> ../data/report.csv`, a successful `result.path` is
+`data/report.csv`. `readlink("links/latest")` returns the original
+`../data/report.csv` text. `stat` and `exists` continue to inspect the link itself,
+so a dangling link can pass `exists`; use `resolve` to check its target.
+
+An absolute target or traversal outside the mounted root is `OUTSIDE_MOUNT`,
+which does not prove that the target is broken. More than 40 links is
+`TOO_MANY_SYMLINKS`, possibly a cycle. Relative targets start at their containing
+directory; `..` and trailing slashes are evaluated during traversal. Limits are
+4096 cumulative components and 64 KiB of cumulative UTF-8 text. Permission,
+connection, timeout, stale-handle and encoding failures raise typed exceptions.
+Non-UTF-8 targets raise `NfsEncodingError` instead of selecting a replacement name.
+The result reports existence at observation time; it does not check read/write
+access or guarantee a subsequent open.
 
 ## Scan directories using file handles
 

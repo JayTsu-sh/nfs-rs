@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-09
+
+### Changed
+
+- Rust callers constructing exhaustive `Attr` struct literals must initialize
+  the new `nfs4_attributes` field or use `..Attr::default()`. The Python
+  `FileInfo` shape is unchanged.
+
 ### Added
 
 - Rust `Mount::resolve_path` / `sync_resolve_path` and Python `Client.resolve` /
