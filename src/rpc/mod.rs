@@ -22,16 +22,17 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::dialer::{BoxedRpcStream, Dialer, Endpoint};
 use auth::Auth;
 pub(crate) use header::Header;
 
@@ -125,24 +126,24 @@ enum PortmapProc2 {
 }
 
 pub(crate) async fn portmap(
-    addrs: &Vec<SocketAddr>,
+    dialer: &Arc<dyn Dialer>,
+    addrs: &[Endpoint],
     prog: u32,
     vers: u32,
     auth: &Auth,
     max_retries: usize,
-    noresvport: bool,
 ) -> Result<u16> {
-    let mut last_err: Option<(SocketAddr, NfsError)> = None;
+    let mut last_err: Option<(Endpoint, NfsError)> = None;
     for addr in addrs {
         debug!(addr = %addr, prog, vers, "attempting portmapper lookup");
-        match portmap_on_addr(addr, prog, vers, auth, max_retries, noresvport).await {
+        match portmap_on_addr(dialer, addr, prog, vers, auth, max_retries).await {
             Ok(port) => {
                 info!(addr = %addr, prog, vers, port, "portmapper resolved port");
                 return Ok(port);
             }
             Err(e) => {
                 warn!(addr = %addr, prog, vers, error = %e, "portmapper lookup failed on address");
-                last_err = Some((*addr, e));
+                last_err = Some((addr.clone(), e));
             }
         }
     }
@@ -157,14 +158,14 @@ pub(crate) async fn portmap(
 }
 
 async fn portmap_on_addr(
-    addr: &SocketAddr,
+    dialer: &Arc<dyn Dialer>,
+    addr: &Endpoint,
     prog: u32,
     vers: u32,
     auth: &Auth,
     max_retries: usize,
-    noresvport: bool,
 ) -> Result<u16> {
-    let mux = StreamMux::connect(*addr, noresvport).await?;
+    let mux = StreamMux::dial(Arc::clone(dialer), addr.clone()).await?;
     let client = Client::new(mux, None);
     let result = portmap_calls(&client, prog, vers, auth, max_retries).await;
     let _ = client.shutdown().await;
@@ -317,43 +318,115 @@ impl Drop for RebindPublicationGuard<'_> {
 /// is established (see `enable_backchannel`); read by the reader loop on each CALL.
 type BackchannelSlot = Arc<std::sync::Mutex<Option<BackchannelHandler>>>;
 
+/// The write side of one connection.
+///
+/// Once a record is left partially written the connection cannot carry
+/// another record: the writer is poisoned, its half of the stream dropped and
+/// the reader told to stop, which releases the other half and closes the
+/// stream. Later writes fail with `BrokenPipe` until a reconnect installs a
+/// new writer.
+struct ConnectionWriter {
+    half: Option<WriteHalf<BoxedRpcStream>>,
+    closed: Arc<Notify>,
+}
+
+impl ConnectionWriter {
+    fn poison(&mut self) {
+        self.half = None;
+        self.closed.notify_one();
+    }
+
+    fn poisoned() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection closed after an incomplete RPC record",
+        )
+    }
+}
+
+impl AsyncWrite for ConnectionWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.half.as_mut() {
+            Some(half) => Pin::new(half).poll_write(cx, buf),
+            None => std::task::Poll::Ready(Err(Self::poisoned())),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.half.as_mut() {
+            Some(half) => Pin::new(half).poll_flush(cx),
+            None => std::task::Poll::Ready(Err(Self::poisoned())),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.half.as_mut() {
+            Some(half) => Pin::new(half).poll_shutdown(cx),
+            None => std::task::Poll::Ready(Ok(())),
+        }
+    }
+}
+
 /// A partially written record cannot be followed by another RPC record.
-/// Synchronous socket shutdown in Drop also covers task cancellation and timeout.
+/// Poisoning the writer in Drop also covers task cancellation and timeout.
 struct FrameWriteGuard<'a> {
-    writer: TokioMutexGuard<'a, OwnedWriteHalf>,
+    writer: TokioMutexGuard<'a, ConnectionWriter>,
     complete: bool,
 }
 
 impl Drop for FrameWriteGuard<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            let _ = socket2::SockRef::from(self.writer.as_ref()).shutdown(std::net::Shutdown::Both);
+            self.writer.poison();
         }
     }
 }
 
-async fn connect_stream(addr: SocketAddr, noresvport: bool) -> Result<tokio::net::TcpStream> {
-    tokio::time::timeout(
-        METADATA_TIMEOUT,
-        crate::connect_to_target(&addr, noresvport),
-    )
-    .await
-    .map_err(|_| {
-        NfsError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "RPC connect timeout",
-        ))
-    })?
+type ConnectionReader = BufReader<ReadHalf<BoxedRpcStream>>;
+
+async fn connect_stream(dialer: &dyn Dialer, endpoint: &Endpoint) -> Result<BoxedRpcStream> {
+    tokio::time::timeout(METADATA_TIMEOUT, dialer.dial(endpoint))
+        .await
+        .map_err(|_| {
+            NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "RPC connect timeout",
+            ))
+        })?
+        .map_err(NfsError::Io)
+}
+
+/// Splits a fresh stream into the reader the reader task owns and the writer
+/// the mux shares; the two are tied by the writer's close signal.
+fn split_connection(stream: BoxedRpcStream) -> (ConnectionReader, ConnectionWriter, Arc<Notify>) {
+    let (reader, writer) = tokio::io::split(stream);
+    let closed = Arc::new(Notify::new());
+    let writer = ConnectionWriter {
+        half: Some(writer),
+        closed: Arc::clone(&closed),
+    };
+    (BufReader::with_capacity(1_048_576, reader), writer, closed)
 }
 
 pub(crate) struct StreamMux {
     /// Wrapped in an `Arc` so the reader loop can also write backchannel replies
     /// onto the same connection (NFSv4.1 backchannel rides the fore-channel TCP).
-    writer: Arc<TokioMutex<OwnedWriteHalf>>,
+    writer: Arc<TokioMutex<ConnectionWriter>>,
     pending: PendingMap,
     backchannel: BackchannelSlot,
-    addr: SocketAddr,
-    noresvport: bool,
+    /// Redialed through `dialer` on reconnect.
+    endpoint: Endpoint,
+    dialer: Arc<dyn Dialer>,
     generation: AtomicU64,
     reconnect_lock: TokioMutex<()>,
     reconnect_handler: std::sync::Mutex<Option<ReconnectHandler>>,
@@ -367,29 +440,48 @@ pub(crate) struct StreamMux {
 }
 
 impl StreamMux {
-    pub(crate) async fn connect(addr: SocketAddr, noresvport: bool) -> Result<Arc<Self>> {
-        let stream = connect_stream(addr, noresvport).await?;
-        let (reader, writer) = stream.into_split();
+    /// Opens a connection to `endpoint` through `dialer`; reconnects use the same pair.
+    pub(crate) async fn dial(dialer: Arc<dyn Dialer>, endpoint: Endpoint) -> Result<Arc<Self>> {
+        let stream = connect_stream(&*dialer, &endpoint).await?;
+        info!(addr = %endpoint, "RPC stream mux connected");
+        Ok(Self::from_stream(stream, endpoint, dialer))
+    }
+
+    /// A direct TCP connection, as the default dialer opens it.
+    #[cfg(test)]
+    pub(crate) async fn connect(addr: std::net::SocketAddr, noresvport: bool) -> Result<Arc<Self>> {
+        Self::dial(
+            Arc::new(crate::dialer::TcpDialer::new(noresvport)),
+            Endpoint::from(addr),
+        )
+        .await
+    }
+
+    fn from_stream(
+        stream: BoxedRpcStream,
+        endpoint: Endpoint,
+        dialer: Arc<dyn Dialer>,
+    ) -> Arc<Self> {
+        let (reader, writer, closed) = split_connection(stream);
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let writer = Arc::new(TokioMutex::new(writer));
         let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
-        let reader = BufReader::with_capacity(1_048_576, reader);
         let failed_generation = Arc::new(AtomicU64::new(0));
         let reader_handle = tokio::spawn(reader_loop(
             reader,
+            closed,
             Arc::clone(&pending),
             Arc::clone(&writer),
             Arc::clone(&backchannel),
             Arc::clone(&failed_generation),
             0,
         ));
-        info!(addr = %addr, "RPC stream mux connected");
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             writer,
             pending,
             backchannel,
-            addr,
-            noresvport,
+            endpoint,
+            dialer,
             generation: AtomicU64::new(0),
             reconnect_lock: TokioMutex::new(()),
             reconnect_handler: std::sync::Mutex::new(None),
@@ -398,7 +490,7 @@ impl StreamMux {
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
             failed_generation,
-        }))
+        })
     }
 
     fn generation(&self) -> u64 {
@@ -558,24 +650,23 @@ impl StreamMux {
             )));
         }
         let _reconnect = self.reconnect_lock.lock().await;
-        info!(addr = %self.addr, failed_gen, "initiating reconnection");
+        info!(addr = %self.endpoint, failed_gen, "initiating reconnection");
         // Fast path: another caller already reconnected (no lock needed).
         let current_gen = self.generation.load(Ordering::Acquire);
         if current_gen > failed_gen {
-            debug!(addr = %self.addr, current_gen, failed_gen, "reconnection already performed by another caller");
+            debug!(addr = %self.endpoint, current_gen, failed_gen, "reconnection already performed by another caller");
             return Ok(());
         }
         // Establish new TCP connection OUTSIDE the writer lock so that
         // concurrent send_and_receive() calls are not blocked during connect.
-        let stream = connect_stream(self.addr, self.noresvport).await?;
-        let (reader, new_writer) = stream.into_split();
-        let reader = BufReader::with_capacity(1_048_576, reader);
+        let stream = connect_stream(&*self.dialer, &self.endpoint).await?;
+        let (reader, new_writer, closed) = split_connection(stream);
 
         // Take the lock only to swap writer/reader (microsecond-level hold).
         let mut writer = self.writer.lock().await;
         let current_gen = self.generation.load(Ordering::Acquire);
         if current_gen > failed_gen {
-            debug!(addr = %self.addr, current_gen, failed_gen, "reconnection already performed by another caller (after connect)");
+            debug!(addr = %self.endpoint, current_gen, failed_gen, "reconnection already performed by another caller (after connect)");
             return Ok(()); // discard the connection we just built
         }
         // 再次检查 shutdown，避免在等锁期间被 shutdown
@@ -605,7 +696,7 @@ impl StreamMux {
                 .lock()
                 .map_err(|_| NfsError::Rpc("pending map lock poisoned".to_string()))?;
             if !map.is_empty() {
-                debug!(addr = %self.addr, pending_count = map.len(), "failing pending requests due to reconnection");
+                debug!(addr = %self.endpoint, pending_count = map.len(), "failing pending requests due to reconnection");
             }
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
@@ -623,6 +714,7 @@ impl StreamMux {
                 .map_err(|_| NfsError::Rpc("reader_handle lock poisoned".to_string()))?;
             *guard = Some(tokio::spawn(reader_loop(
                 reader,
+                closed,
                 Arc::clone(&self.pending),
                 Arc::clone(&self.writer),
                 Arc::clone(&self.backchannel),
@@ -644,13 +736,13 @@ impl StreamMux {
         }
         self.generation.store(next_generation, Ordering::Release);
         publication.publish();
-        info!(addr = %self.addr, generation = next_generation, "reconnection ready");
+        info!(addr = %self.endpoint, generation = next_generation, "reconnection ready");
         Ok(())
     }
 
     async fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
-        debug!(addr = %self.addr, "shutting down StreamMux");
+        debug!(addr = %self.endpoint, "shutting down StreamMux");
         if let Ok(mut guard) = self.reader_handle.lock()
             && let Some(handle) = guard.take()
         {
@@ -693,15 +785,21 @@ impl Drop for StreamMux {
 /// handed to the registered backchannel handler and the reply is written back on
 /// the same connection.
 async fn reader_loop(
-    mut reader: BufReader<OwnedReadHalf>,
+    mut reader: ConnectionReader,
+    closed: Arc<Notify>,
     pending: PendingMap,
-    writer: Arc<TokioMutex<OwnedWriteHalf>>,
+    writer: Arc<TokioMutex<ConnectionWriter>>,
     backchannel: BackchannelSlot,
     failed_generation: Arc<AtomicU64>,
     reader_generation: u64,
 ) {
     loop {
-        match read_one_response(&mut reader).await {
+        let next = tokio::select! {
+            biased;
+            () = closed.notified() => Err(NfsError::Io(ConnectionWriter::poisoned())),
+            next = read_one_response(&mut reader) => next,
+        };
+        match next {
             Ok((xid, data)) => {
                 // RPC msg_type lives at bytes [4..8]: 0 = CALL, 1 = REPLY.
                 // A CALL here is a server-initiated backchannel request, not a
@@ -761,7 +859,7 @@ async fn reader_loop(
 async fn dispatch_backchannel_call(
     xid: u32,
     data: Bytes,
-    writer: &Arc<TokioMutex<OwnedWriteHalf>>,
+    writer: &Arc<TokioMutex<ConnectionWriter>>,
     backchannel: &BackchannelSlot,
 ) {
     let handler = match backchannel.lock() {
@@ -807,7 +905,7 @@ async fn dispatch_backchannel_call(
 /// are rejected to prevent memory exhaustion from malicious or buggy servers.
 const MAX_RPC_RESPONSE: usize = 4 * 1024 * 1024 + 4096;
 
-async fn read_one_response(reader: &mut BufReader<OwnedReadHalf>) -> Result<(u32, Bytes)> {
+async fn read_one_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u32, Bytes)> {
     let mut hdr = [0u8; 4];
     reader.read_exact(&mut hdr).await?;
     let raw = BigEndian::read_u32(&hdr);
@@ -869,7 +967,7 @@ pub(crate) struct Client {
 impl std::fmt::Debug for StreamMux {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamMux")
-            .field("addr", &self.addr)
+            .field("addr", &self.endpoint)
             .field("generation", &self.generation.load(Ordering::Acquire))
             .finish()
     }
@@ -1131,35 +1229,11 @@ impl Client {
             tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
         let stream = stream_result.unwrap();
         stream.set_nodelay(true).unwrap();
-        let (reader, writer) = stream.into_split();
-        let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let writer = Arc::new(TokioMutex::new(writer));
-        let backchannel: BackchannelSlot = Arc::new(std::sync::Mutex::new(None));
-        let reader = BufReader::with_capacity(1_048_576, reader);
-        let failed_generation = Arc::new(AtomicU64::new(0));
-        let reader_handle = tokio::spawn(reader_loop(
-            reader,
-            Arc::clone(&pending),
-            Arc::clone(&writer),
-            Arc::clone(&backchannel),
-            Arc::clone(&failed_generation),
-            0,
-        ));
-        let mux = Arc::new(StreamMux {
-            writer,
-            pending,
-            backchannel,
-            addr,
-            noresvport: false,
-            generation: AtomicU64::new(0),
-            reconnect_lock: TokioMutex::new(()),
-            reconnect_handler: std::sync::Mutex::new(None),
-            readiness: AtomicU8::new(CONNECTION_READY),
-            readiness_notify: Notify::new(),
-            reader_handle: std::sync::Mutex::new(Some(reader_handle)),
-            shutdown_flag: AtomicBool::new(false),
-            failed_generation,
-        });
+        let mux = StreamMux::from_stream(
+            Box::new(stream),
+            Endpoint::from(addr),
+            Arc::new(crate::dialer::TcpDialer::new(false)),
+        );
         Self {
             nfs_mux: mux,
             mount_mux: None,
@@ -1332,7 +1406,7 @@ mod tests {
         }
     }
 
-    async fn read_test_record(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    async fn read_test_record<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;
         let len = (marker & 0x7fff_ffff) as usize;
         let mut record = vec![0; len];
@@ -1340,8 +1414,8 @@ mod tests {
         Ok(record)
     }
 
-    async fn write_test_rpc_reply(
-        stream: &mut tokio::net::TcpStream,
+    async fn write_test_rpc_reply<S: AsyncWrite + Unpin>(
+        stream: &mut S,
         xid: u32,
         payload: &[u8],
     ) -> std::io::Result<()> {
@@ -1570,9 +1644,18 @@ mod tests {
     #[tokio::test]
     async fn portmap_error_includes_underlying_detail() {
         // Connect to a localhost port nobody listens on → ConnectionRefused
-        let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let dead_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let auth = Auth::new_null();
-        let res = portmap(&vec![dead_addr], NFS_PROG, NFS3_VERSION, &auth, 2, false).await;
+        let dialer: Arc<dyn Dialer> = Arc::new(crate::dialer::TcpDialer::new(false));
+        let res = portmap(
+            &dialer,
+            &[Endpoint::from(dead_addr)],
+            NFS_PROG,
+            NFS3_VERSION,
+            &auth,
+            2,
+        )
+        .await;
         let err = res.expect_err("dead port should fail");
         let msg = err.to_string();
         assert!(
@@ -1876,6 +1959,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_redials_the_same_endpoint_through_the_dialer() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let mut second = dialer.accept();
+        let server = tokio::spawn(async move {
+            // The first connection dies after taking the request.
+            read_test_record(&mut first).await.unwrap();
+            drop(first);
+            let record = read_test_record(&mut second).await.unwrap();
+            write_test_rpc_reply(&mut second, BigEndian::read_u32(&record[..4]), b"ok")
+                .await
+                .unwrap();
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint.clone())
+            .await
+            .unwrap();
+        let client = Client::new(mux, None);
+        let reply = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(reply, Bytes::from_static(b"ok"));
+        assert_eq!(dialer.dialed(), vec![endpoint.clone(), endpoint]);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn rpc_timeout_includes_waiting_for_writer() {
         let client = Client::new_dummy().await;
         let writer = client.nfs_mux.writer.lock().await;
@@ -1928,6 +2044,21 @@ mod tests {
         }
     }
 
+    /// TCP with a 1 KiB send buffer, so a large record stays partially written.
+    struct SmallSendBufferDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for SmallSendBufferDialer {
+        async fn dial(&self, endpoint: &Endpoint) -> std::io::Result<BoxedRpcStream> {
+            let addr = endpoint
+                .socket_addr()
+                .expect("test endpoint is an IP literal");
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            socket2::SockRef::from(&stream).set_send_buffer_size(1024)?;
+            Ok(Box::new(stream))
+        }
+    }
+
     async fn unfinished_frame_is_discarded(cancel: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1954,13 +2085,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let client = Client::new(StreamMux::connect(addr, true).await.unwrap(), None);
-        {
-            let writer = client.nfs_mux.writer.lock().await;
-            socket2::SockRef::from(writer.as_ref())
-                .set_send_buffer_size(1024)
-                .unwrap();
-        }
+        let mux = StreamMux::dial(Arc::new(SmallSendBufferDialer), Endpoint::from(addr))
+            .await
+            .unwrap();
+        let client = Client::new(mux, None);
         let task_client = client.clone();
         let call = tokio::spawn(async move {
             task_client

@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Rust `Dialer` trait, `Endpoint`, `TcpDialer`, `MountOptions`, `mount_with`
+  and `list_exports_with`: every connection of a mount (portmapper, MOUNT, NFS,
+  NFSACL, pNFS data servers and reconnects) can be opened by a caller-supplied
+  dialer over any byte stream, with server names resolved by the dialer. The
+  URL entry points keep their behavior through the default `TcpDialer`.
+
 ## [0.12.0] - 2026-11-09
 
 ### Changed
