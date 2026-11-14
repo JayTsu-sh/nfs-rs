@@ -1036,12 +1036,11 @@ pub(crate) async fn mount(
     } else {
         NFS4_DEFAULT_PORT
     };
-    // Use tokio async DNS to avoid blocking the worker thread (H8)
-    let addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host(format!("{}:{}", args.host, nfsport))
-            .await
-            .map_err(NfsError::Io)?
-            .collect();
+    let addrs = args
+        .dialer()
+        .resolve(&args.host, nfsport)
+        .await
+        .map_err(NfsError::Io)?;
     debug!(host = %args.host, port = nfsport, addr_count = addrs.len(), "resolved NFSv4.1 server addresses");
 
     let auth = Auth::new_unix("nfs-rs", args.uid, args.gid);
@@ -1060,7 +1059,7 @@ pub(crate) async fn mount(
 }
 
 async fn mount_on_addr(
-    addr: &std::net::SocketAddr,
+    addr: &crate::dialer::Endpoint,
     args: &crate::MountArgs,
     auth: &Auth,
     minor_version: MinorVersion,
@@ -1068,7 +1067,8 @@ async fn mount_on_addr(
     info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
 
     // 1. TCP connect
-    let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
+    let dialer = args.dialer();
+    let nfs_mux = rpc::StreamMux::dial(Arc::clone(&dialer), addr.clone()).await?;
     let client = rpc::Client::new(nfs_mux, None); // no separate mount connection
 
     // 2. Establish session (EXCHANGE_ID → CREATE_SESSION → RECLAIM_COMPLETE)
@@ -1102,7 +1102,7 @@ async fn mount_on_addr(
         "negotiated transfer sizes"
     );
 
-    let layout_manager = Arc::new(LayoutManager::new(args.noresvport));
+    let layout_manager = Arc::new(LayoutManager::new(dialer));
 
     // Set up the NFSv4.1 backchannel on this fore-channel connection. In v4.1 the
     // server sends CB_COMPOUND callbacks back over the *same* connection, so we
@@ -1176,7 +1176,11 @@ async fn mount_on_addr(
         client_identity,
         state: StateManager::new(),
         layout_manager,
-        server_addr: *addr,
+        // Unknown when the dialer resolves the name: the unspecified address
+        // matches no data server, so pNFS never reuses the metadata connection.
+        server_addr: addr.socket_addr().unwrap_or_else(|| {
+            std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), addr.port())
+        }),
         lease_renewal,
         recall_handle,
         recall_tx,
@@ -2826,7 +2830,9 @@ pub(super) fn test_mount(client: rpc::Client, addr: std::net::SocketAddr) -> Mou
         recovery_lock: tokio::sync::Mutex::new(()),
         client_identity: ClientIdentity::new(),
         state: StateManager::new(),
-        layout_manager: Arc::new(LayoutManager::new(true)),
+        layout_manager: Arc::new(LayoutManager::new(std::sync::Arc::new(
+            crate::dialer::TcpDialer::new(true),
+        ))),
         server_addr: addr,
         recall_handle: None,
         recall_tx,

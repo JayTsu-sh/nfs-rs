@@ -251,6 +251,30 @@ the RFC 1813 secure-port convention. This may require elevated privileges.
 Setting `noresvport=true` avoids privileged-port exhaustion, but the NFS server
 must accept non-privileged source ports (the `insecure` export option on Linux).
 
+### Custom transports
+
+`mount_with(options, dialer)` and `list_exports_with(host, dialer)` open every
+connection through a caller-supplied `Dialer` instead of a direct TCP socket:
+portmapper, MOUNT, NFS, NFSACL, pNFS data servers and reconnects alike. The
+dialer receives server names unresolved, so it can carry the RPC records over
+an SSH channel or a proxy and resolve names where that stream ends. The
+default `TcpDialer` keeps the URL entry's behavior, privileged source port and
+keepalives included. `retain-delegations=true` is refused with a custom
+dialer, because NFSv4.0 delegation callbacks need the server to connect back.
+
+```rust,no_run
+use std::sync::Arc;
+use nfs_rs::{MountOptions, Result, TcpDialer, mount_with};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let options = MountOptions::from_url("nfs://nfs.example.internal/export?version=4.1")?;
+    let mount = mount_with(options, Arc::new(TcpDialer::new(true))).await?;
+    mount.umount().await?;
+    Ok(())
+}
+```
+
 ### NFSv4.0 migration notes
 
 Use exact `version=4.0`; the ambiguous selector `version=4` is invalid. Existing

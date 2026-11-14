@@ -5,7 +5,6 @@ use futures::stream::TryStreamExt as _;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +26,7 @@ use super::compound::{
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
+use crate::dialer::Endpoint;
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, NFSVersion};
 use crate::nfs4::acl;
@@ -162,14 +162,15 @@ pub(crate) async fn mount(args: &MountArgs) -> Result<Box<dyn Mount>> {
     } else {
         args.nfsport
     };
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{port}", args.host))
+    let addrs = args
+        .dialer()
+        .resolve(&args.host, port)
         .await
-        .map_err(NfsError::Io)?
-        .collect();
+        .map_err(NfsError::Io)?;
     let auth = Auth::new_unix("nfs-rs", args.uid, args.gid);
     let mut last_error = None;
     for addr in addrs {
-        match mount_on_addr(addr, args, auth.clone()).await {
+        match mount_on_addr(&addr, args, auth.clone()).await {
             Ok(mount) => return Ok(Box::new(mount)),
             Err(error) => last_error = Some(error),
         }
@@ -177,12 +178,17 @@ pub(crate) async fn mount(args: &MountArgs) -> Result<Box<dyn Mount>> {
     Err(last_error.unwrap_or_else(|| NfsError::Rpc("NFSv4.0 resolved no addresses".to_string())))
 }
 
-async fn mount_on_addr(addr: SocketAddr, args: &MountArgs, auth: Auth) -> Result<Mount40> {
-    let mux = rpc::StreamMux::connect(addr, args.noresvport).await?;
+async fn mount_on_addr(addr: &Endpoint, args: &MountArgs, auth: Auth) -> Result<Mount40> {
+    let mux = rpc::StreamMux::dial(args.dialer(), addr.clone()).await?;
     let rpc = rpc::Client::new(mux, None);
 
     let callback = if args.retain_delegations {
-        Some(CallbackService::bind_for(addr).await?)
+        // The callback listener is reached by the server directly, so it is
+        // bound for the server's resolved address.
+        let server = addr.socket_addr().ok_or_else(|| {
+            NfsError::InvalidInput("delegation callbacks need a resolved server address".into())
+        })?;
+        Some(CallbackService::bind_for(server).await?)
     } else {
         None
     };
@@ -2457,6 +2463,7 @@ impl Mount for Mount40 {
 mod tests {
     use super::*;
     use crate::nfs4::compound::xdr_opaque;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4163,8 +4170,11 @@ mod tests {
             readdir_buffer: None,
             noresvport: true,
             retain_delegations: false,
+            dialer: None,
         };
-        let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
+        let mount = mount_on_addr(&addr.into(), &args, Auth::new_null())
+            .await
+            .unwrap();
         assert_eq!(mount.get_max_read_size(), 65536);
         assert_eq!(mount.get_max_write_size(), 32768);
         // Without `readdir-buffer`, READDIR replies are sized from the published MAXREAD.
@@ -4211,8 +4221,11 @@ mod tests {
                 readdir_buffer,
                 noresvport: true,
                 retain_delegations: false,
+                dialer: None,
             };
-            let mount = mount_on_addr(addr, &args, Auth::new_null()).await.unwrap();
+            let mount = mount_on_addr(&addr.into(), &args, Auth::new_null())
+                .await
+                .unwrap();
             assert_eq!(mount.get_max_read_size(), crate::mount::MAX_IO_SIZE);
             assert_eq!(mount.get_max_write_size(), 32768);
             assert_eq!((mount.dircount, mount.maxcount), expected);
@@ -4268,9 +4281,10 @@ mod tests {
             readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: true,
+            dialer: None,
         };
 
-        let error = mount_on_addr(addr, &args, Auth::new_null())
+        let error = mount_on_addr(&addr.into(), &args, Auth::new_null())
             .await
             .unwrap_err();
         assert!(matches!(error, NfsError::Rpc(_) | NfsError::Io(_)));
@@ -4671,8 +4685,10 @@ mod tests {
             readdir_buffer: Some((32 * 1024, 32 * 1024)),
             noresvport: true,
             retain_delegations: false,
+            dialer: None,
         };
-        let task = tokio::spawn(async move { mount_on_addr(addr, &args, Auth::new_null()).await });
+        let task =
+            tokio::spawn(async move { mount_on_addr(&addr.into(), &args, Auth::new_null()).await });
         identity_seen_rx.await.unwrap();
         task.abort();
         let _ = task.await;

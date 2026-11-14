@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::compound::CompoundBuilder;
 use super::session::{ClientIdentity, Session};
+use crate::dialer::{Dialer, Endpoint};
 use crate::error::{NfsError, Result};
 use crate::rpc;
 use crate::rpc::auth::Auth;
@@ -224,8 +225,8 @@ pub(crate) struct LayoutManager {
     /// server 可能下发客户端不可达网段的 DS LIF（如 ONTAP 多网段拓扑），
     /// 不拉黑会导致每次 I/O 都重复付一次连接超时。
     unreachable_ds: SyncRwLock<HashSet<SocketAddr>>,
-    /// Whether to use ephemeral (non-privileged) source ports for DS connections.
-    noresvport: bool,
+    /// Opens data-server connections; the same dialer as the metadata server.
+    dialer: Arc<dyn Dialer>,
     active_generation: AtomicU64,
 }
 
@@ -238,7 +239,7 @@ pub(crate) struct DirtyRange {
 }
 
 impl LayoutManager {
-    pub fn new(noresvport: bool) -> Self {
+    pub fn new(dialer: Arc<dyn Dialer>) -> Self {
         Self {
             layouts: RwLock::new(HashMap::new()),
             data_servers: RwLock::new(HashMap::new()),
@@ -252,7 +253,7 @@ impl LayoutManager {
             pending_writes: Mutex::new(HashMap::new()),
             degenerate_logged: AtomicBool::new(false),
             unreachable_ds: SyncRwLock::new(HashSet::new()),
-            noresvport,
+            dialer,
             active_generation: AtomicU64::new(1),
         }
     }
@@ -705,7 +706,7 @@ impl LayoutManager {
         // 整体包超时：server 可能下发不可达网段的 DS 地址（SYN 黑洞时
         // 系统级 connect 超时可达 20s+），失败后拉黑避免每次 I/O 重付。
         let connect_and_establish = async {
-            let mux = rpc::StreamMux::connect(addr, self.noresvport).await?;
+            let mux = rpc::StreamMux::dial(Arc::clone(&self.dialer), Endpoint::from(addr)).await?;
             let new_client = rpc::Client::new(mux, None);
             // RFC 8881 §13.1：DS 需要自己的 client-id + session（EXCHANGE_ID USE_PNFS_DS）
             let session = Session::establish_ds(&new_client, auth, client_identity).await?;
@@ -1256,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_store_and_get() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"file1");
         let layout = Layout {
             generation: 1,
@@ -1272,7 +1273,7 @@ mod tests {
 
     #[tokio::test]
     async fn transition_rejects_late_layout_from_old_generation() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"generation-layout");
         let layout = Layout {
             generation: 1,
@@ -1294,7 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_remove() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"file2");
         mgr.store_layout(
             &fh,
@@ -1418,7 +1419,7 @@ mod tests {
             std::future::pending::<()>().await;
             drop(socket);
         });
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let auth = Auth::new_unix("ds-timeout-test", 0, 0);
         let identity = ClientIdentity::new();
         let result = tokio::time::timeout(
@@ -1456,7 +1457,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_ds_mark_and_check() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let addr: SocketAddr = "192.168.13.131:2049".parse().unwrap();
         assert!(!mgr.is_ds_unreachable(&addr).await);
         assert!(mgr.mark_ds_unreachable_at(addr, mgr.generation()).await);
@@ -1468,7 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_generation_cannot_poison_ds_reachability() {
-        let manager = LayoutManager::new(false);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let address: SocketAddr = "192.0.2.20:2049".parse().unwrap();
         let old_generation = manager.generation();
 
@@ -1486,7 +1487,9 @@ mod tests {
     async fn concurrent_cold_start_for_one_ds_is_singleflight() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let manager = Arc::new(LayoutManager::new(true));
+        let manager = Arc::new(LayoutManager::new(std::sync::Arc::new(
+            crate::dialer::TcpDialer::new(true),
+        )));
         let address: SocketAddr = "192.0.2.10:2049".parse().unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -1538,14 +1541,14 @@ mod tests {
 
     #[tokio::test]
     async fn degenerate_log_only_once() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         assert!(mgr.should_log_degenerate());
         assert!(!mgr.should_log_degenerate());
     }
 
     #[tokio::test]
     async fn dirty_range_merge() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty1");
         mgr.mark_dirty(&fh, 4096, 8192).await;
         mgr.mark_dirty(&fh, 0, 4096).await;
@@ -1555,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_take_removes() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty2");
         mgr.mark_dirty(&fh, 100, 200).await;
         assert_eq!(mgr.take_dirty(&fh).await, Some((100, 200)));
@@ -1564,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_snapshot_survives_unacknowledged_commit() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty-snapshot");
         mgr.mark_dirty(&fh, 100, 200).await;
 
@@ -1576,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_acknowledgement_preserves_concurrent_write() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty-concurrent");
         mgr.mark_dirty(&fh, 100, 200).await;
         let snapshot = mgr.snapshot_dirty(&fh).await.expect("dirty snapshot");
@@ -1588,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_acknowledgement_clears_only_matching_snapshot() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty-ack");
         mgr.mark_dirty(&fh, 0, 4096).await;
         let snapshot = mgr.snapshot_dirty(&fh).await.expect("dirty snapshot");
@@ -1599,7 +1602,9 @@ mod tests {
 
     #[tokio::test]
     async fn file_io_gate_allows_parallel_writes_and_serializes_recall() {
-        let mgr = Arc::new(LayoutManager::new(false));
+        let mgr = Arc::new(LayoutManager::new(std::sync::Arc::new(
+            crate::dialer::TcpDialer::new(false),
+        )));
         let fh = Bytes::from_static(b"gate-shared-exclusive");
         let first_write = mgr.read_file_io(&fh).await;
         let second_write =
@@ -1624,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_io_gate_does_not_serialize_different_files() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let first = mgr.write_file_io(&Bytes::from_static(b"gate-file-a")).await;
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -1638,7 +1643,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_cleared_on_clear() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"dirty3");
         mgr.mark_dirty(&fh, 0, 1).await;
         mgr.clear().await;
@@ -1647,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn transition_rejects_late_device_and_dirty_updates() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let fh = Bytes::from_static(b"stale-side-caches");
         let device_id = [7; 16];
         let info = DeviceInfo {
@@ -1669,7 +1674,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_manager_clear() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         mgr.store_layout(
             &Bytes::from_static(b"a"),
             Layout {
@@ -1832,7 +1837,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cache_store_and_get() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let dev_id = [0xCCu8; 16];
         let info = DeviceInfo {
             stripe_indices: vec![0],
@@ -1851,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_cache_cleared_on_clear() {
-        let mgr = LayoutManager::new(false);
+        let mgr = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(false)));
         let dev_id = [0xDDu8; 16];
         mgr.store_device(
             dev_id,
@@ -1867,7 +1872,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_change_resets_only_related_negative_cache_and_fences_uncached_lookup() {
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let device = [4; 16];
         let related = "192.0.2.10:2049".parse().unwrap();
         let unrelated = "192.0.2.11:2049".parse().unwrap();
@@ -2213,7 +2218,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_layout_is_returned_only_for_a_covered_offset() {
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let fh = Bytes::from_static(b"multipart-file");
         manager
             .store_layout(
@@ -2240,7 +2245,7 @@ mod tests {
 
     #[tokio::test]
     async fn layout_update_replaces_overlapping_segment_and_keeps_other_ranges() {
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let fh = Bytes::from_static(b"growing-multipart-file");
         let segment = |offset, length, marker| LayoutSegment {
             offset,
