@@ -50,7 +50,7 @@
 //! ports.
 
 use percent_encoding::percent_decode_str;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::{TcpSocket, TcpStream};
 
 fn privileged_port_candidates(ports: &[u16], start: usize) -> Vec<u16> {
@@ -253,6 +253,7 @@ pub(crate) async fn connect_to_target(addr: &SocketAddr, noresvport: bool) -> Re
 mod client_core;
 #[cfg(test)]
 mod client_core_contract;
+mod dialer;
 pub mod error;
 mod fileio;
 mod mount;
@@ -268,6 +269,7 @@ mod retry;
 mod rpc;
 mod shared;
 
+pub use dialer::{BoxedRpcStream, Dialer, Endpoint, RpcStream, TcpDialer};
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, RequestId, RequestTransmission, Result, RetryExhaustion, ServerBusyError,
@@ -349,6 +351,110 @@ struct MountArgs {
     readdir_buffer: Option<(u32, u32)>,
     noresvport: bool,
     retain_delegations: bool,
+    /// `None` connects with [`TcpDialer`] and `noresvport`.
+    dialer: Option<CustomDialer>,
+}
+
+/// A caller-supplied [`Dialer`]; its presence marks the mount as not owning
+/// its sockets.
+#[derive(Clone)]
+struct CustomDialer(std::sync::Arc<dyn Dialer>);
+
+impl std::fmt::Debug for CustomDialer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CustomDialer")
+    }
+}
+
+impl MountArgs {
+    /// The dialer every connection of this mount goes through.
+    fn dialer(&self) -> std::sync::Arc<dyn Dialer> {
+        match &self.dialer {
+            Some(CustomDialer(dialer)) => std::sync::Arc::clone(dialer),
+            None => std::sync::Arc::new(TcpDialer::new(self.noresvport)),
+        }
+    }
+}
+
+/// Mount options parsed from an `nfs://` URL, for [`mount_with`] and
+/// [`list_exports_with`].
+///
+/// The URL takes the same form and query parameters as
+/// [`parse_url_and_mount`]. `noresvport` only affects the default
+/// [`TcpDialer`]; a custom dialer decides its own source ports.
+#[derive(Debug)]
+pub struct MountOptions(MountArgs);
+
+impl MountOptions {
+    pub fn from_url(url: &str) -> Result<Self> {
+        parse_url(url).map(Self)
+    }
+}
+
+impl std::str::FromStr for MountOptions {
+    type Err = NfsError;
+
+    fn from_str(url: &str) -> Result<Self> {
+        Self::from_url(url)
+    }
+}
+
+/// Mounts an NFS export with every connection opened through `dialer`.
+///
+/// Server names are passed to [`Dialer::resolve`] and [`Dialer::dial`]
+/// unresolved, so a dialer that tunnels the connection can resolve them where
+/// the tunnel ends. Reconnects and pNFS data-server connections use the same
+/// dialer.
+///
+/// `retain-delegations=true` is refused: NFSv4.0 delegation callbacks need
+/// the server to connect back to a local listener, which a dialed stream
+/// cannot provide.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use nfs_rs::{MountOptions, TcpDialer, mount_with};
+///
+/// # async fn example() -> nfs_rs::Result<()> {
+/// let options = MountOptions::from_url("nfs://nfs.example.internal/export?version=4.1")?;
+/// let mount = mount_with(options, Arc::new(TcpDialer::new(true))).await?;
+/// mount.umount().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn mount_with(
+    options: MountOptions,
+    dialer: std::sync::Arc<dyn Dialer>,
+) -> Result<Box<dyn Mount>> {
+    let mut args = options.0;
+    if args.retain_delegations {
+        return Err(NfsError::InvalidInput(
+            "retain-delegations requires a direct TCP connection and cannot be used with a custom dialer"
+                .to_string(),
+        ));
+    }
+    args.dialer = Some(CustomDialer(dialer));
+    mount(args).await
+}
+
+/// [`list_exports`] with every connection opened through `dialer`; `host`
+/// reaches the dialer unresolved.
+pub async fn list_exports_with(
+    host: &str,
+    dialer: std::sync::Arc<dyn Dialer>,
+) -> Result<Vec<ExportEntry>> {
+    let mut args = parse_url(&export_listing_url(host))?;
+    args.dialer = Some(CustomDialer(dialer));
+    nfs3::query_exports(&args).await
+}
+
+fn export_listing_url(host: &str) -> String {
+    if host.starts_with("nfs://") {
+        host.to_string()
+    } else {
+        format!("nfs://{}/.", host)
+    }
 }
 
 /// Parses the specified URL and attempts to mount the relevant NFS export
@@ -391,12 +497,7 @@ pub async fn parse_url_and_mount(url: &str) -> Result<Box<dyn Mount>> {
 /// }
 /// ```
 pub async fn list_exports(host: &str) -> Result<Vec<ExportEntry>> {
-    let url = if host.starts_with("nfs://") {
-        host.to_string()
-    } else {
-        format!("nfs://{}/.", host)
-    };
-    nfs3::query_exports(&parse_url(&url)?).await
+    nfs3::query_exports(&parse_url(&export_listing_url(host))?).await
 }
 
 fn get_uid_gid() -> (u32, u32) {
@@ -535,6 +636,7 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         readdir_buffer,
         noresvport,
         retain_delegations,
+        dialer: None,
     })
 }
 
@@ -1036,6 +1138,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            dialer: None,
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1056,6 +1159,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            dialer: None,
         };
         let res = mount(args).await;
         assert!(res.is_err());
@@ -1076,6 +1180,7 @@ mod tests {
             readdir_buffer: Default::default(),
             noresvport: Default::default(),
             retain_delegations: Default::default(),
+            dialer: None,
         };
         let res = mount(args).await;
         assert!(res.is_err());

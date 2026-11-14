@@ -645,7 +645,9 @@ mod tests {
             frame,
             state,
             tx,
-            &super::super::layout::LayoutManager::new(true),
+            &super::super::layout::LayoutManager::new(std::sync::Arc::new(
+                crate::dialer::TcpDialer::new(true),
+            )),
         )
     }
 
@@ -726,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn device_change_invalidates_before_ack_and_fences_late_getdeviceinfo() {
         let state = CallbackState::new([7; 16], 1, 1);
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let device = [9; 16];
         let info = DeviceInfo {
             stripe_indices: vec![0],
@@ -752,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_device_notification_has_no_partial_invalidation() {
         let state = CallbackState::new([7; 16], 1, 1);
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let revision = manager.device_revision();
         let (tx, _) = mpsc::channel(4);
         let mut values = device_values([9; 16], Some(false));
@@ -766,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn device_delete_and_stale_generation_never_repopulate_old_mappings() {
         let state = CallbackState::new([7; 16], 1, 1);
-        let manager = LayoutManager::new(true);
+        let manager = LayoutManager::new(std::sync::Arc::new(crate::dialer::TcpDialer::new(true)));
         let device = [9; 16];
         let info = DeviceInfo {
             stripe_indices: vec![],
