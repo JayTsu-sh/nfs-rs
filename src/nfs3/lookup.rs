@@ -16,6 +16,7 @@
 
 use super::{LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result, diropargs3, filename3, nfs_fh3};
 use bytes::Bytes;
+use std::path::Component;
 
 impl Mount {
     pub async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
@@ -24,13 +25,12 @@ impl Mount {
             fh: self.fh.clone(),
             attr: None,
         });
-        for n in &path_clean::clean(path) {
+        for component in path_clean::clean(path).components() {
+            // Skip path syntax, not filename text: on Unix, `\` is a normal name.
             if let Ok(ref r) = res
-                && !n.is_empty()
-                && n != "/"
-                && n != "."
-                && n != "\\"
+                && !matches!(component, Component::RootDir | Component::CurDir)
             {
+                let n = component.as_os_str();
                 tracing::trace!(component = %n.to_string_lossy(), "resolving path component");
                 res = self.lookup(r.fh.clone(), &n.to_string_lossy()).await;
             }
@@ -57,3 +57,7 @@ impl From<LOOKUP3resok> for Result<ObjRes> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "lookup_tests.rs"]
+mod tests;
