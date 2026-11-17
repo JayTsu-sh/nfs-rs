@@ -43,6 +43,8 @@ fi
 touch "$FAKE_SS_CALLED"
 """,
                 "sleep": "#!/bin/bash\nexec /bin/sleep 0.005\n",
+                # The fixture has its own deadline in subprocess.run below.
+                "timeout": "#!/bin/bash\nset -eu\n[[ \"$1\" == 300 ]]\nshift\nexec \"$@\"\n",
             }
             for name, source in commands.items():
                 command = root / name
