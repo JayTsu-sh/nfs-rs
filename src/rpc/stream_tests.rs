@@ -1,6 +1,6 @@
 #![cfg(test)]
-//! Records over caller-supplied streams: a buffered writer must be flushed
-//! before a record counts as sent.
+//! Connection lifecycle over caller-supplied streams: buffered writers must be
+//! flushed before a record counts as sent, and closing a stream is bounded.
 
 use super::*;
 use std::sync::Mutex as StdMutex;
@@ -105,6 +105,69 @@ impl AsyncWrite for FaultyFlush {
     }
 }
 
+/// Forwards reads, writes and flushes; shutdown writes a closing byte first, so
+/// it waits whenever the transport cannot take more bytes.
+struct ClosingByte(DuplexStream);
+
+impl AsyncRead for ClosingByte {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ClosingByte {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_write(cx, b"!").map_ok(|_| ())
+    }
+}
+
+/// Forwards reads, writes and flushes; shutdown never completes.
+struct NeverClosed(DuplexStream);
+
+impl AsyncRead for NeverClosed {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NeverClosed {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+
 #[tokio::test]
 async fn buffered_stream_carries_the_request() {
     let (client_end, mut server_end) = tokio::io::duplex(4096);
@@ -186,4 +249,61 @@ async fn a_flush_that_does_not_finish_retires_the_connection() {
         assert!(released(&mut server_end).await);
         client.shutdown().await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_is_bounded_when_the_close_cannot_be_sent() {
+    let (mut client_end, server_end) = tokio::io::duplex(1);
+    client_end.write_all(b"x").await.unwrap();
+    let mux = mux_over(Box::new(ClosingByte(client_end)));
+
+    tokio::time::timeout(Duration::from_secs(300), mux.shutdown())
+        .await
+        .expect("shutdown must give up on a close the transport cannot take");
+    drop(server_end);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_fails_pending_requests_before_the_close() {
+    let (client_end, mut server_end) = tokio::io::duplex(4096);
+    let mux = mux_over(Box::new(NeverClosed(client_end)));
+    let client = Client::new(Arc::clone(&mux), None);
+    let call = tokio::spawn(async move {
+        client
+            .call(
+                nfs_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                Duration::from_secs(600),
+            )
+            .await
+    });
+    read_record(&mut server_end).await.unwrap();
+
+    let shutdown = tokio::spawn({
+        let mux = Arc::clone(&mux);
+        async move { mux.shutdown().await }
+    });
+    let result = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("pending requests fail without waiting for the close")
+        .unwrap();
+
+    assert!(result.is_err());
+    shutdown.await.unwrap();
+    assert!(released(&mut server_end).await);
+    drop(mux);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_shutdown_still_releases_the_stream() {
+    let (mut client_end, mut server_end) = tokio::io::duplex(1);
+    client_end.write_all(b"x").await.unwrap();
+    let mux = mux_over(Box::new(ClosingByte(client_end)));
+
+    let cancelled = tokio::time::timeout(Duration::from_millis(10), mux.shutdown()).await;
+
+    assert!(cancelled.is_err(), "the close is still waiting at the cut");
+    // The mux is still held here: only the cancelled shutdown can have let go.
+    assert!(released(&mut server_end).await);
+    drop(mux);
 }

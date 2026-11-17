@@ -750,8 +750,6 @@ impl StreamMux {
         {
             handle.abort();
         }
-        let mut writer = self.writer.lock().await;
-        let _ = writer.shutdown().await;
         if let Ok(mut map) = self.pending.lock() {
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(NfsError::Io(std::io::Error::new(
@@ -759,6 +757,20 @@ impl StreamMux {
                     "shutdown",
                 ))));
             }
+        }
+        // A caller-supplied stream may send bytes to close, and the transport
+        // may never take them. The guard is never marked complete, so the
+        // writer is poisoned (and the stream released) whether the close
+        // finishes, times out or is cancelled.
+        let close = async {
+            let mut frame = FrameWriteGuard {
+                writer: self.writer.lock().await,
+                complete: false,
+            };
+            frame.writer.shutdown().await
+        };
+        if tokio::time::timeout(METADATA_TIMEOUT, close).await.is_err() {
+            warn!(addr = %self.endpoint, "stream close did not finish before the deadline");
         }
     }
 }
