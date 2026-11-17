@@ -1342,15 +1342,18 @@ mod tests {
 
     #[tokio::test]
     async fn callback_listener_rejects_a_different_source_address() {
-        let service = CallbackService::bind_for("127.0.0.1:2049".parse().unwrap())
+        // Only 127.0.0.1 is bindable on every OS (macOS has no 127.0.0.2), so
+        // the server is 127.0.0.2 and the callback comes from 127.0.0.1.
+        let service = CallbackService::bind_for("127.0.0.2:2049".parse().unwrap())
             .await
             .unwrap();
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
-        let mut stream = socket
-            .connect(socket_addr(service.universal_addr()))
+        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
             .await
             .unwrap();
+        assert_eq!(
+            stream.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
         let mut call = Vec::new();
         for word in cb_null_call(41) {
             call.extend_from_slice(&word.to_be_bytes());
