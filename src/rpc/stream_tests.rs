@@ -307,3 +307,48 @@ async fn a_cancelled_shutdown_still_releases_the_stream() {
     assert!(released(&mut server_end).await);
     drop(mux);
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_interrupts_a_send_that_holds_the_writer() {
+    let (client_end, mut server_end) = tokio::io::duplex(4096);
+    let stream = FaultyFlush {
+        inner: client_end,
+        fault: FlushFault::Stall,
+    };
+    let mux = mux_over(Box::new(stream));
+    let client = Client::new(Arc::clone(&mux), None);
+    let call = tokio::spawn(async move {
+        client
+            .call(
+                nfs_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                Duration::from_secs(600),
+            )
+            .await
+    });
+    // The record is written; its flush stalls with the writer held.
+    read_record(&mut server_end).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), mux.shutdown())
+        .await
+        .expect("shutdown must not wait for the stalled send");
+    let result = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("the stalled send ends with the shutdown")
+        .unwrap();
+
+    assert!(result.is_err());
+    assert!(released(&mut server_end).await);
+    let late = Client::new(Arc::clone(&mux), None)
+        .call(
+            nfs_body(),
+            ReplayPolicy::ONE_ATTEMPT,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a request after shutdown must not be written");
+    assert_eq!(
+        late.request_transmission(),
+        Some(crate::RequestTransmission::NotSent)
+    );
+}

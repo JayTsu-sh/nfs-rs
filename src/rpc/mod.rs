@@ -435,6 +435,8 @@ pub(crate) struct StreamMux {
     reader_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// 标记 shutdown 已调用，阻止后续 reconnect 尝试
     shutdown_flag: AtomicBool,
+    /// Wakes a send in progress when shutdown starts, so it gives up the writer.
+    stopping: Notify,
     /// Highest closed reader generation plus one; old readers cannot poison a new connection.
     failed_generation: Arc<AtomicU64>,
 }
@@ -489,6 +491,7 @@ impl StreamMux {
             readiness_notify: Notify::new(),
             reader_handle: std::sync::Mutex::new(Some(reader_handle)),
             shutdown_flag: AtomicBool::new(false),
+            stopping: Notify::new(),
             failed_generation,
         })
     }
@@ -584,7 +587,18 @@ impl StreamMux {
 
             // Write request under the writer lock — released before awaiting the response.
             // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
-            let write_result = {
+            // Shutdown interrupts a send waiting for the writer or stalled in
+            // it; the frame guard then releases the stream.
+            let stopping = self.stopping.notified();
+            tokio::pin!(stopping);
+            stopping.as_mut().enable();
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(NfsError::transport(
+                    crate::RequestTransmission::NotSent,
+                    NfsError::Io(Self::shut_down()),
+                ));
+            }
+            let write = async {
                 let writer = self.writer.lock().await;
                 let mut frame = FrameWriteGuard {
                     writer,
@@ -606,9 +620,13 @@ impl StreamMux {
                 }
                 .await
             };
+            let write_result = tokio::select! {
+                biased;
+                () = &mut stopping => Err(NfsError::Io(Self::shut_down())),
+                result = write => result,
+            };
 
-            write_result
-                .map_err(|error| NfsError::transport(crate::RequestTransmission::Sent, error))?;
+            write_result.map_err(|error| NfsError::transport(transmission, error))?;
 
             // Wait for response from the reader task with timeout.
             match tokio::time::timeout(timeout, rx).await {
@@ -742,8 +760,13 @@ impl StreamMux {
         Ok(())
     }
 
+    fn shut_down() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shutdown")
+    }
+
     async fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
+        self.stopping.notify_waiters();
         debug!(addr = %self.endpoint, "shutting down StreamMux");
         if let Ok(mut guard) = self.reader_handle.lock()
             && let Some(handle) = guard.take()
