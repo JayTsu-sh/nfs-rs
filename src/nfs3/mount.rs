@@ -25,9 +25,11 @@ use super::{
     Mount, MountProc3, ObjRes, Time, encode_dirpath, export::decode_exports, mount_mountstat3,
     mountres3_ok, rpc_header,
 };
+use crate::dialer::{Dialer, Endpoint};
 use crate::error::{NfsError, Result};
 use crate::mount::{WriteOutcome, WriteStability};
-use crate::{NFSVersion, SocketAddr, ToSocketAddrs, nfs3, rpc};
+use crate::{NFSVersion, nfs3, rpc};
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct Mount3 {
@@ -280,53 +282,53 @@ impl crate::Mount for Mount3 {
 }
 
 async fn ensure_port(
-    addrs: &Vec<SocketAddr>,
+    dialer: &Arc<dyn Dialer>,
+    addrs: &[Endpoint],
     port: u16,
     prog: u32,
     vers: u32,
     auth: &crate::Auth,
     max_retries: usize,
-    noresvport: bool,
 ) -> Result<u16> {
     if port != 0 {
         return Ok(port);
     }
-    rpc::portmap(addrs, prog, vers, auth, max_retries, noresvport).await
+    rpc::portmap(dialer, addrs, prog, vers, auth, max_retries).await
 }
 
 pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
     // start by resolving host address and assigning portmapper port to each resolved address
-    let addrs: Vec<SocketAddr> = (args.host.as_str(), rpc::PORTMAP_PORT)
-        .to_socket_addrs()?
-        .collect();
+    let dialer = args.dialer();
+    let addrs = dialer.resolve(&args.host, rpc::PORTMAP_PORT).await?;
     debug!(host = %args.host, addr_count = addrs.len(), "resolved NFS server addresses");
     let auth = crate::Auth::new_unix("nfs-rs", args.uid, args.gid);
-    // Run both portmapper queries concurrently — they are independent TCP connections.
+    // Run both portmapper queries concurrently — they are independent connections.
     let (nfsport, mountport) = tokio::try_join!(
         ensure_port(
+            &dialer,
             &addrs,
             args.nfsport,
             rpc::NFS_PROG,
             rpc::NFS3_VERSION,
             &auth,
             MOUNT_RETRIES,
-            args.noresvport
         ),
         ensure_port(
+            &dialer,
             &addrs,
             args.mountport,
             rpc::MOUNT_PROG,
             rpc::MOUNT3_VERSION,
             &auth,
             MOUNT_RETRIES,
-            args.noresvport
         ),
     )?;
     info!(nfsport, mountport, "ports resolved");
     let mut last_error = None;
-    for mut addr in addrs {
-        addr.set_port(nfsport); // replace portmapper port with NFS port obtained above
-        match mount_on_addr(&addr, args, &auth, mountport).await {
+    for addr in addrs {
+        // replace portmapper port with NFS port obtained above
+        let addr = addr.with_port(nfsport);
+        match mount_on_addr(&dialer, &addr, args, &auth, mountport).await {
             Ok(mount) => return Ok(mount),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "mount attempt failed on address");
@@ -339,18 +341,17 @@ pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Moun
 }
 
 async fn mount_on_addr(
-    addr: &SocketAddr,
+    dialer: &Arc<dyn Dialer>,
+    addr: &Endpoint,
     args: &crate::MountArgs,
     auth: &crate::Auth,
     mountport: u16,
 ) -> Result<Box<dyn crate::Mount>> {
     info!(addr = %addr, dirpath = %args.dirpath, "connecting to NFS server for mount");
-    let nfs_mux = rpc::StreamMux::connect(*addr, args.noresvport).await?;
+    let nfs_mux = rpc::StreamMux::dial(Arc::clone(dialer), addr.clone()).await?;
     let dir: String = args.dirpath.to_owned();
     let mount_mux = if mountport != addr.port() {
-        let mut mount_addr = *addr;
-        mount_addr.set_port(mountport);
-        Some(rpc::StreamMux::connect(mount_addr, args.noresvport).await?)
+        Some(rpc::StreamMux::dial(Arc::clone(dialer), addr.with_port(mountport)).await?)
     } else {
         None
     };
@@ -410,7 +411,7 @@ async fn mount_on_addr(
         "NFS mount complete, negotiated transfer sizes"
     );
 
-    let posix_acl = super::acl::Client::discover(*addr, &m.rpc, auth, args.noresvport).await;
+    let posix_acl = super::acl::Client::discover(dialer, addr, &m.rpc, auth).await;
     Ok(Box::new(Mount3 { m, posix_acl }))
 }
 
@@ -421,23 +422,22 @@ async fn mount_on_addr(
 pub(crate) async fn query_exports(
     args: &crate::MountArgs,
 ) -> Result<Vec<crate::mount::ExportEntry>> {
-    let addrs: Vec<SocketAddr> = (args.host.as_str(), rpc::PORTMAP_PORT)
-        .to_socket_addrs()?
-        .collect();
+    let dialer = args.dialer();
+    let addrs = dialer.resolve(&args.host, rpc::PORTMAP_PORT).await?;
     let auth = crate::Auth::new_unix("nfs-rs", args.uid, args.gid);
     let mountport = ensure_port(
+        &dialer,
         &addrs,
         args.mountport,
         rpc::MOUNT_PROG,
         rpc::MOUNT3_VERSION,
         &auth,
         MOUNT_RETRIES,
-        args.noresvport,
     )
     .await?;
-    for mut addr in addrs {
-        addr.set_port(mountport);
-        let res = query_exports_on_addr(&addr, &auth, MOUNT_RETRIES, args.noresvport).await;
+    for addr in addrs {
+        let addr = addr.with_port(mountport);
+        let res = query_exports_on_addr(&dialer, &addr, &auth, MOUNT_RETRIES).await;
         if res.is_ok() {
             return res;
         }
@@ -446,12 +446,12 @@ pub(crate) async fn query_exports(
 }
 
 async fn query_exports_on_addr(
-    addr: &SocketAddr,
+    dialer: &Arc<dyn Dialer>,
+    addr: &Endpoint,
     auth: &crate::Auth,
     max_retries: usize,
-    noresvport: bool,
 ) -> Result<Vec<crate::mount::ExportEntry>> {
-    let mux = rpc::StreamMux::connect(*addr, noresvport).await?;
+    let mux = rpc::StreamMux::dial(Arc::clone(dialer), addr.clone()).await?;
     let client = rpc::Client::new(mux, None);
     let mut buf = Vec::with_capacity(128);
     rpc_header(
@@ -474,8 +474,9 @@ async fn query_exports_on_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use crate::dialer::ScriptedDialer;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn guarded_open_options_reuse_parent_and_preserve_raced_file_attributes() {
@@ -591,7 +592,7 @@ mod tests {
         }
     }
 
-    async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    async fn read_record<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
         let marker = stream.read_u32().await?;
         let mut record = vec![0; (marker & 0x7fff_ffff) as usize];
         stream.read_exact(&mut record).await?;
@@ -599,7 +600,11 @@ mod tests {
     }
 
     /// An accepted RPC reply (AUTH_NONE verifier, SUCCESS) to `request` carrying `payload`.
-    async fn reply(stream: &mut TcpStream, request: &[u8], payload: &[u8]) -> std::io::Result<()> {
+    async fn reply<S: AsyncWrite + Unpin>(
+        stream: &mut S,
+        request: &[u8],
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         let mut response = request[0..4].to_vec();
         for word in [1u32, 0, 0, 0, 0] {
             response.extend_from_slice(&word.to_be_bytes());
@@ -674,6 +679,75 @@ mod tests {
         Ok(sizes)
     }
 
+    /// A mount through a custom dialer: the server name reaches the dialer
+    /// unresolved, and every connection, the optional NFSACL portmapper
+    /// lookup included, is opened by it.
+    #[tokio::test]
+    async fn mount_with_dials_every_connection_through_the_dialer() {
+        let dialer = Arc::new(ScriptedDialer::default());
+        let mut stream = dialer.accept();
+        let server = tokio::spawn(async move {
+            let mnt = read_record(&mut stream).await?;
+            reply(&mut stream, &mnt, &mnt_ok()).await?;
+            let fsinfo = read_record(&mut stream).await?;
+            reply(&mut stream, &fsinfo, &fsinfo_ok(65536)).await?;
+            let probe = read_record(&mut stream).await?;
+            let mut unsupported = probe[..4].to_vec();
+            for word in [1u32, 0, 0, 0, 1] {
+                // Accepted RPC reply, PROG_UNAVAIL.
+                unsupported.extend_from_slice(&word.to_be_bytes());
+            }
+            stream
+                .write_u32(0x8000_0000 | unsupported.len() as u32)
+                .await?;
+            stream.write_all(&unsupported).await?;
+            Ok::<_, std::io::Error>(stream)
+        });
+        let options = crate::MountOptions::from_url(
+            "nfs://nfs.example.internal/export?version=3&nfsport=2049&mountport=2049",
+        )
+        .unwrap();
+        let mount = crate::mount_with(options, dialer.clone()).await.unwrap();
+        assert_eq!(mount.get_max_read_size(), 65536);
+        let _stream = server.await.unwrap().unwrap();
+        assert_eq!(
+            dialer.dialed(),
+            vec![
+                Endpoint::new("nfs.example.internal", 2049),
+                // NFSACL is not on the NFS port; its portmapper is asked
+                // through the same dialer (refused here, so ACLs stay off).
+                Endpoint::new("nfs.example.internal", rpc::PORTMAP_PORT),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_exports_with_asks_the_portmapper_through_the_dialer() {
+        let dialer = Arc::new(ScriptedDialer::default());
+        let error = crate::list_exports_with("nfs.example.internal", dialer.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert_eq!(
+            dialer.dialed(),
+            vec![Endpoint::new("nfs.example.internal", rpc::PORTMAP_PORT)]
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_with_refuses_retained_delegations() {
+        let dialer = Arc::new(ScriptedDialer::default());
+        let options = crate::MountOptions::from_url(
+            "nfs://nfs.example.internal/export?version=4.0&retain-delegations=true",
+        )
+        .unwrap();
+        let error = crate::mount_with(options, dialer.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NfsError::InvalidInput(_)), "{error:?}");
+        assert!(dialer.dialed().is_empty());
+    }
+
     /// Without `readdir-buffer`, an NFSv3 mount sizes READDIRPLUS `dircount` and `maxcount` from
     /// the FSINFO `rtmax` it negotiated for READ (bounded by the client ceiling); an explicit
     /// `readdir-buffer` is sent as given. Checked on the READDIRPLUS request itself.
@@ -700,9 +774,10 @@ mod tests {
                 readdir_buffer,
                 noresvport: true,
                 retain_delegations: false,
+                dialer: None,
             };
             let auth = crate::Auth::new_null();
-            let mount = mount_on_addr(&addr, &args, &auth, addr.port())
+            let mount = mount_on_addr(&args.dialer(), &addr.into(), &args, &auth, addr.port())
                 .await
                 .unwrap();
             assert_eq!(mount.get_max_read_size(), rtmax.min(ceiling));

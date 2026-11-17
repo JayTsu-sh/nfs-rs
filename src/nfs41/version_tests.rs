@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! RFC 7862 §2, §§3.2–3.3 and RFC 8178 §8.1: exercise actual RPC codecs.
 use bytes::{Buf, Bytes};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::MinorVersion;
@@ -87,75 +87,83 @@ async fn server(steps: Vec<Step>) -> (std::net::SocketAddr, tokio::task::JoinHan
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut previous_owner = None;
         for step in steps {
-            let marker = stream.read_u32().await.unwrap();
-            let mut frame = vec![0; (marker & 0x7fffffff) as usize];
-            stream.read_exact(&mut frame).await.unwrap();
-            let mut args = Bytes::from(frame);
-            let xid = args.get_u32();
-            args.advance(20);
-            for _ in 0..2 {
-                args.advance(4);
-                take_opaque(&mut args, "auth").unwrap();
-            }
-            let tag = take_opaque(&mut args, "tag").unwrap();
-            assert_eq!(tag.as_ref(), step.tag.as_bytes());
-            assert_eq!(args.get_u32(), step.minor, "minor version for {}", step.tag);
-            if step.drop_reply {
-                drop(stream);
-                stream = listener.accept().await.unwrap().0;
-                continue;
-            }
-            let _count = args.get_u32();
-            let opcode = args.get_u32();
-            if opcode == 42 {
-                let mut exchange_args = args.clone();
-                exchange_args.advance(8); // verifier
-                let owner = take_opaque(&mut exchange_args, "owner").unwrap();
-                let flags = exchange_args.get_u32();
-                assert_eq!(flags & 4 != 0, step.minor == 2);
-                if let Some((minor, previous)) = previous_owner.take() {
-                    if minor == step.minor {
-                        assert_eq!(owner, previous);
-                    } else {
-                        assert_ne!(owner, previous);
-                    }
-                }
-                previous_owner = Some((step.minor, owner));
-            }
-            let mut replies = step.replies;
-            if opcode == 53 {
-                let mut sequence = args.split_to(28).to_vec();
-                xdr_u32(&mut sequence, 0); // target highest slot
-                xdr_u32(&mut sequence, 0); // flags
-                replies.insert(0, ok(53, sequence));
-            }
-            let mut response = Vec::new();
-            for word in [xid, 1, 0, 0, 0, 0] {
-                xdr_u32(&mut response, word);
-            }
-            xdr_u32(
-                &mut response,
-                replies.last().map_or(10021, |reply| reply.status),
-            );
-            xdr_opaque(&mut response, &tag);
-            xdr_u32(&mut response, replies.len() as u32);
-            for reply in replies {
-                xdr_u32(&mut response, reply.opcode);
-                xdr_u32(&mut response, reply.status);
-                response.extend(reply.data);
-            }
-            stream
-                .write_u32(0x80000000 | response.len() as u32)
-                .await
-                .unwrap();
-            stream.write_all(&response).await.unwrap();
-            if step.reconnect {
+            let reconnect = step.reconnect || step.drop_reply;
+            answer(&mut stream, step, &mut previous_owner).await;
+            if reconnect {
                 drop(stream);
                 stream = listener.accept().await.unwrap().0;
             }
         }
     });
     (addr, task)
+}
+
+// Read one request and check it against `step`; reply unless the step drops it.
+async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    step: Step,
+    previous_owner: &mut Option<(u32, Bytes)>,
+) {
+    let marker = stream.read_u32().await.unwrap();
+    let mut frame = vec![0; (marker & 0x7fffffff) as usize];
+    stream.read_exact(&mut frame).await.unwrap();
+    let mut args = Bytes::from(frame);
+    let xid = args.get_u32();
+    args.advance(20);
+    for _ in 0..2 {
+        args.advance(4);
+        take_opaque(&mut args, "auth").unwrap();
+    }
+    let tag = take_opaque(&mut args, "tag").unwrap();
+    assert_eq!(tag.as_ref(), step.tag.as_bytes());
+    assert_eq!(args.get_u32(), step.minor, "minor version for {}", step.tag);
+    if step.drop_reply {
+        return;
+    }
+    let _count = args.get_u32();
+    let opcode = args.get_u32();
+    if opcode == 42 {
+        let mut exchange_args = args.clone();
+        exchange_args.advance(8); // verifier
+        let owner = take_opaque(&mut exchange_args, "owner").unwrap();
+        let flags = exchange_args.get_u32();
+        assert_eq!(flags & 4 != 0, step.minor == 2);
+        if let Some((minor, previous)) = previous_owner.take() {
+            if minor == step.minor {
+                assert_eq!(owner, previous);
+            } else {
+                assert_ne!(owner, previous);
+            }
+        }
+        *previous_owner = Some((step.minor, owner));
+    }
+    let mut replies = step.replies;
+    if opcode == 53 {
+        let mut sequence = args.split_to(28).to_vec();
+        xdr_u32(&mut sequence, 0); // target highest slot
+        xdr_u32(&mut sequence, 0); // flags
+        replies.insert(0, ok(53, sequence));
+    }
+    let mut response = Vec::new();
+    for word in [xid, 1, 0, 0, 0, 0] {
+        xdr_u32(&mut response, word);
+    }
+    xdr_u32(
+        &mut response,
+        replies.last().map_or(10021, |reply| reply.status),
+    );
+    xdr_opaque(&mut response, &tag);
+    xdr_u32(&mut response, replies.len() as u32);
+    for reply in replies {
+        xdr_u32(&mut response, reply.opcode);
+        xdr_u32(&mut response, reply.status);
+        response.extend(reply.data);
+    }
+    stream
+        .write_u32(0x80000000 | response.len() as u32)
+        .await
+        .unwrap();
+    stream.write_all(&response).await.unwrap();
 }
 
 #[tokio::test]
@@ -314,6 +322,34 @@ async fn explicit_v42_v41_preference_falls_back_to_v41() {
     assert_eq!(mount.version(), crate::NFSVersion::NFSv4p1);
     mount.umount().await.unwrap();
     task.await.unwrap();
+}
+
+/// An NFSv4.1 mount through a custom dialer: the server name reaches the
+/// dialer unresolved, and the session, the backchannel and teardown all run
+/// on the one stream it opened.
+#[tokio::test]
+async fn v41_mount_with_dials_the_server_through_the_dialer() {
+    let dialer = std::sync::Arc::new(crate::dialer::ScriptedDialer::default());
+    let mut stream = dialer.accept();
+    let mut steps = bootstrap(1);
+    steps.push(step(1, "destroy_session", vec![ok(44, vec![])]));
+    steps.push(step(1, "destroy_clientid", vec![ok(57, vec![])]));
+    let task = tokio::spawn(async move {
+        let mut previous_owner = None;
+        for step in steps {
+            answer(&mut stream, step, &mut previous_owner).await;
+        }
+    });
+    let options =
+        crate::MountOptions::from_url("nfs://nfs.example.internal/export?version=4.1").unwrap();
+    let mount = crate::mount_with(options, dialer.clone()).await.unwrap();
+    assert_eq!(mount.version(), crate::NFSVersion::NFSv4p1);
+    mount.umount().await.unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        dialer.dialed(),
+        vec![crate::Endpoint::new("nfs.example.internal", 2049)]
+    );
 }
 
 #[tokio::test]

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import io
 import os
+import socket
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from enum import Enum, IntEnum, IntFlag
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol, runtime_checkable
 
 __version__: str
 
@@ -324,6 +325,10 @@ class NfsModeError(io.UnsupportedOperation, NfsError): ...
 class NfsFileCloseError(NfsError): ...
 class NfsClientCloseError(NfsError): ...
 
+@runtime_checkable
+class Dialer(Protocol):
+    def dial(self, host: str, port: int) -> socket.socket: ...
+
 class Client:
     def __init__(self, _private: NoReturn) -> None: ...
     @classmethod
@@ -335,6 +340,7 @@ class Client:
         retain_delegations: bool | None = ...,
         connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
+        dialer: Dialer | None = ...,
     ) -> Client: ...
     @property
     def version(self) -> Version: ...
@@ -410,6 +416,7 @@ class AsyncClient:
         retain_delegations: bool | None = ...,
         connect_timeout: float | None = ...,
         operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
+        dialer: Dialer | None = ...,
     ) -> AsyncClient: ...
     @property
     def version(self) -> Version: ...
@@ -531,6 +538,7 @@ def list_exports(
     readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
     retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
     operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
+    dialer: Dialer | None = ...,
 ) -> tuple[ExportEntry, ...]: ...
 async def list_exports_async(
     host: str, *, versions: tuple[str, ...] | list[str] | None = ...,
@@ -539,4 +547,5 @@ async def list_exports_async(
     readdir_buffer: int | tuple[int, int] | None = ..., noresvport: bool | None = ...,
     retain_delegations: bool | None = ..., connect_timeout: float | None = ...,
     operation_timeout: float | None = ..., recovery_event_capacity: int = ...,
+    dialer: Dialer | None = ...,
 ) -> tuple[ExportEntry, ...]: ...
