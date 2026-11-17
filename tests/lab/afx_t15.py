@@ -6,8 +6,6 @@ its public artifacts. Raw captures stay in the private executor workspace.
 """
 
 import argparse
-import ctypes
-import errno
 import fcntl
 import hashlib
 import ipaddress
@@ -84,30 +82,7 @@ def workspace_for(args):
     return workspace
 
 
-def darwin_argv(pid):
-    # macOS has no /proc. KERN_PROCARGS2 returns argc, the executable path,
-    # alignment padding and then the exact argv. EINVAL covers exited, zombie
-    # and other users' processes, like a missing /proc entry on Linux.
-    libc = ctypes.CDLL(None, use_errno=True)
-    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
-    size = ctypes.c_size_t(os.sysconf("SC_ARG_MAX"))
-    buffer = ctypes.create_string_buffer(size.value)
-    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0):
-        error = ctypes.get_errno()
-        if error in (errno.EINVAL, errno.ESRCH):
-            return []
-        raise OSError(error, os.strerror(error))
-    raw = buffer.raw[: size.value]
-    argc = int.from_bytes(raw[:4], sys.byteorder)
-    fields = raw[4:].split(b"\0")[1:]
-    while fields and not fields[0]:
-        fields.pop(0)
-    return fields[:argc]
-
-
 def identity_alive(pid, marker):
-    if sys.platform == "darwin":
-        return marker.encode() in darwin_argv(pid)
     try:
         return marker.encode() in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except FileNotFoundError:
