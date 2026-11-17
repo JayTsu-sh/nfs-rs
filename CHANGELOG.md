@@ -14,6 +14,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   NFSACL, pNFS data servers and reconnects) can be opened by a caller-supplied
   dialer over any byte stream, with server names resolved by the dialer. The
   URL entry points keep their behavior through the default `TcpDialer`.
+  Every RPC record is flushed before it counts as sent, so a buffered
+  stream works.
 
 ## [0.12.0] - 2026-11-09
 

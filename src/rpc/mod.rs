@@ -599,6 +599,8 @@ impl StreamMux {
                             frame.writer.write_all(&[0u8; 4][..data_pad]).await?;
                         }
                     }
+                    // A buffered stream holds the record until flushed.
+                    frame.writer.flush().await?;
                     frame.complete = true;
                     Ok::<(), NfsError>(())
                 }
@@ -892,6 +894,7 @@ async fn dispatch_backchannel_call(
             complete: false,
         };
         frame.writer.write_all(&out).await?;
+        frame.writer.flush().await?;
         frame.complete = true;
         Ok::<(), std::io::Error>(())
     })
@@ -1365,6 +1368,9 @@ pub(crate) fn get_current_time() -> u32 {
         .unwrap_or_default();
     (since_epoch.as_secs() as u32).wrapping_mul(1000) + since_epoch.subsec_millis()
 }
+
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {
