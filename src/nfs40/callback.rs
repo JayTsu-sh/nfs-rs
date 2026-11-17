@@ -103,6 +103,14 @@ impl CallbackService {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .map_err(NfsError::Io)?;
+        Self::from_listener(listener, local_ip, server_ip)
+    }
+
+    fn from_listener(
+        listener: TcpListener,
+        local_ip: Ipv4Addr,
+        server_ip: Ipv4Addr,
+    ) -> Result<Self> {
         let port = listener.local_addr().map_err(NfsError::Io)?.port();
         let universal_addr = format!(
             "{}.{}.{}.{}.{}.{}",
@@ -1341,35 +1349,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_listener_accepts_the_server_source_address() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service =
+            CallbackService::from_listener(listener, Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+                .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            round_trip(&mut stream, &cb_null_call(41)),
+        )
+        .await
+        .expect("authorized callback did not receive a reply");
+        assert_eq!(reply, [41, 1, 0, 0, 0, 0]);
+        service.stop().await;
+    }
+
+    #[tokio::test]
     async fn callback_listener_rejects_a_different_source_address() {
-        // Only 127.0.0.1 is bindable on every OS (macOS has no 127.0.0.2), so
-        // the server is 127.0.0.2 and the callback comes from 127.0.0.1.
-        let service = CallbackService::bind_for("127.0.0.2:2049".parse().unwrap())
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // This IP is only compared with the accepted peer's IP.
+        let service = CallbackService::from_listener(
+            listener,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(192, 0, 2, 1),
+        )
+        .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
             .await
-            .unwrap();
-        let mut stream = tokio::net::TcpStream::connect(socket_addr(service.universal_addr()))
-            .await
-            .unwrap();
-        assert_eq!(
-            stream.local_addr().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-        let mut call = Vec::new();
-        for word in cb_null_call(41) {
-            call.extend_from_slice(&word.to_be_bytes());
+            .expect("listener did not close the mismatched connection");
+        match read {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected EOF or connection reset, got {other:?}"),
         }
-        let write = async {
-            stream.write_u32(0x8000_0000 | call.len() as u32).await?;
-            stream.write_all(&call).await
-        }
-        .await;
-        if write.is_ok() {
-            let read = tokio::time::timeout(Duration::from_millis(100), stream.read_u32()).await;
-            assert!(
-                !matches!(read, Ok(Ok(_))),
-                "unauthorized callback source received an RPC response"
-            );
-        }
+        service.stop().await;
     }
 
     #[tokio::test]
