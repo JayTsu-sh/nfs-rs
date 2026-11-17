@@ -399,7 +399,7 @@ Protocol for an object that opens the connections of a client or export query: p
 def dial(self, host: str, port: int) -> socket.socket: ...
 ```
 
-Return a connected SOCK_STREAM socket to host and port, for example one end of socket.socketpair() bridged to a tunnel. The client takes ownership: the socket object is detached and its descriptor closed by the client. dial runs on a native thread, not the event loop, and may run again at any time while the client is open (reconnects, new data servers). An OSError it raises keeps its errno class (ConnectionRefusedError raises NfsConnectionError); returning anything else fails the connection.
+Return a connected SOCK_STREAM socket to host and port, for example one end of socket.socketpair() bridged to a tunnel. It must be a plain socket.socket: a subclass or a wrapper such as ssl.SSLSocket is refused and left open with its owner. The client takes ownership: the socket object is detached and its descriptor closed by the client. dial runs on a native thread, not the event loop, and may run again at any time while the client is open (reconnects, new data servers). A dial cannot be interrupted: past the connect deadline it keeps running until it returns. At most 16 dial calls run at once in a process, and waiting for a free one counts against the same deadline. An OSError it raises keeps its errno class (ConnectionRefusedError raises NfsConnectionError); returning anything else fails the connection.
 
 ### ExportEntry
 

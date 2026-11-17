@@ -167,9 +167,12 @@ with Client.connect("nfs://server/export?version=4.1", dialer=Direct()) as clien
     print(client.listdir("/"))
 ```
 
-`dial` runs on a native thread and can run again at any time while the
-client is open. An `OSError` it raises keeps its errno class, so a refused
-connection raises `NfsConnectionError`. `retain_delegations=True` is refused
+`dial` must return a plain `socket.socket`; a subclass or a wrapper such
+as `ssl.SSLSocket` is refused. It runs on a native thread and can run again
+at any time while the client is open. A `dial` that blocks cannot be
+interrupted: past the connect deadline it keeps running until it returns,
+and at most 16 such calls run at once in a process. An `OSError` it raises
+keeps its errno class, so a refused connection raises `NfsConnectionError`. `retain_delegations=True` is refused
 with a dialer, because NFSv4.0 delegation callbacks need the server to
 connect back to a local listener.
 

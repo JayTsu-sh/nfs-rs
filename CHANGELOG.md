@@ -19,7 +19,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Python `dialer` option for `Client.connect`, `AsyncClient.connect`,
   `list_exports` and `list_exports_async`, and the `Dialer` protocol: an object
   whose `dial(host, port)` returns a connected socket opens every connection.
-  The client owns the socket and the RPC records stay in native code.
+  The client owns the socket and the RPC records stay in native code. Only a
+  plain `socket.socket` is taken, and at most 16 dial calls run at once.
 
 ## [0.12.0] - 2026-11-09
 

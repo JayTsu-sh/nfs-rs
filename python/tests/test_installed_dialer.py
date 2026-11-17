@@ -183,3 +183,92 @@ def test_retained_delegations_are_refused_with_a_dialer():
     with pytest.raises(ValueError, match="retain-delegations"):
         asyncio.run(AsyncClient.connect(url, dialer=dialer, retain_delegations=True))
     assert dialer.dialed == []
+
+
+def test_only_a_plain_socket_is_taken():
+    import ssl
+
+    from nfs_rs import Client, NfsError
+
+    class Kept(socket.socket):
+        detached = False
+
+        def detach(self):
+            Kept.detached = True
+            return self.fileno()
+
+    class Returning:
+        def __init__(self, make):
+            self.made = []
+            self.make = make
+
+        def dial(self, host, port):
+            self.made.append(self.make())
+            return self.made[-1]
+
+    def subclass():
+        return Kept(socket.AF_INET, socket.SOCK_STREAM)
+
+    def wrapper():
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        return context.wrap_socket(socket.socket(), server_hostname=HOST, do_handshake_on_connect=False)
+
+    for make in (subclass, wrapper):
+        dialer = Returning(make)
+        with pytest.raises(NfsError, match="plain socket.socket"):
+            Client.connect(f"nfs://{HOST}/export?version=4.1", dialer=dialer)
+        # Refused: the object still owns its open descriptor.
+        assert dialer.made and all(made.fileno() >= 0 for made in dialer.made)
+        for made in dialer.made:
+            made.close()
+    assert not Kept.detached
+
+
+class BlockingDialer:
+    """Holds every dial until released; counts the calls running at once."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.lock = threading.Condition()
+        self.running = 0
+        self.most = 0
+        self.calls = 0
+
+    def dial(self, host, port):
+        with self.lock:
+            self.calls += 1
+            self.running += 1
+            self.most = max(self.most, self.running)
+        try:
+            self.release.wait(30)
+            raise ConnectionRefusedError("released")
+        finally:
+            with self.lock:
+                self.running -= 1
+                self.lock.notify_all()
+
+    def wait_idle(self):
+        with self.lock:
+            assert self.lock.wait_for(lambda: self.running == 0, 30)
+
+
+def test_dial_calls_past_their_deadline_are_capped():
+    from nfs_rs import Client
+
+    url = f"nfs://{HOST}/export?version=4.1"
+    dialer = BlockingDialer()
+    try:
+        for _ in range(24):
+            with pytest.raises(TimeoutError):
+                Client.connect(url, dialer=dialer, connect_timeout=0.05)
+        # A call past its deadline keeps its slot; later connects time out
+        # waiting for one and never reach dial.
+        assert dialer.calls == dialer.most == 16
+    finally:
+        dialer.release.set()
+        dialer.wait_idle()
+
+    refusing = RefusingDialer()
+    with pytest.raises(ConnectionError):
+        Client.connect(url, dialer=refusing)
+    assert refusing.dialed == [(HOST, 2049)]

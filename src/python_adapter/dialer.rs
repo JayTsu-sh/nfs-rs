@@ -5,6 +5,11 @@
 //! through Python. `dial` runs on its own thread, attached to the interpreter
 //! only for the call: a tokio worker never waits for the GIL, and a runtime
 //! being dropped by a thread that holds the GIL never waits for a dial.
+//!
+//! A synchronous `dial` cannot be cut: past the caller's deadline the call
+//! goes on until it returns. At most [`MAX_DIALS_IN_FLIGHT`] calls run at
+//! once in a process; waiting for a slot counts against the same deadline,
+//! and a call keeps its slot until `dial` returns.
 use crate::dialer::{BoxedRpcStream, Dialer, Endpoint};
 use async_trait::async_trait;
 use pyo3::exceptions::{
@@ -15,6 +20,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// Python `dial` calls running at once in this process.
+pub(super) const MAX_DIALS_IN_FLIGHT: usize = 16;
+
+static DIAL_SLOTS: Semaphore = Semaphore::const_new(MAX_DIALS_IN_FLIGHT);
 
 pub(super) struct PythonDialer {
     target: Arc<Py<PyAny>>,
@@ -48,6 +59,10 @@ pub(super) fn dialer_option(
 #[async_trait]
 impl Dialer for PythonDialer {
     async fn dial(&self, endpoint: &Endpoint) -> std::io::Result<BoxedRpcStream> {
+        let slot = DIAL_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| Error::other("Python dial slots are closed"))?;
         let target = Arc::clone(&self.target);
         let host = endpoint.host().to_owned();
         let port = endpoint.port();
@@ -55,6 +70,7 @@ impl Dialer for PythonDialer {
         std::thread::Builder::new()
             .name("nfs-rs-python-dial".to_owned())
             .spawn(move || {
+                let _slot = slot;
                 // A socket that arrives after the client gave up is closed
                 // when the unsent result is dropped.
                 let _ = sender.send(dial_socket(&target, &host, port));
@@ -86,11 +102,16 @@ fn dial_socket(target: &Py<PyAny>, host: &str, port: u16) -> std::io::Result<soc
 
 /// Takes the descriptor of a connected `socket.socket` of type `SOCK_STREAM`.
 /// The Python object is left detached (closed); the descriptor is owned here.
+///
+/// Only the exact class is taken, never a subclass: a subclass can keep its
+/// descriptor while returning it, and a wrapper such as `ssl.SSLSocket` holds
+/// transport state the raw descriptor does not carry. The descriptor is taken
+/// with the native `_socket.socket.detach`, never a method the object provides.
 fn owned_socket(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<socket2::Socket> {
     let module = py.import("socket")?;
-    if !value.is_instance(&module.getattr("socket")?)? {
+    if !value.get_type().is(&module.getattr("socket")?) {
         return Err(PyTypeError::new_err(
-            "dialer.dial() must return a socket.socket",
+            "dialer.dial() must return a plain socket.socket, not a subclass or wrapper",
         ));
     }
     if !value.getattr("type")?.eq(module.getattr("SOCK_STREAM")?)? {
@@ -98,7 +119,8 @@ fn owned_socket(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<socket2::S
             "dialer.dial() must return a SOCK_STREAM socket",
         ));
     }
-    let descriptor: i64 = value.call_method0("detach")?.extract()?;
+    let detach = py.import("_socket")?.getattr("socket")?.getattr("detach")?;
+    let descriptor: i64 = detach.call1((value,))?.extract()?;
     if descriptor < 0 {
         return Err(PyValueError::new_err(
             "dialer.dial() returned a closed socket",
@@ -112,8 +134,8 @@ fn from_descriptor(descriptor: i64) -> std::io::Result<socket2::Socket> {
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     let raw = RawFd::try_from(descriptor)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "socket descriptor out of range"))?;
-    // SAFETY: `socket.detach()` hands over an open descriptor that nothing
-    // else owns any more.
+    // SAFETY: the native `_socket.socket.detach` of an exact `socket.socket`
+    // hands over an open descriptor that nothing else owns any more.
     Ok(socket2::Socket::from(unsafe { OwnedFd::from_raw_fd(raw) }))
 }
 
@@ -122,8 +144,8 @@ fn from_descriptor(descriptor: i64) -> std::io::Result<socket2::Socket> {
     use std::os::windows::io::{FromRawSocket, OwnedSocket, RawSocket};
     let raw = RawSocket::try_from(descriptor)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "socket handle out of range"))?;
-    // SAFETY: `socket.detach()` hands over an open socket that nothing else
-    // owns any more.
+    // SAFETY: the native `_socket.socket.detach` of an exact `socket.socket`
+    // hands over an open socket that nothing else owns any more.
     Ok(socket2::Socket::from(unsafe {
         OwnedSocket::from_raw_socket(raw)
     }))
