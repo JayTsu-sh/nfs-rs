@@ -49,6 +49,7 @@ options. Transfer sizes are negotiated; concurrency is capped at eight.
 | connect_timeout | None | Positive seconds for connection setup; None adds no Python deadline. |
 | operation_timeout | None | Positive seconds for an operation; None adds no Python deadline. |
 | recovery_event_capacity | 256 | Positive maximum retained diagnostic-event count. |
+| dialer | None | Object with `dial(host, port)` that opens every connection; see Dialer. None connects over TCP directly. |
 
 ## Module functions and version
 
@@ -74,6 +75,7 @@ def list_exports(
     connect_timeout: float | None = None,
     operation_timeout: float | None = None,
     recovery_event_capacity: int = 256,
+    dialer: Dialer | None = None,
 ) -> tuple[ExportEntry, ...]: ...
 ```
 
@@ -96,6 +98,7 @@ async def list_exports_async(
     connect_timeout: float | None = None,
     operation_timeout: float | None = None,
     recovery_event_capacity: int = 256,
+    dialer: Dialer | None = None,
 ) -> tuple[ExportEntry, ...]: ...
 ```
 
@@ -385,6 +388,18 @@ Frozen result of one scandir_page call.
 | `DirectoryPage.entries` | `tuple[DirEntry, ...]` | Entries of this page in server order, with the same metadata and handles as scandir. May be empty before EOF only when the server returned nothing but NFSv3 dot entries. |
 | `DirectoryPage.next` | `DirectoryCookie` | Position after the last entry of this page; pass it to the next scandir_page call. |
 | `DirectoryPage.eof` | `bool` | True when the server reported the end of the directory. |
+
+### Dialer
+
+Protocol for an object that opens the connections of a client or export query: portmapper, MOUNT, NFS, NFSACL, pNFS data servers and reconnects. Pass it as the dialer connection option. The server name reaches dial unresolved, so it can be resolved where the connection ends, for example on the far side of an SSH tunnel or proxy. retain_delegations is refused with a dialer because its callback needs a local listener.
+
+#### Dialer.dial
+
+```python
+def dial(self, host: str, port: int) -> socket.socket: ...
+```
+
+Return a connected SOCK_STREAM socket to host and port, for example one end of socket.socketpair() bridged to a tunnel. The client takes ownership: the socket object is detached and its descriptor closed by the client. dial runs on a native thread, not the event loop, and may run again at any time while the client is open (reconnects, new data servers). An OSError it raises keeps its errno class (ConnectionRefusedError raises NfsConnectionError); returning anything else fails the connection.
 
 ### ExportEntry
 
@@ -712,6 +727,7 @@ def connect(
     connect_timeout: float | None = None,
     operation_timeout: float | None = None,
     recovery_event_capacity: int = 256,
+    dialer: Dialer | None = None,
 ) -> Client: ...
 ```
 
@@ -1108,6 +1124,7 @@ async def connect(
     connect_timeout: float | None = None,
     operation_timeout: float | None = None,
     recovery_event_capacity: int = 256,
+    dialer: Dialer | None = None,
 ) -> AsyncClient: ...
 ```
 

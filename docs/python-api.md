@@ -142,6 +142,37 @@ for export in list_exports("nfs://server/"):
 Use `await list_exports_async(...)` in async code. It is not NFSv4 namespace
 discovery; availability depends on the server exposing the MOUNT service.
 
+## Custom connections
+
+The `dialer` option opens every connection of a client or export query
+through an object with `dial(host, port)`: portmapper, MOUNT, NFS, NFSACL,
+pNFS data servers and reconnects. `dial` receives the server name
+unresolved and returns a connected `SOCK_STREAM` socket, so the connection
+can go through an SSH tunnel or a proxy and the name is resolved where it
+ends. The client takes ownership of the socket and carries the RPC records
+in native code; Python only opens the connection.
+
+```python
+import socket
+
+from nfs_rs import Client
+
+
+class Direct:
+    def dial(self, host: str, port: int) -> socket.socket:
+        return socket.create_connection((host, port), timeout=10)
+
+
+with Client.connect("nfs://server/export?version=4.1", dialer=Direct()) as client:
+    print(client.listdir("/"))
+```
+
+`dial` runs on a native thread and can run again at any time while the
+client is open. An `OSError` it raises keeps its errno class, so a refused
+connection raises `NfsConnectionError`. `retain_delegations=True` is refused
+with a dialer, because NFSv4.0 delegation callbacks need the server to
+connect back to a local listener.
+
 ## Synchronous workflow
 
 Clients and files are context managers. Closing the client closes resources it
@@ -633,6 +664,7 @@ The stable facade exports:
 - clients: `Client`, `AsyncClient`
 - files: `File`, `AsyncFile`
 - export discovery: `list_exports`, `list_exports_async`
+- connections: `Dialer` (the `dialer` option)
 - information values: `FileInfo`, `DirectoryRef`, `DirEntry`, `ExportEntry`, `FsInfo`, `FsStat`,
   `Capabilities`, `IoLimits`, `Health`, `RecoveryEvent`, `NfsAce`, `NfsAcl41`, `PathResolution`
 - enums: `Version`, `FileType`, `Lifecycle`, `OperationOutcome`,

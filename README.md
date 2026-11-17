@@ -275,6 +275,10 @@ async fn main() -> Result<()> {
 }
 ```
 
+Python takes the same seam as the `dialer` option of `Client.connect`,
+`AsyncClient.connect`, `list_exports` and `list_exports_async`: an object whose
+`dial(host, port)` returns a connected socket (see the Python guide).
+
 ### NFSv4.0 migration notes
 
 Use exact `version=4.0`; the ambiguous selector `version=4` is invalid. Existing

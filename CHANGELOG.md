@@ -16,6 +16,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   URL entry points keep their behavior through the default `TcpDialer`.
   Every RPC record is flushed before it counts as sent, so a buffered
   stream works, and closing a stream is bounded by a deadline.
+- Python `dialer` option for `Client.connect`, `AsyncClient.connect`,
+  `list_exports` and `list_exports_async`, and the `Dialer` protocol: an object
+  whose `dial(host, port)` returns a connected socket opens every connection.
+  The client owns the socket and the RPC records stay in native code.
 
 ## [0.12.0] - 2026-11-09
 
