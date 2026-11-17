@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -44,6 +45,14 @@ touch "$FAKE_SS_CALLED"
 """,
                 "sleep": "#!/bin/bash\nexec /bin/sleep 0.005\n",
             }
+            if shutil.which("timeout") is None:
+                # macOS has no GNU timeout; the gate never reaches its limit here.
+                commands["timeout"] = """#!/bin/bash
+set -eu
+[[ "$1" =~ ^[0-9]+$ ]]
+shift
+exec "$@"
+"""
             for name, source in commands.items():
                 command = root / name
                 command.write_text(source)
