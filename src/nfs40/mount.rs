@@ -2795,6 +2795,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_with_stale_stateid_is_treated_as_released() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_stateid_lane(&mount, 218, [0xcb; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // STALE_STATEID says the server has no such state, so CLOSE is
+            // already satisfied and no seqid probe is needed (unlike
+            // BAD_STATEID, where the state may still exist further ahead).
+            reply(&mut stream, &close, &failed_lock_result("close", 4, 10023)).await
+        });
+        mount
+            .close(Bytes::from_static(b"fh"))
+            .await
+            .expect("STALE_STATEID on CLOSE means the server already released the state");
+        assert!(mount.state.by_owner(218).await.is_none());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn close_bad_stateid_with_ahead_seqid_probes_previous_seqid_then_releases() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;

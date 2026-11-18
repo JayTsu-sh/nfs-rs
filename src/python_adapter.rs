@@ -6274,3 +6274,23 @@ mod directory_batch_tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_state_recovery_maps_to_the_dedicated_python_error() {
+        let error = NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
+            operation: "close".into(),
+            status: crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+            source: Box::new(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)),
+        }));
+
+        let kind = error_kind(&error);
+
+        assert_eq!(kind.class_name, "NfsStateRecoveryExhaustedError");
+        assert_eq!(kind.recovery, Some("reopen"));
+        assert!(kind.errno.is_none());
+    }
+}
