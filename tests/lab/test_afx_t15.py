@@ -1,6 +1,7 @@
 """T15 negative evidence and cleanup contracts; never contacts a storage host."""
 
 import argparse
+from contextlib import nullcontext
 import copy
 import json
 import os
@@ -394,13 +395,31 @@ sys.exit(r.run())
             )
             runner = controller.Runner(args, root)
             probe = controller.Probe(runner, "probe", "partial")
+            # macOS has no procfs. Supply identity only for this fixture's
+            # child and exercise real process-group signaling and reaping.
+            identity = (
+                patch.object(
+                    controller,
+                    "identity_alive",
+                    side_effect=lambda pid, marker: (pid, marker)
+                    == (probe.process.pid, str(binary)),
+                )
+                if sys.platform == "darwin"
+                else nullcontext()
+            )
             try:
-                with self.assertRaisesRegex(EvidenceError, "timed out"):
-                    probe.wait({"ready"}, 0.1)
+                try:
+                    with self.assertRaisesRegex(EvidenceError, "timed out"):
+                        probe.wait({"ready"}, 0.1)
+                finally:
+                    with identity:
+                        controller.cleanup(root, runner.state)
+                self.assertIsNotNone(probe.process.poll())
             finally:
-                controller.cleanup(root, runner.state)
+                if probe.process.poll() is None:
+                    probe.process.kill()
+                    probe.process.wait(timeout=5)
                 probe.close()
-            self.assertIsNotNone(probe.process.poll())
 
 
 if __name__ == "__main__":

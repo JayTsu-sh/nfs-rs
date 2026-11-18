@@ -1,4 +1,5 @@
 mod completion;
+mod dialer;
 
 use crate::client_core::{
     ClientCore, ClientDriver, CoreOperation, CoreRecoveryEvent, OperationGuard, ResourceKey,
@@ -3383,13 +3384,23 @@ fn timeout_option(options: Option<&Bound<'_, PyDict>>, name: &str) -> PyResult<O
         .transpose()
 }
 
-async fn connect_mount(url: &str, timeout: Option<Duration>) -> Result<Box<dyn Mount>> {
+async fn connect_mount(
+    url: &str,
+    timeout: Option<Duration>,
+    dialer: Option<Arc<dyn crate::Dialer>>,
+) -> Result<Box<dyn Mount>> {
+    let mount = async {
+        match dialer {
+            Some(dialer) => crate::mount_with(crate::MountOptions::from_url(url)?, dialer).await,
+            None => parse_url_and_mount(url).await,
+        }
+    };
     if let Some(timeout) = timeout {
-        tokio::time::timeout(timeout, parse_url_and_mount(url))
+        tokio::time::timeout(timeout, mount)
             .await
             .map_err(|_| deadline_exceeded("connection"))?
     } else {
-        parse_url_and_mount(url).await
+        mount.await
     }
 }
 
@@ -4352,13 +4363,20 @@ impl AsyncFile {
 async fn export_values(
     host: &str,
     timeout: Option<Duration>,
+    dialer: Option<Arc<dyn crate::Dialer>>,
 ) -> Result<Vec<(String, Vec<String>)>> {
+    let exports = async {
+        match dialer {
+            Some(dialer) => crate::list_exports_with(host, dialer).await,
+            None => crate::list_exports(host).await,
+        }
+    };
     let exports = if let Some(timeout) = timeout {
-        tokio::time::timeout(timeout, crate::list_exports(host))
+        tokio::time::timeout(timeout, exports)
             .await
             .map_err(|_| deadline_exceeded("export discovery"))??
     } else {
-        crate::list_exports(host).await?
+        exports.await?
     };
     Ok(exports
         .into_iter()
@@ -4387,13 +4405,14 @@ fn python_list_exports(
         return Ok(values);
     }
     let timeout = timeout_option(options, "connect_timeout")?;
+    let dialer = dialer::dialer_option(options)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .thread_name("nfs-rs-python-exports")
         .build()
         .map_err(python_error)?;
-    py.detach(|| runtime.block_on(export_values(&host, timeout)))
+    py.detach(|| runtime.block_on(export_values(&host, timeout, dialer)))
         .map_err(nfs_error)
 }
 
@@ -4407,8 +4426,11 @@ fn python_async_list_exports<'py>(
         return completion::future_into_py(py, async move { Ok(values) });
     }
     let timeout = timeout_option(options, "connect_timeout")?;
+    let dialer = dialer::dialer_option(options)?;
     completion::future_into_py(py, async move {
-        export_values(&host, timeout).await.map_err(nfs_error)
+        export_values(&host, timeout, dialer)
+            .await
+            .map_err(nfs_error)
     })
 }
 
@@ -4461,6 +4483,7 @@ impl SyncClient {
         let capacity = recovery_capacity(options)?;
         let connect_timeout = timeout_option(options, "connect_timeout")?;
         let operation_timeout = timeout_option(options, "operation_timeout")?;
+        let dialer = dialer::dialer_option(options)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -4502,7 +4525,7 @@ impl SyncClient {
             });
         }
         let mount = py
-            .detach(|| runtime.block_on(connect_mount(&url, connect_timeout)))
+            .detach(|| runtime.block_on(connect_mount(&url, connect_timeout, dialer)))
             .map_err(nfs_error)?;
         let ConnectedParts {
             core,
@@ -5152,6 +5175,7 @@ impl AsyncClient {
         let capacity = recovery_capacity(options)?;
         let connect_timeout = timeout_option(options, "connect_timeout")?;
         let operation_timeout = timeout_option(options, "operation_timeout")?;
+        let dialer = dialer::dialer_option(options)?;
         if let Some(parts) = test_connected_parts(&url, capacity) {
             let parts = parts?;
             let ConnectedParts {
@@ -5180,7 +5204,7 @@ impl AsyncClient {
             });
         }
         completion::future_into_py(py, async move {
-            let mount = connect_mount(&url, connect_timeout)
+            let mount = connect_mount(&url, connect_timeout, dialer)
                 .await
                 .map_err(nfs_error)?;
             let ConnectedParts {

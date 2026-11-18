@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Rust `Dialer` trait, `Endpoint`, `TcpDialer`, `MountOptions`, `mount_with`
+  and `list_exports_with`: every connection of a mount (portmapper, MOUNT, NFS,
+  NFSACL, pNFS data servers and reconnects) can be opened by a caller-supplied
+  dialer over any byte stream, with server names resolved by the dialer. The
+  URL entry points keep their behavior through the default `TcpDialer`.
+  Every RPC record is flushed before it counts as sent, so a buffered
+  stream works, and closing a stream is bounded by a deadline.
+- Python `dialer` option for `Client.connect`, `AsyncClient.connect`,
+  `list_exports` and `list_exports_async`, and the `Dialer` protocol: an object
+  whose `dial(host, port)` returns a connected socket opens every connection.
+  The client owns the socket and the RPC records stay in native code. Only a
+  plain `socket.socket` is taken, and at most 16 dial calls run at once.
+
 ### Fixed
 
 - NFSv3 path lookup on Unix preserves a literal backslash filename component

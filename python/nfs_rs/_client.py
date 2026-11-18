@@ -15,7 +15,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass
 from types import ModuleType
 from collections.abc import AsyncIterator, Iterator
-from typing import Any, ClassVar
+import socket
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from ._errors import (
     NfsClosedResourceError, NfsError, NfsFileCloseError, NfsModeError,
@@ -518,6 +519,19 @@ def _record_cleanup_failure(exc: BaseException, cleanup_error: BaseException, ow
         exc.__context__ = cleanup_error
 
 
+@runtime_checkable
+class Dialer(Protocol):
+    """Opens every connection of a mount: portmapper, MOUNT, NFS, NFSACL,
+    pNFS data servers and reconnects.
+
+    ``dial`` receives the server name unresolved and returns a connected
+    ``SOCK_STREAM`` socket. The client takes ownership of the socket. It may
+    be called again at any time while the client is open, from another thread.
+    """
+
+    def dial(self, host: str, port: int) -> socket.socket: ...
+
+
 def _configured_url(url: str, options: dict[str, Any]) -> str:
     parsed = urlsplit(url)
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
@@ -576,6 +590,7 @@ def _options(
     connect_timeout: float | None,
     operation_timeout: float | None,
     recovery_event_capacity: int,
+    dialer: Dialer | None,
 ) -> dict[str, Any]:
     if versions is not None:
         versions = tuple(versions)
@@ -601,6 +616,8 @@ def _options(
             raise ValueError(f"{name} must be positive")
     if isinstance(recovery_event_capacity, bool) or recovery_event_capacity <= 0:
         raise ValueError("recovery_event_capacity must be positive")
+    if dialer is not None and not callable(getattr(dialer, "dial", None)):
+        raise TypeError("dialer must have a callable dial(host, port) method")
     if not isinstance(noresvport, (bool, type(None))):
         raise TypeError("noresvport must be bool or None")
     if not isinstance(retain_delegations, (bool, type(None))):
@@ -627,6 +644,7 @@ def _options(
             "connect_timeout": connect_timeout,
             "operation_timeout": operation_timeout,
             "recovery_event_capacity": recovery_event_capacity,
+            "dialer": dialer,
         }.items()
         if value is not None
     }
@@ -650,6 +668,7 @@ class _ClientOptions:
         connect_timeout: float | None = None,
         operation_timeout: float | None = None,
         recovery_event_capacity: int = 256,
+        dialer: Dialer | None = None,
     ) -> dict[str, Any]:
         values = locals()
         values.pop("cls")

@@ -9,11 +9,13 @@
 use super::{METADATA_TIMEOUT, NFS_REPLAY, rpc_header, xdr_u32, xdr_var_bytes};
 use crate::error::classify_sent_nfs3_error;
 use crate::{
-    Auth, NfsError, OperationClass, PosixAcl, PosixAclEntry, RequestContext, Result, SocketAddr,
+    Auth, NfsError, OperationClass, PosixAcl, PosixAclEntry, RequestContext, Result,
+    dialer::{Dialer, Endpoint},
     rpc,
 };
 use bytes::{Buf, Bytes};
 use std::io::{Error as IoError, ErrorKind};
+use std::sync::Arc;
 
 const PROGRAM: u32 = rpc::NFSACL_PROG;
 const VERSION: u32 = 3;
@@ -29,10 +31,10 @@ pub(super) struct Client {
 
 impl Client {
     pub(super) async fn discover(
-        addr: SocketAddr,
+        dialer: &Arc<dyn Dialer>,
+        addr: &Endpoint,
         rpc: &rpc::Client,
         auth: &Auth,
-        noresvport: bool,
     ) -> Option<Self> {
         // Linux normally multiplexes NFSACL on the NFS socket. Probe it there
         // first, then resolve a dedicated TCP port for other implementations.
@@ -45,24 +47,23 @@ impl Client {
             if direct.probe().await.is_ok() {
                 return Some(direct);
             }
-            let mut mapper_addr = addr;
-            mapper_addr.set_port(rpc::PORTMAP_PORT);
+            let mapper_addr = addr.with_port(rpc::PORTMAP_PORT);
             let port = rpc::portmap(
-                &vec![mapper_addr],
+                dialer,
+                &[mapper_addr],
                 PROGRAM,
                 VERSION,
                 auth,
                 super::MOUNT_RETRIES,
-                noresvport,
             )
             .await
             .ok()?;
             if port == addr.port() {
                 return None;
             }
-            let mut acl_addr = addr;
-            acl_addr.set_port(port);
-            let mux = rpc::StreamMux::connect(acl_addr, noresvport).await.ok()?;
+            let mux = rpc::StreamMux::dial(Arc::clone(dialer), addr.with_port(port))
+                .await
+                .ok()?;
             let client = Self {
                 rpc: rpc::Client::new(mux, None),
                 auth: auth.clone(),

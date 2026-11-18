@@ -2044,7 +2044,9 @@ mod tests {
 
     #[tokio::test]
     async fn incoming_write_waits_for_healthy_recall_commit() {
-        let manager = Arc::new(LayoutManager::new(true));
+        let manager = Arc::new(LayoutManager::new(std::sync::Arc::new(
+            crate::dialer::TcpDialer::new(true),
+        )));
         let fh = Bytes::from_static(b"recall-commit");
         let write = pending(false, 0, vec![reply(false, 1)]);
         let writes = [&write];
