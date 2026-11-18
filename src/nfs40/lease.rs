@@ -284,6 +284,12 @@ impl LeaseState {
         }
     }
 
+    /// Conservative lease deadline: the point after which the server may have
+    /// discarded this client's state, so retrying recovery is pointless.
+    pub(crate) fn lease_deadline(&self) -> tokio::time::Instant {
+        *self.deadline.borrow()
+    }
+
     fn mark_suspect(&self) {
         self.healthy.store(false, Ordering::Release);
         self.transition(MountLifecycleState::Suspect);

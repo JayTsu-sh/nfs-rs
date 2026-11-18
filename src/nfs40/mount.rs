@@ -29,7 +29,7 @@ use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::dialer::Endpoint;
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
-use crate::mount::{self, NFSVersion};
+use crate::mount::{self, MountLifecycleState, NFSVersion};
 use crate::nfs4::acl;
 use crate::nfs4::attrs::{
     decode_fattr4_envelope, decode_getattr_response, encode_setattr, fattr4_has,
@@ -951,24 +951,53 @@ impl RecoveryContext {
     }
 
     async fn recover_or_lose(&self) -> Result<()> {
+        // A mount that already lost its state (or is unmounting) must not be
+        // revived by the delayed retry scheduled below.
+        match self.lease.health().lifecycle {
+            MountLifecycleState::LostState => {
+                return Err(NfsError::LostOpenState(
+                    "NFSv4.0 recovery skipped: mount already lost its state".into(),
+                ));
+            }
+            MountLifecycleState::Closed | MountLifecycleState::Closing => {
+                return Err(NfsError::LostOpenState(
+                    "NFSv4.0 recovery skipped: mount is closing".into(),
+                ));
+            }
+            _ => {}
+        }
         // One recovery at a time: SETCLIENTID must not be issued twice for the
         // same client identity, and the reclaim pass reads the whole state map.
         let _recovery = self.lease.recovery_guard().await;
         if self.lease.recovery_deferred() {
             return Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE));
         }
+        match self.attempt_recovery().await {
+            // RFC 7530 §9.6.2: NFS4ERR_GRACE is a retry signal, not a reason to
+            // discard state. Keep every lane and fail fast until the backoff
+            // lapses; a fresh OPEN during grace would otherwise wipe opens and
+            // locks that must be kept. Do not resume the mount or extend the
+            // lease deadline: recovery is still incomplete and RENEW owns the
+            // lost-lease decision. RENEW does not retry on its own, so one task
+            // owns the retries until the mount settles.
+            Err(error) if error.is_server_busy() => {
+                tokio::spawn(retry_recovery(self.clone()));
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    /// One recovery attempt with the recovery mutex held: on success the mount
+    /// resumes, on a busy server the backoff window is refreshed, and any other
+    /// failure loses the state.
+    async fn attempt_recovery(&self) -> Result<()> {
         match self.recover().await {
             Ok(()) => {
                 self.lease.clear_recovery_deferral();
                 self.lease.mark_recovered();
                 Ok(())
             }
-            // RFC 7530 §9.6.2: NFS4ERR_GRACE is a retry signal, not a reason to
-            // discard state. Keep every lane and fail fast until the backoff
-            // lapses; a fresh OPEN during grace would otherwise wipe opens and
-            // locks that must be kept. Do not resume the mount or extend the
-            // lease deadline: recovery is still incomplete and RENEW owns the
-            // lost-lease decision.
             Err(error) if error.is_server_busy() => {
                 self.lease
                     .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF);
@@ -995,6 +1024,39 @@ impl RecoveryContext {
                     ),
                 )))
             }
+        }
+    }
+}
+
+/// Retries recovery once each backoff window lapses until the mount settles.
+/// GRACE/DELAY would otherwise leave the mount gated (Reclaiming) with no one
+/// to retry: RENEW only triggers recovery on NFS4ERR_EXPIRED/STALE_CLIENTID.
+async fn retry_recovery(context: RecoveryContext) {
+    loop {
+        tokio::time::sleep(RECOVERY_BACKOFF + Duration::from_millis(100)).await;
+        // Past the lease deadline the server may have discarded this client's
+        // state, so a reclaim can no longer succeed; stop instead of retrying
+        // for the lifetime of an abandoned mount.
+        if tokio::time::Instant::now() >= context.lease.lease_deadline() {
+            return;
+        }
+        let _recovery = context.lease.recovery_guard().await;
+        match context.lease.health().lifecycle {
+            MountLifecycleState::Ready
+            | MountLifecycleState::LostState
+            | MountLifecycleState::Closed
+            | MountLifecycleState::Closing => return,
+            _ => {}
+        }
+        // Another recovery refreshed the window; wait it out instead of
+        // issuing SETCLIENTID concurrently with the work in flight.
+        if context.lease.recovery_deferred() {
+            continue;
+        }
+        match context.attempt_recovery().await {
+            Ok(()) => return,
+            Err(error) if error.is_server_busy() => continue,
+            Err(_) => return,
         }
     }
 }
@@ -7287,6 +7349,87 @@ mod tests {
             retry,
             NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)
         ));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_recovery_is_retried_after_the_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 87, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            // First recovery hits grace; the client must come back on its own
+            // once the backoff lapses and then reclaim the lane successfully.
+            for client_id in [19u64, 20] {
+                let identity = read_record(&mut stream).await?;
+                let mut identity_data = Vec::new();
+                identity_data.extend_from_slice(&client_id.to_be_bytes());
+                identity_data.extend_from_slice(&[0x79; 8]);
+                reply(
+                    &mut stream,
+                    &identity,
+                    &compound_result("identity", &[(35, &identity_data)]),
+                )
+                .await?;
+                let confirm = read_record(&mut stream).await?;
+                reply(
+                    &mut stream,
+                    &confirm,
+                    &compound_result("confirm", &[(36, &[])]),
+                )
+                .await?;
+                let reclaim = read_record(&mut stream).await?;
+                if client_id == 19 {
+                    reply(
+                        &mut stream,
+                        &reclaim,
+                        &failed_lock_result("reclaim-open", 18, 10013),
+                    )
+                    .await?;
+                } else {
+                    reply(&mut stream, &reclaim, &open_result(0, [0x62; 16], b"fh")).await?;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-grace-retry".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        let error = context.recover_or_lose().await.unwrap_err();
+        assert!(
+            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::Reclaiming
+        );
+        let retried = tokio::time::timeout(Duration::from_secs(10), async {
+            while mount.health().lifecycle != crate::MountLifecycleState::Ready {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            retried.is_ok(),
+            "GRACE backoff never retried recovery; mount stayed {:?}",
+            mount.health().lifecycle
+        );
+        assert!(!mount.lease.recovery_deferred());
+        let lane = mount.state.by_owner(87).await.unwrap();
+        assert_eq!(lane.lock().await.stateid, [0x62; 16]);
         server.await.unwrap().unwrap();
     }
 
