@@ -10,8 +10,8 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
     AceFlags, AceMask, AceType, Acl, Acl41Flags, DirectoryCookie, Mount, MountCapabilities,
-    MountLifecycleState, NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time,
-    parse_url_and_mount,
+    MountLifecycleState, NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, OpenOptions,
+    Time, parse_url_and_mount,
 };
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
@@ -236,7 +236,17 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
     let _ = mount.remove_path(&path).await;
 
     let result: TestResult = async {
-        let file = mount.open_path(&path, OPEN_BOTH).await?;
+        let file = mount
+            .open_path_with_options(
+                &path,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
         nfs_rs::write_all(mount.as_ref(), file.fh.clone(), 0, payload.clone()).await?;
         mount
             .commit(file.fh.clone(), 0, payload.len() as u32)
@@ -295,7 +305,17 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
     let _ = mount.remove_path(&path).await;
 
     let result: TestResult = async {
-        let file = mount.open_path(&path, OPEN_BOTH).await?;
+        let file = mount
+            .open_path_with_options(
+                &path,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
         nfs_rs::write_all(mount.as_ref(), file.fh.clone(), 0, payload.clone()).await?;
         mount
             .commit(file.fh.clone(), 0, payload.len() as u32)
@@ -345,8 +365,28 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
     let _ = mount.remove_path(&second).await;
 
     let result: TestResult = async {
-        let file_a = mount.open_path(&first, OPEN_BOTH).await?;
-        let file_b = mount.open_path(&second, OPEN_BOTH).await?;
+        let file_a = mount
+            .open_path_with_options(
+                &first,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
+        let file_b = mount
+            .open_path_with_options(
+                &second,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
         nfs_rs::write_all(mount.as_ref(), file_a.fh.clone(), 0, payload_a.clone()).await?;
         nfs_rs::write_all(mount.as_ref(), file_b.fh.clone(), 0, payload_b.clone()).await?;
         mount

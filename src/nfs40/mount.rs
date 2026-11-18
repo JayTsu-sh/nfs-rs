@@ -2517,7 +2517,19 @@ impl Mount40 {
             .state
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+            .ok_or_else(|| {
+                // After a failed crash recovery the lane is gone but the mount is
+                // no longer Ready; report a typed lost-state failure so callers
+                // can reopen instead of treating it as a programming error.
+                let lifecycle = self.lease.health().lifecycle;
+                if lifecycle == MountLifecycleState::Ready {
+                    NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into())
+                } else {
+                    NfsError::LostOpenState(format!(
+                        "NFSv4.0 WRITE: open state lost while mount is {lifecycle:?}"
+                    ))
+                }
+            })?;
         let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?
         } else {
