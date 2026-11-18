@@ -217,6 +217,47 @@ async fn release_server_state(command: &str, settle_ms: u64) -> TestResult {
 /// `NFS_RS_LAB_V40_STATEID_RECOVERY_URL=nfs://host/export?version=4.0`
 /// `NFS_RS_LAB_V40_STATEID_RECOVERY_CMD='<command that resets server state>'`
 /// `cargo test --test lab_e2e nfs_v40_stateid_recovery_after_state_loss -- --ignored --nocapture`
+/// TFS 不支持 CLAIM_PREVIOUS（reclaim 返回 -95），此时恢复的契约是返回
+/// 类型化 LostOpenState，而不是假装成功。其它 lab 服务端默认要求完整恢复。
+fn stateid_reclaim_supported() -> bool {
+    std::env::var("NFS_RS_LAB_V40_STATEID_RECLAIM").map_or(true, |value| value != "unsupported")
+}
+
+fn is_lost_state(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<NfsError>(),
+        Some(NfsError::LostOpenState(_))
+    )
+}
+
+fn expect_recovery_outcome(result: TestResult) -> TestResult {
+    if stateid_reclaim_supported() {
+        return result;
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_lost_state(error.as_ref()) => Ok(()),
+        Err(error) => Err(format!(
+            "expected LostOpenState from a server without reclaim support, got: {error}"
+        )
+        .into()),
+    }
+}
+
+fn expect_close_outcome(result: TestResult) -> TestResult {
+    if stateid_reclaim_supported() {
+        return result;
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_lost_state(error.as_ref()) => Ok(()),
+        Err(error) => Err(format!(
+            "CLOSE must succeed or report LostOpenState without reclaim support, got: {error}"
+        )
+        .into()),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires a writable NFSv4.0 fixture and a runner-side state-release command"]
 async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
@@ -280,7 +321,7 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
 
     let _ = mount.remove_path(&path).await;
     mount.umount().await?;
-    result
+    expect_recovery_outcome(result)
 }
 
 /// E2E for nfs-rs#158: once the server has dropped our open state, CLOSE must
@@ -333,7 +374,7 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
 
     let _ = mount.remove_path(&path).await;
     mount.umount().await?;
-    result
+    expect_close_outcome(result)
 }
 
 /// E2E for nfs-rs#159: two lanes lose their open state at the same time. Each
@@ -438,7 +479,7 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
     let _ = mount.remove_path(&first).await;
     let _ = mount.remove_path(&second).await;
     mount.umount().await?;
-    result
+    expect_recovery_outcome(result)
 }
 
 #[tokio::test]

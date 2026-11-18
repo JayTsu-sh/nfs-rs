@@ -2381,11 +2381,18 @@ impl Mount for Mount40 {
                 "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
             ));
         }
-        let lane = self
-            .state
-            .for_fh(&fh, crate::OPEN_BOTH)
-            .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 CLOSE requires an open file".into()))?;
+        let lane = match self.state.for_fh(&fh, crate::OPEN_BOTH).await {
+            Some(lane) => lane,
+            // A failed recovery already dropped the lane; the server cannot
+            // hold state either, so CLOSE is satisfied instead of surfacing a
+            // programming error.
+            None if self.lease.health().lifecycle != MountLifecycleState::Ready => return Ok(()),
+            None => {
+                return Err(NfsError::InvalidInput(
+                    "NFSv4.0 CLOSE requires an open file".into(),
+                ));
+            }
+        };
         self.close_lane(lane).await
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
