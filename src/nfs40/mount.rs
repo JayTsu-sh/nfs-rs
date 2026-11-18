@@ -897,25 +897,29 @@ impl RecoveryContext {
     }
 }
 
+/// A retry task stops once recovery can no longer help: the lease window has
+/// lapsed (the server may have discarded this client's state) or the mount has
+/// already settled (resumed, lost, or unmounted).
+fn retry_settled(lease: &LeaseState) -> bool {
+    tokio::time::Instant::now() >= lease.lease_deadline()
+        || matches!(
+            lease.health().lifecycle,
+            MountLifecycleState::Ready
+                | MountLifecycleState::LostState
+                | MountLifecycleState::Closed
+                | MountLifecycleState::Closing
+        )
+}
+
 /// Retries recovery once each backoff window lapses until the mount settles.
 /// GRACE/DELAY would otherwise leave the mount gated (Reclaiming) with no one
 /// to retry: RENEW only triggers recovery on NFS4ERR_EXPIRED/STALE_CLIENTID.
 async fn retry_recovery(context: RecoveryContext) {
     loop {
         tokio::time::sleep(RECOVERY_BACKOFF + Duration::from_millis(100)).await;
-        // Past the lease deadline the server may have discarded this client's
-        // state, so a reclaim can no longer succeed; stop instead of retrying
-        // for the lifetime of an abandoned mount.
-        if tokio::time::Instant::now() >= context.lease.lease_deadline() {
-            return;
-        }
         let _recovery = context.lease.recovery_guard().await;
-        match context.lease.health().lifecycle {
-            MountLifecycleState::Ready
-            | MountLifecycleState::LostState
-            | MountLifecycleState::Closed
-            | MountLifecycleState::Closing => return,
-            _ => {}
+        if retry_settled(&context.lease) {
+            return;
         }
         // Another recovery refreshed the window; wait it out instead of
         // issuing SETCLIENTID concurrently with the work in flight.
@@ -5666,6 +5670,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_delay_keeps_state_and_defers_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 78, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            // NFS4ERR_DELAY is the other retryable status: the reclaim was not
+            // executed, so the lane must survive exactly as it does for GRACE.
+            reply(
+                &mut stream,
+                &reclaim,
+                &failed_lock_result("reclaim-open", 18, 10008),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-delay".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        let error = context.recover_or_lose().await.unwrap_err();
+        assert!(
+            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_DELAY)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::Reclaiming
+        );
+        assert_eq!(mount.health().generation, 1);
+        assert!(!mount.state.snapshot().await.is_empty());
+        assert!(mount.lease.recovery_deferred());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_settled_stops_at_the_deadline_or_a_terminal_lifecycle() {
+        // lease_seconds = 0 puts the deadline in the past.
+        assert!(retry_settled(&LeaseState::ready(1, 0)));
+
+        let active = LeaseState::ready(1, 60);
+        active.mark_reclaiming();
+        assert!(!retry_settled(&active));
+
+        active.mark_ready();
+        assert!(retry_settled(&active));
+
+        let lost = LeaseState::ready(1, 60);
+        lost.mark_lost().await;
+        assert!(retry_settled(&lost));
+
+        let closing = LeaseState::ready(1, 60);
+        closing.mark_closing();
+        assert!(retry_settled(&closing));
+
+        let closed = LeaseState::ready(1, 60);
+        closed.mark_closed();
+        assert!(retry_settled(&closed));
+    }
+
+    #[tokio::test]
+    async fn concurrent_recoveries_are_serialized() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 89, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            for client_id in [19u64, 20] {
+                let identity = read_record(&mut stream).await?;
+                let mut identity_data = Vec::new();
+                identity_data.extend_from_slice(&client_id.to_be_bytes());
+                identity_data.extend_from_slice(&[0x79; 8]);
+                reply(
+                    &mut stream,
+                    &identity,
+                    &compound_result("identity", &[(35, &identity_data)]),
+                )
+                .await?;
+                let confirm = read_record(&mut stream).await?;
+                reply(
+                    &mut stream,
+                    &confirm,
+                    &compound_result("confirm", &[(36, &[])]),
+                )
+                .await?;
+                let reclaim = read_record(&mut stream).await?;
+                if client_id == 19 {
+                    // The waiting caller must not issue its own SETCLIENTID
+                    // while this reclaim is still in flight.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(30), read_record(&mut stream))
+                            .await
+                            .is_err(),
+                        "concurrent recovery issued a second SETCLIENTID"
+                    );
+                }
+                reply(&mut stream, &reclaim, &open_result(0, [0x63; 16], b"fh")).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-serialized".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        let second = context.clone();
+        let (first, next) = tokio::join!(context.recover_or_lose(), second.recover_or_lose());
+        first.unwrap();
+        next.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn busy_recovery_is_retried_after_the_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
@@ -5741,6 +5894,8 @@ mod tests {
             mount.health().lifecycle
         );
         assert!(!mount.lease.recovery_deferred());
+        // mark_recovered resumes the lease but only RENEW counts as a renewal.
+        assert_eq!(mount.health().lease_renewals, 0);
         let lane = mount.state.by_owner(87).await.unwrap();
         assert_eq!(lane.lock().await.stateid, [0x62; 16]);
         server.await.unwrap().unwrap();
