@@ -598,7 +598,7 @@ impl RecoveryContext {
             match self.reclaim_open_lane(&lane, renewed_client_id).await {
                 Ok(()) => Ok(()),
                 Err(error) if error.is_server_busy() => Err(error),
-                Err(error) if matches!(error, NfsError::Nfs4(_)) => {
+                Err(error) if matches!(error, NfsError::Nfs4(_) | NfsError::LostOpenState(_)) => {
                     let (owner, fh) = {
                         let open = lane.lock().await;
                         (open.owner, open.fh.clone())
@@ -632,7 +632,9 @@ impl RecoveryContext {
                                 .await;
                         }
                         Err(error) if error.is_server_busy() => return Err(error),
-                        Err(error) if matches!(error, NfsError::Nfs4(_)) => {
+                        Err(error)
+                            if matches!(error, NfsError::Nfs4(_) | NfsError::LostOpenState(_)) =>
+                        {
                             let (owner, stateid) = {
                                 let lock = lane.lock().await;
                                 (lock.owner, lock.stateid)
@@ -728,7 +730,7 @@ impl RecoveryContext {
         owner_wire: &[u8],
         client_id: u64,
     ) -> Result<()> {
-        let fresh = fresh_open_lane_with_seqid(
+        let attempt = fresh_open_lane_with_seqid(
             &self.rpc,
             &self.auth,
             &open.dir_fh,
@@ -739,8 +741,20 @@ impl RecoveryContext {
             open.next_seqid,
             "reclaim-fallback-open",
         )
-        .await
-        .result?;
+        .await;
+        let fresh = match attempt.result {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                // RFC 7530 §9.1.7: a failed OPEN consumes its open-owner seqid
+                // unless the status is in the exception table. Record it so the
+                // retry after a busy recovery (GRACE/DELAY) does not replay a
+                // consumed seqid and get stuck on NFS4ERR_BAD_SEQID.
+                if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
+                    open.next_seqid = attempt.seqid.wrapping_add(1);
+                }
+                return Err(error);
+            }
+        };
         if fresh.fh != open.fh {
             return Err(NfsError::Xdr(
                 "NFSv4.0 fresh OPEN after rejected reclaim returned a different filehandle".into(),
@@ -769,11 +783,11 @@ impl RecoveryContext {
             let lock = lane.lock().await;
             (lock.open_owner, lock.stateid)
         };
-        let open_lane = self
-            .state
-            .by_owner(open_owner)
-            .await
-            .ok_or_else(|| NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NOENT))?;
+        let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
+            NfsError::LostOpenState(format!(
+                "NFSv4.0 reclaim LOCK lost its open-owner {open_owner}"
+            ))
+        })?;
         let mut open = open_lane.lock().await;
         let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
         let mut lock = lane.lock().await;
@@ -821,9 +835,10 @@ impl RecoveryContext {
             // RFC 7530 §9.6.2: NFS4ERR_GRACE is a retry signal, not a reason to
             // discard state. Keep every lane and fail fast until the backoff
             // lapses; a fresh OPEN during grace would otherwise wipe opens and
-            // locks that must be kept.
+            // locks that must be kept. Do not resume the mount or extend the
+            // lease deadline: recovery is still incomplete and RENEW owns the
+            // lost-lease decision.
             Err(error) if error.is_server_busy() => {
-                self.lease.mark_recovered();
                 self.lease
                     .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF);
                 Err(error)
@@ -4131,6 +4146,131 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn rejected_reclaim_fallback_grace_records_consumed_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 85, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            let reclaim = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &reclaim,
+                &failed_lock_result("reclaim-open", 18, 10033),
+            )
+            .await?;
+            // The open-owner record survived, so the seqid-0 fallback is a
+            // replay check (BAD_SEQID); the seqid-1 fallback then hits grace.
+            let fallback_zero = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &fallback_zero,
+                &failed_lock_result("fallback-open", 18, 10026),
+            )
+            .await?;
+            let fallback_lane_seqid = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &fallback_lane_seqid,
+                &failed_lock_result("fallback-open", 18, 10013),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-fallback-grace".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        let error = context.recover_or_lose().await.unwrap_err();
+        assert!(matches!(
+            error,
+            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)
+        ));
+        // GRACE consumed the seqid sent by the fallback OPEN (1), so the next
+        // recovery must send 2 instead of replaying 1.
+        let lane = mount.state.by_owner(85).await.unwrap();
+        let lane = lane.lock().await;
+        assert_eq!(lane.next_seqid, 2);
+        assert_eq!(lane.stateid, [0x61; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclaim_lock_without_open_owner_drops_only_the_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 86, [0x86; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            // No open lane exists, so no reclaim request is sent for the lock.
+            Ok::<(), std::io::Error>(())
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-orphan-lock".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        // The missing open-owner is a per-lane condition: only the orphan lock
+        // is dropped, the mount still recovers.
+        context.recover_or_lose().await.unwrap();
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+        assert!(mount.locks.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
+    }
+
     async fn reply(stream: &mut TcpStream, request: &[u8], payload: &[u8]) -> std::io::Result<()> {
         let xid = u32::from_be_bytes(request[0..4].try_into().unwrap());
         let mut response = Vec::new();
@@ -5445,9 +5585,13 @@ mod tests {
             matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
             "unexpected error: {error:?}"
         );
-        // Grace is a retry signal: state and identity survive, service resumes,
-        // and the next attempt fails fast until the backoff lapses.
-        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+        // Grace is a retry signal: state and identity survive, but the mount
+        // stays gated (Reclaiming) and stops extending the lease deadline: a
+        // fresh OPEN during grace would wipe opens and locks that must be kept.
+        assert_eq!(
+            mount.health().lifecycle,
+            crate::MountLifecycleState::Reclaiming
+        );
         assert_eq!(mount.health().generation, 1);
         assert!(!mount.state.snapshot().await.is_empty());
         assert!(mount.lease.recovery_deferred());
