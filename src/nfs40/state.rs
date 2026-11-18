@@ -9,6 +9,10 @@ pub(crate) struct OwnerLane {
     pub next_seqid: u32,
     pub stateid: [u8; 16],
     pub fh: Bytes,
+    /// Directory handle and name used by OPEN, retained so a released state can
+    /// be re-established with a fresh OPEN (CLAIM_NULL) without a path walk.
+    pub dir_fh: Bytes,
+    pub name: String,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
     /// Shared permits cover in-flight stateid I/O. CLOSE takes the exclusive
@@ -214,6 +218,8 @@ mod tests {
                     next_seqid: 1,
                     stateid: [owner as u8; 16],
                     fh: Bytes::from_static(b"fh"),
+                    dir_fh: Bytes::from_static(b"dir"),
+                    name: "file".into(),
                     access: if owner == 11 {
                         crate::OPEN_READ
                     } else {
