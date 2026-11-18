@@ -155,6 +155,7 @@ class NfsOperationOutcomeError(NfsError): pass
 class NfsUncertainOutcomeError(NfsOperationOutcomeError): pass
 class NfsPositionUncertainError(NfsError): pass
 class NfsLostOpenStateError(NfsStateLostError): pass
+class NfsStateRecoveryExhaustedError(NfsStateLostError): pass
 class NfsClosedResourceError(ValueError, NfsError): __init__ = _structured_init
 class NfsClientClosedError(NfsClosedResourceError): pass
 class NfsModeError(io.UnsupportedOperation, NfsError): __init__ = _structured_init
