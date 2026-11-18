@@ -30,6 +30,12 @@ pub(crate) struct LeaseState {
     renewals: AtomicU64,
     deadline: watch::Sender<tokio::time::Instant>,
     publication: RwLock<()>,
+    /// Serializes crash recovery (SETCLIENTID + reclaim) so the renewal task
+    /// and any other caller never establish competing client identities.
+    recovery: tokio::sync::Mutex<()>,
+    /// While set, recovery hit a busy server and callers fail fast instead of
+    /// re-running SETCLIENTID + reclaim on every attempt.
+    recovery_deferred_until: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl LeaseState {
@@ -44,7 +50,48 @@ impl LeaseState {
             renewals: AtomicU64::new(0),
             deadline,
             publication: RwLock::new(()),
+            recovery: tokio::sync::Mutex::new(()),
+            recovery_deferred_until: Mutex::new(None),
         })
+    }
+
+    /// Held for the whole of crash recovery: identity re-establishment and the
+    /// subsequent reclaim pass must never overlap another recovery.
+    pub(crate) async fn recovery_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.recovery.lock().await
+    }
+
+    /// Back off recovery until `until`: the server answered NFS4ERR_GRACE or
+    /// NFS4ERR_DELAY, so re-running recovery would only add load.
+    pub(crate) fn defer_recovery(&self, until: tokio::time::Instant) {
+        *self
+            .recovery_deferred_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(until);
+    }
+
+    pub(crate) fn clear_recovery_deferral(&self) {
+        *self
+            .recovery_deferred_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// True while a busy recovery is still backing off; the window lapses on
+    /// its own so a later attempt retries recovery.
+    pub(crate) fn recovery_deferred(&self) -> bool {
+        let mut deferred = self
+            .recovery_deferred_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *deferred {
+            Some(until) if tokio::time::Instant::now() < until => true,
+            Some(_) => {
+                *deferred = None;
+                false
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn health(&self) -> MountHealth {
@@ -143,6 +190,15 @@ impl LeaseState {
     pub(crate) fn mark_ready(&self) {
         self.record_activity();
         self.renewals.fetch_add(1, Ordering::AcqRel);
+        self.healthy.store(true, Ordering::Release);
+        self.lifecycle
+            .store(MountLifecycleState::Ready as u8, Ordering::Release);
+    }
+
+    /// Recovery finished: resume service and extend the lease window. Unlike
+    /// `mark_ready`, this does not count a renewal, which only RENEW validates.
+    pub(crate) fn mark_recovered(&self) {
+        self.record_activity();
         self.healthy.store(true, Ordering::Release);
         self.lifecycle
             .store(MountLifecycleState::Ready as u8, Ordering::Release);

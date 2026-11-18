@@ -44,6 +44,9 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
 const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
 const MAX_CONCURRENT_RECLAIMS: usize = 16;
+/// RFC 7530 §9.6.2: after NFS4ERR_GRACE the client should retry "on the order
+/// of several seconds" rather than driving a recovery per I/O request.
+const RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
 
 struct DetachedSettlement<T: 'static> {
     future: Option<Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>>,
@@ -580,6 +583,10 @@ impl RecoveryContext {
         self.client_id.store(renewed_client_id, Ordering::Release);
         self.lease.mark_reclaiming();
 
+        // One lane's reclaim failing for an authoritative reason (removed,
+        // replaced, or not reclaimable) must not discard state that other lanes
+        // can still recover. Busy statuses abort the pass instead, because the
+        // remaining lanes were never attempted and must be kept for the retry.
         stream::iter(
             self.state
                 .snapshot()
@@ -588,49 +595,25 @@ impl RecoveryContext {
                 .map(Ok::<_, NfsError>),
         )
         .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
-            let mut open = lane.lock().await;
-            let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
-            let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
-            let response = self
-                .rpc
-                .call(
-                    CompoundBuilder::new("reclaim-open")
-                        .putfh(&open.fh)
-                        .open_reclaim(OpenReclaimArgs {
-                            seqid: 0,
-                            share_access: open.access,
-                            client_id: renewed_client_id,
-                            owner: owner_wire.as_bytes(),
-                        })
-                        .getfh()
-                        .encode_with_header(&self.auth),
-                    ReplayPolicy::ONE_ATTEMPT,
-                    METADATA_TIMEOUT,
-                )
-                .await?;
-            let (reclaimed, fh) = decode_open_response(response)?;
-            if reclaimed.confirm_required || fh != open.fh {
-                return Err(NfsError::Xdr(
-                    "NFSv4.0 reclaim OPEN returned incompatible state".into(),
-                ));
+            match self.reclaim_open_lane(&lane, renewed_client_id).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_server_busy() => Err(error),
+                Err(error) if matches!(error, NfsError::Nfs4(_)) => {
+                    let (owner, fh) = {
+                        let open = lane.lock().await;
+                        (open.owner, open.fh.clone())
+                    };
+                    tracing::warn!(
+                        target: "nfs_rs::stateid",
+                        owner,
+                        error = %error,
+                        "NFSv4.0 open reclaim failed for one lane; dropping only that lane"
+                    );
+                    self.state.remove(owner, &fh).await;
+                    Ok(())
+                }
+                Err(error) => Err(error),
             }
-            if let Some(delegation) = reclaimed.delegation {
-                let response = self
-                    .rpc
-                    .call(
-                        CompoundBuilder::new("reclaim-delegreturn")
-                            .putfh(&fh)
-                            .delegreturn(&delegation.stateid)
-                            .encode_with_header(&self.auth),
-                        ReplayPolicy::ONE_ATTEMPT,
-                        METADATA_TIMEOUT,
-                    )
-                    .await?;
-                decode_delegreturn_response(response)?;
-            }
-            open.stateid = reclaimed.stateid;
-            open.next_seqid = 1;
-            Ok(())
         })
         .await?;
 
@@ -642,45 +625,28 @@ impl RecoveryContext {
         stream::iter(lock_groups.into_values().map(Ok::<_, NfsError>))
             .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lanes| async move {
                 for lane in lanes {
-                    let (open_owner, old_stateid) = {
-                        let lock = lane.lock().await;
-                        (lock.open_owner, lock.stateid)
-                    };
-                    let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
-                        NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
-                    })?;
-                    let mut open = open_lane.lock().await;
-                    let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
-                    let mut lock = lane.lock().await;
-                    let response = self
-                        .rpc
-                        .call(
-                            CompoundBuilder::new("reclaim-lock")
-                                .putfh(&lock.fh)
-                                .lock_new(NewLockArgs {
-                                    lock_type: lock.lock_type,
-                                    reclaim: true,
-                                    offset: lock.offset,
-                                    length: lock.length,
-                                    open_seqid: open.next_seqid,
-                                    open_stateid: &open.stateid,
-                                    lock_seqid: 0,
-                                    client_id: renewed_client_id,
-                                    owner: &lock.owner_wire,
-                                })
-                                .encode_with_header(&self.auth),
-                            ReplayPolicy::ONE_ATTEMPT,
-                            METADATA_TIMEOUT,
-                        )
-                        .await?;
-                    let new_stateid = decode_lock_response(response, 12, "LOCK")?;
-                    open.next_seqid = open.next_seqid.wrapping_add(1);
-                    lock.stateid = new_stateid;
-                    lock.next_seqid = 1;
-                    drop(lock);
-                    self.locks
-                        .rekey(old_stateid, new_stateid, Arc::clone(&lane))
-                        .await;
+                    match self.reclaim_lock_lane(&lane, renewed_client_id).await {
+                        Ok((old_stateid, new_stateid)) => {
+                            self.locks
+                                .rekey(old_stateid, new_stateid, Arc::clone(&lane))
+                                .await;
+                        }
+                        Err(error) if error.is_server_busy() => return Err(error),
+                        Err(error) if matches!(error, NfsError::Nfs4(_)) => {
+                            let (owner, stateid) = {
+                                let lock = lane.lock().await;
+                                (lock.owner, lock.stateid)
+                            };
+                            tracing::warn!(
+                                target: "nfs_rs::stateid",
+                                owner,
+                                error = %error,
+                                "NFSv4.0 lock reclaim failed for one lane; dropping only that lock"
+                            );
+                            self.locks.remove(&stateid).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(())
             })
@@ -688,10 +654,184 @@ impl RecoveryContext {
         Ok(())
     }
 
+    /// Reclaim one open lane.
+    ///
+    /// A lane that is already closing is released by CLOSE, not by reclaim;
+    /// waiting for its I/O fence here can deadlock with the closer, which holds
+    /// the fence and waits for this same lane.
+    async fn reclaim_open_lane(
+        &self,
+        lane: &Arc<tokio::sync::Mutex<OwnerLane>>,
+        client_id: u64,
+    ) -> Result<()> {
+        let mut open = lane.lock().await;
+        if open.closing {
+            return Ok(());
+        }
+        let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+        let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
+        let reclaim = self
+            .rpc
+            .call(
+                CompoundBuilder::new("reclaim-open")
+                    .putfh(&open.fh)
+                    .open_reclaim(OpenReclaimArgs {
+                        seqid: 0,
+                        share_access: open.access,
+                        client_id,
+                        owner: owner_wire.as_bytes(),
+                    })
+                    .getfh()
+                    .encode_with_header(&self.auth),
+                ReplayPolicy::ONE_ATTEMPT,
+                METADATA_TIMEOUT,
+            )
+            .await
+            .and_then(decode_open_response);
+        let needs_fallback = match &reclaim {
+            // An incompatible success leaves the lane with state it cannot use,
+            // so re-establish the open with a normal OPEN.
+            Ok((reclaimed, fh)) => reclaimed.confirm_required || *fh != open.fh,
+            // RFC 7530 §9.6.3.4.5: only a definitive rejection of the reclaim
+            // justifies a normal OPEN. Busy statuses mean the request was not
+            // executed and must keep their retryable semantics.
+            Err(NfsError::Nfs4(status)) => !is_busy_status(*status),
+            // Io/Rpc/Xdr mean the transmission outcome is unknown; keep the
+            // existing Uncertain handling instead of guessing a rejection.
+            Err(_) => false,
+        };
+        match reclaim {
+            Ok((reclaimed, fh)) if !needs_fallback => {
+                return_delegation(&self.rpc, &self.auth, &fh, reclaimed.delegation).await?;
+                open.stateid = reclaimed.stateid;
+                open.next_seqid = 1;
+            }
+            Ok(_) => {
+                self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
+                    .await?;
+            }
+            Err(NfsError::Nfs4(status)) if !is_busy_status(status) => {
+                self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
+                    .await?;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// RFC 7530 §9.6.3.4.5: a reclaim rejected by the FSAL does not end
+    /// recovery. Re-establish the open with a normal `CLAIM_NULL` OPEN and
+    /// keep the lane's stateid and seqid in sync.
+    async fn reopen_after_rejected_reclaim(
+        &self,
+        open: &mut OwnerLane,
+        owner_wire: &[u8],
+        client_id: u64,
+    ) -> Result<()> {
+        let fresh = fresh_open_lane_with_seqid(
+            &self.rpc,
+            &self.auth,
+            &open.dir_fh,
+            &open.name,
+            owner_wire,
+            open.access,
+            client_id,
+            open.next_seqid,
+            "reclaim-fallback-open",
+        )
+        .await
+        .result?;
+        if fresh.fh != open.fh {
+            return Err(NfsError::Xdr(
+                "NFSv4.0 fresh OPEN after rejected reclaim returned a different filehandle".into(),
+            ));
+        }
+        let _ = return_delegation(&self.rpc, &self.auth, &fresh.fh, fresh.delegation).await;
+        tracing::debug!(
+            target: "nfs_rs::stateid",
+            operation = "reclaim",
+            owner = open.owner,
+            "NFSv4.0 reclaim was rejected; open state re-established with a fresh OPEN"
+        );
+        open.stateid = fresh.stateid;
+        open.next_seqid = fresh.next_seqid;
+        Ok(())
+    }
+
+    /// Reclaim one lock lane, returning the stateids so the lock index can be
+    /// re-keyed by the caller.
+    async fn reclaim_lock_lane(
+        &self,
+        lane: &Arc<tokio::sync::Mutex<LockLane>>,
+        client_id: u64,
+    ) -> Result<([u8; 16], [u8; 16])> {
+        let (open_owner, old_stateid) = {
+            let lock = lane.lock().await;
+            (lock.open_owner, lock.stateid)
+        };
+        let open_lane = self
+            .state
+            .by_owner(open_owner)
+            .await
+            .ok_or_else(|| NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NOENT))?;
+        let mut open = open_lane.lock().await;
+        let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+        let mut lock = lane.lock().await;
+        let response = self
+            .rpc
+            .call(
+                CompoundBuilder::new("reclaim-lock")
+                    .putfh(&lock.fh)
+                    .lock_new(NewLockArgs {
+                        lock_type: lock.lock_type,
+                        reclaim: true,
+                        offset: lock.offset,
+                        length: lock.length,
+                        open_seqid: open.next_seqid,
+                        open_stateid: &open.stateid,
+                        lock_seqid: 0,
+                        client_id,
+                        owner: &lock.owner_wire,
+                    })
+                    .encode_with_header(&self.auth),
+                ReplayPolicy::ONE_ATTEMPT,
+                METADATA_TIMEOUT,
+            )
+            .await?;
+        let new_stateid = decode_lock_response(response, 12, "LOCK")?;
+        open.next_seqid = open.next_seqid.wrapping_add(1);
+        lock.stateid = new_stateid;
+        lock.next_seqid = 1;
+        Ok((old_stateid, new_stateid))
+    }
+
     async fn recover_or_lose(&self) -> Result<()> {
+        // One recovery at a time: SETCLIENTID must not be issued twice for the
+        // same client identity, and the reclaim pass reads the whole state map.
+        let _recovery = self.lease.recovery_guard().await;
+        if self.lease.recovery_deferred() {
+            return Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE));
+        }
         match self.recover().await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.lease.clear_recovery_deferral();
+                self.lease.mark_recovered();
+                Ok(())
+            }
+            // RFC 7530 §9.6.2: NFS4ERR_GRACE is a retry signal, not a reason to
+            // discard state. Keep every lane and fail fast until the backoff
+            // lapses; a fresh OPEN during grace would otherwise wipe opens and
+            // locks that must be kept.
+            Err(error) if error.is_server_busy() => {
+                self.lease.mark_recovered();
+                self.lease
+                    .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF);
+                Err(error)
+            }
             Err(error) => {
+                // Losing state supersedes any busy backoff: later callers must
+                // observe lost state, not a stale NFS4ERR_GRACE.
+                self.lease.clear_recovery_deferral();
                 self.lease.mark_lost().await;
                 self.state.clear().await;
                 self.locks.clear().await;
@@ -745,6 +885,15 @@ fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
         Err(NfsError::Nfs4(status)) => status_consumes_seqid(*status),
         Err(_) => false,
     }
+}
+
+/// Transient server-busy statuses: the operation was not executed and the
+/// caller may retry it once the server is ready.
+fn is_busy_status(status: crate::Nfs4ErrorCode) -> bool {
+    matches!(
+        status,
+        crate::Nfs4ErrorCode::NFS4ERR_DELAY | crate::Nfs4ErrorCode::NFS4ERR_GRACE
+    )
 }
 
 async fn settled_call(
@@ -5170,11 +5319,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_grace_reclaim_clears_protection_and_advances_generation() {
+    async fn reclaim_rejected_by_fsal_falls_back_to_fresh_open_per_lane() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
         register_scripted_open(&mount, 73, b"fh").await;
-        register_scripted_lock(&mount, 74, [0x74; 16]).await;
+        register_scripted_lock(&mount, 73, [0x74; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            // RFC 7530 §9.6.3.4.5: the FSAL rejects CLAIM_PREVIOUS, so the
+            // client re-establishes the open with a normal CLAIM_NULL OPEN.
+            let reclaim = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &reclaim,
+                &failed_lock_result("reclaim-open", 18, 10033),
+            )
+            .await?;
+            let fresh = read_record(&mut stream).await?;
+            reply(&mut stream, &fresh, &open_result(0, [0x7a; 16], b"fh")).await?;
+            let reclaim_lock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &reclaim_lock,
+                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x7b; 16])]),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-no-grace".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        context.recover_or_lose().await.unwrap();
+        // A rejected reclaim no longer discards the mount: only that lane is
+        // re-opened, and the generation (and lease identity) is preserved.
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+        assert_eq!(mount.health().generation, 1);
+        let lane = mount.state.by_owner(73).await.unwrap();
+        assert_eq!(lane.lock().await.stateid, [0x7a; 16]);
+        let lock = mount.locks.by_stateid(&[0x7b; 16]).await.unwrap();
+        assert_eq!(lock.lock().await.stateid, [0x7b; 16]);
+        // The pre-recovery stateid remains a valid alias for the same lane.
+        let aliased = mount.locks.by_stateid(&[0x74; 16]).await.unwrap();
+        assert!(Arc::ptr_eq(&lock, &aliased));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_grace_keeps_state_and_defers_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 76, b"fh").await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let identity = read_record(&mut stream).await?;
@@ -5198,16 +5419,19 @@ mod tests {
             reply(
                 &mut stream,
                 &reclaim,
-                &failed_lock_result("reclaim-open", 18, 10033),
+                &failed_lock_result("reclaim-open", 18, 10013),
             )
-            .await
+            .await?;
+            // The backoff must suppress a second recovery: no further request
+            // may arrive on this connection.
+            Ok::<(), std::io::Error>(())
         });
         let context = RecoveryContext {
             rpc: mount.rpc.clone(),
             auth: mount.auth.clone(),
             identity: ClientIdentity {
                 verifier: [0x59; 8],
-                owner: "scripted-no-grace".into(),
+                owner: "scripted-grace".into(),
             },
             client_id: Arc::clone(&mount.client_id),
             issuer: mount.issuer,
@@ -5217,20 +5441,141 @@ mod tests {
             callback_addr: None,
         };
         let error = context.recover_or_lose().await.unwrap_err();
-        let outcome = error.operation_outcome().unwrap();
-        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
-        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
-        assert!(matches!(
-            outcome.source.as_ref(),
-            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE)
-        ));
-        assert_eq!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::LostState
+        assert!(
+            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
+            "unexpected error: {error:?}"
         );
-        assert_eq!(mount.health().generation, 2);
-        assert!(mount.state.snapshot().await.is_empty());
-        assert!(mount.locks.snapshot().await.is_empty());
+        // Grace is a retry signal: state and identity survive, service resumes,
+        // and the next attempt fails fast until the backoff lapses.
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+        assert_eq!(mount.health().generation, 1);
+        assert!(!mount.state.snapshot().await.is_empty());
+        assert!(mount.lease.recovery_deferred());
+        let retry = context.recover_or_lose().await.unwrap_err();
+        assert!(matches!(
+            retry,
+            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)
+        ));
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclaim_failure_drops_only_the_failed_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 81, b"fh1").await;
+        register_scripted_open(&mount, 82, b"fh2").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            // One lane's file is gone: its reclaim is rejected, and the fresh
+            // OPEN fallback reports the same NOENT. The other lane reclaims
+            // normally. Reclaims run concurrently, so answer by payload.
+            for _ in 0..3 {
+                let request = read_record(&mut stream).await?;
+                if request.windows(3).any(|wire| wire == b"fh1") {
+                    reply(
+                        &mut stream,
+                        &request,
+                        &failed_lock_result("reclaim-open", 18, 10033),
+                    )
+                    .await?;
+                } else if request.windows(13).any(|wire| wire == b"scripted-file") {
+                    reply(
+                        &mut stream,
+                        &request,
+                        &failed_lock_result("reclaim-fallback", 18, 2),
+                    )
+                    .await?;
+                } else {
+                    reply(&mut stream, &request, &open_result(0, [0x83; 16], b"fh2")).await?;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-partial".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        context.recover_or_lose().await.unwrap();
+        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+        // Exactly one lane was lost; the mount and its generation survive.
+        let remaining = mount.state.snapshot().await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(mount.health().generation, 1);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_closing_lanes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 84, [0x84; 16], crate::OPEN_BOTH).await;
+        lane.lock().await.closing = true;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await
+        });
+        let context = RecoveryContext {
+            rpc: mount.rpc.clone(),
+            auth: mount.auth.clone(),
+            identity: ClientIdentity {
+                verifier: [0x59; 8],
+                owner: "scripted-closing".into(),
+            },
+            client_id: Arc::clone(&mount.client_id),
+            issuer: mount.issuer,
+            state: Arc::clone(&mount.state),
+            locks: Arc::clone(&mount.locks),
+            lease: Arc::clone(&mount.lease),
+            callback_addr: None,
+        };
+        // No reclaim request is sent for the closing lane, so recovery does not
+        // wait on (or deadlock with) the CLOSE that owns the lane.
+        context.recover_or_lose().await.unwrap();
+        assert!(mount.state.by_owner(84).await.is_some());
         server.await.unwrap().unwrap();
     }
 
