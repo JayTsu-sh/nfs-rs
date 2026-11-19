@@ -11,5 +11,10 @@ export NFS_RS_LAB_E2E=1
 export NFS_RS_LAB_PNFS_URL="nfs://$LAB_PNFS_MDS_DATA$LAB_PNFS_SECONDARY_EXPORT?version=4.1&noresvport=true"
 export NFS_RS_LAB_PNFS_RUN_ID="$run_id"
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is not available; skipping the best-effort pNFS cleanup test" >&2
+  exit 0
+fi
+
 timeout 120 cargo test --locked --test lab_e2e \
   nfs_v41_pnfs_cleanup_run -- --ignored --nocapture

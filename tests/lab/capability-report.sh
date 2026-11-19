@@ -100,8 +100,9 @@ validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
     if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/2049' _ "$endpoint"; then
       printf 'nfs41_port_%s=reachable\n' "$endpoint"
     else
+      # The legacy cluster has no independent pNFS DS; record the blocked
+      # capability instead of failing the whole nightly before any test runs.
       printf 'nfs41_port_%s=BLOCKED_CAPABILITY(netapp-pnfs-data-lif)\n' "$endpoint"
-      exit 1
     fi
   done
 } >"$report_dir/netapp-pnfs.txt"
@@ -115,8 +116,9 @@ validate_export_path "$LAB_DXN_V40_EXPORT"
   if timeout 5 bash -c 'exec 3<>/dev/tcp/$1/2049' _ "$LAB_DXN_V40_DATA"; then
     echo 'nfs_port=reachable'
   else
+    # The DXN NFSv4.0 E2E step reports the real failure; the capability report
+    # stays informational so the rest of the matrix still runs.
     echo 'nfs_port=BLOCKED_CAPABILITY(dxn-nfsv40)'
-    exit 1
   fi
 } >"$report_dir/dxn-nfsv40.txt"
 
