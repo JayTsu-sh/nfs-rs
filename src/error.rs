@@ -58,7 +58,12 @@ pub enum RetryExhaustion {
 /// The filehandle is valid in both cases; only the open state differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateidFailure {
-    /// BAD/STALE/OLD stateid: nfs-rs refreshes the lane and retries in place.
+    /// BAD/OLD stateid: nfs-rs refreshes the lane and retries in place.
+    ///
+    /// STALE_STATEID is also classified here because the close path treats it
+    /// as an already-released open, but READ/WRITE report it as
+    /// [`NfsError::LostOpenState`] instead of refreshing in place: the state
+    /// belongs to an earlier server instance, so the caller must reopen.
     Recoverable,
     /// The bounded recovery attempt did not restore usable open state, which
     /// callers observe as [`NfsError::StateRecoveryExhausted`].
@@ -352,7 +357,9 @@ impl NfsError {
             _ => false,
         }
     }
-    /// True when the failure is an NFSv4.0 stateid that nfs-rs can refresh in place.
+    /// True when the failure is an NFSv4.0 stateid that nfs-rs handles in
+    /// place: BAD/OLD refresh the lane, STALE is treated as released by CLOSE
+    /// but reported as [`NfsError::LostOpenState`] by READ/WRITE.
     #[must_use]
     pub fn is_recoverable_state(&self) -> bool {
         matches!(

@@ -37,6 +37,9 @@ pub(crate) struct LeaseState {
     /// re-running SETCLIENTID + reclaim on every attempt. The stored status is
     /// the busy reply (GRACE or DELAY) that started the backoff.
     recovery_backoff: Mutex<Option<(tokio::time::Instant, crate::Nfs4ErrorCode)>>,
+    /// True while a retry task owns the backoff loop; prevents one task per
+    /// failed I/O call during a long GRACE or DELAY window.
+    retry_task_active: AtomicBool,
 }
 
 impl LeaseState {
@@ -53,6 +56,7 @@ impl LeaseState {
             publication: RwLock::new(()),
             recovery: tokio::sync::Mutex::new(()),
             recovery_backoff: Mutex::new(None),
+            retry_task_active: AtomicBool::new(false),
         })
     }
 
@@ -71,7 +75,7 @@ impl LeaseState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((until, status));
     }
 
-    pub(crate) fn clear_recovery_deferral(&self) {
+    pub(crate) fn clear_recovery_backoff(&self) {
         *self
             .recovery_backoff
             .lock()
@@ -82,7 +86,7 @@ impl LeaseState {
     ///
     /// Returns `None` once the window has lapsed, clearing it so a later caller
     /// retries recovery.
-    pub(crate) fn recovery_backoff_active(&self) -> Option<crate::Nfs4ErrorCode> {
+    pub(crate) fn active_recovery_backoff(&self) -> Option<crate::Nfs4ErrorCode> {
         let mut backoff = self
             .recovery_backoff
             .lock()
@@ -95,6 +99,17 @@ impl LeaseState {
             }
             None => None,
         }
+    }
+
+    /// Claim the single retry-task slot; false when one is already running.
+    pub(crate) fn claim_retry_task(&self) -> bool {
+        self.retry_task_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn release_retry_task(&self) {
+        self.retry_task_active.store(false, Ordering::Release);
     }
 
     pub(crate) fn health(&self) -> MountHealth {
@@ -489,6 +504,15 @@ impl Drop for LeaseRenewal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_task_slot_has_a_single_owner() {
+        let lease = LeaseState::ready(1, 30);
+        assert!(lease.claim_retry_task());
+        assert!(!lease.claim_retry_task());
+        lease.release_retry_task();
+        assert!(lease.claim_retry_task());
+    }
 
     #[test]
     fn renewal_jitter_stays_within_the_conservative_window() {
