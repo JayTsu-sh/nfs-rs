@@ -255,10 +255,14 @@ impl RecoveryContext {
                 }
             }
         }
-        if let Some(error) = hard_error {
+        // Busy wins over hard: GRACE/DELAY means the server will accept the
+        // reclaim later, so the pass keeps every lane and retries instead of
+        // discarding state because another lane hit a transport failure. The
+        // retry is bounded by the lease deadline in `retry_settled`.
+        if let Some(error) = busy_error {
             return Err(error);
         }
-        if let Some(error) = busy_error {
+        if let Some(error) = hard_error {
             return Err(error);
         }
 
@@ -274,11 +278,12 @@ impl RecoveryContext {
             .map(|lanes| async move {
                 for lane in lanes {
                     match self.reclaim_lock_lane(&lane, renewed_client_id).await {
-                        Ok((old_stateid, new_stateid)) => {
+                        Ok(Some((old_stateid, new_stateid))) => {
                             self.locks
                                 .rekey(old_stateid, new_stateid, Arc::clone(&lane))
                                 .await;
                         }
+                        Ok(None) => {}
                         Err(error) if error.is_server_busy() => return Err(error),
                         Err(error) if is_authoritative_lane_loss(&error) => {
                             let (owner, stateid) = {
@@ -314,10 +319,12 @@ impl RecoveryContext {
                 }
             }
         }
-        if let Some(error) = hard_error {
+        // Same priority as the open pass: a busy reply keeps every lane for the
+        // retry, and a hard failure is only reported when nothing was busy.
+        if let Some(error) = busy_error {
             return Err(error);
         }
-        if let Some(error) = busy_error {
+        if let Some(error) = hard_error {
             return Err(error);
         }
         Ok(())
@@ -335,6 +342,12 @@ impl RecoveryContext {
     ) -> Result<()> {
         let mut open = lane.lock().await;
         if open.closing {
+            return Ok(());
+        }
+        // A pass retried after GRACE/DELAY must not reclaim this lane again: the
+        // owner already exists and a second CLAIM_PREVIOUS with seqid 0 is
+        // answered with NFS4ERR_BAD_SEQID, which would drop a usable lane.
+        if self.lease.open_reclaimed(open.owner) {
             return Ok(());
         }
         let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
@@ -392,6 +405,7 @@ impl RecoveryContext {
             }
             Err(error) => return Err(error),
         }
+        self.lease.mark_open_reclaimed(open.owner);
         Ok(())
     }
 
@@ -456,15 +470,21 @@ impl RecoveryContext {
 
     /// Reclaim one lock lane, returning the stateids so the lock index can be
     /// re-keyed by the caller.
+    ///
+    /// `None` means the lane was already reclaimed by an earlier attempt of the
+    /// same session (a pass retried after GRACE/DELAY).
     async fn reclaim_lock_lane(
         &self,
         lane: &Arc<tokio::sync::Mutex<LockLane>>,
         client_id: u64,
-    ) -> Result<([u8; 16], [u8; 16])> {
-        let (open_owner, old_stateid) = {
+    ) -> Result<Option<([u8; 16], [u8; 16])>> {
+        let (open_owner, lock_owner, old_stateid) = {
             let lock = lane.lock().await;
-            (lock.open_owner, lock.stateid)
+            (lock.open_owner, lock.owner, lock.stateid)
         };
+        if self.lease.lock_reclaimed(lock_owner) {
+            return Ok(None);
+        }
         let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
             NfsError::LostOpenState(format!(
                 "NFSv4.0 reclaim LOCK lost its open-owner {open_owner}"
@@ -498,7 +518,9 @@ impl RecoveryContext {
         open.next_seqid = open.next_seqid.wrapping_add(1);
         lock.stateid = new_stateid;
         lock.next_seqid = 1;
-        Ok((old_stateid, new_stateid))
+        drop(lock);
+        self.lease.mark_lock_reclaimed(lock_owner);
+        Ok(Some((old_stateid, new_stateid)))
     }
 
     pub(super) async fn recover_or_lose(&self) -> Result<()> {
@@ -558,6 +580,9 @@ impl RecoveryContext {
                     ));
                 }
                 self.lease.clear_recovery_backoff();
+                // Every lane is usable again, so the next recovery session must
+                // reclaim them from scratch.
+                self.lease.clear_reclaimed();
                 self.lease.mark_recovered();
                 Ok(())
             }
@@ -571,6 +596,7 @@ impl RecoveryContext {
                 // Losing state supersedes any busy backoff: later callers must
                 // observe lost state, not a stale NFS4ERR_GRACE.
                 self.lease.clear_recovery_backoff();
+                self.lease.clear_reclaimed();
                 // Never rewrite the lifecycle of a mount that already unmounted:
                 // `Closed` is terminal, and `Closing` still owns its cleanup.
                 if !matches!(
@@ -687,11 +713,12 @@ pub(super) fn open_owner_wire(issuer: u64, owner: u64) -> String {
 
 /// Shared bounded-retry step for stateid-carrying operations.
 ///
-/// `retries` counts refreshes already performed, so a second stateid failure is
-/// reported as exhausted instead of refreshing the lane again. The error is
-/// returned to the caller, which may still need it to report a lane that
-/// vanished between the two attempts.
-pub(super) fn stateid_retry_trigger(
+/// Classifies a stateid failure and consumes one refresh from the caller's
+/// budget. `retries` counts refreshes already performed, so a second stateid
+/// failure is reported as exhausted instead of refreshing the lane again. The
+/// error is returned to the caller, which may still need it to report a lane
+/// that vanished between the two attempts.
+pub(super) fn classify_stateid_failure(
     operation: &str,
     retries: &mut u8,
     error: NfsError,
@@ -710,15 +737,16 @@ pub(super) fn stateid_retry_trigger(
 ///
 /// An authoritative protocol status explains why the lane could not be refreshed
 /// and keeps its own meaning: busy statuses (GRACE, DELAY) stay retryable, and
-/// statuses such as NOENT or ACCESS keep their errno mapping. Only failures
-/// without an authoritative status (transport, encoding, closed state) are
-/// reported as exhausted recovery.
+/// statuses such as NOENT or ACCESS keep their errno mapping. A closed open
+/// state is a local lifecycle answer, not an exhausted recovery either. Only
+/// failures without a definitive outcome (transport, encoding) are reported as
+/// exhausted recovery.
 pub(super) fn recovery_failure(
     operation: &str,
     trigger: StateidRecovery,
     source: NfsError,
 ) -> NfsError {
-    if is_authoritative_lane_loss(&source) {
+    if is_authoritative_lane_loss(&source) || matches!(source, NfsError::ClosedResource(_)) {
         return source;
     }
     state_recovery_exhausted(operation, trigger, source)
