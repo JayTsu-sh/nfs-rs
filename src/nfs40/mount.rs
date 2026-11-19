@@ -3514,7 +3514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_stateid_read_refreshes_seqid_without_reopening() {
+    async fn old_stateid_read_recovers_with_fresh_open() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
         let lane = register_stateid_lane(&mount, 203, [0xa3; 16], crate::OPEN_READ).await;
@@ -3522,16 +3522,20 @@ mod tests {
             let (mut stream, _) = listener.accept().await?;
             let read = read_record(&mut stream).await?;
             reply(&mut stream, &read, &failed_lock_result("read", 25, 10024)).await?;
+            // OLD_STATEID does not carry the server's current seqid, so the lane
+            // is refreshed with exactly one fresh OPEN instead of a blind seqid
+            // increment.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
             let retry = read_record(&mut stream).await?;
             reply(&mut stream, &retry, &read_result(b"data")).await
         });
         let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
         assert_eq!(data, Bytes::from_static(b"data"));
         let lane = lane.lock().await;
-        let refreshed = u32::from_be_bytes(lane.stateid[..4].try_into().unwrap());
-        assert_eq!(refreshed, 0xa3a3_a3a4);
-        // Only the stateid seqid moves; the open-owner seqid is untouched
-        // because the failed READ consumed nothing.
+        assert_eq!(lane.stateid, [0xb3; 16]);
+        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
+        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds).
         assert_eq!(lane.next_seqid, 1);
         server.await.unwrap().unwrap();
     }
@@ -3795,9 +3799,12 @@ mod tests {
             let (mut stream, _) = listener.accept().await?;
             let lock = read_record(&mut stream).await?;
             reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10024)).await?;
-            // OLD_STATEID is not in the §9.1.7 exception table: it consumes the
-            // open-owner seqid (1 -> 2) and the lock-owner seqid (0 -> 1), but
-            // only the stateid seqid is refreshed (0xaa..aa -> 0xaa..ab).
+            // OLD_STATEID is not in the §9.1.7 exception table, so the rejected
+            // LOCK consumes the open-owner seqid; the lane is then refreshed
+            // with one fresh OPEN, and OLD_STATEID also advances the lock-owner
+            // seqid (0 -> 1) on the retry.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
             let retry = read_record(&mut stream).await?;
             let expected = [
                 2u32.to_be_bytes().as_slice(),
@@ -3805,15 +3812,14 @@ mod tests {
                 0u64.to_be_bytes().as_slice(),
                 1u64.to_be_bytes().as_slice(),
                 1u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                &[0xaa, 0xaa, 0xaa, 0xab],
-                &[0xaa; 12],
+                1u32.to_be_bytes().as_slice(),
+                &[0xb3; 16],
                 1u32.to_be_bytes().as_slice(),
             ]
             .concat();
             assert!(
                 retry.windows(expected.len()).any(|wire| wire == expected),
-                "LOCK retry after OLD_STATEID did not advance the seqids"
+                "LOCK retry after OLD_STATEID did not advance the lock seqid or swap the refreshed stateid"
             );
             reply(
                 &mut stream,
@@ -3828,11 +3834,11 @@ mod tests {
             .unwrap();
         assert_eq!(stateid, Bytes::from_static(&[0xb6; 16]));
         let lane = open_lane.lock().await;
-        // 1 was sent on the rejected attempt, 2 on the successful retry, so the
-        // next LOCK carries 3.
-        assert_eq!(lane.next_seqid, 3);
-        let seqid = u32::from_be_bytes(lane.stateid[..4].try_into().unwrap());
-        assert_eq!(seqid, 0xaaaa_aaab);
+        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
+        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds);
+        // the successful retry LOCK then consumes it once more (1 -> 2).
+        assert_eq!(lane.stateid, [0xb3; 16]);
+        assert_eq!(lane.next_seqid, 2);
         drop(lane);
         let lock_lane = mount.locks.by_stateid(&[0xb6; 16]).await.unwrap();
         assert_eq!(lock_lane.lock().await.next_seqid, 2);
