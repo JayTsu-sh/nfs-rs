@@ -1305,11 +1305,10 @@ impl Mount40 {
                     if attempt == 1 {
                         return Err(Self::state_recovery_exhausted("lock", trigger, error));
                     }
-                    let Some(failed_stateid) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
-                    };
+                    let failed_stateid = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("lock", trigger, error))?;
                     self.refresh_lane_stateid(&open_lane, failed_stateid, trigger, "lock")
                         .await
                         .map_err(|failure| Self::recovery_failure("lock", trigger, failure))?;
@@ -2609,11 +2608,10 @@ impl Mount40 {
                     if attempt == 1 {
                         return Err(Self::state_recovery_exhausted("write", trigger, error));
                     }
-                    let Some(recovered) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("write", trigger, error));
-                    };
+                    let recovered = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("write", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "write")
                         .await
                         .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
@@ -3619,11 +3617,10 @@ impl Mount for Mount40 {
                     if attempt == 1 {
                         return Err(Self::state_recovery_exhausted("read", trigger, error));
                     }
-                    let Some(recovered) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("read", trigger, error));
-                    };
+                    let recovered = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("read", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "read")
                         .await
                         .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
