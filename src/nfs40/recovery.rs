@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream;
-use futures::stream::TryStreamExt as _;
+use futures::stream::StreamExt as _;
 
 use super::compound::{
     CallbackAddress, CompoundBuilder, DelegationGrant, NewLockArgs, OpenArgs, OpenReclaimArgs,
@@ -218,19 +218,25 @@ impl RecoveryContext {
 
         // One lane's reclaim failing for an authoritative reason (removed,
         // replaced, or not reclaimable) must not discard state that other lanes
-        // can still recover. Busy statuses abort the pass instead, because the
-        // remaining lanes were never attempted and must be kept for the retry.
-        stream::iter(
-            self.state
-                .snapshot()
-                .await
-                .into_iter()
-                .map(Ok::<_, NfsError>),
-        )
-        .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
-            match self.reclaim_open_lane(&lane, renewed_client_id).await {
-                Ok(()) => Ok(()),
-                Err(error) if error.is_server_busy() => Err(error),
+        // can still recover. Busy statuses keep every remaining lane for the
+        // retry. The pass always waits for all lanes: cancelling in-flight
+        // reclaims could leave server state that the lanes never record.
+        let open_results = stream::iter(self.state.snapshot().await)
+            .map(|lane| async move {
+                let result = self.reclaim_open_lane(&lane, renewed_client_id).await;
+                (lane, result)
+            })
+            .buffer_unordered(MAX_CONCURRENT_RECLAIMS)
+            .collect::<Vec<_>>()
+            .await;
+        let mut busy_error = None;
+        let mut hard_error = None;
+        for (lane, result) in open_results {
+            match result {
+                Ok(()) => {}
+                Err(error) if error.is_server_busy() => {
+                    busy_error.get_or_insert(error);
+                }
                 Err(error) if is_authoritative_lane_loss(&error) => {
                     let (owner, fh) = {
                         let open = lane.lock().await;
@@ -243,20 +249,29 @@ impl RecoveryContext {
                         "NFSv4.0 open reclaim failed for one lane; dropping only that lane"
                     );
                     self.state.remove(owner, &fh).await;
-                    Ok(())
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    hard_error.get_or_insert(error);
+                }
             }
-        })
-        .await?;
+        }
+        if let Some(error) = hard_error {
+            return Err(error);
+        }
+        if let Some(error) = busy_error {
+            return Err(error);
+        }
 
         let mut lock_groups = BTreeMap::<u64, Vec<_>>::new();
         for lane in self.locks.snapshot().await {
             let open_owner = lane.lock().await.open_owner;
             lock_groups.entry(open_owner).or_default().push(lane);
         }
-        stream::iter(lock_groups.into_values().map(Ok::<_, NfsError>))
-            .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lanes| async move {
+        // Lanes sharing an open owner must be reclaimed in order, so each group
+        // stays sequential while groups run concurrently. As with opens, the
+        // pass waits for every group before deciding the outcome.
+        let lock_results = stream::iter(lock_groups.into_values())
+            .map(|lanes| async move {
                 for lane in lanes {
                     match self.reclaim_lock_lane(&lane, renewed_client_id).await {
                         Ok((old_stateid, new_stateid)) => {
@@ -283,7 +298,28 @@ impl RecoveryContext {
                 }
                 Ok(())
             })
-            .await?;
+            .buffer_unordered(MAX_CONCURRENT_RECLAIMS)
+            .collect::<Vec<_>>()
+            .await;
+        let mut busy_error = None;
+        let mut hard_error = None;
+        for result in lock_results {
+            match result {
+                Ok(()) => {}
+                Err(error) if error.is_server_busy() => {
+                    busy_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    hard_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = hard_error {
+            return Err(error);
+        }
+        if let Some(error) = busy_error {
+            return Err(error);
+        }
         Ok(())
     }
 
