@@ -252,9 +252,30 @@ impl LeaseState {
             .store(MountLifecycleState::Recovering as u8, Ordering::Release);
     }
 
-    pub(crate) fn mark_reclaiming(&self) {
-        self.lifecycle
-            .store(MountLifecycleState::Reclaiming as u8, Ordering::Release);
+    /// Enter the reclaim phase unless the mount already started unmounting.
+    ///
+    /// Recovery establishes a new client identity before reclaiming; an unmount
+    /// may mark the mount `Closing`/`Closed` during that wait. Returning false
+    /// lets recovery stop instead of overwriting a terminal lifecycle and
+    /// re-creating server state that unmount is releasing.
+    pub(crate) fn mark_reclaiming(&self) -> bool {
+        let closing = MountLifecycleState::Closing as u8;
+        let closed = MountLifecycleState::Closed as u8;
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if current == closing || current == closed {
+                return false;
+            }
+            match self.lifecycle.compare_exchange_weak(
+                current,
+                MountLifecycleState::Reclaiming as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub(crate) fn mark_closing(&self) {
@@ -442,6 +463,19 @@ mod tests {
         assert!(!lease.claim_retry_task());
         lease.release_retry_task();
         assert!(lease.claim_retry_task());
+    }
+
+    #[test]
+    fn reclaiming_refuses_to_revive_a_terminal_mount() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closing();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closing);
+
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closed();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closed);
     }
 
     #[test]
