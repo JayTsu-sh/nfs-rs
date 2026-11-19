@@ -362,23 +362,20 @@ impl NfsError {
     /// but reported as [`NfsError::LostOpenState`] by READ/WRITE.
     #[must_use]
     pub fn is_recoverable_state(&self) -> bool {
-        matches!(
-            self,
-            Self::Nfs4(
-                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-            )
-        )
+        matches!(self.stateid_failure(), Some(StateidFailure::Recoverable))
     }
 
     /// Classification of a stateid failure without requiring callers to parse status codes.
+    ///
+    /// Single source for the stateid status set; other classifiers delegate here.
     #[must_use]
     pub fn stateid_failure(&self) -> Option<StateidFailure> {
-        if self.is_recoverable_state() {
-            return Some(StateidFailure::Recoverable);
-        }
         match self {
+            Self::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+            ) => Some(StateidFailure::Recoverable),
             Self::StateRecoveryExhausted(_) => Some(StateidFailure::Exhausted),
             _ => None,
         }

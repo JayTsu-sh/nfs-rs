@@ -40,6 +40,9 @@ pub(crate) struct LeaseState {
     /// True while a retry task owns the backoff loop; prevents one task per
     /// failed I/O call during a long GRACE or DELAY window.
     retry_task_active: AtomicBool,
+    /// Open/lock owners reclaimed since the current recovery session started.
+    reclaimed_opens: Mutex<std::collections::HashSet<u64>>,
+    reclaimed_locks: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl LeaseState {
@@ -57,6 +60,8 @@ impl LeaseState {
             recovery: tokio::sync::Mutex::new(()),
             recovery_backoff: Mutex::new(None),
             retry_task_active: AtomicBool::new(false),
+            reclaimed_opens: Mutex::new(std::collections::HashSet::new()),
+            reclaimed_locks: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -325,6 +330,52 @@ impl LeaseState {
 
     pub(crate) fn mark_reclaiming(&self) -> bool {
         self.transition(MountLifecycleState::Reclaiming)
+    }
+
+    /// Owners already reclaimed during the current recovery session.
+    ///
+    /// A busy reply (GRACE/DELAY) ends the pass and schedules a retry. Without
+    /// this ledger the retry would send CLAIM_PREVIOUS with seqid 0 for lanes
+    /// that already reclaimed, which the server answers with NFS4ERR_BAD_SEQID
+    /// and the pass would drop. The set is cleared whenever a recovery session
+    /// settles so the next session reclaims every lane again.
+    pub(crate) fn open_reclaimed(&self, owner: u64) -> bool {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&owner)
+    }
+
+    pub(crate) fn mark_open_reclaimed(&self, owner: u64) {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner);
+    }
+
+    pub(crate) fn lock_reclaimed(&self, owner: u64) -> bool {
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&owner)
+    }
+
+    pub(crate) fn mark_lock_reclaimed(&self, owner: u64) {
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner);
+    }
+
+    pub(crate) fn clear_reclaimed(&self) {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     pub(crate) fn mark_closing(&self) {
