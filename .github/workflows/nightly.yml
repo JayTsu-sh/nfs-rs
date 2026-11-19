@@ -154,6 +154,9 @@ jobs:
       - name: NFSv4.1 real knfsd callback reply-loss E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-real-callback-replay-e2e.sh "$RUN_ID"
       - name: Public Python API conformance on every real protocol
+        env:
+          # This physical cluster does not support pNFS. Ordinary NFS is required.
+          LAB_PNFS_REQUIRE_INDEPENDENT_DS: "0"
         run: |
           mkdir -p "$RUNNER_TEMP/python-api-conformance"
           flock --wait 10800 /tmp/terrasync-lab-tests.lock \

@@ -5,6 +5,16 @@ source "$(dirname "$0")/common.sh"
 run_id="${1:?run id required}"
 output="${2:?output path required}"
 python="${PYTHON:-python3}"
+require_independent_ds="${LAB_PNFS_REQUIRE_INDEPENDENT_DS:-1}"
+if [ "$require_independent_ds" != "0" ] && [ "$require_independent_ds" != "1" ]; then
+  echo "LAB_PNFS_REQUIRE_INDEPENDENT_DS must be 0 or 1" >&2
+  exit 2
+fi
+if [ "$require_independent_ds" = "1" ]; then
+  pnfs_required=true
+else
+  pnfs_required=false
+fi
 validate_run_id "$run_id"
 validate_ipv4 "$LAB_SOURCE_DATA"
 validate_ipv4 "$LAB_DXN_V40_DATA"
@@ -20,4 +30,4 @@ validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
   --case "linux-source-v3|3|nfs://$LAB_SOURCE_DATA$LAB_NFS3_EXPORT/ci/$run_id?version=3&noresvport=true|false" \
   --case "dxn-v40|4.0|nfs://$LAB_DXN_V40_DATA$LAB_DXN_V40_EXPORT?version=4.0&noresvport=true&uid=0&gid=0|false" \
   --case "linux-source-v41|4.1|nfs://$LAB_SOURCE_DATA$LAB_NFS41_EXPORT/ci/$run_id?version=4.1&noresvport=true|false" \
-  --case "netapp-pnfs-mds|4.1|nfs://$LAB_PNFS_MDS_DATA$LAB_PNFS_SECONDARY_EXPORT?version=4.1&noresvport=true|true"
+  --case "netapp-pnfs-mds|4.1|nfs://$LAB_PNFS_MDS_DATA$LAB_PNFS_SECONDARY_EXPORT?version=4.1&noresvport=true|$pnfs_required"
