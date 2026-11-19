@@ -989,36 +989,13 @@ impl Mount40 {
                 .await
                 .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
-            // RFC 7530 §9.1.7: OLD_STATEID is not in the "seqid does not
-            // advance" exception list, so the rejected CLOSE consumed the
-            // open-owner seqid. Advance both seqids before resending; reusing
-            // the old value would make the retry a replay and the server would
-            // return the cached OLD_STATEID.
-            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &result {
-                lane.next_seqid = lane.next_seqid.wrapping_add(1);
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                )
-                .wrapping_add(1);
-                lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
-                let request = CompoundBuilder::new("close")
-                    .putfh(&lane.fh)
-                    .close(lane.next_seqid, &lane.stateid)
-                    .encode_with_header(&auth);
-                let (class, ctx) = context(
-                    "close",
-                    lane.owner,
-                    lane.next_seqid,
-                    OperationClass::ReplaySensitive,
-                );
-                result = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
-            }
+            // RFC 7530 §9.1.4.4: OLD_STATEID means the server holds this open
+            // state with a newer stateid seqid. The gap is not disclosed, so a
+            // client-side +1 cannot converge when it is larger than one, and
+            // close_lane has no dir_fh/name with which to re-sync via a fresh
+            // OPEN. Leave `result` untouched: the OLD_STATEID arm below reports
+            // the loss (recovery_action=reopen) after advancing the consumed
+            // open-owner seqid (§9.1.7).
             // RFC 7530 §9.1.4.4: BAD_STATEID is also returned when the stateid
             // seqid is later than the server's, in which case the open state
             // still exists. Probe once with the previous stateid seqid before
@@ -1056,11 +1033,12 @@ impl Mount40 {
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
-                    // Still behind after one retry: the open state exists with an
-                    // even newer seqid. Keep the lane (a silently leaked open
-                    // state is worse than a reported one) and let the caller
-                    // retry. The failed retry consumed its seqid too, so a later
-                    // CLOSE must not reuse it.
+                    // The server still holds this open state with a newer stateid
+                    // seqid that close_lane cannot determine without a fresh OPEN.
+                    // The rejected CLOSE consumed the open-owner seqid (§9.1.7),
+                    // so advance it before the caller's reopen reissues CLOSE and
+                    // would otherwise trip BAD_SEQID. Keep the lane closeable and
+                    // report the loss (recovery_action=reopen).
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     lane.closing = false;
                     return Err(Self::state_recovery_exhausted(
@@ -2872,63 +2850,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_with_old_stateid_retries_with_advanced_seqid_then_releases() {
+    async fn close_with_old_stateid_reports_exhaustion_without_blind_retry() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
+        let lane = register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await?;
-            // The retry must advance BOTH the open-owner seqid (1 -> 2) and the
-            // stateid seqid (0xa9a9_a9a9 -> 0xa9a9_a9aa), otherwise the server
-            // would treat it as a replay of the rejected CLOSE.
-            let retry = read_record(&mut stream).await?;
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                &[0xa9, 0xa9, 0xa9, 0xaa],
-                &[0xa9; 12],
-            ]
-            .concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE retry did not carry the advanced seqids"
-            );
-            reply(&mut stream, &retry, &close_result([0xc9; 16])).await
-        });
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        assert!(mount.state.by_owner(209).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_still_old_stateid_keeps_lane_and_reports_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 210, [0xa0; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &retry,
-                &failed_lock_result("close-retry", 4, 10024),
-            )
-            .await
+            // OLD_STATEID discloses no seqid gap, so the client must not guess
+            // it with a blind stateid +1 and resend. Exactly one CLOSE is sent.
+            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await
         });
         let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
         assert_eq!(
             error.stateid_failure(),
             Some(crate::StateidFailure::StateRecoveryExhausted)
         );
-        // The open state still exists server-side: the lane must survive so a
-        // later attempt can converge on the server's seqid.
+        // The lane survives (the open state still exists server-side) and stays
+        // closeable for the caller's reopen; only the consumed open-owner seqid
+        // advanced. The stateid seqid is untouched because the server's current
+        // seqid is unknown.
         let lane = lane.lock().await;
         assert!(!lane.closing);
-        let seqid = u32::from_be_bytes(lane.stateid[..4].try_into().unwrap());
-        assert_eq!(seqid, 0xa0a0_a0a1);
+        assert_eq!(lane.next_seqid, 2);
+        assert_eq!(lane.stateid, [0xa9; 16]);
         server.await.unwrap().unwrap();
     }
 
