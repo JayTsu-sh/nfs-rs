@@ -1057,7 +1057,7 @@ impl Mount40 {
                 let open_owner = open.owner;
                 *used_in_task
                     .lock()
-                    .expect("lock stateid slot is not poisoned") = Some(open.stateid);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(open.stateid);
                 let request = CompoundBuilder::new("lock")
                     .putfh(&fh)
                     .lock_new(NewLockArgs {
@@ -1123,8 +1123,8 @@ impl Mount40 {
                     }
                     let failed_stateid = used
                         .lock()
-                        .expect("lock stateid slot is not poisoned")
-                        .expect("LOCK sent a stateid before failing");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("lock", trigger, error))?;
                     self.refresh_lane_stateid(&open_lane, failed_stateid, trigger, "lock")
                         .await
                         .map_err(|failure| Self::recovery_failure("lock", trigger, failure))?;
@@ -1415,11 +1415,12 @@ impl Mount40 {
             // return the cached OLD_STATEID.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &result {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                )
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ])
                 .wrapping_add(1);
                 lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
                 let request = CompoundBuilder::new("close")
@@ -1444,11 +1445,12 @@ impl Mount40 {
             // assuming the state is gone; a genuine loss just repeats the
             // status, and BAD_STATEID does not consume the open-owner seqid.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &result {
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                );
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ]);
                 if let Some(previous) = seqid.checked_sub(1) {
                     let mut probe_stateid = lane.stateid;
                     probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
@@ -1565,11 +1567,12 @@ impl Mount40 {
             // the server's current one. Advance it by one and retry once.
             // Only the stateid seqid moves: READ/WRITE/SETATTR carry no
             // open-owner seqid, and the failed operation consumed nothing.
-            let old_seqid = u32::from_be_bytes(
-                old_stateid[..4]
-                    .try_into()
-                    .expect("stateid seqid is four bytes"),
-            );
+            let old_seqid = u32::from_be_bytes([
+                old_stateid[0],
+                old_stateid[1],
+                old_stateid[2],
+                old_stateid[3],
+            ]);
             let new_seqid = old_seqid.wrapping_add(1);
             open.stateid[..4].copy_from_slice(&new_seqid.to_be_bytes());
             tracing::debug!(
@@ -2206,7 +2209,7 @@ impl Mount40 {
                 };
                 *used_in_task
                     .lock()
-                    .expect("write stateid slot is not poisoned") = Some(stateid);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stateid);
                 let request = CompoundBuilder::new("write")
                     .putfh(&fh_for_settlement)
                     .write_header(&stateid, offset, stable, data_for_settlement.len() as u32)
@@ -2240,8 +2243,8 @@ impl Mount40 {
                     }
                     let recovered = used
                         .lock()
-                        .expect("write stateid slot is not poisoned")
-                        .expect("write sent a stateid before failing");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("write", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "write")
                         .await
                         .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
@@ -2866,11 +2869,12 @@ impl Mount for Mount40 {
             // with a newer stateid seqid. Advance it by one and retry once with
             // the current lock-owner seqid before giving up.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &decoded {
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                )
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ])
                 .wrapping_add(1);
                 lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
                 let request = CompoundBuilder::new("locku")
@@ -2897,11 +2901,12 @@ impl Mount for Mount40 {
             // treating the lock as released; a genuine loss just repeats the
             // status, and BAD_STATEID does not consume the lock-owner seqid.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &decoded {
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                );
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ]);
                 if let Some(previous) = seqid.checked_sub(1) {
                     let mut probe_stateid = lane.stateid;
                     probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
@@ -3158,7 +3163,7 @@ impl Mount for Mount40 {
                 };
                 *used_in_task
                     .lock()
-                    .expect("read stateid slot is not poisoned") = Some(stateid);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stateid);
                 let request = CompoundBuilder::new("read")
                     .putfh(&fh_for_settlement)
                     .read(&stateid, offset, count)
@@ -3193,8 +3198,8 @@ impl Mount for Mount40 {
                     }
                     let recovered = used
                         .lock()
-                        .expect("read stateid slot is not poisoned")
-                        .expect("read sent a stateid before failing");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| Self::state_recovery_exhausted("read", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "read")
                         .await
                         .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
