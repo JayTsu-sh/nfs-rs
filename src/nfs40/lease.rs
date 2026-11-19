@@ -323,8 +323,8 @@ impl LeaseState {
         self.transition(MountLifecycleState::Recovering);
     }
 
-    pub(crate) fn mark_reclaiming(&self) {
-        self.transition(MountLifecycleState::Reclaiming);
+    pub(crate) fn mark_reclaiming(&self) -> bool {
+        self.transition(MountLifecycleState::Reclaiming)
     }
 
     pub(crate) fn mark_closing(&self) {
@@ -512,6 +512,19 @@ mod tests {
         assert!(!lease.claim_retry_task());
         lease.release_retry_task();
         assert!(lease.claim_retry_task());
+    }
+
+    #[test]
+    fn reclaiming_refuses_to_revive_a_terminal_mount() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closing();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closing);
+
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closed();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closed);
     }
 
     #[test]

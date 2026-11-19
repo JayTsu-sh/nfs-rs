@@ -25,8 +25,9 @@ use super::compound::{
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::recovery::{
     FreshOpenSpec, RecoveryContext, StateidRecovery, bump_stateid_seqid, consumes_owner_seqid,
-    establish_identity, fresh_open_lane_with_seqid, is_authoritative_lane_loss, set_stateid_seqid,
-    stateid_hex, stateid_recovery, stateid_seqid, status_consumes_seqid,
+    establish_identity, fresh_open_lane_with_seqid, open_owner_wire, recovery_failure,
+    set_stateid_seqid, state_recovery_exhausted, stateid_hex, stateid_retry_trigger, stateid_seqid,
+    status_consumes_seqid,
 };
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::dialer::Endpoint;
@@ -46,9 +47,6 @@ const NFS4_DEFAULT_PORT: u16 = 2049;
 pub(super) const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
 const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
-/// In-place lane refresh is attempted once; a second stateid failure is
-/// reported as exhausted instead of looping on the same lane.
-const MAX_STATEID_RETRIES: u8 = 1;
 struct DetachedSettlement<T: 'static> {
     future: Option<Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>>,
 }
@@ -569,15 +567,14 @@ impl Mount40 {
                 Err(error) => {
                     // The LOCK carries the open stateid; a stateid failure is the
                     // open lane's to recover before the lock can be created.
-                    let (trigger, error) =
-                        Self::stateid_retry_trigger("lock", &mut retries, error)?;
+                    let (trigger, error) = stateid_retry_trigger("lock", &mut retries, error)?;
                     let failed_stateid = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .ok_or_else(|| Self::state_recovery_exhausted("lock", trigger, error))?;
+                        .ok_or_else(|| state_recovery_exhausted("lock", trigger, error))?;
                     self.refresh_lane_stateid(&open_lane, failed_stateid, trigger, "lock")
                         .await
-                        .map_err(|failure| Self::recovery_failure("lock", trigger, failure))?;
+                        .map_err(|failure| recovery_failure("lock", trigger, failure))?;
                     if trigger == StateidRecovery::Old {
                         lock_seqid = lock_seqid.wrapping_add(1);
                     }
@@ -982,7 +979,7 @@ impl Mount40 {
                     // report the loss (recovery_action=reopen).
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     lane.closing = false;
-                    return Err(Self::state_recovery_exhausted(
+                    return Err(state_recovery_exhausted(
                         "close",
                         StateidRecovery::Old,
                         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID),
@@ -1237,75 +1234,6 @@ impl Mount40 {
             "NFSv4.0 stateid recovered with a fresh OPEN"
         );
         Ok(())
-    }
-
-    /// Shared bounded-retry step for stateid-carrying operations.
-    ///
-    /// `retries` counts refreshes already performed, so a second stateid
-    /// failure is reported as exhausted instead of refreshing the lane again.
-    /// The error is returned to the caller, which may still need it to report a
-    /// lane that vanished between the two attempts.
-    fn stateid_retry_trigger(
-        operation: &str,
-        retries: &mut u8,
-        error: NfsError,
-    ) -> Result<(StateidRecovery, NfsError)> {
-        let Some(trigger) = stateid_recovery(&error) else {
-            return Err(error);
-        };
-        if *retries >= MAX_STATEID_RETRIES {
-            return Err(Self::state_recovery_exhausted(operation, trigger, error));
-        }
-        *retries += 1;
-        Ok((trigger, error))
-    }
-
-    /// Classify a failure raised while refreshing a lane.
-    ///
-    /// An authoritative protocol status explains why the lane could not be
-    /// refreshed and keeps its own meaning: busy statuses (GRACE, DELAY) stay
-    /// retryable, and statuses such as NOENT or ACCESS keep their errno
-    /// mapping. Only failures without an authoritative status (transport,
-    /// encoding, closed state) are reported as exhausted recovery.
-    fn recovery_failure(operation: &str, trigger: StateidRecovery, source: NfsError) -> NfsError {
-        // A stateid status raised by the recovery OPEN itself means the
-        // bounded recovery did not restore usable state: report exhaustion
-        // instead of handing callers a status that claims to be recoverable
-        // in place.
-        if stateid_recovery(&source).is_none()
-            && (matches!(&source, NfsError::Nfs4(_))
-                || matches!(&source, NfsError::LostOpenState(_))
-                // A lifecycle/generation gate already carries the right
-                // recovery action (for example Reopen after a lost mount).
-                || matches!(&source, NfsError::OperationOutcome(_)))
-        {
-            return source;
-        }
-        Self::state_recovery_exhausted(operation, trigger, source)
-    }
-
-    fn state_recovery_exhausted(
-        operation: &str,
-        trigger: StateidRecovery,
-        source: NfsError,
-    ) -> NfsError {
-        let status = match trigger {
-            StateidRecovery::Bad => crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
-            StateidRecovery::Stale => crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-            StateidRecovery::Old => crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
-        };
-        tracing::warn!(
-            target: "nfs_rs::stateid",
-            operation,
-            status = %status,
-            error = %source,
-            "NFSv4.0 stateid recovery exhausted"
-        );
-        NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
-            operation: operation.to_string(),
-            status,
-            source: Box::new(source),
-        }))
     }
 
     async fn readdir_payload(
@@ -1748,10 +1676,10 @@ impl Mount40 {
                     let Some(lane) = &lane else {
                         return Err(error);
                     };
-                    let (trigger, _) = Self::stateid_retry_trigger(operation, &mut retries, error)?;
+                    let (trigger, _) = stateid_retry_trigger(operation, &mut retries, error)?;
                     self.refresh_lane_stateid(lane, stateid, trigger, operation)
                         .await
-                        .map_err(|failure| Self::recovery_failure(operation, trigger, failure))?;
+                        .map_err(|failure| recovery_failure(operation, trigger, failure))?;
                 }
             }
         }
@@ -1794,17 +1722,14 @@ impl Mount40 {
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
             .ok_or_else(|| {
-                // After a failed crash recovery the lane is gone but the mount is
-                // no longer Ready; report a typed lost-state failure so callers
-                // can reopen instead of treating it as a programming error.
-                let lifecycle = self.lease.health().lifecycle;
-                if lifecycle == MountLifecycleState::Ready {
-                    NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into())
-                } else {
-                    NfsError::LostOpenState(format!(
-                        "NFSv4.0 WRITE: open state lost while mount is {lifecycle:?}"
-                    ))
-                }
+                // A lane can be gone because crash recovery dropped it while the
+                // mount itself resumed, so lifecycle alone cannot tell a
+                // programming error from lost open state. Always report the
+                // typed failure so callers can reopen the file.
+                NfsError::LostOpenState(format!(
+                    "NFSv4.0 WRITE: no open state for this filehandle while mount is {:?}",
+                    self.lease.health().lifecycle
+                ))
             })?;
         let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?
@@ -1879,15 +1804,14 @@ impl Mount40 {
             match settled {
                 Ok(settled) => break settled,
                 Err(error) => {
-                    let (trigger, error) =
-                        Self::stateid_retry_trigger("write", &mut retries, error)?;
+                    let (trigger, error) = stateid_retry_trigger("write", &mut retries, error)?;
                     let recovered = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .ok_or_else(|| Self::state_recovery_exhausted("write", trigger, error))?;
+                        .ok_or_else(|| state_recovery_exhausted("write", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "write")
                         .await
-                        .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
+                        .map_err(|failure| recovery_failure("write", trigger, failure))?;
                 }
             }
         };
@@ -2594,11 +2518,9 @@ impl Mount for Mount40 {
                     Ok(())
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
-                    // The lock exists with a newer stateid that the status does
-                    // not disclose. Keep the lane (the lock is still held
-                    // server-side) with its last server-issued stateid and let
-                    // the caller decide whether to reopen.
-                    Err(Mount40::state_recovery_exhausted(
+                    // Still behind after one retry: the lock state exists with an
+                    // even newer seqid. Keep the lane so later attempts converge.
+                    Err(state_recovery_exhausted(
                         "locku",
                         StateidRecovery::Old,
                         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID),
@@ -2883,15 +2805,14 @@ impl Mount for Mount40 {
             match settled {
                 Ok(data) => return Ok(data),
                 Err(error) => {
-                    let (trigger, error) =
-                        Self::stateid_retry_trigger("read", &mut retries, error)?;
+                    let (trigger, error) = stateid_retry_trigger("read", &mut retries, error)?;
                     let recovered = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .ok_or_else(|| Self::state_recovery_exhausted("read", trigger, error))?;
+                        .ok_or_else(|| state_recovery_exhausted("read", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "read")
                         .await
-                        .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
+                        .map_err(|failure| recovery_failure("read", trigger, failure))?;
                 }
             }
         }

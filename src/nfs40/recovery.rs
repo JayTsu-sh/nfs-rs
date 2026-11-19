@@ -1,4 +1,4 @@
-//! NFSv4.0 stateid recovery: lane refresh, reclaim, and GRACE/DELAY backoff.
+//! NFSv4.0 stateid recovery: bounded lane refresh, reclaim, and GRACE/DELAY backoff.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,6 +23,9 @@ use crate::rpc::auth::Auth;
 use crate::rpc::{self, ReplayPolicy};
 
 pub(super) const MAX_CONCURRENT_RECLAIMS: usize = 16;
+/// In-place lane refresh is attempted once; a second stateid failure is
+/// reported as exhausted instead of looping on the same lane.
+const MAX_STATEID_RETRIES: u8 = 1;
 /// RFC 7530 §9.6.2: after NFS4ERR_GRACE the client should retry "on the order
 /// of several seconds" rather than driving a recovery per I/O request.
 pub(super) const RECOVERY_BACKOFF: Duration = Duration::from_secs(5);
@@ -206,7 +209,12 @@ impl RecoveryContext {
         )
         .await?;
         self.client_id.store(renewed_client_id, Ordering::Release);
-        self.lease.mark_reclaiming();
+        if !self.lease.mark_reclaiming() {
+            return Err(NfsError::LostOpenState(
+                "NFSv4.0 recovery aborted: the mount started unmounting during identity re-establishment"
+                    .into(),
+            ));
+        }
 
         // One lane's reclaim failing for an authoritative reason (removed,
         // replaced, or not reclaimable) must not discard state that other lanes
@@ -294,7 +302,7 @@ impl RecoveryContext {
             return Ok(());
         }
         let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
-        let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
+        let owner_wire = open_owner_wire(self.issuer, open.owner);
         let reclaim = self
             .rpc
             .call(
@@ -313,21 +321,23 @@ impl RecoveryContext {
             )
             .await
             .and_then(decode_open_response);
-        let needs_fallback = match &reclaim {
-            // An incompatible success leaves the lane with state it cannot use,
-            // so re-establish the open with a normal OPEN.
-            Ok((reclaimed, fh)) => reclaimed.confirm_required || *fh != open.fh,
-            // RFC 7530 §9.6.3.4.5: only a definitive rejection of the reclaim
-            // justifies a normal OPEN. Busy statuses mean the request was not
-            // executed and must keep their retryable semantics.
-            Err(NfsError::Nfs4(status)) => !is_busy_status(*status),
-            // Io/Rpc/Xdr mean the transmission outcome is unknown; keep the
-            // existing Uncertain handling instead of guessing a rejection.
-            Err(_) => false,
-        };
         match reclaim {
-            Ok((reclaimed, fh)) if !needs_fallback => {
-                return_delegation(&self.rpc, &self.auth, &fh, reclaimed.delegation).await?;
+            // An incompatible success leaves the lane with state it cannot use,
+            // so only a compatible result is kept as-is.
+            Ok((reclaimed, fh)) if !reclaimed.confirm_required && fh == open.fh => {
+                // The recovered open state does not depend on the delegation
+                // being returned; a failed DELEGRETURN must not discard state
+                // that other lanes can still reclaim.
+                if let Err(error) =
+                    return_delegation(&self.rpc, &self.auth, &fh, reclaimed.delegation).await
+                {
+                    tracing::warn!(
+                        target: "nfs_rs::stateid",
+                        owner = open.owner,
+                        error = %error,
+                        "NFSv4.0 reclaim could not return the recovered delegation"
+                    );
+                }
                 open.stateid = reclaimed.stateid;
                 open.next_seqid = 1;
             }
@@ -335,6 +345,11 @@ impl RecoveryContext {
                 self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
                     .await?;
             }
+            // RFC 7530 §9.6.3.4.5: only a definitive rejection of the reclaim
+            // justifies a normal OPEN. Busy statuses mean the request was not
+            // executed and must keep their retryable semantics; Io/Rpc/Xdr mean
+            // the transmission outcome is unknown, so the pass keeps its
+            // Uncertain handling instead of guessing a rejection.
             Err(NfsError::Nfs4(status)) if !is_busy_status(status) => {
                 self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
                     .await?;
@@ -382,7 +397,12 @@ impl RecoveryContext {
             }
         };
         if fresh.fh != open.fh {
-            return Err(NfsError::Xdr(
+            // The path now resolves to a different object (replaced or
+            // re-created by another client). This lane cannot be recovered, but
+            // it says nothing about the other lanes: report it as an
+            // authoritative per-lane loss so the reclaim pass drops only this
+            // open instead of invalidating the whole mount.
+            return Err(NfsError::LostOpenState(
                 "NFSv4.0 fresh OPEN after rejected reclaim returned a different filehandle".into(),
             ));
         }
@@ -621,6 +641,75 @@ pub(super) fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
         Err(NfsError::Nfs4(status)) => status_consumes_seqid(*status),
         Err(_) => false,
     }
+}
+
+/// Wire form of an open-owner name, shared by recovery and I/O so both address
+/// the same server-side owner.
+pub(super) fn open_owner_wire(issuer: u64, owner: u64) -> String {
+    format!("nfs-rs-{issuer:016x}-{owner:016x}")
+}
+
+/// Shared bounded-retry step for stateid-carrying operations.
+///
+/// `retries` counts refreshes already performed, so a second stateid failure is
+/// reported as exhausted instead of refreshing the lane again. The error is
+/// returned to the caller, which may still need it to report a lane that
+/// vanished between the two attempts.
+pub(super) fn stateid_retry_trigger(
+    operation: &str,
+    retries: &mut u8,
+    error: NfsError,
+) -> Result<(StateidRecovery, NfsError)> {
+    let Some(trigger) = stateid_recovery(&error) else {
+        return Err(error);
+    };
+    if *retries >= MAX_STATEID_RETRIES {
+        return Err(state_recovery_exhausted(operation, trigger, error));
+    }
+    *retries += 1;
+    Ok((trigger, error))
+}
+
+/// Classify a failure raised while refreshing a lane.
+///
+/// An authoritative protocol status explains why the lane could not be refreshed
+/// and keeps its own meaning: busy statuses (GRACE, DELAY) stay retryable, and
+/// statuses such as NOENT or ACCESS keep their errno mapping. Only failures
+/// without an authoritative status (transport, encoding, closed state) are
+/// reported as exhausted recovery.
+pub(super) fn recovery_failure(
+    operation: &str,
+    trigger: StateidRecovery,
+    source: NfsError,
+) -> NfsError {
+    if is_authoritative_lane_loss(&source) {
+        return source;
+    }
+    state_recovery_exhausted(operation, trigger, source)
+}
+
+pub(super) fn state_recovery_exhausted(
+    operation: &str,
+    trigger: StateidRecovery,
+    source: NfsError,
+) -> NfsError {
+    let status = match trigger {
+        StateidRecovery::Bad => crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
+        StateidRecovery::Stale => crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+        StateidRecovery::Old => crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+    };
+    tracing::warn!(
+        target: "nfs_rs::stateid",
+        operation,
+        status = %status,
+        error = %source,
+        "NFSv4.0 stateid recovery exhausted"
+    );
+    NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
+        operation: operation.to_string(),
+        status,
+        source: Box::new(source),
+    }))
 }
 
 /// Transient server-busy statuses: the operation was not executed and the

@@ -318,7 +318,12 @@ impl OpenState {
     ) -> Option<Arc<Mutex<OwnerLane>>> {
         let owners = self.by_fh.read().await.get(fh)?.clone();
         for owner in owners.into_iter().rev() {
-            let lane = self.by_owner(owner).await?;
+            // An owner may already be removed from `lanes` while its entry is
+            // still visible in `by_fh`; skip it instead of failing the whole
+            // lookup for a lane that is still usable.
+            let Some(lane) = self.by_owner(owner).await else {
+                continue;
+            };
             if lane.lock().await.access & required_access != 0 {
                 return Some(lane);
             }
@@ -420,6 +425,35 @@ mod tests {
                 .owner,
             11
         );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_entry_does_not_hide_a_live_lane() {
+        let state = OpenState::default();
+        for owner in [11, 12] {
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid: 1,
+                    stateid: [owner as u8; 16],
+                    fh: Bytes::from_static(b"fh"),
+                    dir_fh: Bytes::from_static(b"dir"),
+                    name: "file".into(),
+                    access: crate::OPEN_WRITE,
+                    write_verifier: None,
+                    io_fence: Arc::new(RwLock::new(())),
+                    closing: false,
+                })
+                .await;
+        }
+        // Simulate `remove(12)` racing a lookup: the lane is gone from `lanes`
+        // but its owner is still listed under `by_fh`.
+        state.lanes.write().await.remove(&12);
+        let lane = state
+            .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_WRITE)
+            .await
+            .expect("the remaining owner lane stays usable");
+        assert_eq!(lane.lock().await.owner, 11);
     }
 
     #[test]
