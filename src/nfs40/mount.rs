@@ -435,6 +435,15 @@ async fn establish_identity(
     Ok(client_id)
 }
 
+/// Inputs shared by the fresh-OPEN helpers.
+struct FreshOpenSpec<'a> {
+    dir_fh: &'a Bytes,
+    name: &'a str,
+    owner_wire: &'a [u8],
+    access: u32,
+    client_id: u64,
+}
+
 struct FreshOpen {
     stateid: [u8; 16],
     next_seqid: u32,
@@ -445,7 +454,7 @@ struct FreshOpen {
 struct FreshOpenAttempt {
     result: Result<FreshOpen>,
     /// Open-owner seqid carried by the last OPEN that was actually sent.
-    seqid: u32,
+    sent_seqid: u32,
 }
 
 /// Issue a normal `CLAIM_NULL` OPEN for a lane, without resolving a path again.
@@ -453,26 +462,21 @@ struct FreshOpenAttempt {
 /// RFC 7530 §9.6.3.4.5 allows a client whose reclaim was rejected by the FSAL
 /// to re-establish state with a normal OPEN. The directory handle and name are
 /// the ones retained on the lane at open time.
-#[allow(clippy::too_many_arguments)]
 async fn fresh_open_lane(
     rpc: &rpc::Client,
     auth: &Auth,
-    dir_fh: &Bytes,
-    name: &str,
-    owner_wire: &[u8],
-    access: u32,
-    client_id: u64,
+    spec: &FreshOpenSpec<'_>,
     seqid: u32,
     operation: &str,
 ) -> Result<FreshOpen> {
     let request = CompoundBuilder::new(operation)
-        .putfh(dir_fh)
+        .putfh(spec.dir_fh)
         .open(OpenArgs {
             seqid,
-            share_access: access,
-            client_id,
-            owner: owner_wire,
-            filename: name,
+            share_access: spec.access,
+            client_id: spec.client_id,
+            owner: spec.owner_wire,
+            filename: spec.name,
             create: false,
         })
         .getfh()
@@ -504,35 +508,26 @@ async fn fresh_open_lane(
 
 /// Fresh OPEN bounded to two attempts: a released open-owner restarts at
 /// seqid 0, while a still-current open-owner expects the lane's next seqid.
-#[allow(clippy::too_many_arguments)]
 async fn fresh_open_lane_with_seqid(
     rpc: &rpc::Client,
     auth: &Auth,
-    dir_fh: &Bytes,
-    name: &str,
-    owner_wire: &[u8],
-    access: u32,
-    client_id: u64,
+    spec: &FreshOpenSpec<'_>,
     next_seqid: u32,
     operation: &str,
 ) -> FreshOpenAttempt {
-    match fresh_open_lane(
-        rpc, auth, dir_fh, name, owner_wire, access, client_id, 0, operation,
-    )
-    .await
-    {
+    match fresh_open_lane(rpc, auth, spec, 0, operation).await {
         Err(NfsError::Nfs4(
             crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
             | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
             | crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID,
         )) if next_seqid != 0 => FreshOpenAttempt {
-            result: fresh_open_lane(
-                rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
-            )
-            .await,
-            seqid: next_seqid,
+            result: fresh_open_lane(rpc, auth, spec, next_seqid, operation).await,
+            sent_seqid: next_seqid,
         },
-        result => FreshOpenAttempt { result, seqid: 0 },
+        result => FreshOpenAttempt {
+            result,
+            sent_seqid: 0,
+        },
     }
 }
 
@@ -598,7 +593,7 @@ impl RecoveryContext {
             match self.reclaim_open_lane(&lane, renewed_client_id).await {
                 Ok(()) => Ok(()),
                 Err(error) if error.is_server_busy() => Err(error),
-                Err(error) if matches!(error, NfsError::Nfs4(_) | NfsError::LostOpenState(_)) => {
+                Err(error) if is_authoritative_lane_loss(&error) => {
                     let (owner, fh) = {
                         let open = lane.lock().await;
                         (open.owner, open.fh.clone())
@@ -632,9 +627,7 @@ impl RecoveryContext {
                                 .await;
                         }
                         Err(error) if error.is_server_busy() => return Err(error),
-                        Err(error)
-                            if matches!(error, NfsError::Nfs4(_) | NfsError::LostOpenState(_)) =>
-                        {
+                        Err(error) if is_authoritative_lane_loss(&error) => {
                             let (owner, stateid) = {
                                 let lock = lane.lock().await;
                                 (lock.owner, lock.stateid)
@@ -730,14 +723,17 @@ impl RecoveryContext {
         owner_wire: &[u8],
         client_id: u64,
     ) -> Result<()> {
+        let spec = FreshOpenSpec {
+            dir_fh: &open.dir_fh,
+            name: &open.name,
+            owner_wire,
+            access: open.access,
+            client_id,
+        };
         let attempt = fresh_open_lane_with_seqid(
             &self.rpc,
             &self.auth,
-            &open.dir_fh,
-            &open.name,
-            owner_wire,
-            open.access,
-            client_id,
+            &spec,
             open.next_seqid,
             "reclaim-fallback-open",
         )
@@ -750,7 +746,7 @@ impl RecoveryContext {
                 // retry after a busy recovery (GRACE/DELAY) does not replay a
                 // consumed seqid and get stuck on NFS4ERR_BAD_SEQID.
                 if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
-                    open.next_seqid = attempt.seqid.wrapping_add(1);
+                    open.next_seqid = attempt.sent_seqid.wrapping_add(1);
                 }
                 return Err(error);
             }
@@ -838,8 +834,8 @@ impl RecoveryContext {
         // One recovery at a time: SETCLIENTID must not be issued twice for the
         // same client identity, and the reclaim pass reads the whole state map.
         let _recovery = self.lease.recovery_guard().await;
-        if self.lease.recovery_deferred() {
-            return Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE));
+        if let Some(status) = self.lease.recovery_backoff_active() {
+            return Err(NfsError::Nfs4(status));
         }
         match self.attempt_recovery().await {
             // RFC 7530 §9.6.2: NFS4ERR_GRACE is a retry signal, not a reason to
@@ -863,22 +859,43 @@ impl RecoveryContext {
     async fn attempt_recovery(&self) -> Result<()> {
         match self.recover().await {
             Ok(()) => {
+                // A finishing recovery must not revive a mount that started
+                // unmounting while the reclaim pass was in flight.
+                if matches!(
+                    self.lease.health().lifecycle,
+                    MountLifecycleState::Closing | MountLifecycleState::Closed
+                ) {
+                    return Err(NfsError::LostOpenState(
+                        "NFSv4.0 recovery finished after unmount started".into(),
+                    ));
+                }
                 self.lease.clear_recovery_deferral();
                 self.lease.mark_recovered();
                 Ok(())
             }
             Err(error) if error.is_server_busy() => {
+                let status = match &error {
+                    NfsError::Nfs4(status) => *status,
+                    _ => crate::Nfs4ErrorCode::NFS4ERR_GRACE,
+                };
                 self.lease
-                    .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF);
+                    .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF, status);
                 Err(error)
             }
             Err(error) => {
                 // Losing state supersedes any busy backoff: later callers must
                 // observe lost state, not a stale NFS4ERR_GRACE.
                 self.lease.clear_recovery_deferral();
-                self.lease.mark_lost().await;
-                self.state.clear().await;
-                self.locks.clear().await;
+                // Never rewrite the lifecycle of a mount that already unmounted:
+                // `Closed` is terminal, and `Closing` still owns its cleanup.
+                if !matches!(
+                    self.lease.health().lifecycle,
+                    MountLifecycleState::Closing | MountLifecycleState::Closed
+                ) {
+                    self.lease.mark_lost().await;
+                    self.state.clear().await;
+                    self.locks.clear().await;
+                }
                 Err(NfsError::OperationOutcome(Box::new(
                     crate::error::OperationOutcomeError::new(
                         crate::error::OperationOutcome::Uncertain,
@@ -923,7 +940,7 @@ async fn retry_recovery(context: RecoveryContext) {
         }
         // Another recovery refreshed the window; wait it out instead of
         // issuing SETCLIENTID concurrently with the work in flight.
-        if context.lease.recovery_deferred() {
+        if context.lease.recovery_backoff_active().is_some() {
             continue;
         }
         match context.attempt_recovery().await {
@@ -954,10 +971,23 @@ fn context(
 /// for this exception list. OLD_STATEID is deliberately not an exception, so a
 /// rejected request must still advance the client's seqid before a retry.
 fn status_consumes_seqid(status: crate::Nfs4ErrorCode) -> bool {
-    !matches!(
-        status as u32,
-        10022 | 10023 | 10025 | 10026 | 10036 | 10018 | 10020 | 10019
-    )
+    use crate::Nfs4ErrorCode::{
+        NFS4ERR_BAD_SEQID, NFS4ERR_BAD_STATEID, NFS4ERR_BADXDR, NFS4ERR_MOVED,
+        NFS4ERR_NOFILEHANDLE, NFS4ERR_STALE_CLIENTID, NFS4ERR_STALE_STATEID,
+    };
+    // NFS4ERR_RESOURCE (10018) belongs to the RFC exception list but is not
+    // modelled by the generated enum.
+    const NFS4ERR_RESOURCE: u32 = 10018;
+    !(matches!(
+        status,
+        NFS4ERR_BADXDR
+            | NFS4ERR_BAD_SEQID
+            | NFS4ERR_BAD_STATEID
+            | NFS4ERR_MOVED
+            | NFS4ERR_NOFILEHANDLE
+            | NFS4ERR_STALE_CLIENTID
+            | NFS4ERR_STALE_STATEID
+    ) || status as u32 == NFS4ERR_RESOURCE)
 }
 
 fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
@@ -975,6 +1005,41 @@ fn is_busy_status(status: crate::Nfs4ErrorCode) -> bool {
         status,
         crate::Nfs4ErrorCode::NFS4ERR_DELAY | crate::Nfs4ErrorCode::NFS4ERR_GRACE
     )
+}
+
+/// A status that definitively invalidates the state this lane represents.
+///
+/// Busy statuses are handled before this check. Anything not listed here
+/// (transport failures, XDR, unexpected statuses) aborts the reclaim pass
+/// instead, so the lane is kept for a later retry rather than discarded.
+fn is_authoritative_lane_loss(error: &NfsError) -> bool {
+    match error {
+        NfsError::LostOpenState(_) => true,
+        NfsError::Nfs4(status) => matches!(
+            status,
+            crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+                | crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+                | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
+                | crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID
+                | crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+                | crate::Nfs4ErrorCode::NFS4ERR_FHEXPIRED
+                | crate::Nfs4ErrorCode::NFS4ERR_NOENT
+                | crate::Nfs4ErrorCode::NFS4ERR_NOFILEHANDLE
+        ),
+        _ => false,
+    }
+}
+
+/// Decode the seqid carried by the first four bytes of a stateid.
+fn stateid_seqid(stateid: &[u8; 16]) -> u32 {
+    u32::from_be_bytes([stateid[0], stateid[1], stateid[2], stateid[3]])
+}
+
+/// Advance a stateid's seqid by one, returning the new value.
+fn bump_stateid_seqid(stateid: &mut [u8; 16]) -> u32 {
+    let next = stateid_seqid(stateid).wrapping_add(1);
+    stateid[..4].copy_from_slice(&next.to_be_bytes());
+    next
 }
 
 async fn settled_call(
@@ -1039,7 +1104,7 @@ impl Mount40 {
         // retry must advance it instead of reusing lock_seqid 0 (which the
         // server would treat as a replay and answer from its cache).
         let mut lock_seqid = 0u32;
-        let mut attempt = 0;
+        let mut attempt = 0u8;
         loop {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
@@ -1115,12 +1180,8 @@ impl Mount40 {
                 Err(error) => {
                     // The LOCK carries the open stateid; a stateid failure is the
                     // open lane's to recover before the lock can be created.
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
-                    }
+                    let (trigger, error) =
+                        Self::stateid_retry_trigger("lock", &mut attempt, error)?;
                     let failed_stateid = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1415,14 +1476,7 @@ impl Mount40 {
             // return the cached OLD_STATEID.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &result {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
-                let seqid = u32::from_be_bytes([
-                    lane.stateid[0],
-                    lane.stateid[1],
-                    lane.stateid[2],
-                    lane.stateid[3],
-                ])
-                .wrapping_add(1);
-                lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
+                bump_stateid_seqid(&mut lane.stateid);
                 let request = CompoundBuilder::new("close")
                     .putfh(&lane.fh)
                     .close(lane.next_seqid, &lane.stateid)
@@ -1444,32 +1498,26 @@ impl Mount40 {
             // still exists. Probe once with the previous stateid seqid before
             // assuming the state is gone; a genuine loss just repeats the
             // status, and BAD_STATEID does not consume the open-owner seqid.
-            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &result {
-                let seqid = u32::from_be_bytes([
-                    lane.stateid[0],
-                    lane.stateid[1],
-                    lane.stateid[2],
-                    lane.stateid[3],
-                ]);
-                if let Some(previous) = seqid.checked_sub(1) {
-                    let mut probe_stateid = lane.stateid;
-                    probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
-                    let request = CompoundBuilder::new("close")
-                        .putfh(&lane.fh)
-                        .close(lane.next_seqid, &probe_stateid)
-                        .encode_with_header(&auth);
-                    let (class, ctx) = context(
-                        "close",
-                        lane.owner,
-                        lane.next_seqid,
-                        OperationClass::ReplaySensitive,
-                    );
-                    result = rpc
-                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await
-                        .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
-                }
+            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &result
+                && let Some(previous) = stateid_seqid(&lane.stateid).checked_sub(1)
+            {
+                let mut probe_stateid = lane.stateid;
+                probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
+                let request = CompoundBuilder::new("close")
+                    .putfh(&lane.fh)
+                    .close(lane.next_seqid, &probe_stateid)
+                    .encode_with_header(&auth);
+                let (class, ctx) = context(
+                    "close",
+                    lane.owner,
+                    lane.next_seqid,
+                    OperationClass::ReplaySensitive,
+                );
+                result = rpc
+                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await
+                    .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             }
             match result {
                 Ok(stateid) => {
@@ -1567,14 +1615,8 @@ impl Mount40 {
             // the server's current one. Advance it by one and retry once.
             // Only the stateid seqid moves: READ/WRITE/SETATTR carry no
             // open-owner seqid, and the failed operation consumed nothing.
-            let old_seqid = u32::from_be_bytes([
-                old_stateid[0],
-                old_stateid[1],
-                old_stateid[2],
-                old_stateid[3],
-            ]);
-            let new_seqid = old_seqid.wrapping_add(1);
-            open.stateid[..4].copy_from_slice(&new_seqid.to_be_bytes());
+            let old_seqid = stateid_seqid(&old_stateid);
+            let new_seqid = bump_stateid_seqid(&mut open.stateid);
             tracing::debug!(
                 target: "nfs_rs::stateid",
                 operation,
@@ -1588,18 +1630,16 @@ impl Mount40 {
         }
         let client_id = self.client_id.load(Ordering::Acquire);
         let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
-        let attempt = fresh_open_lane_with_seqid(
-            &self.rpc,
-            &self.auth,
-            &open.dir_fh,
-            &open.name,
-            owner_wire.as_bytes(),
-            open.access,
+        let spec = FreshOpenSpec {
+            dir_fh: &open.dir_fh,
+            name: &open.name,
+            owner_wire: owner_wire.as_bytes(),
+            access: open.access,
             client_id,
-            open.next_seqid,
-            operation,
-        )
-        .await;
+        };
+        let attempt =
+            fresh_open_lane_with_seqid(&self.rpc, &self.auth, &spec, open.next_seqid, operation)
+                .await;
         let fresh = match attempt.result {
             Ok(fresh) => fresh,
             Err(error) => {
@@ -1608,7 +1648,7 @@ impl Mount40 {
                 // consumed value, otherwise a later attempt would replay the
                 // cached reply (e.g. NFS4ERR_GRACE) instead of re-opening.
                 if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
-                    open.next_seqid = attempt.seqid.wrapping_add(1);
+                    open.next_seqid = attempt.sent_seqid.wrapping_add(1);
                 }
                 return Err(error);
             }
@@ -1630,6 +1670,27 @@ impl Mount40 {
             "NFSv4.0 stateid recovered with a fresh OPEN"
         );
         Ok(())
+    }
+
+    /// Shared bounded-retry step for stateid-carrying operations.
+    ///
+    /// `attempt` counts retries already performed, so the second failure is
+    /// reported as exhausted instead of refreshing the lane again. The error is
+    /// returned to the caller, which may still need it to report a lane that
+    /// vanished between the two attempts.
+    fn stateid_retry_trigger(
+        operation: &str,
+        attempt: &mut u8,
+        error: NfsError,
+    ) -> Result<(StateidRecovery, NfsError)> {
+        let Some(trigger) = stateid_recovery(&error) else {
+            return Err(error);
+        };
+        if *attempt == 1 {
+            return Err(Self::state_recovery_exhausted(operation, trigger, error));
+        }
+        *attempt += 1;
+        Ok((trigger, error))
     }
 
     /// Classify a failure raised while refreshing a lane.
@@ -2075,7 +2136,7 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
-        let mut attempt = 0;
+        let mut attempt = 0u8;
         loop {
             let (stateid, expected_generation) = match &lane {
                 Some(lane) => {
@@ -2110,16 +2171,10 @@ impl Mount40 {
                     let Some(lane) = &lane else {
                         return Err(error);
                     };
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted(operation, trigger, error));
-                    }
+                    let (trigger, _) = Self::stateid_retry_trigger(operation, &mut attempt, error)?;
                     self.refresh_lane_stateid(lane, stateid, trigger, operation)
                         .await
                         .map_err(|failure| Self::recovery_failure(operation, trigger, failure))?;
-                    attempt += 1;
                 }
             }
         }
@@ -2179,7 +2234,7 @@ impl Mount40 {
         } else {
             false
         };
-        let mut attempt = 0;
+        let mut attempt = 0u8;
         let (count, committed, verifier) = loop {
             let expected_generation = self.lease.begin_stateful("write")?;
             let io_guard = if let Some(callback_state) = &self.callback_state {
@@ -2235,12 +2290,8 @@ impl Mount40 {
             match settled {
                 Ok(settled) => break settled,
                 Err(error) => {
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("write", trigger, error));
-                    }
+                    let (trigger, error) =
+                        Self::stateid_retry_trigger("write", &mut attempt, error)?;
                     let recovered = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2248,7 +2299,6 @@ impl Mount40 {
                     self.refresh_lane_stateid(&lane, recovered, trigger, "write")
                         .await
                         .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
-                    attempt += 1;
                 }
             }
         };
@@ -3134,7 +3184,7 @@ impl Mount for Mount40 {
                     .await?,
             );
         };
-        let mut attempt = 0;
+        let mut attempt = 0u8;
         loop {
             let expected_generation = self.lease.begin_stateful("read")?;
             let io_guard = if let Some(callback_state) = &self.callback_state {
@@ -3190,12 +3240,8 @@ impl Mount for Mount40 {
             match settled {
                 Ok(data) => return Ok(data),
                 Err(error) => {
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("read", trigger, error));
-                    }
+                    let (trigger, error) =
+                        Self::stateid_retry_trigger("read", &mut attempt, error)?;
                     let recovered = used
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3203,7 +3249,6 @@ impl Mount for Mount40 {
                     self.refresh_lane_stateid(&lane, recovered, trigger, "read")
                         .await
                         .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
-                    attempt += 1;
                 }
             }
         }
@@ -3530,7 +3575,7 @@ mod tests {
             assert!(error.is_recoverable_state());
             assert_eq!(
                 error.stateid_failure(),
-                Some(crate::StateidFailure::RecoverableState)
+                Some(crate::StateidFailure::Recoverable)
             );
         }
         let exhausted = NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
@@ -3540,7 +3585,7 @@ mod tests {
         }));
         assert_eq!(
             exhausted.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
+            Some(crate::StateidFailure::Exhausted)
         );
         assert_eq!(NfsError::InvalidInput("x".into()).stateid_failure(), None);
     }
@@ -3678,7 +3723,7 @@ mod tests {
         let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
         assert_eq!(
             error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
+            Some(crate::StateidFailure::Exhausted)
         );
         // The open state still exists server-side: the lane must survive so a
         // later attempt can converge on the server's seqid.
@@ -3811,7 +3856,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
+            Some(crate::StateidFailure::Exhausted)
         );
         match error {
             NfsError::StateRecoveryExhausted(error) => {
@@ -5684,7 +5729,7 @@ mod tests {
         );
         assert_eq!(mount.health().generation, 1);
         assert!(!mount.state.snapshot().await.is_empty());
-        assert!(mount.lease.recovery_deferred());
+        assert!(mount.lease.recovery_backoff_active().is_some());
         let retry = context.recover_or_lose().await.unwrap_err();
         assert!(matches!(
             retry,
@@ -5752,7 +5797,7 @@ mod tests {
         );
         assert_eq!(mount.health().generation, 1);
         assert!(!mount.state.snapshot().await.is_empty());
-        assert!(mount.lease.recovery_deferred());
+        assert!(mount.lease.recovery_backoff_active().is_some());
         server.await.unwrap().unwrap();
     }
 
@@ -5917,7 +5962,7 @@ mod tests {
             "GRACE backoff never retried recovery; mount stayed {:?}",
             mount.health().lifecycle
         );
-        assert!(!mount.lease.recovery_deferred());
+        assert!(mount.lease.recovery_backoff_active().is_none());
         // mark_recovered resumes the lease but only RENEW counts as a renewal.
         assert_eq!(mount.health().lease_renewals, 0);
         let lane = mount.state.by_owner(87).await.unwrap();

@@ -59,9 +59,10 @@ pub enum RetryExhaustion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateidFailure {
     /// BAD/STALE/OLD stateid: nfs-rs refreshes the lane and retries in place.
-    RecoverableState,
-    /// The bounded recovery attempt did not restore usable open state.
-    StateRecoveryExhausted,
+    Recoverable,
+    /// The bounded recovery attempt did not restore usable open state, which
+    /// callers observe as [`NfsError::StateRecoveryExhausted`].
+    Exhausted,
 }
 
 /// An NFSv4.0 open stateid could not be restored within the bounded budget.
@@ -368,10 +369,10 @@ impl NfsError {
     #[must_use]
     pub fn stateid_failure(&self) -> Option<StateidFailure> {
         if self.is_recoverable_state() {
-            return Some(StateidFailure::RecoverableState);
+            return Some(StateidFailure::Recoverable);
         }
         match self {
-            Self::StateRecoveryExhausted(_) => Some(StateidFailure::StateRecoveryExhausted),
+            Self::StateRecoveryExhausted(_) => Some(StateidFailure::Exhausted),
             _ => None,
         }
     }
