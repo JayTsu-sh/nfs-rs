@@ -518,11 +518,10 @@ async fn fresh_open_lane_with_seqid(
     )
     .await
     {
-        Err(NfsError::Nfs4(
-            crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-            | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-            | crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID,
-        )) if next_seqid != 0 => FreshOpenAttempt {
+        // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
+        // reply; BAD/OLD_STATEID here do not prove that, so only BAD_SEQID
+        // retries with the lane's next_seqid.
+        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID)) if next_seqid != 0 => FreshOpenAttempt {
             result: fresh_open_lane(
                 rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
             )
@@ -1330,29 +1329,10 @@ impl Mount40 {
             return Ok(());
         }
         let old_stateid = open.stateid;
-        if trigger == StateidRecovery::Old {
-            // RFC 7530 §9.1.4.4: OLD_STATEID means our stateid seqid is behind
-            // the server's current one. Advance it by one and retry once.
-            // Only the stateid seqid moves: READ/WRITE/SETATTR carry no
-            // open-owner seqid, and the failed operation consumed nothing.
-            let old_seqid = u32::from_be_bytes(
-                old_stateid[..4]
-                    .try_into()
-                    .expect("stateid seqid is four bytes"),
-            );
-            let new_seqid = old_seqid.wrapping_add(1);
-            open.stateid[..4].copy_from_slice(&new_seqid.to_be_bytes());
-            tracing::debug!(
-                target: "nfs_rs::stateid",
-                operation,
-                old_stateid = %stateid_hex(&old_stateid),
-                new_stateid = %stateid_hex(&open.stateid),
-                old_seqid,
-                new_seqid,
-                "NFSv4.0 OLD_STATEID stateid seqid refreshed"
-            );
-            return Ok(());
-        }
+        // OLD_STATEID does not carry the server's current seqid, so a blind +1
+        // cannot converge when the server advanced by more than one. Fall
+        // through to a fresh OPEN, which re-syncs the stateid authoritatively
+        // regardless of the gap.
         let client_id = self.client_id.load(Ordering::Acquire);
         let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
         let attempt = fresh_open_lane_with_seqid(
@@ -1380,11 +1360,30 @@ impl Mount40 {
                 return Err(error);
             }
         };
-        let _ = return_delegation(&self.rpc, &self.auth, &fresh.fh, fresh.delegation).await;
         if fresh.fh != open.fh {
+            // The re-open resolved to a different filehandle: release the
+            // freshly created state rather than leak it, then refuse to commit
+            // the recovery.
+            let release = CompoundBuilder::new("close-fresh")
+                .putfh(&fresh.fh)
+                .close(fresh.next_seqid, &fresh.stateid)
+                .encode_with_header(&self.auth);
+            let _ = self
+                .rpc
+                .call(release, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                .await;
             return Err(NfsError::Xdr(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
+        }
+        if let Err(error) =
+            return_delegation(&self.rpc, &self.auth, &fresh.fh, fresh.delegation).await
+        {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "DELEGRETURN after NFSv4.0 stateid recovery failed; the server may hold a delegation it cannot recall"
+            );
         }
         open.stateid = fresh.stateid;
         open.next_seqid = fresh.next_seqid;
