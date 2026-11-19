@@ -34,8 +34,9 @@ pub(crate) struct LeaseState {
     /// and any other caller never establish competing client identities.
     recovery: tokio::sync::Mutex<()>,
     /// While set, recovery hit a busy server and callers fail fast instead of
-    /// re-running SETCLIENTID + reclaim on every attempt.
-    recovery_deferred_until: Mutex<Option<tokio::time::Instant>>,
+    /// re-running SETCLIENTID + reclaim on every attempt. The stored status is
+    /// the busy reply (GRACE or DELAY) that started the backoff.
+    recovery_backoff: Mutex<Option<(tokio::time::Instant, crate::Nfs4ErrorCode)>>,
 }
 
 impl LeaseState {
@@ -51,7 +52,7 @@ impl LeaseState {
             deadline,
             publication: RwLock::new(()),
             recovery: tokio::sync::Mutex::new(()),
-            recovery_deferred_until: Mutex::new(None),
+            recovery_backoff: Mutex::new(None),
         })
     }
 
@@ -61,36 +62,38 @@ impl LeaseState {
         self.recovery.lock().await
     }
 
-    /// Back off recovery until `until`: the server answered NFS4ERR_GRACE or
-    /// NFS4ERR_DELAY, so re-running recovery would only add load.
-    pub(crate) fn defer_recovery(&self, until: tokio::time::Instant) {
+    /// Start a backoff until `until`, remembering the busy status that caused
+    /// it so callers can report the real server reply instead of guessing.
+    pub(crate) fn defer_recovery(&self, until: tokio::time::Instant, status: crate::Nfs4ErrorCode) {
         *self
-            .recovery_deferred_until
+            .recovery_backoff
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(until);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((until, status));
     }
 
     pub(crate) fn clear_recovery_deferral(&self) {
         *self
-            .recovery_deferred_until
+            .recovery_backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
-    /// True while a busy recovery is still backing off; the window lapses on
-    /// its own so a later attempt retries recovery.
-    pub(crate) fn recovery_deferred(&self) -> bool {
-        let mut deferred = self
-            .recovery_deferred_until
+    /// The busy status while the backoff window is still open.
+    ///
+    /// Returns `None` once the window has lapsed, clearing it so a later caller
+    /// retries recovery.
+    pub(crate) fn recovery_backoff_active(&self) -> Option<crate::Nfs4ErrorCode> {
+        let mut backoff = self
+            .recovery_backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match *deferred {
-            Some(until) if tokio::time::Instant::now() < until => true,
+        match *backoff {
+            Some((until, status)) if tokio::time::Instant::now() < until => Some(status),
             Some(_) => {
-                *deferred = None;
-                false
+                *backoff = None;
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
