@@ -30,6 +30,22 @@ pub(crate) struct LeaseState {
     renewals: AtomicU64,
     deadline: watch::Sender<tokio::time::Instant>,
     publication: RwLock<()>,
+    /// Serializes crash recovery (SETCLIENTID + reclaim) so the renewal task
+    /// and any other caller never establish competing client identities.
+    recovery: tokio::sync::Mutex<()>,
+    /// While set, recovery hit a busy server and callers fail fast instead of
+    /// re-running SETCLIENTID + reclaim on every attempt. The stored status is
+    /// the busy reply (GRACE or DELAY) that started the backoff.
+    recovery_backoff: Mutex<Option<(tokio::time::Instant, crate::Nfs4ErrorCode)>>,
+    /// True while a retry task owns the backoff loop; prevents one task per
+    /// failed I/O call during a long GRACE or DELAY window.
+    retry_task_active: AtomicBool,
+    /// Open/lock owners reclaimed since the current recovery session started.
+    reclaimed_opens: Mutex<std::collections::HashSet<u64>>,
+    reclaimed_locks: Mutex<std::collections::HashSet<u64>>,
+    /// Wakes the renewal task after a reconnect so it probes the client id
+    /// immediately instead of waiting for the next scheduled RENEW.
+    renewal_wake: tokio::sync::Notify,
 }
 
 impl LeaseState {
@@ -44,7 +60,71 @@ impl LeaseState {
             renewals: AtomicU64::new(0),
             deadline,
             publication: RwLock::new(()),
+            recovery: tokio::sync::Mutex::new(()),
+            recovery_backoff: Mutex::new(None),
+            retry_task_active: AtomicBool::new(false),
+            reclaimed_opens: Mutex::new(std::collections::HashSet::new()),
+            reclaimed_locks: Mutex::new(std::collections::HashSet::new()),
+            renewal_wake: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Ask the renewal task to run now. A successful RENEW proves the client id
+    /// survived the disconnect; STALE_CLIENTID/EXPIRED starts crash recovery.
+    pub(crate) fn wake_renewal(&self) {
+        self.renewal_wake.notify_one();
+    }
+
+    /// Held for the whole of crash recovery: identity re-establishment and the
+    /// subsequent reclaim pass must never overlap another recovery.
+    pub(crate) async fn recovery_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.recovery.lock().await
+    }
+
+    /// Start a backoff until `until`, remembering the busy status that caused
+    /// it so callers can report the real server reply instead of guessing.
+    pub(crate) fn defer_recovery(&self, until: tokio::time::Instant, status: crate::Nfs4ErrorCode) {
+        *self
+            .recovery_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((until, status));
+    }
+
+    pub(crate) fn clear_recovery_backoff(&self) {
+        *self
+            .recovery_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// The busy status while the backoff window is still open.
+    ///
+    /// Returns `None` once the window has lapsed, clearing it so a later caller
+    /// retries recovery.
+    pub(crate) fn active_recovery_backoff(&self) -> Option<crate::Nfs4ErrorCode> {
+        let mut backoff = self
+            .recovery_backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *backoff {
+            Some((until, status)) if tokio::time::Instant::now() < until => Some(status),
+            Some(_) => {
+                *backoff = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Claim the single retry-task slot; false when one is already running.
+    pub(crate) fn claim_retry_task(&self) -> bool {
+        self.retry_task_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn release_retry_task(&self) {
+        self.retry_task_active.store(false, Ordering::Release);
     }
 
     pub(crate) fn health(&self) -> MountHealth {
@@ -141,11 +221,74 @@ impl LeaseState {
     }
 
     pub(crate) fn mark_ready(&self) {
+        if !self.enter(MountLifecycleState::Ready) {
+            return;
+        }
         self.record_activity();
         self.renewals.fetch_add(1, Ordering::AcqRel);
         self.healthy.store(true, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Ready as u8, Ordering::Release);
+    }
+
+    /// A successful RENEW only proves the client id is alive: it extends the
+    /// lease window and clears `Suspect`/`Reconnecting`, but must not cancel an
+    /// in-progress recovery by promoting `Recovering`/`Reclaiming` to `Ready`.
+    pub(crate) fn mark_renewed(&self) {
+        self.record_activity();
+        self.renewals.fetch_add(1, Ordering::AcqRel);
+        self.healthy.store(true, Ordering::Release);
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            if current != MountLifecycleState::Ready as u8
+                && current != MountLifecycleState::Suspect as u8
+                && current != MountLifecycleState::Reconnecting as u8
+            {
+                return;
+            }
+            if self
+                .lifecycle
+                .compare_exchange_weak(
+                    current,
+                    MountLifecycleState::Ready as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Recovery finished: resume service and extend the lease window. Unlike
+    /// `mark_ready`, this does not count a renewal, which only RENEW validates.
+    pub(crate) fn mark_recovered(&self) {
+        if !self.enter(MountLifecycleState::Ready) {
+            return;
+        }
+        self.record_activity();
+        self.healthy.store(true, Ordering::Release);
+    }
+
+    /// Move between non-terminal lifecycle states without ever reviving a mount
+    /// that has started unmounting.
+    fn enter(&self, target: MountLifecycleState) -> bool {
+        let closing = MountLifecycleState::Closing as u8;
+        let closed = MountLifecycleState::Closed as u8;
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if current == closing || current == closed {
+                return false;
+            }
+            match self.lifecycle.compare_exchange_weak(
+                current,
+                target as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub(crate) fn record_activity(&self) {
@@ -154,27 +297,97 @@ impl LeaseState {
             .send_replace(tokio::time::Instant::now() + lease_duration);
     }
 
+    /// Conservative lease deadline: the point after which the server may have
+    /// discarded this client's state, so retrying recovery is pointless.
+    pub(crate) fn lease_deadline(&self) -> tokio::time::Instant {
+        *self.deadline.borrow()
+    }
+
     fn mark_suspect(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Suspect as u8, Ordering::Release);
+        self.enter(MountLifecycleState::Suspect);
     }
 
     pub(crate) fn mark_reconnecting(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Reconnecting as u8, Ordering::Release);
+        self.enter(MountLifecycleState::Reconnecting);
     }
 
     pub(crate) fn mark_recovering(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Recovering as u8, Ordering::Release);
+        self.enter(MountLifecycleState::Recovering);
     }
 
-    pub(crate) fn mark_reclaiming(&self) {
-        self.lifecycle
-            .store(MountLifecycleState::Reclaiming as u8, Ordering::Release);
+    /// Enter the reclaim phase unless the mount already started unmounting.
+    ///
+    /// Recovery establishes a new client identity before reclaiming; an unmount
+    /// may mark the mount `Closing`/`Closed` during that wait. Returning false
+    /// lets recovery stop instead of overwriting a terminal lifecycle and
+    /// re-creating server state that unmount is releasing.
+    pub(crate) fn mark_reclaiming(&self) -> bool {
+        let closing = MountLifecycleState::Closing as u8;
+        let closed = MountLifecycleState::Closed as u8;
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if current == closing || current == closed {
+                return false;
+            }
+            match self.lifecycle.compare_exchange_weak(
+                current,
+                MountLifecycleState::Reclaiming as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Owners already reclaimed during the current recovery session.
+    ///
+    /// A busy reply (GRACE/DELAY) ends the pass and schedules a retry. Without
+    /// this ledger the retry would send CLAIM_PREVIOUS with seqid 0 for lanes
+    /// that already reclaimed, which the server answers with NFS4ERR_BAD_SEQID
+    /// and the pass would drop. The set is cleared whenever a recovery session
+    /// settles so the next session reclaims every lane again.
+    pub(crate) fn open_reclaimed(&self, owner: u64) -> bool {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&owner)
+    }
+
+    pub(crate) fn mark_open_reclaimed(&self, owner: u64) {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner);
+    }
+
+    pub(crate) fn lock_reclaimed(&self, owner: u64) -> bool {
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&owner)
+    }
+
+    pub(crate) fn mark_lock_reclaimed(&self, owner: u64) {
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner);
+    }
+
+    pub(crate) fn clear_reclaimed(&self) {
+        self.reclaimed_opens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     pub(crate) fn mark_closing(&self) {
@@ -226,6 +439,7 @@ impl LeaseRenewal {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(renewal_delay(interval, rand::random())) => {}
+                    _ = state.renewal_wake.notified() => {}
                     changed = stopping.changed() => {
                         if changed.is_err() || *stopping.borrow() {
                             return;
@@ -275,7 +489,7 @@ impl LeaseRenewal {
                 };
                 match result {
                     Ok(()) => {
-                        state.mark_ready();
+                        state.mark_renewed();
                     }
                     Err(NfsError::Nfs4(
                         crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
@@ -354,6 +568,54 @@ impl Drop for LeaseRenewal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_task_slot_has_a_single_owner() {
+        let lease = LeaseState::ready(1, 30);
+        assert!(lease.claim_retry_task());
+        assert!(!lease.claim_retry_task());
+        lease.release_retry_task();
+        assert!(lease.claim_retry_task());
+    }
+
+    #[test]
+    fn reclaiming_refuses_to_revive_a_terminal_mount() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closing();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closing);
+
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closed();
+        assert!(!lease.mark_reclaiming());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closed);
+    }
+
+    #[test]
+    fn closing_is_sticky_against_late_lifecycle_writes() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_closing();
+        lease.mark_suspect();
+        lease.mark_recovering();
+        lease.mark_recovered();
+        lease.mark_ready();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Closing);
+    }
+
+    #[test]
+    fn renewal_does_not_cancel_an_in_progress_reclaim() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_recovering();
+        assert!(lease.mark_reclaiming());
+        lease.mark_renewed();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Reclaiming);
+
+        lease.mark_recovered();
+        let renewals = lease.health().lease_renewals;
+        lease.mark_renewed();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Ready);
+        assert_eq!(lease.health().lease_renewals, renewals + 1);
+    }
 
     #[test]
     fn renewal_jitter_stays_within_the_conservative_window() {

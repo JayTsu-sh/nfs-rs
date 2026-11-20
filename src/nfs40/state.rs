@@ -9,6 +9,10 @@ pub(crate) struct OwnerLane {
     pub next_seqid: u32,
     pub stateid: [u8; 16],
     pub fh: Bytes,
+    /// Directory handle and name used by OPEN, retained so a released state can
+    /// be re-established with a fresh OPEN (CLAIM_NULL) without a path walk.
+    pub dir_fh: Bytes,
+    pub name: String,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
     /// Shared permits cover in-flight stateid I/O. CLOSE takes the exclusive
@@ -111,10 +115,14 @@ impl LockState {
         new_stateid: [u8; 16],
         lane: Arc<Mutex<LockLane>>,
     ) {
+        // Hold both maps for the update: a LOOKUP that runs between them would
+        // miss `old_stateid` in `lanes` before the alias exists and report a
+        // lock that is still live as unknown.
         let mut lanes = self.lanes.write().await;
+        let mut aliases = self.aliases.write().await;
+        aliases.insert(old_stateid, Arc::clone(&lane));
         lanes.remove(&old_stateid);
-        lanes.insert(new_stateid, Arc::clone(&lane));
-        self.aliases.write().await.insert(old_stateid, lane);
+        lanes.insert(new_stateid, lane);
     }
 
     pub(crate) async fn clear(&self) {
@@ -150,7 +158,12 @@ impl OpenState {
     ) -> Option<Arc<Mutex<OwnerLane>>> {
         let owners = self.by_fh.read().await.get(fh)?.clone();
         for owner in owners.into_iter().rev() {
-            let lane = self.by_owner(owner).await?;
+            // An owner may already be removed from `lanes` while its entry is
+            // still visible in `by_fh`; skip it instead of failing the whole
+            // lookup for a lane that is still usable.
+            let Some(lane) = self.by_owner(owner).await else {
+                continue;
+            };
             if lane.lock().await.access & required_access != 0 {
                 return Some(lane);
             }
@@ -214,6 +227,8 @@ mod tests {
                     next_seqid: 1,
                     stateid: [owner as u8; 16],
                     fh: Bytes::from_static(b"fh"),
+                    dir_fh: Bytes::from_static(b"dir"),
+                    name: "file".into(),
                     access: if owner == 11 {
                         crate::OPEN_READ
                     } else {
@@ -250,6 +265,61 @@ mod tests {
                 .owner,
             11
         );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_entry_does_not_hide_a_live_lane() {
+        let state = OpenState::default();
+        for owner in [11, 12] {
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid: 1,
+                    stateid: [owner as u8; 16],
+                    fh: Bytes::from_static(b"fh"),
+                    dir_fh: Bytes::from_static(b"dir"),
+                    name: "file".into(),
+                    access: crate::OPEN_WRITE,
+                    write_verifier: None,
+                    io_fence: Arc::new(RwLock::new(())),
+                    closing: false,
+                })
+                .await;
+        }
+        // Simulate `remove(12)` racing a lookup: the lane is gone from `lanes`
+        // but its owner is still listed under `by_fh`.
+        state.lanes.write().await.remove(&12);
+        let lane = state
+            .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_WRITE)
+            .await
+            .expect("the remaining owner lane stays usable");
+        assert_eq!(lane.lock().await.owner, 11);
+    }
+
+    #[tokio::test]
+    async fn rekey_keeps_the_old_stateid_resolvable() {
+        let state = LockState::default();
+        let lane = state
+            .register(LockLane {
+                owner: 7,
+                open_owner: 11,
+                owner_wire: Bytes::from_static(b"lock"),
+                next_seqid: 1,
+                stateid: [1; 16],
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 1,
+                offset: 0,
+                length: 0,
+            })
+            .await;
+        state.rekey([1; 16], [2; 16], Arc::clone(&lane)).await;
+
+        // An in-flight LOCKU still carries the pre-reclaim stateid.
+        assert!(state.by_stateid(&[1; 16]).await.is_some());
+        assert!(state.by_stateid(&[2; 16]).await.is_some());
+
+        state.remove(&[2; 16]).await;
+        assert!(state.by_stateid(&[1; 16]).await.is_none());
     }
 
     #[test]
