@@ -273,6 +273,7 @@ pub use dialer::{BoxedRpcStream, Dialer, Endpoint, RpcStream, TcpDialer};
 pub use error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext, RequestId, RequestTransmission, Result, RetryExhaustion, ServerBusyError,
+    StateRecoveryError, StateidFailure,
 };
 pub use fileio::{BufferedFile, write_all};
 pub use mount::{
@@ -721,6 +722,7 @@ fn nfs_error_msg(err: &NfsError) -> String {
         ),
         NfsError::RdattrError(code) => format!("rdattr_error: nfsstat4 {}", code),
         NfsError::OperationOutcome(error) => error.to_string(),
+        NfsError::StateRecoveryExhausted(error) => error.to_string(),
     }
 }
 
