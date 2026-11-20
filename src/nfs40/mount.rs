@@ -1339,10 +1339,15 @@ impl Mount40 {
                 return Err(error);
             }
         };
+        // The OPEN succeeded, so the server consumed its open-owner seqid
+        // regardless of which stateid it returned. Record it before the early
+        // returns below, otherwise the lane would keep a consumed seqid and
+        // every later attempt would replay this OPEN instead of converging.
+        open.next_seqid = fresh.next_seqid;
         if fresh.fh != open.fh {
             // The re-open resolved to a different filehandle: release the
             // freshly created state rather than leak it, then refuse to commit
-            // the recovery.
+            // the recovery. The lane is unusable until the caller reopens.
             let release = CompoundBuilder::new("close-fresh")
                 .putfh(&fresh.fh)
                 .close(fresh.next_seqid, &fresh.stateid)
@@ -1379,7 +1384,6 @@ impl Mount40 {
             ));
         }
         open.stateid = fresh.stateid;
-        open.next_seqid = fresh.next_seqid;
         tracing::debug!(
             target: "nfs_rs::stateid",
             operation,
@@ -3414,14 +3418,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
         let lane = register_stateid_lane(&mount, 211, [0xab; 16], crate::OPEN_READ).await;
+        // A lane that already used seqids: the fresh OPEN restarts at seqid 0,
+        // so the recorded value must drop to 1 even though the recovery fails.
+        lane.lock().await.next_seqid = 3;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let read = read_record(&mut stream).await?;
             reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // A fresh OPEN that answers with the stateid that just failed must
-            // not be mistaken for a recovered lane: the single retry would
-            // resend the same stateid and fail again.
             let open = read_record(&mut stream).await?;
+            // A fresh OPEN that answers with the stateid that just failed must
+            // not be mistaken for a recovered lane; its seqid is consumed all
+            // the same and the lane must record it.
             reply(&mut stream, &open, &open_result(0, [0xab; 16], b"fh")).await
         });
         let error = mount
@@ -3432,7 +3439,10 @@ mod tests {
             error.stateid_failure(),
             Some(crate::StateidFailure::StateRecoveryExhausted)
         );
-        assert_eq!(lane.lock().await.stateid, [0xab; 16]);
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xab; 16]);
+        assert_eq!(lane.next_seqid, 1);
+        drop(lane);
         server.await.unwrap().unwrap();
     }
 
