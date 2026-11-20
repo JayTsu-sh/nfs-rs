@@ -46,9 +46,7 @@ pub(super) fn stateid_recovery(error: &NfsError) -> Option<StateidRecovery> {
     }
     match error {
         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID) => Some(StateidRecovery::Bad),
-        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => {
-            Some(StateidRecovery::Stale)
-        }
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => Some(StateidRecovery::Stale),
         // A restart invalidates the whole client id; operations carrying an old
         // stateid then answer STALE_CLIENTID (or EXPIRED) rather than
         // STALE_STATEID. Treat both as the same "earlier server instance"
