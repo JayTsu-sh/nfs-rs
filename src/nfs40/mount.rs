@@ -2617,36 +2617,12 @@ impl Mount for Mount40 {
             if consumes_owner_seqid(&decoded) {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
             }
-            // RFC 7530 §9.1.4.4: OLD_STATEID means the lock state still exists
-            // with a newer stateid seqid. Advance it by one and retry once with
-            // the current lock-owner seqid before giving up.
-            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &decoded {
-                let seqid = u32::from_be_bytes([
-                    lane.stateid[0],
-                    lane.stateid[1],
-                    lane.stateid[2],
-                    lane.stateid[3],
-                ])
-                .wrapping_add(1);
-                lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
-                let request = CompoundBuilder::new("locku")
-                    .putfh(&fh)
-                    .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
-                    .encode_with_header(&auth);
-                (class, ctx) = context(
-                    "locku",
-                    lane.owner,
-                    lane.next_seqid,
-                    OperationClass::ReplaySensitive,
-                );
-                decoded = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-                if consumes_owner_seqid(&decoded) {
-                    lane.next_seqid = lane.next_seqid.wrapping_add(1);
-                }
-            }
+            // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
+            // current lock seqid, so a blind +1 retry cannot converge when the
+            // server advanced by more than one and would leave the lane holding
+            // a stateid the server never issued. Report the exhaustion and keep
+            // the server-issued stateid untouched; LOCKU has no dir_fh/name to
+            // re-open with, so reopening is the caller's decision.
             // RFC 7530 §9.1.4.4: BAD_STATEID is also returned when the stateid
             // seqid is later than the server's, in which case the lock still
             // exists. Probe once with the previous stateid seqid before
@@ -2705,8 +2681,10 @@ impl Mount for Mount40 {
                     Ok(())
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
-                    // Still behind after one retry: the lock state exists with an
-                    // even newer seqid. Keep the lane so later attempts converge.
+                    // The lock exists with a newer stateid that the status does
+                    // not disclose. Keep the lane (the lock is still held
+                    // server-side) with its last server-issued stateid and let
+                    // the caller decide whether to reopen.
                     Err(Mount40::state_recovery_exhausted(
                         "locku",
                         StateidRecovery::Old,
@@ -3900,43 +3878,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn locku_old_stateid_retries_with_advanced_seqid() {
+    async fn locku_old_stateid_reports_exhaustion_without_blind_bump() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
         register_scripted_lock(&mount, 211, [0xb1; 16]).await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let locku = read_record(&mut stream).await?;
-            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10024)).await?;
-            // OLD_STATEID consumes the lock-owner seqid, so the retry must use
-            // seqid 2 and the advanced stateid seqid.
-            let retry = read_record(&mut stream).await?;
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                &[0xb1, 0xb1, 0xb1, 0xb2],
-                &[0xb1; 12],
-            ]
-            .concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "LOCKU retry did not carry the advanced seqids"
-            );
-            reply(
-                &mut stream,
-                &retry,
-                &compound_result("locku-retry", &[(22, &[]), (14, &[0xb2; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
+            // OLD_STATEID does not disclose the server's lock seqid: answer
+            // once and let the lane survive with the issued stateid.
+            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10024)).await
         });
-        mount
+        let error = mount
             .locku(
                 Bytes::from_static(b"fh"),
                 Bytes::from([0xb1; 16].as_slice()),
@@ -3945,8 +3898,17 @@ mod tests {
                 1,
             )
             .await
-            .unwrap();
-        assert!(mount.locks.by_stateid(&[0xb1; 16]).await.is_none());
+            .unwrap_err();
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        // The lock is still held server-side: the lane must survive with the
+        // stateid the server issued, not a locally fabricated one.
+        let lane = mount.locks.by_stateid(&[0xb1; 16]).await.unwrap();
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xb1; 16]);
+        drop(lane);
         server.await.unwrap().unwrap();
     }
 
