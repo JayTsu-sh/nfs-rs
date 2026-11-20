@@ -38,9 +38,23 @@ pub(super) enum StateidRecovery {
 }
 
 pub(super) fn stateid_recovery(error: &NfsError) -> Option<StateidRecovery> {
+    // Outcome wrappers keep the authoritative status in `source`; classify it
+    // so a definite STALE_CLIENTID after a restart is not mistaken for a
+    // generic replay-sensitive failure.
+    if let NfsError::OperationOutcome(details) = error {
+        return stateid_recovery(&details.source);
+    }
     match error {
         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID) => Some(StateidRecovery::Bad),
-        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => Some(StateidRecovery::Stale),
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => {
+            Some(StateidRecovery::Stale)
+        }
+        // A restart invalidates the whole client id; operations carrying an old
+        // stateid then answer STALE_CLIENTID (or EXPIRED) rather than
+        // STALE_STATEID. Treat both as the same "earlier server instance"
+        // recovery so callers get the typed LostOpenState contract.
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID)
+        | NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_EXPIRED) => Some(StateidRecovery::Stale),
         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID) => Some(StateidRecovery::Old),
         _ => None,
     }
@@ -151,6 +165,33 @@ pub(super) async fn fresh_open_lane_with_seqid(
     }
 }
 
+/// Best-effort CLOSE for a just-created open state that will not be kept.
+///
+/// The handle is about to be discarded, so a failure only leaves server state
+/// behind until the lease expires; it must not mask the caller's own error.
+pub(super) async fn close_fresh_open(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+    stateid: &[u8; 16],
+    seqid: u32,
+) {
+    let request = CompoundBuilder::new("open-discard")
+        .putfh(fh)
+        .close(seqid, stateid)
+        .encode_with_header(auth);
+    if let Err(error) = rpc
+        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+        .await
+    {
+        tracing::debug!(
+            target: "nfs_rs::stateid",
+            error = %error,
+            "NFSv4.0 could not discard a fresh OPEN; the server state expires with the lease"
+        );
+    }
+}
+
 pub(super) async fn establish_identity(
     rpc: &rpc::Client,
     auth: &Auth,
@@ -208,6 +249,11 @@ impl RecoveryContext {
             self.callback_addr.as_deref(),
         )
         .await?;
+        // Lanes reclaimed under a previous client id are not reclaimable under a
+        // new one, so the ledger only applies while the identity is unchanged.
+        if renewed_client_id != self.client_id.load(Ordering::Acquire) {
+            self.lease.clear_reclaimed();
+        }
         self.client_id.store(renewed_client_id, Ordering::Release);
         if !self.lease.mark_reclaiming() {
             return Err(NfsError::LostOpenState(
@@ -451,7 +497,18 @@ impl RecoveryContext {
             // re-created by another client). This lane cannot be recovered, but
             // it says nothing about the other lanes: report it as an
             // authoritative per-lane loss so the reclaim pass drops only this
-            // open instead of invalidating the whole mount.
+            // open instead of invalidating the whole mount. Release the state
+            // just created for the replacement object, otherwise the dropped
+            // lane leaks a server open until the lease expires.
+            let _ = return_delegation(&self.rpc, &self.auth, &fresh.fh, fresh.delegation).await;
+            close_fresh_open(
+                &self.rpc,
+                &self.auth,
+                &fresh.fh,
+                &fresh.stateid,
+                fresh.next_seqid,
+            )
+            .await;
             return Err(NfsError::LostOpenState(
                 "NFSv4.0 fresh OPEN after rejected reclaim returned a different filehandle".into(),
             ));
@@ -472,7 +529,10 @@ impl RecoveryContext {
     /// re-keyed by the caller.
     ///
     /// `None` means the lane was already reclaimed by an earlier attempt of the
-    /// same session (a pass retried after GRACE/DELAY).
+    /// same session (a pass retried after GRACE/DELAY). A lane that returned a
+    /// busy status replays the same open/lock seqids on that retry; a server
+    /// that consumes the seqid for GRACE answers NFS4ERR_BAD_SEQID and the lane
+    /// is then dropped as an authoritative loss.
     async fn reclaim_lock_lane(
         &self,
         lane: &Arc<tokio::sync::Mutex<LockLane>>,

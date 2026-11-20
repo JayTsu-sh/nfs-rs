@@ -25,9 +25,9 @@ use super::compound::{
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::recovery::{
     FreshOpenSpec, RecoveryContext, StateidRecovery, bump_stateid_seqid, classify_stateid_failure,
-    consumes_owner_seqid, establish_identity, fresh_open_lane_with_seqid, open_owner_wire,
-    recovery_failure, set_stateid_seqid, state_recovery_exhausted, stateid_hex, stateid_seqid,
-    status_consumes_seqid,
+    close_fresh_open, consumes_owner_seqid, establish_identity, fresh_open_lane_with_seqid,
+    open_owner_wire, recovery_failure, set_stateid_seqid, state_recovery_exhausted, stateid_hex,
+    stateid_seqid, status_consumes_seqid,
 };
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::dialer::Endpoint;
@@ -258,6 +258,9 @@ async fn mount_on_addr(addr: &Endpoint, args: &MountArgs, auth: Auth) -> Result<
         let lease = Arc::clone(&reconnect_lease);
         async move {
             lease.mark_reconnecting();
+            // Probe the client id now: a restart answers STALE_CLIENTID and
+            // starts recovery immediately instead of after the next RENEW tick.
+            lease.wake_renewal();
             Ok(())
         }
     })?;
@@ -528,11 +531,29 @@ impl Mount40 {
                 }
                 let stateid =
                     decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-                let _publication = lease.publication_guard().await;
-                // Register before the lifecycle fence: the server may already
-                // have granted the lock, and losing the lane would leak it
-                // until lease expiry. A lost mount removes it below; a Suspect
-                // mount keeps it so the caller can unlock after recovery.
+                let publication = lease.publication_guard().await;
+                if let Err(error) = lease.finish_stateful(expected_generation, "lock") {
+                    // The LOCK was granted but the mount left Ready before it
+                    // could be published: the caller never sees the token, so
+                    // release the lock instead of leaking it until the lease
+                    // expires. Do not hold the publication lock across that
+                    // RPC: it would delay `mark_lost` by a full round trip.
+                    drop(publication);
+                    let request = CompoundBuilder::new("lock-discard")
+                        .putfh(&fh)
+                        .locku(
+                            lock_type,
+                            lock_seqid_for_task.wrapping_add(1),
+                            &stateid,
+                            offset,
+                            length,
+                        )
+                        .encode_with_header(&auth);
+                    let _ = rpc
+                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await;
+                    return Err(error);
+                }
                 locks
                     .register(LockLane {
                         owner,
@@ -748,30 +769,27 @@ impl Mount40 {
                     next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                let result = async {
-                    let response = rpc
-                        .call(
-                            CompoundBuilder::new("delegreturn")
-                                .putfh(&fh)
-                                .delegreturn(&delegation.stateid)
-                                .encode_with_header(&auth),
-                            ReplayPolicy::ONE_ATTEMPT,
-                            METADATA_TIMEOUT,
-                        )
-                        .await
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-                    decode_delegreturn_response(response)
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
-                }
-                .await;
-                if let Err(error) = result {
-                    // The lane is registered before this follow-up so a failed
-                    // DELEGRETURN stays closeable. If the mount was lost in the
-                    // meantime its maps were cleared, and the lane must not be
-                    // left behind.
-                    if lease.generation() != expected_generation {
-                        state.remove(owner, &fh).await;
-                    }
+                let returned = rpc
+                    .call(
+                        CompoundBuilder::new("delegreturn")
+                            .putfh(&fh)
+                            .delegreturn(&delegation.stateid)
+                            .encode_with_header(&auth),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        METADATA_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))
+                    .and_then(|response| {
+                        decode_delegreturn_response(response)
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                    });
+                if let Err(error) = returned {
+                    // The OPEN already succeeded, but the caller never receives
+                    // the handle. Release the state instead of leaking it until
+                    // the lease expires, then report the DELEGRETURN failure.
+                    close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
+                    state.remove(owner, &fh).await;
                     return Err(error);
                 }
             }
@@ -787,19 +805,18 @@ impl Mount40 {
             } else {
                 None
             };
-            let _publication = lease.publication_guard().await;
+            let publication = lease.publication_guard().await;
             if let Err(error) = lease.finish_stateful(expected_generation, "open") {
-                // A lost/rotated mount has already cleared its state maps, so
-                // the lane published above would be unreachable. A Suspect or
-                // Reconnecting mount still owns this open, and removing it
-                // would discard the only handle that can close it.
-                if lease.generation() != expected_generation {
-                    state.remove(owner, &fh).await;
-                }
+                // The caller never receives the handle, so release the state we
+                // just created instead of leaving an orphan open for the next
+                // recovery pass to adopt.
+                drop(publication);
+                close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
+                state.remove(owner, &fh).await;
                 return Err(error);
             }
-            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation)
-                && let Err(error) = callback_state.register_delegation(
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
+                callback_state.register_delegation(
                     fh.clone(),
                     delegation,
                     expected_generation,
@@ -987,8 +1004,18 @@ impl Mount40 {
                 }
                 // RFC 7530 §9.1.4.3: BAD/STALE mean the server no longer knows
                 // this state, so CLOSE is already satisfied. Treat it as
-                // released instead of wedging the lane in `closing`.
-                Err(error) if error.is_recoverable_state() => {
+                // released instead of wedging the lane in `closing`. An
+                // invalid client id after a restart proves the same thing.
+                Err(error)
+                    if error.is_recoverable_state()
+                        || matches!(
+                            &error,
+                            NfsError::Nfs4(
+                                crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID
+                                    | crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+                            )
+                        ) =>
+                {
                     tracing::debug!(
                         target: "nfs_rs::stateid",
                         operation = "close",
@@ -1152,27 +1179,18 @@ impl Mount40 {
         // every later attempt would replay this OPEN instead of converging.
         open.next_seqid = fresh.next_seqid;
         if fresh.fh != open.fh {
-            // The re-open resolved to a different filehandle: release the
-            // freshly created state rather than leak it, then refuse to commit
-            // the recovery. The lane's cursor must still reflect the cleanup
-            // CLOSE: it consumes the seqid it was sent with, so discarding the
-            // reply would make the next owner-sequenced request replay it and
-            // fail with BAD_SEQID. An unknown outcome makes both values unsafe
-            // to replay, so retire the lane instead.
-            match close_unpublished_state(&rpc, &auth, &fresh.fh, fresh.next_seqid, &fresh.stateid)
-                .await
-            {
-                Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
-                Some(false) => {}
-                None => {
-                    open.closing = true;
-                    let owner = open.owner;
-                    let fh = open.fh.clone();
-                    drop(open);
-                    open_state.remove(owner, &fh).await;
-                }
-            }
-            return Err(NfsError::Xdr(
+            // The path now resolves to a different object (replaced or
+            // re-created by another client). The old lane cannot be used any
+            // more, so report it as lost state: callers reopen instead of
+            // treating this as an encoding fault. Release the fresh state and
+            // drop the lane, otherwise both the server open and the map entry
+            // outlive every caller that could still reference them.
+            close_fresh_open(&rpc, &auth, &fresh.fh, &fresh.stateid, fresh.next_seqid).await;
+            let owner = open.owner;
+            let stale_fh = open.fh.clone();
+            drop(open);
+            open_state.remove(owner, &stale_fh).await;
+            return Err(NfsError::LostOpenState(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
         }

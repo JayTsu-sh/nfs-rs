@@ -268,10 +268,14 @@ impl LockState {
         new_stateid: [u8; 16],
         lane: Arc<Mutex<LockLane>>,
     ) {
+        // Hold both maps for the update: a LOOKUP that runs between them would
+        // miss `old_stateid` in `lanes` before the alias exists and report a
+        // lock that is still live as unknown.
         let mut lanes = self.lanes.write().await;
+        let mut aliases = self.aliases.write().await;
+        aliases.insert(old_stateid, Arc::clone(&lane));
         lanes.remove(&old_stateid);
-        lanes.insert(new_stateid, Arc::clone(&lane));
-        self.aliases.write().await.insert(old_stateid, lane);
+        lanes.insert(new_stateid, lane);
     }
 
     pub(crate) async fn clear(&self) {
@@ -454,6 +458,32 @@ mod tests {
             .await
             .expect("the remaining owner lane stays usable");
         assert_eq!(lane.lock().await.owner, 11);
+    }
+
+    #[tokio::test]
+    async fn rekey_keeps_the_old_stateid_resolvable() {
+        let state = LockState::default();
+        let lane = state
+            .register(LockLane {
+                owner: 7,
+                open_owner: 11,
+                owner_wire: Bytes::from_static(b"lock"),
+                next_seqid: 1,
+                stateid: [1; 16],
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 1,
+                offset: 0,
+                length: 0,
+            })
+            .await;
+        state.rekey([1; 16], [2; 16], Arc::clone(&lane)).await;
+
+        // An in-flight LOCKU still carries the pre-reclaim stateid.
+        assert!(state.by_stateid(&[1; 16]).await.is_some());
+        assert!(state.by_stateid(&[2; 16]).await.is_some());
+
+        state.remove(&[2; 16]).await;
+        assert!(state.by_stateid(&[1; 16]).await.is_none());
     }
 
     #[test]

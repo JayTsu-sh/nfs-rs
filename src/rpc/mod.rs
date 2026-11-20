@@ -1176,9 +1176,17 @@ impl Client {
                     let is_conn_error = e.is_connection_lost();
                     let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
-                        let recovery =
-                            disconnect.get_or_insert_with(|| DisconnectRecovery::new(e, deadline));
-                        attempt += 1;
+                        let recovery = disconnect.get_or_insert_with(|| {
+                            DisconnectRecovery::new(e, deadline)
+                        });
+                        // A request that never crossed the send boundary cannot
+                        // have executed, so it does not consume a replay attempt:
+                        // ONE_ATTEMPT (WRITE) must still resend after a reconnect.
+                        // Only sends after a real transmission are bounded by the
+                        // policy's attempt count.
+                        if logical_transmission == crate::RequestTransmission::Sent {
+                            attempt += 1;
+                        }
                         if attempt >= max_attempts {
                             break;
                         }
