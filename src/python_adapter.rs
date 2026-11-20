@@ -1642,6 +1642,11 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
             errno: None,
             recovery: Some("reopen"),
         },
+        NfsError::StateRecoveryExhausted(_) => PythonErrorKind {
+            class_name: "NfsStateRecoveryExhaustedError",
+            errno: None,
+            recovery: Some("reopen"),
+        },
         NfsError::FileClose(_) => PythonErrorKind {
             class_name: "NfsFileCloseError",
             errno: None,
