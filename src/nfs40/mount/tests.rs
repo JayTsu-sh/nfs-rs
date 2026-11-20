@@ -1,3 +1,7 @@
+//! Test-only module. The inner `cfg` also tells the panic scan in
+//! `tests/reliability_coverage.rs` to skip this file as production code.
+#![cfg(test)]
+
 use super::*;
 use crate::nfs4::compound::xdr_opaque;
 use crate::nfs40::recovery::{MAX_CONCURRENT_RECLAIMS, retry_settled};
@@ -2982,7 +2986,9 @@ async fn disabled_retention_reports_unsolicited_delegreturn_failure() {
         .await?;
         let close = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
             .await
-            .map_err(|_| std::io::Error::other("OPEN state was not retained for CLOSE"))??;
+            .map_err(|_| {
+                std::io::Error::other("OPEN state was not released after DELEGRETURN")
+            })??;
         reply(
             &mut stream,
             &close,
@@ -2996,10 +3002,8 @@ async fn disabled_retention_reports_unsolicited_delegreturn_failure() {
         .await
         .expect_err("OPEN must not publish a delegation the client failed to return");
     assert!(matches!(error, NfsError::Nfs4(_)) || error.operation_outcome().is_some());
-    mount
-        .close(Bytes::from_static(b"delegated-fh"))
-        .await
-        .expect("failed DELEGRETURN must retain a closeable OPEN state");
+    // The caller never receives a handle, so the failed OPEN must release the
+    // state itself instead of leaking it until the lease expires.
     assert!(mount.state.snapshot().await.is_empty());
     server.await.unwrap().unwrap();
 }
