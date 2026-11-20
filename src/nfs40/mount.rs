@@ -1180,37 +1180,12 @@ impl Mount40 {
                 .await
                 .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
-            // RFC 7530 §9.1.7: OLD_STATEID is not in the "seqid does not
-            // advance" exception list, so the rejected CLOSE consumed the
-            // open-owner seqid. Advance both seqids before resending; reusing
-            // the old value would make the retry a replay and the server would
-            // return the cached OLD_STATEID.
-            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) = &result {
-                lane.next_seqid = lane.next_seqid.wrapping_add(1);
-                let seqid = u32::from_be_bytes([
-                    lane.stateid[0],
-                    lane.stateid[1],
-                    lane.stateid[2],
-                    lane.stateid[3],
-                ])
-                .wrapping_add(1);
-                lane.stateid[..4].copy_from_slice(&seqid.to_be_bytes());
-                let request = CompoundBuilder::new("close")
-                    .putfh(&lane.fh)
-                    .close(lane.next_seqid, &lane.stateid)
-                    .encode_with_header(&auth);
-                let (class, ctx) = context(
-                    "close",
-                    lane.owner,
-                    lane.next_seqid,
-                    OperationClass::ReplaySensitive,
-                );
-                result = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
-            }
+            // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
+            // current stateid seqid, and the rejected CLOSE consumed the
+            // open-owner seqid. A blind +1 retry cannot converge when the
+            // server advanced by more than one, so report the exhaustion and
+            // keep the lane (the open state still exists server-side) instead
+            // of burning another open-owner seqid.
             // RFC 7530 §9.1.4.4: BAD_STATEID is also returned when the stateid
             // seqid is later than the server's, in which case the open state
             // still exists. Probe once with the previous stateid seqid before
@@ -1249,11 +1224,10 @@ impl Mount40 {
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
-                    // Still behind after one retry: the open state exists with an
-                    // even newer seqid. Keep the lane (a silently leaked open
+                    // The open state exists with a newer seqid that the status
+                    // does not disclose. Keep the lane (a silently leaked open
                     // state is worse than a reported one) and let the caller
-                    // retry. The failed retry consumed its seqid too, so a later
-                    // CLOSE must not reuse it.
+                    // retry; the rejected CLOSE consumed its open-owner seqid.
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     lane.closing = false;
                     return Err(Self::state_recovery_exhausted(
@@ -1390,6 +1364,20 @@ impl Mount40 {
                 "DELEGRETURN after NFSv4.0 stateid recovery failed; the server may hold a delegation it cannot recall"
             );
         }
+        if fresh.stateid == failed_stateid {
+            // The OPEN succeeded but kept the stateid that just failed. The
+            // caller has a single retry left and it would send exactly that
+            // stateid again, so report exhaustion instead of claiming a
+            // recovery that did not happen. Do not CLOSE it: the stateid names
+            // the very state the lane must keep.
+            return Err(Self::state_recovery_exhausted(
+                operation,
+                trigger,
+                NfsError::Xdr(
+                    "NFSv4.0 stateid recovery returned the stateid that just failed".into(),
+                ),
+            ));
+        }
         open.stateid = fresh.stateid;
         open.next_seqid = fresh.next_seqid;
         tracing::debug!(
@@ -1411,7 +1399,14 @@ impl Mount40 {
     /// mapping. Only failures without an authoritative status (transport,
     /// encoding, closed state) are reported as exhausted recovery.
     fn recovery_failure(operation: &str, trigger: StateidRecovery, source: NfsError) -> NfsError {
-        if matches!(&source, NfsError::Nfs4(_)) || matches!(&source, NfsError::LostOpenState(_)) {
+        // A stateid status raised by the recovery OPEN itself means the
+        // bounded recovery did not restore usable state: report exhaustion
+        // instead of handing callers a status that claims to be recoverable
+        // in place.
+        if stateid_recovery(&source).is_none()
+            && (matches!(&source, NfsError::Nfs4(_))
+                || matches!(&source, NfsError::LostOpenState(_)))
+        {
             return source;
         }
         Self::state_recovery_exhausted(operation, trigger, source)
@@ -3383,63 +3378,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_with_old_stateid_retries_with_advanced_seqid_then_releases() {
+    async fn close_with_old_stateid_reports_exhaustion_without_blind_bump() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
+        let lane = register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await?;
-            // The retry must advance BOTH the open-owner seqid (1 -> 2) and the
-            // stateid seqid (0xa9a9_a9a9 -> 0xa9a9_a9aa), otherwise the server
-            // would treat it as a replay of the rejected CLOSE.
-            let retry = read_record(&mut stream).await?;
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                &[0xa9, 0xa9, 0xa9, 0xaa],
-                &[0xa9; 12],
-            ]
-            .concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE retry did not carry the advanced seqids"
-            );
-            reply(&mut stream, &retry, &close_result([0xc9; 16])).await
-        });
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        assert!(mount.state.by_owner(209).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_still_old_stateid_keeps_lane_and_reports_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 210, [0xa0; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &retry,
-                &failed_lock_result("close-retry", 4, 10024),
-            )
-            .await
+            // OLD_STATEID does not disclose the server's current seqid, so no
+            // retry can converge: answer once and let the lane survive.
+            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await
         });
         let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
         assert_eq!(
             error.stateid_failure(),
             Some(crate::StateidFailure::StateRecoveryExhausted)
         );
-        // The open state still exists server-side: the lane must survive so a
-        // later attempt can converge on the server's seqid.
+        assert!(matches!(
+            error,
+            NfsError::StateRecoveryExhausted(ref failure)
+                if failure.status == crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
+        ));
+        // The open state still exists server-side: the lane must survive. The
+        // rejected CLOSE consumed the open-owner seqid, while a blind bump of
+        // the stateid seqid (which the retry used to do) must not happen.
         let lane = lane.lock().await;
         assert!(!lane.closing);
-        let seqid = u32::from_be_bytes(lane.stateid[..4].try_into().unwrap());
-        assert_eq!(seqid, 0xa0a0_a0a1);
+        assert_eq!(lane.next_seqid, 2);
+        assert_eq!(lane.stateid, [0xa9; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_returning_same_stateid_reports_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 211, [0xab; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // A fresh OPEN that answers with the stateid that just failed must
+            // not be mistaken for a recovered lane: the single retry would
+            // resend the same stateid and fail again.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xab; 16], b"fh")).await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        assert_eq!(lane.lock().await.stateid, [0xab; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_old_stateid_is_reported_as_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 212, [0xac; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &failed_lock_result("open-recover", 18, 10024),
+            )
+            .await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        // OLD_STATEID from the recovery OPEN itself means the bounded recovery
+        // already failed; it must not surface as recoverable in place.
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        match error {
+            NfsError::StateRecoveryExhausted(failure) => {
+                assert_eq!(failure.operation, "read");
+                assert_eq!(failure.status, crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID);
+                assert!(matches!(
+                    *failure.source,
+                    NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(lane.lock().await.stateid, [0xac; 16]);
         server.await.unwrap().unwrap();
     }
 
