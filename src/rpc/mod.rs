@@ -1176,9 +1176,8 @@ impl Client {
                     let is_conn_error = e.is_connection_lost();
                     let is_timeout = kind == std::io::ErrorKind::TimedOut;
                     if is_conn_error {
-                        let recovery = disconnect.get_or_insert_with(|| {
-                            DisconnectRecovery::new(e, deadline)
-                        });
+                        let recovery =
+                            disconnect.get_or_insert_with(|| DisconnectRecovery::new(e, deadline));
                         // A request that never crossed the send boundary cannot
                         // have executed, so it does not consume a replay attempt:
                         // ONE_ATTEMPT (WRITE) must still resend after a reconnect.
