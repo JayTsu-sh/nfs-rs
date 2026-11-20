@@ -1002,11 +1002,12 @@ impl Mount40 {
             // assuming the state is gone; a genuine loss just repeats the
             // status, and BAD_STATEID does not consume the open-owner seqid.
             if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &result {
-                let seqid = u32::from_be_bytes(
-                    lane.stateid[..4]
-                        .try_into()
-                        .expect("stateid seqid is four bytes"),
-                );
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ]);
                 if let Some(previous) = seqid.checked_sub(1) {
                     let mut probe_stateid = lane.stateid;
                     probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
