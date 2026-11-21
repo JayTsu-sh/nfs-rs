@@ -43,6 +43,13 @@ pub(crate) struct LeaseState {
     /// Open/lock owners reclaimed since the current recovery session started.
     reclaimed_opens: Mutex<std::collections::HashSet<u64>>,
     reclaimed_locks: Mutex<std::collections::HashSet<u64>>,
+    /// Next unconsumed seqid for an in-progress open-owner reclaim. A reclaim
+    /// starts at seqid 0 after the server forgot the owner; a consuming busy
+    /// reply advances the cursor so a retry in the same session does not
+    /// replay a seqid the server already consumed.
+    open_reclaim_seqids: Mutex<std::collections::HashMap<u64, u32>>,
+    /// Same cursor for the lock owner of an in-progress reclaim.
+    lock_reclaim_seqids: Mutex<std::collections::HashMap<u64, u32>>,
     /// Wakes the renewal task after a reconnect so it probes the client id
     /// immediately instead of waiting for the next scheduled RENEW.
     renewal_wake: tokio::sync::Notify,
@@ -65,6 +72,8 @@ impl LeaseState {
             retry_task_active: AtomicBool::new(false),
             reclaimed_opens: Mutex::new(std::collections::HashSet::new()),
             reclaimed_locks: Mutex::new(std::collections::HashSet::new()),
+            open_reclaim_seqids: Mutex::new(std::collections::HashMap::new()),
+            lock_reclaim_seqids: Mutex::new(std::collections::HashMap::new()),
             renewal_wake: tokio::sync::Notify::new(),
         })
     }
@@ -446,12 +455,54 @@ impl LeaseState {
             .insert(owner);
     }
 
+    /// Next unconsumed seqid for an open-owner reclaim attempt.
+    pub(crate) fn open_reclaim_seqid(&self, owner: u64) -> u32 {
+        self.open_reclaim_seqids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_open_reclaim_seqid(&self, owner: u64, seqid: u32) {
+        self.open_reclaim_seqids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner, seqid);
+    }
+
+    /// Next unconsumed seqid for a lock-owner reclaim attempt.
+    pub(crate) fn lock_reclaim_seqid(&self, owner: u64) -> u32 {
+        self.lock_reclaim_seqids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_lock_reclaim_seqid(&self, owner: u64, seqid: u32) {
+        self.lock_reclaim_seqids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(owner, seqid);
+    }
+
     pub(crate) fn clear_reclaimed(&self) {
         self.reclaimed_opens
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.reclaimed_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.open_reclaim_seqids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.lock_reclaim_seqids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -682,6 +733,60 @@ mod tests {
         lease.mark_renewed();
         assert_eq!(lease.health().lifecycle, MountLifecycleState::Ready);
         assert_eq!(lease.health().lease_renewals, renewals + 1);
+    }
+
+    #[test]
+    fn transport_health_does_not_erase_an_incomplete_reclaim() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_recovering();
+        assert!(lease.mark_reclaiming());
+        // A reconnect during the busy backoff, followed by a successful RENEW,
+        // must not promote the mount to Ready while lanes still need reclaim.
+        lease.mark_reconnecting();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Reclaiming);
+        lease.mark_renewed();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Reclaiming);
+        lease.mark_suspect();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::Reclaiming);
+    }
+
+    #[tokio::test]
+    async fn recovery_cannot_revive_a_mount_that_lost_its_state() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_recovering();
+        assert!(lease.mark_reclaiming());
+        lease.mark_lost().await;
+        assert!(!lease.mark_recovered());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+    }
+
+    #[tokio::test]
+    async fn lost_state_is_not_revived_by_transport_health() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_lost().await;
+        // A transport error after the state was discarded must not turn a
+        // terminal mount into Suspect/Reconnecting, which a successful RENEW
+        // would then promote back to Ready.
+        lease.mark_suspect();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+        lease.mark_reconnecting();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+        lease.mark_renewed();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+    }
+
+    #[tokio::test]
+    async fn lost_state_is_not_revived_by_the_renewal_recovery_path() {
+        let lease = LeaseState::ready(1, 30);
+        lease.mark_lost().await;
+        // The renewal loop marks Recovering before calling the recovery
+        // handler, so that transition itself must refuse a lost mount.
+        lease.mark_recovering();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+        lease.mark_ready();
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
+        assert!(!lease.mark_recovered());
+        assert_eq!(lease.health().lifecycle, MountLifecycleState::LostState);
     }
 
     #[test]

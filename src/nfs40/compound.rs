@@ -814,6 +814,7 @@ pub(crate) fn decode_link_response(buf: Bytes) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_lock_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
     decode_lock_denied_result(buf.clone(), opcode, name)?;
     decode_stateid_response(buf, opcode, name)
@@ -978,6 +979,228 @@ pub(crate) fn decode_stateid_op_outcome(
     if overall != 0 {
         // A successful operation list must be paired with NFS4_OK. Trusting the
         // per-operation success here could publish state the server rejected.
+        return Ok(StateidOpOutcome::Executed(status_error(overall)?));
+    }
+    Ok(StateidOpOutcome::Completed(take_stateid(&mut buf, name)?))
+}
+
+/// LOCK/LOCKU outcome. A denial carries the conflicting range and must be
+/// preserved, but it still consumed both owner seqids.
+#[derive(Debug)]
+pub(crate) enum LockOpOutcome {
+    Granted([u8; 16]),
+    Executed(NfsError),
+    Denied(NfsError),
+    Rejected(NfsError),
+    NotExecuted(NfsError),
+}
+
+impl LockOpOutcome {
+    pub(crate) fn into_result(self) -> Result<[u8; 16]> {
+        match self {
+            Self::Granted(stateid) => Ok(stateid),
+            Self::Executed(error)
+            | Self::Denied(error)
+            | Self::Rejected(error)
+            | Self::NotExecuted(error) => Err(error),
+        }
+    }
+}
+
+fn denied_error(buf: &mut Bytes, name: &str) -> Result<NfsError> {
+    if buf.remaining() < 28 {
+        return Err(NfsError::Xdr(format!("{name} denied range truncated")));
+    }
+    let offset = buf.get_u64();
+    let length = buf.get_u64();
+    let lock_type = buf.get_u32();
+    buf.advance(8); // conflicting owner clientid
+    let owner = take_opaque(buf, &format!("{name} denied owner"))?;
+    if owner.len() > MAX_LOCK_OWNER_LEN {
+        return Err(NfsError::Xdr(format!(
+            "{name} denied owner exceeds {MAX_LOCK_OWNER_LEN} bytes"
+        )));
+    }
+    Ok(NfsError::LockDenied {
+        lock_type,
+        offset,
+        length,
+        owner,
+    })
+}
+
+pub(crate) fn decode_lock_op_outcome(buf: Bytes, opcode: u32, name: &str) -> Result<LockOpOutcome> {
+    let (overall, count, mut buf) = response_header(buf)?;
+    if !(1..=2).contains(&count) {
+        return Err(NfsError::Xdr(format!(
+            "{name} response has {count} operations, expected 1 or 2"
+        )));
+    }
+    let putfh_status = take_op_status(&mut buf, OP_PUTFH, "PUTFH")?;
+    if putfh_status != 0 {
+        return Ok(LockOpOutcome::NotExecuted(status_error(putfh_status)?));
+    }
+    if count == 1 {
+        return Err(NfsError::Xdr(format!(
+            "{name} response stopped after a successful PUTFH"
+        )));
+    }
+    let status = take_op_status(&mut buf, opcode, name)?;
+    if status == NFS4ERR_DENIED {
+        return Ok(LockOpOutcome::Denied(denied_error(&mut buf, name)?));
+    }
+    if status != 0 {
+        return Ok(LockOpOutcome::Rejected(status_error(status)?));
+    }
+    if overall != 0 {
+        return Ok(LockOpOutcome::Executed(status_error(overall)?));
+    }
+    Ok(LockOpOutcome::Granted(take_stateid(&mut buf, name)?))
+}
+
+/// OPEN outcome. `Executed` means OPEN succeeded (and consumed its seqid) but
+/// GETFH failed, so no usable filehandle is available.
+#[derive(Debug)]
+pub(crate) enum OpenOpOutcome {
+    Completed(OpenResult, Bytes),
+    Executed(NfsError),
+    Rejected(NfsError),
+    NotExecuted(NfsError),
+}
+
+impl OpenOpOutcome {
+    pub(crate) fn into_result(self) -> Result<(OpenResult, Bytes)> {
+        match self {
+            Self::Completed(opened, fh) => Ok((opened, fh)),
+            Self::Executed(error) | Self::Rejected(error) | Self::NotExecuted(error) => Err(error),
+        }
+    }
+}
+
+pub(crate) fn decode_open_op_outcome(buf: Bytes) -> Result<OpenOpOutcome> {
+    let (overall, count, mut buf) = response_header(buf)?;
+    if !(1..=3).contains(&count) {
+        return Err(NfsError::Xdr(format!(
+            "OPEN response has {count} operations, expected 1 to 3"
+        )));
+    }
+    let putfh_status = take_op_status(&mut buf, OP_PUTFH, "PUTFH")?;
+    if putfh_status != 0 {
+        return Ok(OpenOpOutcome::NotExecuted(status_error(putfh_status)?));
+    }
+    if count < 2 {
+        return Err(NfsError::Xdr(
+            "OPEN response stopped after a successful PUTFH".into(),
+        ));
+    }
+    let open_status = take_op_status(&mut buf, OP_OPEN, "OPEN")?;
+    if open_status != 0 {
+        return Ok(OpenOpOutcome::Rejected(status_error(open_status)?));
+    }
+    let stateid = take_stateid(&mut buf, "OPEN")?;
+    if buf.remaining() < 20 {
+        return Err(NfsError::Xdr("OPEN change_info truncated".into()));
+    }
+    buf.advance(20);
+    let flags = take_u32(&mut buf, "OPEN result flags")?;
+    skip_bitmap(&mut buf, "OPEN attrset")?;
+    let delegation = decode_delegation(&mut buf)?;
+    let opened = OpenResult {
+        stateid,
+        confirm_required: flags & OPEN4_RESULT_CONFIRM != 0,
+        delegation,
+    };
+    if count < 3 {
+        return Err(NfsError::Xdr("OPEN success without a GETFH result".into()));
+    }
+    let getfh_status = take_op_status(&mut buf, OP_GETFH, "GETFH")?;
+    if getfh_status != 0 {
+        return Ok(OpenOpOutcome::Executed(status_error(getfh_status)?));
+    }
+    let fh = take_opaque(&mut buf, "GETFH filehandle")?;
+    if overall != 0 {
+        return Ok(OpenOpOutcome::Executed(status_error(overall)?));
+    }
+    Ok(OpenOpOutcome::Completed(opened, fh))
+}
+
+/// Parses a COMPOUND reply header **without** rejecting a non-zero overall
+/// status: the overall status only says that some operation failed, not which
+/// one, and the caller needs the per-operation results to tell them apart.
+fn response_header(mut buf: Bytes) -> Result<(u32, u32, Bytes)> {
+    let overall = take_u32(&mut buf, "COMPOUND status")?;
+    let _tag = take_opaque(&mut buf, "COMPOUND tag")?;
+    let count = take_u32(&mut buf, "COMPOUND result count")?;
+    Ok((overall, count, buf))
+}
+
+fn status_error(status: u32) -> Result<NfsError> {
+    let mut wire = Bytes::copy_from_slice(&status.to_be_bytes());
+    let status = crate::nfs4::fastxdr::nfsstat4::try_from(&mut wire)
+        .map_err(|error| NfsError::Xdr(format!("invalid NFSv4 status: {error}")))?;
+    Ok(NfsError::Nfs4(status))
+}
+
+fn take_op_status(buf: &mut Bytes, expected: u32, name: &str) -> Result<u32> {
+    let actual = take_u32(buf, &format!("{name} opcode"))?;
+    if actual != expected {
+        return Err(NfsError::Xdr(format!(
+            "{name} opcode {actual} does not match {expected}"
+        )));
+    }
+    take_u32(buf, &format!("{name} status"))
+}
+
+/// Which operation in a `PUTFH + <stateid op>` COMPOUND failed.
+///
+/// RFC 7530 §9.1.7 only consumes the owner seqid when the stateid operation
+/// actually ran. `NotExecuted` is the PUTFH failure case, which must never
+/// advance a cursor even though the overall status is non-zero.
+#[derive(Debug)]
+pub(crate) enum StateidOpOutcome<T> {
+    Completed(T),
+    /// The target operation ran and consumed its seqid, but the reply cannot be
+    /// trusted (a later operation failed, or the overall status contradicts a
+    /// fully successful operation list).
+    Executed(NfsError),
+    Rejected(NfsError),
+    NotExecuted(NfsError),
+}
+
+impl<T> StateidOpOutcome<T> {
+    pub(crate) fn into_result(self) -> Result<T> {
+        match self {
+            Self::Completed(value) => Ok(value),
+            Self::Executed(error) | Self::Rejected(error) | Self::NotExecuted(error) => Err(error),
+        }
+    }
+}
+
+pub(crate) fn decode_stateid_op_outcome(
+    buf: Bytes,
+    opcode: u32,
+    name: &str,
+) -> Result<StateidOpOutcome<[u8; 16]>> {
+    let (overall, count, mut buf) = response_header(buf)?;
+    if !(1..=2).contains(&count) {
+        return Err(NfsError::Xdr(format!(
+            "{name} response has {count} operations, expected 1 or 2"
+        )));
+    }
+    let putfh_status = take_op_status(&mut buf, OP_PUTFH, "PUTFH")?;
+    if putfh_status != 0 {
+        return Ok(StateidOpOutcome::NotExecuted(status_error(putfh_status)?));
+    }
+    if count == 1 {
+        return Err(NfsError::Xdr(format!(
+            "{name} response stopped after a successful PUTFH"
+        )));
+    }
+    let status = take_op_status(&mut buf, opcode, name)?;
+    if status != 0 {
+        return Ok(StateidOpOutcome::Rejected(status_error(status)?));
+    }
+    if overall != 0 {
         return Ok(StateidOpOutcome::Executed(status_error(overall)?));
     }
     Ok(StateidOpOutcome::Completed(take_stateid(&mut buf, name)?))

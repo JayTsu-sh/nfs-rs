@@ -72,8 +72,12 @@ async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 fn compound_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+    compound_result_with_status(0, tag, ops)
+}
+
+fn compound_result_with_status(overall: u32, tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
     let mut result = Vec::new();
-    result.extend_from_slice(&0u32.to_be_bytes());
+    result.extend_from_slice(&overall.to_be_bytes());
     xdr_opaque(&mut result, tag.as_bytes());
     result.extend_from_slice(&(ops.len() as u32).to_be_bytes());
     for (opcode, data) in ops {
@@ -82,6 +86,11 @@ fn compound_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
         result.extend_from_slice(data);
     }
     result
+}
+
+/// A reply whose overall status contradicts a fully successful operation list.
+fn contradictory_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+    compound_result_with_status(10006, tag, ops)
 }
 
 fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
@@ -111,6 +120,17 @@ fn failed_lock_result(tag: &str, opcode: u32, status: u32) -> Vec<u8> {
     result.extend_from_slice(&22u32.to_be_bytes());
     result.extend_from_slice(&0u32.to_be_bytes());
     result.extend_from_slice(&opcode.to_be_bytes());
+    result.extend_from_slice(&status.to_be_bytes());
+    result
+}
+
+/// A COMPOUND that failed at PUTFH: the following operation never ran.
+fn putfh_failure_result(tag: &str, status: u32) -> Vec<u8> {
+    let mut result = Vec::new();
+    result.extend_from_slice(&status.to_be_bytes());
+    xdr_opaque(&mut result, tag.as_bytes());
+    result.extend_from_slice(&1u32.to_be_bytes());
+    result.extend_from_slice(&22u32.to_be_bytes());
     result.extend_from_slice(&status.to_be_bytes());
     result
 }
@@ -188,6 +208,56 @@ fn stateid_failures_are_classified_for_callers() {
         Some(crate::StateidFailure::Exhausted)
     );
     assert_eq!(NfsError::InvalidInput("x".into()).stateid_failure(), None);
+}
+
+/// RFC 7530 §9.1.7: every owner-sequenced operation consumes its seqid except
+/// for a fixed exception table. Pin the table so a constant or a status that
+/// was added to the enum cannot silently change reclaim retry behaviour.
+#[test]
+fn seqid_consumption_matches_the_rfc7530_exception_table() {
+    use crate::Nfs4ErrorCode;
+    use crate::nfs40::recovery::{consumes_owner_seqid, status_consumes_seqid};
+
+    for status in [
+        Nfs4ErrorCode::NFS4ERR_BADXDR,
+        Nfs4ErrorCode::NFS4ERR_BAD_SEQID,
+        Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
+        Nfs4ErrorCode::NFS4ERR_MOVED,
+        Nfs4ErrorCode::NFS4ERR_NOFILEHANDLE,
+        Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID,
+        Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+    ] {
+        assert!(
+            !status_consumes_seqid(status),
+            "{status:?} is in the exception table and must not consume the seqid"
+        );
+    }
+    // NFS4ERR_RESOURCE (10018) is in the RFC table but not modelled by the
+    // generated enum, so it cannot be constructed here.
+    for status in [
+        Nfs4ErrorCode::NFS4ERR_SERVERFAULT,
+        Nfs4ErrorCode::NFS4ERR_DELAY,
+        Nfs4ErrorCode::NFS4ERR_GRACE,
+        Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+        Nfs4ErrorCode::NFS4ERR_LOCKED,
+        Nfs4ErrorCode::NFS4ERR_EXPIRED,
+    ] {
+        assert!(
+            status_consumes_seqid(status),
+            "{status:?} must consume the seqid"
+        );
+    }
+    assert!(consumes_owner_seqid(&Ok::<(), NfsError>(())));
+    assert!(consumes_owner_seqid(&Err::<(), _>(NfsError::Nfs4(
+        Nfs4ErrorCode::NFS4ERR_SERVERFAULT
+    ))));
+    assert!(!consumes_owner_seqid(&Err::<(), _>(NfsError::Nfs4(
+        Nfs4ErrorCode::NFS4ERR_BAD_SEQID
+    ))));
+    // Io/Rpc failures have an unknown outcome, so the cursor must not move.
+    assert!(!consumes_owner_seqid(&Err::<(), _>(NfsError::Io(
+        std::io::Error::other("unknown outcome")
+    ))));
 }
 
 #[tokio::test]
@@ -270,6 +340,29 @@ async fn close_failure_does_not_wedge_the_lane() {
     assert!(!lane.lock().await.closing);
     mount.close(Bytes::from_static(b"fh")).await.unwrap();
     assert!(mount.state.by_owner(208).await.is_none());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn close_putfh_failure_does_not_consume_the_owner_seqid() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let lane = register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let close = read_record(&mut stream).await?;
+        reply(&mut stream, &close, &putfh_failure_result("close", 10006)).await?;
+        let retry = read_record(&mut stream).await?;
+        let expected = [1u32.to_be_bytes().as_slice(), &[0xa9; 16]].concat();
+        assert!(
+            retry.windows(expected.len()).any(|wire| wire == expected),
+            "the retry must reuse seqid 1 that PUTFH never consumed"
+        );
+        reply(&mut stream, &retry, &close_result([0xc9; 16])).await
+    });
+    assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+    assert_eq!(lane.lock().await.next_seqid, 1);
+    mount.close(Bytes::from_static(b"fh")).await.unwrap();
     server.await.unwrap().unwrap();
 }
 
@@ -714,6 +807,131 @@ async fn lock_stateid_recovery_is_bounded_to_one_refresh() {
     // The refreshed state stays on the lane so a later attempt can converge.
     let open_lane = mount.state.by_owner(215).await.unwrap();
     assert_eq!(open_lane.lock().await.stateid, [0xb4; 16]);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn lock_putfh_failure_does_not_consume_the_open_seqid() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let lane = register_stateid_lane(&mount, 216, [0xac; 16], crate::OPEN_BOTH).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let lock = read_record(&mut stream).await?;
+        reply(&mut stream, &lock, &putfh_failure_result("lock", 10006)).await
+    });
+    assert!(
+        mount
+            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        lane.lock().await.next_seqid,
+        1,
+        "a PUTFH failure never ran LOCK and must not consume seqid 1"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn close_overall_status_contradiction_consumes_the_owner_seqid() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let lane = register_stateid_lane(&mount, 217, [0xad; 16], crate::OPEN_BOTH).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let close = read_record(&mut stream).await?;
+        // PUTFH and CLOSE both succeeded, but the overall status claims failure:
+        // the CLOSE still ran and consumed its seqid.
+        reply(
+            &mut stream,
+            &close,
+            &contradictory_result("close", &[(22, &[]), (4, &[0xb7; 16])]),
+        )
+        .await
+    });
+    assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+    assert_eq!(lane.lock().await.next_seqid, 2);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn close_probe_putfh_failure_keeps_the_first_consumption() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let lane = register_stateid_lane(&mount, 218, [0xdb; 16], crate::OPEN_BOTH).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let close = read_record(&mut stream).await?;
+        // Overall BAD_STATEID but PUTFH and CLOSE both succeeded: the CLOSE ran
+        // and consumed its seqid, so a BAD_STATEID probe is issued.
+        reply(
+            &mut stream,
+            &close,
+            &compound_result_with_status(10025, "close", &[(22, &[]), (4, &[0xdb; 16])]),
+        )
+        .await?;
+        let probe = read_record(&mut stream).await?;
+        // The probe never reached CLOSE and must not erase the first request's
+        // consumption.
+        reply(
+            &mut stream,
+            &probe,
+            &putfh_failure_result("close-probe", 10006),
+        )
+        .await
+    });
+    assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+    assert_eq!(
+        lane.lock().await.next_seqid,
+        2,
+        "an unexecuted probe must not discard the first CLOSE's consumption"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn open_confirm_putfh_failure_keeps_only_the_open_consumption() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+        .await
+        .unwrap();
+    let client = rpc::Client::new(mux, None);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let open = read_record(&mut stream).await?;
+        reply(&mut stream, &open, &open_result(2, [0x21; 16], b"fh")).await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &putfh_failure_result("open_confirm", 10006),
+        )
+        .await
+    });
+    let dir = Bytes::from_static(b"dir");
+    let spec = crate::nfs40::recovery::FreshOpenSpec {
+        dir_fh: &dir,
+        name: "file",
+        owner_wire: b"owner",
+        access: crate::OPEN_READ,
+        client_id: 7,
+    };
+    let attempt = crate::nfs40::recovery::fresh_open_lane_with_seqid(
+        &client,
+        &Auth::new_null(),
+        &spec,
+        1,
+        "recovery-open",
+    )
+    .await;
+    assert!(attempt.result.is_err());
+    assert_eq!(attempt.sent_seqid, 0);
+    assert_eq!(
+        attempt.next_seqid, 1,
+        "OPEN consumed seqid 0, but a PUTFH-failed CONFIRM did not consume 1"
+    );
     server.await.unwrap().unwrap();
 }
 
@@ -2278,6 +2496,176 @@ async fn reclaim_rejected_by_fsal_falls_back_to_fresh_open_per_lane() {
 }
 
 #[tokio::test]
+async fn non_consuming_reclaim_rejection_keeps_the_reclaim_cursor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 72, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x79; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let reclaim = read_record(&mut stream).await?;
+        // BAD_SEQID is in the §9.1.7 exception table, so the reclaim did not
+        // consume seqid 0. The fallback OPEN therefore starts at seqid 0 too.
+        let expected = [
+            0u32.to_be_bytes().as_slice(),
+            crate::OPEN_BOTH.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        assert!(
+            reclaim.windows(expected.len()).any(|wire| wire == expected),
+            "reclaim OPEN must carry seqid 0"
+        );
+        reply(
+            &mut stream,
+            &reclaim,
+            &failed_lock_result("reclaim-open", 18, 10026),
+        )
+        .await?;
+        let fresh = read_record(&mut stream).await?;
+        assert!(
+            fresh.windows(expected.len()).any(|wire| wire == expected),
+            "fresh OPEN must reuse seqid 0 that BAD_SEQID never consumed"
+        );
+        // End the recovery pass on a retryable status so the reclaim cursor is
+        // not cleared by a successful recovery.
+        reply(
+            &mut stream,
+            &fresh,
+            &failed_lock_result("reclaim-fallback-open", 18, 10013),
+        )
+        .await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x59; 8],
+            owner: "scripted-non-consuming-reclaim".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let error = context.recover_or_lose().await.unwrap_err();
+    assert!(
+        matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::Reclaiming
+    );
+    assert_eq!(
+        mount.lease.open_reclaim_seqid(72),
+        0,
+        "a non-consuming reclaim rejection must not advance the cursor"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_putfh_failure_does_not_consume_the_reclaim_cursor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 71, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x71; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let expected = [
+            0u32.to_be_bytes().as_slice(),
+            crate::OPEN_BOTH.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        let reclaim = read_record(&mut stream).await?;
+        assert!(
+            reclaim.windows(expected.len()).any(|wire| wire == expected),
+            "reclaim OPEN must carry seqid 0"
+        );
+        // SERVERFAULT is normally consuming, but a PUTFH failure means the
+        // reclaim OPEN never ran, so seqid 0 must stay unconsumed.
+        reply(
+            &mut stream,
+            &reclaim,
+            &putfh_failure_result("reclaim-open", 10006),
+        )
+        .await?;
+        let fresh = read_record(&mut stream).await?;
+        assert!(
+            fresh.windows(expected.len()).any(|wire| wire == expected),
+            "fresh OPEN must reuse seqid 0 that PUTFH never consumed"
+        );
+        // End the recovery pass on a retryable status so the reclaim cursor is
+        // not cleared by a successful recovery.
+        reply(
+            &mut stream,
+            &fresh,
+            &failed_lock_result("reclaim-fallback-open", 18, 10013),
+        )
+        .await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x51; 8],
+            owner: "scripted-putfh-failed-reclaim".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let error = context.recover_or_lose().await.unwrap_err();
+    assert!(
+        matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        mount.lease.open_reclaim_seqid(71),
+        0,
+        "a PUTFH failure must not advance the reclaim cursor"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn recovery_grace_keeps_state_and_defers_retry() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
@@ -2341,6 +2729,9 @@ async fn recovery_grace_keeps_state_and_defers_retry() {
     assert_eq!(mount.health().generation, 1);
     assert!(!mount.state.snapshot().await.is_empty());
     assert!(mount.lease.active_recovery_backoff().is_some());
+    // GRACE is outside the §9.1.7 exception table, so the retry must send the
+    // next unconsumed open-owner seqid instead of replaying seqid 0.
+    assert_eq!(mount.lease.open_reclaim_seqid(76), 1);
     let retry = context.recover_or_lose().await.unwrap_err();
     assert!(matches!(
         retry,
@@ -2409,6 +2800,8 @@ async fn recovery_delay_keeps_state_and_defers_retry() {
     assert_eq!(mount.health().generation, 1);
     assert!(!mount.state.snapshot().await.is_empty());
     assert!(mount.lease.active_recovery_backoff().is_some());
+    // DELAY is also outside the exception table.
+    assert_eq!(mount.lease.open_reclaim_seqid(78), 1);
     server.await.unwrap().unwrap();
 }
 
@@ -2578,6 +2971,419 @@ async fn busy_recovery_is_retried_after_the_backoff() {
     assert_eq!(mount.health().lease_renewals, 0);
     let lane = mount.state.by_owner(87).await.unwrap();
     assert_eq!(lane.lock().await.stateid, [0x62; 16]);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn busy_lock_reclaim_retries_with_the_next_unconsumed_seqids() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 88, b"fh").await;
+    register_scripted_lock(&mount, 88, [0x61; 16]).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        // Both recovery sessions get the same client id, so the reclaimed-owner
+        // ledger survives and only the lock is retried.
+        for pass in 0..2 {
+            let identity = read_record(&mut stream).await?;
+            let mut identity_data = Vec::new();
+            identity_data.extend_from_slice(&19u64.to_be_bytes());
+            identity_data.extend_from_slice(&[0x79; 8]);
+            reply(
+                &mut stream,
+                &identity,
+                &compound_result("identity", &[(35, &identity_data)]),
+            )
+            .await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("confirm", &[(36, &[])]),
+            )
+            .await?;
+            if pass == 0 {
+                // OPEN reclaim succeeds and leaves the open owner at seqid 1.
+                let open = read_record(&mut stream).await?;
+                reply(&mut stream, &open, &open_result(0, [0x62; 16], b"fh")).await?;
+                let lock = read_record(&mut stream).await?;
+                let expected = [
+                    1u32.to_be_bytes().as_slice(),
+                    &[0x62; 16],
+                    0u32.to_be_bytes().as_slice(),
+                ]
+                .concat();
+                assert!(
+                    lock.windows(expected.len()).any(|wire| wire == expected),
+                    "first reclaim LOCK did not carry open_seqid=1 and lock_seqid=0"
+                );
+                // DELAY consumed both owner seqids.
+                reply(
+                    &mut stream,
+                    &lock,
+                    &failed_lock_result("reclaim-lock", 12, 10008),
+                )
+                .await?;
+            } else {
+                // The successful OPEN is not replayed; the retry uses the seqids
+                // the DELAYed LOCK consumed.
+                let lock = read_record(&mut stream).await?;
+                let expected = [
+                    2u32.to_be_bytes().as_slice(),
+                    &[0x62; 16],
+                    1u32.to_be_bytes().as_slice(),
+                ]
+                .concat();
+                assert!(
+                    lock.windows(expected.len()).any(|wire| wire == expected),
+                    "lock retry replayed a consumed open/lock seqid"
+                );
+                reply(
+                    &mut stream,
+                    &lock,
+                    &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x63; 16])]),
+                )
+                .await?;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x59; 8],
+            owner: "scripted-busy-lock-retry".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let error = context.recover_or_lose().await.unwrap_err();
+    assert!(
+        matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_DELAY)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        mount
+            .state
+            .by_owner(88)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .next_seqid,
+        2
+    );
+    assert_eq!(mount.lease.lock_reclaim_seqid(88), 1);
+    assert_eq!(mount.lease.open_reclaim_seqid(88), 1);
+    // Reconnecting during the busy backoff and a successful RENEW must not
+    // resume service or cancel the pending reclaim.
+    mount.lease.mark_reconnecting();
+    mount.lease.mark_renewed();
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::Reclaiming
+    );
+    let retried = tokio::time::timeout(Duration::from_secs(12), async {
+        while mount.health().lifecycle != crate::MountLifecycleState::Ready {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        retried.is_ok(),
+        "DELAY backoff never retried recovery; mount stayed {:?}",
+        mount.health().lifecycle
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn reclaim_lock_putfh_failure_does_not_consume_either_cursor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 70, b"fh").await;
+    register_scripted_lock(&mount, 70, [0x60; 16]).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x79; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let open = read_record(&mut stream).await?;
+        reply(&mut stream, &open, &open_result(0, [0x64; 16], b"fh")).await?;
+        let lock = read_record(&mut stream).await?;
+        let expected = [
+            1u32.to_be_bytes().as_slice(),
+            &[0x64; 16],
+            0u32.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        assert!(
+            lock.windows(expected.len()).any(|wire| wire == expected),
+            "reclaim LOCK must carry open_seqid=1 and lock_seqid=0"
+        );
+        // DELAY is retryable, but the PUTFH failure means LOCK never ran and
+        // neither owner seqid was consumed.
+        reply(
+            &mut stream,
+            &lock,
+            &putfh_failure_result("reclaim-lock", 10008),
+        )
+        .await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x58; 8],
+            owner: "scripted-putfh-failed-lock".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let error = context.recover_or_lose().await.unwrap_err();
+    assert!(
+        matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_DELAY)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(mount.lease.lock_reclaim_seqid(70), 0);
+    assert_eq!(
+        mount
+            .state
+            .by_owner(70)
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .next_seqid,
+        1,
+        "the successful reclaim OPEN consumed 0, but the LOCK never ran"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn stale_clientid_during_reclaim_is_not_treated_as_lane_loss() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 90, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x79; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let open = read_record(&mut stream).await?;
+        // The server restarted again: the client id used for the reclaim is
+        // stale, which invalidates every lane rather than just this one.
+        reply(
+            &mut stream,
+            &open,
+            &failed_lock_result("reclaim-open", 18, 10022),
+        )
+        .await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x59; 8],
+            owner: "scripted-stale-clientid".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    assert!(context.recover_or_lose().await.is_err());
+    // The lane must not be silently discarded while the mount is promoted to
+    // Ready; a session-wide failure is terminal for this recovery.
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState
+    );
+    assert!(mount.state.snapshot().await.is_empty());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn recovery_success_after_lost_state_is_not_published() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 91, b"fh").await;
+    let (reclaim_tx, mut reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x79; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let open = read_record(&mut stream).await?;
+        reclaim_tx.send(()).ok();
+        // Hold the successful reclaim until the renewal deadline has crossed.
+        let _ = reply_rx.await;
+        reply(&mut stream, &open, &open_result(0, [0x62; 16], b"fh")).await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x59; 8],
+            owner: "scripted-lost-state".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let recovery = tokio::spawn(async move { context.recover_or_lose().await });
+    reclaim_rx.recv().await.unwrap();
+    // RENEW crossed the lease deadline while the reclaim was in flight.
+    mount.lease.mark_lost().await;
+    reply_tx.send(()).unwrap();
+    assert!(recovery.await.unwrap().is_err());
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState,
+        "a late successful reclaim must not revive a lost mount"
+    );
+    assert!(
+        mount.state.snapshot().await.is_empty(),
+        "a late successful reclaim must not leave usable lanes behind"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn queued_recovery_does_not_start_after_the_mount_lost_its_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 92, b"fh").await;
+    let (reclaim_tx, mut reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, reply_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&19u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7a; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let open = read_record(&mut stream).await?;
+        reclaim_tx.send(()).ok();
+        let _ = reply_rx.await;
+        reply(&mut stream, &open, &open_result(0, [0x63; 16], b"fh")).await
+    });
+    let first_context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5a; 8],
+            owner: "scripted-queued-recovery".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let second_context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5a; 8],
+            owner: "scripted-queued-recovery".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let first = tokio::spawn(async move { first_context.recover_or_lose().await });
+    reclaim_rx.recv().await.unwrap();
+    // This attempt passes the early LostState check while the first recovery
+    // still holds the guard, so it must re-check once it acquires the guard.
+    let second = tokio::spawn(async move { second_context.recover_or_lose().await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    mount.lease.mark_lost().await;
+    reply_tx.send(()).unwrap();
+    assert!(first.await.unwrap().is_err());
+    let error = second.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, NfsError::LostOpenState(_)),
+        "a queued recovery must not run after the mount lost its state: {error:?}"
+    );
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState
+    );
     server.await.unwrap().unwrap();
 }
 

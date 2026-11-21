@@ -10,9 +10,10 @@ use futures::stream;
 use futures::stream::StreamExt as _;
 
 use super::compound::{
-    CallbackAddress, CompoundBuilder, DelegationGrant, NewLockArgs, OpenArgs, OpenReclaimArgs,
-    SetClientIdArgs, decode_confirm_response, decode_lock_response, decode_open_response,
-    decode_setclientid_response, decode_stateid_response,
+    CallbackAddress, CompoundBuilder, DelegationGrant, LockOpOutcome, NewLockArgs, OpenArgs,
+    OpenOpOutcome, OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome, decode_confirm_response,
+    decode_lock_op_outcome, decode_open_op_outcome, decode_setclientid_response,
+    decode_stateid_op_outcome,
 };
 use super::lease::LeaseState;
 use super::mount::{ClientIdentity, METADATA_TIMEOUT, return_delegation};
@@ -87,20 +88,34 @@ pub(super) struct FreshOpenAttempt {
     pub(super) result: Result<FreshOpen>,
     /// Open-owner seqid carried by the last OPEN that was actually sent.
     pub(super) sent_seqid: u32,
+    /// Next unconsumed open-owner seqid after that attempt.
+    pub(super) next_seqid: u32,
+}
+
+impl FreshOpenAttempt {
+    /// Records any seqid the last request consumed without replaying the
+    /// untouched value when the attempt did not consume anything.
+    pub(super) fn record_consumption(&self, open: &mut OwnerLane) {
+        if self.next_seqid != self.sent_seqid {
+            open.next_seqid = self.next_seqid;
+        }
+    }
 }
 
 /// Issue a normal `CLAIM_NULL` OPEN for a lane, without resolving a path again.
 ///
 /// RFC 7530 §9.6.3.4.5 allows a client whose reclaim was rejected by the FSAL
 /// to re-establish state with a normal OPEN. The directory handle and name are
-/// the ones retained on the lane at open time.
+/// the ones retained on the lane at open time. The returned attempt reports the
+/// next unconsumed seqid so a PUTFH failure (which never ran the OPEN) does not
+/// advance the cursor.
 async fn fresh_open_lane(
     rpc: &rpc::Client,
     auth: &Auth,
     spec: &FreshOpenSpec<'_>,
     seqid: u32,
     operation: &str,
-) -> Result<FreshOpen> {
+) -> FreshOpenAttempt {
     let request = CompoundBuilder::new(operation)
         .putfh(spec.dir_fh)
         .open(OpenArgs {
@@ -113,29 +128,97 @@ async fn fresh_open_lane(
         })
         .getfh()
         .encode_with_header(auth);
-    let response = rpc
+    let response = match rpc
         .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-        .await?;
-    let (opened, fh) = decode_open_response(response)?;
-    let mut next_seqid = seqid.wrapping_add(1);
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                sent_seqid: seqid,
+                next_seqid: seqid,
+            };
+        }
+    };
+    let outcome = match decode_open_op_outcome(response) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                sent_seqid: seqid,
+                next_seqid: seqid,
+            };
+        }
+    };
+    let mut next_seqid = if open_op_consumes_seqid(&outcome) {
+        seqid.wrapping_add(1)
+    } else {
+        seqid
+    };
+    let (opened, fh) = match outcome.into_result() {
+        Ok(value) => value,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                sent_seqid: seqid,
+                next_seqid,
+            };
+        }
+    };
     let mut stateid = opened.stateid;
     if opened.confirm_required {
         let request = CompoundBuilder::new("open_confirm")
             .putfh(&fh)
             .open_confirm(&stateid, next_seqid)
             .encode_with_header(auth);
-        let response = rpc
+        let response = match rpc
             .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-            .await?;
-        stateid = decode_stateid_response(response, 20, "OPEN_CONFIRM")?;
-        next_seqid = next_seqid.wrapping_add(1);
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    sent_seqid: seqid,
+                    next_seqid,
+                };
+            }
+        };
+        let confirm = match decode_stateid_op_outcome(response, 20, "OPEN_CONFIRM") {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    sent_seqid: seqid,
+                    next_seqid,
+                };
+            }
+        };
+        if stateid_op_consumes_seqid(&confirm) {
+            next_seqid = next_seqid.wrapping_add(1);
+        }
+        match confirm.into_result() {
+            Ok(confirmed) => stateid = confirmed,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    sent_seqid: seqid,
+                    next_seqid,
+                };
+            }
+        }
     }
-    Ok(FreshOpen {
-        stateid,
+    FreshOpenAttempt {
+        result: Ok(FreshOpen {
+            stateid,
+            next_seqid,
+            fh,
+            delegation: opened.delegation,
+        }),
+        sent_seqid: seqid,
         next_seqid,
-        fh,
-        delegation: opened.delegation,
-    })
+    }
 }
 
 /// Fresh OPEN bounded to two attempts: a released open-owner restarts at
@@ -147,19 +230,14 @@ pub(super) async fn fresh_open_lane_with_seqid(
     next_seqid: u32,
     operation: &str,
 ) -> FreshOpenAttempt {
-    match fresh_open_lane(rpc, auth, spec, 0, operation).await {
+    let attempt = fresh_open_lane(rpc, auth, spec, 0, operation).await;
+    match &attempt.result {
         Err(NfsError::Nfs4(
             crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
             | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
             | crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID,
-        )) if next_seqid != 0 => FreshOpenAttempt {
-            result: fresh_open_lane(rpc, auth, spec, next_seqid, operation).await,
-            sent_seqid: next_seqid,
-        },
-        result => FreshOpenAttempt {
-            result,
-            sent_seqid: 0,
-        },
+        )) if next_seqid != 0 => fresh_open_lane(rpc, auth, spec, next_seqid, operation).await,
+        _ => attempt,
     }
 }
 
@@ -396,13 +474,19 @@ impl RecoveryContext {
         }
         let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
         let owner_wire = open_owner_wire(self.issuer, open.owner);
+        // The first reclaim of a session starts at seqid 0, but a busy reply
+        // still consumes that seqid (§9.1.7). Keep the cursor in LeaseState so
+        // the retry in the same session sends the next unconsumed value instead
+        // of replaying a request whose cached DELAY/GRACE the server returns
+        // forever.
+        let reclaim_seqid = self.lease.open_reclaim_seqid(open.owner);
         let reclaim = self
             .rpc
             .call(
                 CompoundBuilder::new("reclaim-open")
                     .putfh(&open.fh)
                     .open_reclaim(OpenReclaimArgs {
-                        seqid: 0,
+                        seqid: reclaim_seqid,
                         share_access: open.access,
                         client_id,
                         owner: owner_wire.as_bytes(),
@@ -412,8 +496,21 @@ impl RecoveryContext {
                 ReplayPolicy::ONE_ATTEMPT,
                 METADATA_TIMEOUT,
             )
-            .await
-            .and_then(decode_open_response);
+            .await;
+        let (reclaim, consumed) = match reclaim {
+            Ok(response) => match decode_open_op_outcome(response) {
+                Ok(outcome) => {
+                    let consumed = open_op_consumes_seqid(&outcome);
+                    (outcome.into_result(), consumed)
+                }
+                Err(error) => (Err(error), false),
+            },
+            Err(error) => (Err(error), false),
+        };
+        if consumed {
+            self.lease
+                .set_open_reclaim_seqid(open.owner, reclaim_seqid.wrapping_add(1));
+        }
         match reclaim {
             // An incompatible success leaves the lane with state it cannot use,
             // so only a compatible result is kept as-is.
@@ -432,9 +529,10 @@ impl RecoveryContext {
                     );
                 }
                 open.stateid = reclaimed.stateid;
-                open.next_seqid = 1;
+                open.next_seqid = reclaim_seqid.wrapping_add(1);
             }
             Ok(_) => {
+                open.next_seqid = reclaim_seqid.wrapping_add(1);
                 self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
                     .await?;
             }
@@ -442,8 +540,14 @@ impl RecoveryContext {
             // justifies a normal OPEN. Busy statuses mean the request was not
             // executed and must keep their retryable semantics; Io/Rpc/Xdr mean
             // the transmission outcome is unknown, so the pass keeps its
-            // Uncertain handling instead of guessing a rejection.
-            Err(NfsError::Nfs4(status)) if !is_busy_status(status) => {
+            // Uncertain handling instead of guessing a rejection. A client-id
+            // failure is not a per-lane rejection and must abort the session.
+            Err(NfsError::Nfs4(status))
+                if !is_busy_status(status) && !is_session_wide_status(status) =>
+            {
+                if consumed {
+                    open.next_seqid = reclaim_seqid.wrapping_add(1);
+                }
                 self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
                     .await?;
             }
@@ -477,16 +581,13 @@ impl RecoveryContext {
             "reclaim-fallback-open",
         )
         .await;
+        // RFC 7530 §9.1.7: record only what the last OPEN actually consumed; a
+        // PUTFH failure leaves the cursor untouched. Doing this before matching
+        // the result keeps the failure path from replaying a consumed seqid.
+        attempt.record_consumption(open);
         let fresh = match attempt.result {
             Ok(fresh) => fresh,
             Err(error) => {
-                // RFC 7530 §9.1.7: a failed OPEN consumes its open-owner seqid
-                // unless the status is in the exception table. Record it so the
-                // retry after a busy recovery (GRACE/DELAY) does not replay a
-                // consumed seqid and get stuck on NFS4ERR_BAD_SEQID.
-                if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
-                    open.next_seqid = attempt.sent_seqid.wrapping_add(1);
-                }
                 return Err(error);
             }
         };
@@ -527,10 +628,9 @@ impl RecoveryContext {
     /// re-keyed by the caller.
     ///
     /// `None` means the lane was already reclaimed by an earlier attempt of the
-    /// same session (a pass retried after GRACE/DELAY). A lane that returned a
-    /// busy status replays the same open/lock seqids on that retry; a server
-    /// that consumes the seqid for GRACE answers NFS4ERR_BAD_SEQID and the lane
-    /// is then dropped as an authoritative loss.
+    /// same session (a pass retried after GRACE/DELAY). A retry sends the next
+    /// unconsumed open/lock seqids: GRACE and DELAY are outside the §9.1.7
+    /// exception table, so the failed request already advanced both owners.
     async fn reclaim_lock_lane(
         &self,
         lane: &Arc<tokio::sync::Mutex<LockLane>>,
@@ -551,6 +651,10 @@ impl RecoveryContext {
         let mut open = open_lane.lock().await;
         let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
         let mut lock = lane.lock().await;
+        let open_seqid = open.next_seqid;
+        // A reclaim lock owner starts at seqid 0; a consuming busy reply
+        // advances the cursor for the retry in the same session.
+        let lock_seqid = self.lease.lock_reclaim_seqid(lock_owner);
         let response = self
             .rpc
             .call(
@@ -561,9 +665,9 @@ impl RecoveryContext {
                         reclaim: true,
                         offset: lock.offset,
                         length: lock.length,
-                        open_seqid: open.next_seqid,
+                        open_seqid,
                         open_stateid: &open.stateid,
-                        lock_seqid: 0,
+                        lock_seqid,
                         client_id,
                         owner: &lock.owner_wire,
                     })
@@ -571,11 +675,35 @@ impl RecoveryContext {
                 ReplayPolicy::ONE_ATTEMPT,
                 METADATA_TIMEOUT,
             )
-            .await?;
-        let new_stateid = decode_lock_response(response, 12, "LOCK")?;
-        open.next_seqid = open.next_seqid.wrapping_add(1);
+            .await;
+        let (decoded, consumed) = match response {
+            Ok(response) => match decode_lock_op_outcome(response, 12, "LOCK") {
+                Ok(outcome) => {
+                    let consumed = lock_op_consumes_seqid(&outcome);
+                    (outcome.into_result(), consumed)
+                }
+                Err(error) => (Err(error), false),
+            },
+            Err(error) => (Err(error), false),
+        };
+        // A processed LOCK consumes both owner seqids; only the §9.1.7
+        // exception statuses leave them untouched. A PUTFH failure never ran
+        // the LOCK, so it must not advance either cursor.
+        if consumed {
+            open.next_seqid = open_seqid.wrapping_add(1);
+        }
+        let new_stateid = match decoded {
+            Ok(stateid) => stateid,
+            Err(error) => {
+                if consumed {
+                    self.lease
+                        .set_lock_reclaim_seqid(lock_owner, lock_seqid.wrapping_add(1));
+                }
+                return Err(error);
+            }
+        };
         lock.stateid = new_stateid;
-        lock.next_seqid = 1;
+        lock.next_seqid = lock_seqid.wrapping_add(1);
         drop(lock);
         self.lease.mark_lock_reclaimed(lock_owner);
         Ok(Some((old_stateid, new_stateid)))
@@ -600,6 +728,19 @@ impl RecoveryContext {
         // One recovery at a time: SETCLIENTID must not be issued twice for the
         // same client identity, and the reclaim pass reads the whole state map.
         let _recovery = self.lease.recovery_guard().await;
+        // The lifecycle may have become terminal while this recovery was
+        // waiting for its turn (e.g. the previous holder lost state). Re-check
+        // so a queued attempt cannot reclaim into a mount that is already lost.
+        if matches!(
+            self.lease.health().lifecycle,
+            MountLifecycleState::LostState
+                | MountLifecycleState::Closing
+                | MountLifecycleState::Closed
+        ) {
+            return Err(NfsError::LostOpenState(
+                "NFSv4.0 recovery skipped: mount became terminal while waiting".into(),
+            ));
+        }
         if let Some(status) = self.lease.active_recovery_backoff() {
             return Err(NfsError::Nfs4(status));
         }
@@ -627,21 +768,29 @@ impl RecoveryContext {
     async fn attempt_recovery(&self) -> Result<()> {
         match self.recover().await {
             Ok(()) => {
-                // A finishing recovery must not revive a mount that started
-                // unmounting while the reclaim pass was in flight.
-                if matches!(
-                    self.lease.health().lifecycle,
-                    MountLifecycleState::Closing | MountLifecycleState::Closed
-                ) {
-                    return Err(NfsError::LostOpenState(
-                        "NFSv4.0 recovery finished after unmount started".into(),
-                    ));
-                }
                 self.lease.clear_recovery_backoff();
                 // Every lane is usable again, so the next recovery session must
                 // reclaim them from scratch.
                 self.lease.clear_reclaimed();
-                self.lease.mark_recovered();
+                // A finishing recovery must not revive a mount that started
+                // unmounting or crossed the lease deadline while the reclaim
+                // pass was in flight. Take the publication lock so a concurrent
+                // RENEW timeout (`mark_lost`) cannot interleave with this
+                // transition, then re-validate the lifecycle.
+                let publication = self.lease.publication_guard().await;
+                if !self.lease.mark_recovered() {
+                    drop(publication);
+                    // The reclaim pass may have repopulated the map after the
+                    // state was declared lost. A terminal mount must not keep
+                    // reclaimable lanes that later operations could mistake for
+                    // live state.
+                    self.state.clear().await;
+                    self.locks.clear().await;
+                    return Err(NfsError::LostOpenState(
+                        "NFSv4.0 recovery finished after the mount lost its state or started unmounting"
+                            .into(),
+                    ));
+                }
                 Ok(())
             }
             Err(error) if error.is_server_busy() => {
@@ -755,11 +904,45 @@ pub(super) fn status_consumes_seqid(status: crate::Nfs4ErrorCode) -> bool {
     ) || status as u32 == NFS4ERR_RESOURCE)
 }
 
+#[cfg(test)]
 pub(super) fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
     match result {
         Ok(_) | Err(NfsError::LockDenied { .. }) => true,
         Err(NfsError::Nfs4(status)) => status_consumes_seqid(*status),
         Err(_) => false,
+    }
+}
+
+/// RFC 7530 §9.1.7 consumption of a two-operation `PUTFH + stateid op` reply.
+pub(super) fn stateid_op_consumes_seqid(outcome: &StateidOpOutcome<[u8; 16]>) -> bool {
+    match outcome {
+        StateidOpOutcome::Completed(_) | StateidOpOutcome::Executed(_) => true,
+        StateidOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        StateidOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+pub(super) fn open_op_consumes_seqid(outcome: &OpenOpOutcome) -> bool {
+    match outcome {
+        OpenOpOutcome::Completed(_, _) | OpenOpOutcome::Executed(_) => true,
+        OpenOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        OpenOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+pub(super) fn lock_op_consumes_seqid(outcome: &LockOpOutcome) -> bool {
+    match outcome {
+        LockOpOutcome::Granted(_) | LockOpOutcome::Executed(_) | LockOpOutcome::Denied(_) => true,
+        LockOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        LockOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn error_consumes_seqid(error: &NfsError) -> bool {
+    match error {
+        NfsError::Nfs4(status) => status_consumes_seqid(*status),
+        NfsError::LockDenied { .. } => true,
+        _ => false,
     }
 }
 
@@ -804,7 +987,10 @@ pub(super) fn recovery_failure(
     trigger: StateidRecovery,
     source: NfsError,
 ) -> NfsError {
-    if is_authoritative_lane_loss(&source) || matches!(source, NfsError::ClosedResource(_)) {
+    if is_authoritative_lane_loss(&source)
+        || is_session_wide_failure(&source)
+        || matches!(source, NfsError::ClosedResource(_))
+    {
         return source;
     }
     state_recovery_exhausted(operation, trigger, source)
@@ -851,7 +1037,26 @@ fn is_busy_status(status: crate::Nfs4ErrorCode) -> bool {
 /// failures leave the transmission outcome unknown; they abort the pass
 /// instead of discarding state on a guess.
 pub(super) fn is_authoritative_lane_loss(error: &NfsError) -> bool {
-    matches!(error, NfsError::Nfs4(_) | NfsError::LostOpenState(_))
+    match error {
+        // Client-id and lease statuses invalidate the whole client identity,
+        // not just this lane. Dropping the lane would silently discard state
+        // that a session-level recovery can still reclaim.
+        NfsError::Nfs4(status) => !is_session_wide_status(*status),
+        NfsError::LostOpenState(_) => true,
+        _ => false,
+    }
+}
+
+/// Statuses that invalidate the whole client identity for every lane.
+fn is_session_wide_status(status: crate::Nfs4ErrorCode) -> bool {
+    matches!(
+        status,
+        crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID | crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+    )
+}
+
+fn is_session_wide_failure(error: &NfsError) -> bool {
+    matches!(error, NfsError::Nfs4(status) if is_session_wide_status(*status))
 }
 
 /// Innermost NFSv4 status, unwrapping busy and uncertain-outcome wrappers.
