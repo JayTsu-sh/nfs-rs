@@ -14,15 +14,15 @@ use std::time::Duration;
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
     CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
-    OpenReclaimArgs, SetClientIdArgs, create_succeeded_before_compound_failure,
+    OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome, create_succeeded_before_compound_failure,
     decode_access_response, decode_commit_response, decode_confirm_response,
     decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
     decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
     decode_release_lockowner_response, decode_remove_response, decode_rename_response,
-    decode_setattr_response, decode_setclientid_response, decode_stateid_response,
-    decode_write_response, open_succeeded_before_compound_failure,
+    decode_setattr_response, decode_setclientid_response, decode_stateid_op_outcome,
+    decode_stateid_response, decode_write_response, open_succeeded_before_compound_failure,
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
@@ -984,11 +984,25 @@ impl Mount40 {
                 lane.next_seqid,
                 OperationClass::ReplaySensitive,
             );
-            let mut result = rpc
+            // Only a CLOSE that actually ran consumes the open-owner seqid.
+            // A COMPOUND failure at PUTFH also reports a non-zero overall
+            // status, so inspect the per-operation results before advancing.
+            let outcome = rpc
                 .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                 .await
-                .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                .and_then(|response| decode_stateid_op_outcome(response, 4, "CLOSE"));
+            let (result, mut close_executed, mut close_consumed) = match outcome {
+                Ok(StateidOpOutcome::Completed(stateid)) => (Ok(stateid), true, true),
+                Ok(StateidOpOutcome::Executed(error)) => (Err(error), true, true),
+                Ok(StateidOpOutcome::Rejected(error)) => {
+                    let consumed =
+                        matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status));
+                    (Err(error), true, consumed)
+                }
+                Ok(StateidOpOutcome::NotExecuted(error)) => (Err(error), false, false),
+                Err(error) => (Err(error), false, false),
+            };
+            let mut result = result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             // RFC 7530 §9.1.4.4: OLD_STATEID means the server holds this open
             // state with a newer stateid seqid. The gap is not disclosed, so a
             // client-side +1 cannot converge when it is larger than one, and
@@ -1021,17 +1035,43 @@ impl Mount40 {
                         lane.next_seqid,
                         OperationClass::ReplaySensitive,
                     );
-                    result = rpc
+                    let outcome = rpc
                         .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                         .await
-                        .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                        .and_then(|response| decode_stateid_op_outcome(response, 4, "CLOSE"));
+                    let (probe_result, probe_executed, probe_consumed) = match outcome {
+                        Ok(StateidOpOutcome::Completed(stateid)) => (Ok(stateid), true, true),
+                        Ok(StateidOpOutcome::Executed(error)) => (Err(error), true, true),
+                        Ok(StateidOpOutcome::Rejected(error)) => {
+                            let consumed = matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status));
+                            (Err(error), true, consumed)
+                        }
+                        Ok(StateidOpOutcome::NotExecuted(error)) => (Err(error), false, false),
+                        Err(error) => (Err(error), false, false),
+                    };
+                    result =
+                        probe_result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                    // Consumption is monotonic: if the first CLOSE already ran,
+                    // a probe that never executed must not erase that fact.
+                    close_executed |= probe_executed;
+                    close_consumed |= probe_consumed;
                 }
             }
+            // The client's stateid only ever comes from a server reply and is
+            // never advanced beyond the server, so a two-step gap cannot arise:
+            // if both the original CLOSE and the seqid-1 probe report
+            // BAD_STATEID, the server has no state for this open. The remaining
+            // server-side state, if any, expires with the lease.
             match result {
                 Ok(stateid) => {
                     lane.stateid = stateid;
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
+                }
+                Err(error) if !close_executed => {
+                    // CLOSE never ran (e.g. PUTFH failed), so the server did not
+                    // consume the open-owner seqid. Keep it for a normal retry.
+                    lane.closing = false;
+                    return Err(error);
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
                     // The server still holds this open state with a newer stateid
@@ -1065,7 +1105,7 @@ impl Mount40 {
                     // consumed the open-owner seqid, whether or not this was
                     // the OLD_STATEID retry. Advance it so the next CLOSE does
                     // not replay a consumed seqid and get stuck on BAD_SEQID.
-                    if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
+                    if close_consumed {
                         lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     }
                     // Do not leave the lane permanently wedged: a failed CLOSE
@@ -2651,8 +2691,12 @@ mod tests {
     }
 
     fn compound_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+        compound_result_with_status(0, tag, ops)
+    }
+
+    fn compound_result_with_status(overall: u32, tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
         let mut result = Vec::new();
-        result.extend_from_slice(&0u32.to_be_bytes());
+        result.extend_from_slice(&overall.to_be_bytes());
         xdr_opaque(&mut result, tag.as_bytes());
         result.extend_from_slice(&(ops.len() as u32).to_be_bytes());
         for (opcode, data) in ops {
@@ -2696,6 +2740,18 @@ mod tests {
 
     fn close_result(stateid: [u8; 16]) -> Vec<u8> {
         compound_result("close", &[(22, &[]), (4, &stateid)])
+    }
+
+    /// A COMPOUND that failed at PUTFH: only the PUTFH result is present, and
+    /// the target CLOSE never ran.
+    fn putfh_failure_result(tag: &str, status: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&status.to_be_bytes());
+        xdr_opaque(&mut result, tag.as_bytes());
+        result.extend_from_slice(&1u32.to_be_bytes());
+        result.extend_from_slice(&22u32.to_be_bytes());
+        result.extend_from_slice(&status.to_be_bytes());
+        result
     }
 
     async fn register_stateid_lane(
@@ -2774,6 +2830,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_probe_putfh_failure_keeps_the_first_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 219, [0xcc; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // The overall status reports BAD_STATEID, but PUTFH and CLOSE both
+            // succeeded: the CLOSE ran and consumed its seqid.
+            reply(
+                &mut stream,
+                &close,
+                &compound_result_with_status(10025, "close", &[(22, &[]), (4, &[0xcc; 16])]),
+            )
+            .await?;
+            let probe = read_record(&mut stream).await?;
+            // The probe never reached CLOSE, so it must not erase the fact
+            // that the first request already consumed the seqid.
+            reply(
+                &mut stream,
+                &probe,
+                &putfh_failure_result("close-probe", 10006),
+            )
+            .await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            2,
+            "an unexecuted probe must not discard the first CLOSE's consumption"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn close_with_stale_stateid_is_treated_as_released() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
@@ -2821,6 +2912,87 @@ mod tests {
         mount.close(Bytes::from_static(b"fh")).await.unwrap();
         assert!(mount.state.by_owner(216).await.is_none());
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_putfh_failure_does_not_consume_the_owner_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 219, [0xcc; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // PUTFH fails with SERVERFAULT: CLOSE is never executed, so the
+            // server does not consume the open-owner seqid.
+            reply(&mut stream, &close, &putfh_failure_result("close", 10006)).await?;
+            let retry = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0xcc; 16]].concat();
+            assert!(
+                retry.windows(expected.len()).any(|wire| wire == expected),
+                "CLOSE retry must reuse the seqid that PUTFH never consumed"
+            );
+            reply(&mut stream, &retry, &close_result([0xcd; 16])).await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 1);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        assert!(mount.state.by_owner(219).await.is_none());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_seqid_consumption_follows_the_rfc7530_exception_table() {
+        // The COMPOUND overall status cannot distinguish "PUTFH failed" from
+        // "CLOSE ran and was rejected", yet only the latter consumes the
+        // open-owner seqid. Assert the cursor and the next request frame for
+        // both stages and both sides of the §9.1.7 exception table.
+        // (label, failure stage, status, expected next unconsumed seqid)
+        let cases = [
+            ("CLOSE SERVERFAULT", false, 10006u32, 2u32),
+            ("CLOSE BAD_SEQID", false, 10026, 1),
+            ("CLOSE MOVED", false, 10019, 1),
+            ("PUTFH SERVERFAULT", true, 10006, 1),
+            ("PUTFH BAD_SEQID", true, 10026, 1),
+        ];
+        for (index, (label, at_putfh, status, expected)) in cases.into_iter().enumerate() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mount = connected_direct_mount(&listener).await;
+            let owner = 230 + index as u64;
+            let stateid = [0xd0 + index as u8; 16];
+            let lane = register_stateid_lane(&mount, owner, stateid, crate::OPEN_BOTH).await;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let close = read_record(&mut stream).await?;
+                let first = [1u32.to_be_bytes().as_slice(), &stateid].concat();
+                assert!(
+                    close.windows(first.len()).any(|wire| wire == first),
+                    "{label}: first CLOSE must send seqid 1 and the lane stateid"
+                );
+                let response = if at_putfh {
+                    putfh_failure_result("close", status)
+                } else {
+                    failed_lock_result("close", 4, status)
+                };
+                reply(&mut stream, &close, &response).await?;
+                let retry = read_record(&mut stream).await?;
+                let expected_frame = [expected.to_be_bytes().as_slice(), &stateid].concat();
+                assert!(
+                    retry
+                        .windows(expected_frame.len())
+                        .any(|wire| wire == expected_frame),
+                    "{label}: retry must send seqid {expected} and the lane stateid"
+                );
+                reply(&mut stream, &retry, &close_result([0xe0 + index as u8; 16])).await
+            });
+            assert!(
+                mount.close(Bytes::from_static(b"fh")).await.is_err(),
+                "{label}"
+            );
+            assert_eq!(lane.lock().await.next_seqid, expected, "{label}");
+            mount.close(Bytes::from_static(b"fh")).await.unwrap();
+            assert!(mount.state.by_owner(owner).await.is_none(), "{label}");
+            server.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
