@@ -13,16 +13,17 @@ use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
-    OpenReclaimArgs, SetClientIdArgs, create_succeeded_before_compound_failure,
-    decode_access_response, decode_commit_response, decode_confirm_response,
-    decode_create_response, decode_delegreturn_response,
-    decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
-    decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
+    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, LockOpOutcome, NewLockArgs,
+    OpenArgs, OpenOpOutcome, OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome,
+    create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
+    decode_confirm_response, decode_create_response, decode_delegreturn_response,
+    decode_getattr_response as decode_getattr_compound, decode_link_response,
+    decode_lock_op_outcome, decode_lock_response, decode_lockt_response,
+    decode_lookup_getattr_response, decode_open_op_outcome, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
     decode_release_lockowner_response, decode_remove_response, decode_rename_response,
-    decode_setattr_response, decode_setclientid_response, decode_stateid_response,
-    decode_write_response, open_succeeded_before_compound_failure,
+    decode_setattr_response, decode_setclientid_response, decode_stateid_op_outcome,
+    decode_stateid_response, decode_write_response, open_succeeded_before_compound_failure,
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
@@ -441,8 +442,21 @@ struct FreshOpen {
 
 struct FreshOpenAttempt {
     result: Result<FreshOpen>,
-    /// Open-owner seqid carried by the last OPEN that was actually sent.
-    seqid: u32,
+    /// Next unconsumed open-owner seqid after every OPEN/OPEN_CONFIRM stage
+    /// that was actually sent, whether it succeeded or failed.
+    next_seqid: u32,
+    /// Seqid carried by the OPEN request. When it equals `next_seqid`, no
+    /// stage consumed anything and callers must keep the lane's existing
+    /// cursor instead of regressing it.
+    sent_seqid: u32,
+}
+
+impl FreshOpenAttempt {
+    fn record_consumption(&self, lane: &mut OwnerLane) {
+        if self.next_seqid != self.sent_seqid {
+            lane.next_seqid = self.next_seqid;
+        }
+    }
 }
 
 /// Issue a normal `CLAIM_NULL` OPEN for a lane, without resolving a path again.
@@ -461,7 +475,7 @@ async fn fresh_open_lane(
     client_id: u64,
     seqid: u32,
     operation: &str,
-) -> Result<FreshOpen> {
+) -> FreshOpenAttempt {
     let request = CompoundBuilder::new(operation)
         .putfh(dir_fh)
         .open(OpenArgs {
@@ -474,29 +488,103 @@ async fn fresh_open_lane(
         })
         .getfh()
         .encode_with_header(auth);
-    let response = rpc
+    // A transmission failure does not prove that the server consumed the
+    // seqid, so keep the cursor unchanged.
+    let response = match rpc
         .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-        .await?;
-    let (opened, fh) = decode_open_response(response)?;
-    let mut next_seqid = seqid.wrapping_add(1);
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid: seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
+    let outcome = match decode_open_op_outcome(response) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid: seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
+    // Only an OPEN that actually ran consumed its seqid. A PUTFH failure
+    // reports a non-zero overall status too but must leave the cursor alone.
+    let mut next_seqid = if open_op_consumes_seqid(&outcome) {
+        seqid.wrapping_add(1)
+    } else {
+        seqid
+    };
+    let (opened, fh) = match outcome.into_result() {
+        Ok(value) => value,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
     let mut stateid = opened.stateid;
     if opened.confirm_required {
         let request = CompoundBuilder::new("open_confirm")
             .putfh(&fh)
             .open_confirm(&stateid, next_seqid)
             .encode_with_header(auth);
-        let response = rpc
+        let response = match rpc
             .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-            .await?;
-        stateid = decode_stateid_response(response, 20, "OPEN_CONFIRM")?;
-        next_seqid = next_seqid.wrapping_add(1);
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // OPEN_CONFIRM may have reached the server, but only the
+                // already-consumed OPEN seqid is certain.
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        };
+        let confirm = match decode_stateid_op_outcome(response, 20, "OPEN_CONFIRM") {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        };
+        if stateid_op_consumes_seqid(&confirm) {
+            next_seqid = next_seqid.wrapping_add(1);
+        }
+        match confirm.into_result() {
+            Ok(confirmed) => stateid = confirmed,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        }
     }
-    Ok(FreshOpen {
-        stateid,
+    FreshOpenAttempt {
+        result: Ok(FreshOpen {
+            stateid,
+            next_seqid,
+            fh,
+            delegation: opened.delegation,
+        }),
         next_seqid,
-        fh,
-        delegation: opened.delegation,
-    })
+        sent_seqid: seqid,
+    }
 }
 
 /// Fresh OPEN bounded to two attempts: a released open-owner restarts at
@@ -513,25 +601,24 @@ async fn fresh_open_lane_with_seqid(
     next_seqid: u32,
     operation: &str,
 ) -> FreshOpenAttempt {
-    match fresh_open_lane(
+    let attempt = fresh_open_lane(
         rpc, auth, dir_fh, name, owner_wire, access, client_id, 0, operation,
     )
-    .await
+    .await;
+    // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
+    // reply; BAD/OLD_STATEID here do not prove that, so only BAD_SEQID
+    // retries with the lane's next_seqid.
+    if matches!(
+        &attempt.result,
+        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID))
+    ) && next_seqid != 0
     {
-        // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
-        // reply; BAD/OLD_STATEID here do not prove that, so only BAD_SEQID
-        // retries with the lane's next_seqid.
-        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID)) if next_seqid != 0 => {
-            FreshOpenAttempt {
-                result: fresh_open_lane(
-                    rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
-                )
-                .await,
-                seqid: next_seqid,
-            }
-        }
-        result => FreshOpenAttempt { result, seqid: 0 },
+        return fresh_open_lane(
+            rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
+        )
+        .await;
     }
+    attempt
 }
 
 async fn return_delegation(
@@ -740,11 +827,60 @@ fn status_consumes_seqid(status: crate::Nfs4ErrorCode) -> bool {
     )
 }
 
-fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
-    match result {
-        Ok(_) | Err(NfsError::LockDenied { .. }) => true,
-        Err(NfsError::Nfs4(status)) => status_consumes_seqid(*status),
-        Err(_) => false,
+fn error_consumes_seqid(error: &NfsError) -> bool {
+    matches!(error, NfsError::Nfs4(status) if status_consumes_seqid(*status))
+}
+
+/// RFC 7530 §9.1.7 consumption of a two-operation `PUTFH + stateid op` reply.
+fn stateid_op_consumes_seqid(outcome: &StateidOpOutcome<[u8; 16]>) -> bool {
+    match outcome {
+        StateidOpOutcome::Completed(_) | StateidOpOutcome::Executed(_) => true,
+        StateidOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        StateidOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn open_op_consumes_seqid(outcome: &OpenOpOutcome) -> bool {
+    match outcome {
+        OpenOpOutcome::Completed(_, _) | OpenOpOutcome::Executed(_) => true,
+        OpenOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        OpenOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn lock_op_consumes_seqid(outcome: &LockOpOutcome) -> bool {
+    match outcome {
+        LockOpOutcome::Granted(_) | LockOpOutcome::Executed(_) | LockOpOutcome::Denied(_) => true,
+        LockOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        LockOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn decode_stateid_op_call(
+    response: Result<Bytes>,
+    opcode: u32,
+    name: &str,
+) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_stateid_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = stateid_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
+    }
+}
+
+fn decode_lock_op_call(
+    response: Result<Bytes>,
+    opcode: u32,
+    name: &str,
+) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = lock_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
     }
 }
 
@@ -849,11 +985,13 @@ impl Mount40 {
                     lock_seqid_for_task,
                     OperationClass::ReplaySensitive,
                 );
-                let decoded = rpc
-                    .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                    .await
-                    .and_then(|response| decode_lock_response(response, 12, "LOCK"));
-                if consumes_owner_seqid(&decoded) {
+                let (decoded, consumed) = decode_lock_op_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    12,
+                    "LOCK",
+                );
+                if consumed {
                     open.next_seqid = open.next_seqid.wrapping_add(1);
                 }
                 let stateid =
@@ -1175,11 +1313,13 @@ impl Mount40 {
                 lane.next_seqid,
                 OperationClass::ReplaySensitive,
             );
-            let mut result = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+            let (mut result, mut close_seqid_consumed) = decode_stateid_op_call(
+                rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await,
+                4,
+                "CLOSE",
+            );
+            result = result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
             // current stateid seqid, and the rejected CLOSE consumed the
             // open-owner seqid. A blind +1 retry cannot converge when the
@@ -1211,11 +1351,17 @@ impl Mount40 {
                         lane.next_seqid,
                         OperationClass::ReplaySensitive,
                     );
-                    result = rpc
-                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await
-                        .and_then(|response| decode_stateid_response(response, 4, "CLOSE"))
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                    let (probe_result, probe_consumed) = decode_stateid_op_call(
+                        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await,
+                        4,
+                        "CLOSE",
+                    );
+                    result =
+                        probe_result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                    // Consumption is monotonic: a probe that never executed
+                    // must not erase what the first CLOSE already consumed.
+                    close_seqid_consumed |= probe_consumed;
                 }
             }
             match result {
@@ -1253,7 +1399,9 @@ impl Mount40 {
                     // consumed the open-owner seqid, whether or not this was
                     // the OLD_STATEID retry. Advance it so the next CLOSE does
                     // not replay a consumed seqid and get stuck on BAD_SEQID.
-                    if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
+                    // A PUTFH failure also reaches this arm with a non-zero
+                    // status but never ran the CLOSE, so it must not advance.
+                    if close_seqid_consumed {
                         lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     }
                     // Do not leave the lane permanently wedged: a failed CLOSE
@@ -1287,6 +1435,45 @@ impl Mount40 {
         trigger: StateidRecovery,
         operation: &str,
     ) -> Result<()> {
+        // Run the whole refresh in its own task. Cancelling the initiating
+        // READ/WRITE after the recovery OPEN reached the server must not drop
+        // the future while the lane still holds the old stateid and an
+        // unpublished owner seqid: the task keeps the lane lock until it
+        // publishes both.
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let issuer = self.issuer;
+        let client_id = Arc::clone(&self.client_id);
+        let lane = Arc::clone(lane);
+        let operation = operation.to_string();
+        tokio::spawn(async move {
+            Self::refresh_lane_stateid_task(
+                rpc,
+                auth,
+                issuer,
+                client_id,
+                lane,
+                failed_stateid,
+                trigger,
+                &operation,
+            )
+            .await
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 stateid recovery task failed: {error}")))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refresh_lane_stateid_task(
+        rpc: rpc::Client,
+        auth: Auth,
+        issuer: u64,
+        client_id: Arc<AtomicU64>,
+        lane: Arc<tokio::sync::Mutex<OwnerLane>>,
+        failed_stateid: [u8; 16],
+        trigger: StateidRecovery,
+        operation: &str,
+    ) -> Result<()> {
         if trigger == StateidRecovery::Stale {
             // RFC 7530 §13.1.5.6: a stateid from an earlier server instance
             // means crash recovery (SETCLIENTID + reclaim of every open). That
@@ -1312,30 +1499,30 @@ impl Mount40 {
         // cannot converge when the server advanced by more than one. Fall
         // through to a fresh OPEN, which re-syncs the stateid authoritatively
         // regardless of the gap.
-        let client_id = self.client_id.load(Ordering::Acquire);
-        let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
+        let current_client_id = client_id.load(Ordering::Acquire);
+        let owner_wire = format!("nfs-rs-{issuer:016x}-{:016x}", open.owner);
         let attempt = fresh_open_lane_with_seqid(
-            &self.rpc,
-            &self.auth,
+            &rpc,
+            &auth,
             &open.dir_fh,
             &open.name,
             owner_wire.as_bytes(),
             open.access,
-            client_id,
+            current_client_id,
             open.next_seqid,
             operation,
         )
         .await;
+        // RFC 7530 §9.1.7: a definitive OPEN/OPEN_CONFIRM failure consumes its
+        // owner seqid unless the status is in the exception table. The helper
+        // reports the authoritative cursor for every stage that was actually
+        // sent, so record it even when OPEN_CONFIRM (not OPEN) was the failing
+        // stage. If no stage ran (PUTFH failed), keep the lane's existing
+        // cursor and do not regress it to the seqid-0 probe.
+        attempt.record_consumption(&mut open);
         let fresh = match attempt.result {
             Ok(fresh) => fresh,
             Err(error) => {
-                // RFC 7530 §9.1.7: a failed OPEN still consumes its open-owner
-                // seqid unless the status is in the exception table. Record the
-                // consumed value, otherwise a later attempt would replay the
-                // cached reply (e.g. NFS4ERR_GRACE) instead of re-opening.
-                if matches!(&error, NfsError::Nfs4(status) if status_consumes_seqid(*status)) {
-                    open.next_seqid = attempt.seqid.wrapping_add(1);
-                }
                 return Err(error);
             }
         };
@@ -1351,18 +1538,15 @@ impl Mount40 {
             let release = CompoundBuilder::new("close-fresh")
                 .putfh(&fresh.fh)
                 .close(fresh.next_seqid, &fresh.stateid)
-                .encode_with_header(&self.auth);
-            let _ = self
-                .rpc
+                .encode_with_header(&auth);
+            let _ = rpc
                 .call(release, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                 .await;
             return Err(NfsError::Xdr(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
         }
-        if let Err(error) =
-            return_delegation(&self.rpc, &self.auth, &fresh.fh, fresh.delegation).await
-        {
+        if let Err(error) = return_delegation(&rpc, &auth, &fresh.fh, fresh.delegation).await {
             tracing::debug!(
                 target: "nfs_rs::stateid",
                 ?error,
@@ -2610,11 +2794,13 @@ impl Mount for Mount40 {
                 .putfh(&fh)
                 .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
                 .encode_with_header(&auth);
-            let mut decoded = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-            if consumes_owner_seqid(&decoded) {
+            let (mut decoded, consumed) = decode_lock_op_call(
+                rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await,
+                14,
+                "LOCKU",
+            );
+            if consumed {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
             }
             // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
@@ -2648,11 +2834,14 @@ impl Mount for Mount40 {
                         lane.next_seqid,
                         OperationClass::ReplaySensitive,
                     );
-                    decoded = rpc
-                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await
-                        .and_then(|response| decode_lock_response(response, 14, "LOCKU"));
-                    if consumes_owner_seqid(&decoded) {
+                    let (retried, retry_consumed) = decode_lock_op_call(
+                        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await,
+                        14,
+                        "LOCKU",
+                    );
+                    decoded = retried;
+                    if retry_consumed {
                         lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     }
                 }
@@ -3158,8 +3347,12 @@ mod tests {
     }
 
     fn compound_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+        compound_result_with_status(0, tag, ops)
+    }
+
+    fn compound_result_with_status(overall: u32, tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
         let mut result = Vec::new();
-        result.extend_from_slice(&0u32.to_be_bytes());
+        result.extend_from_slice(&overall.to_be_bytes());
         xdr_opaque(&mut result, tag.as_bytes());
         result.extend_from_slice(&(ops.len() as u32).to_be_bytes());
         for (opcode, data) in ops {
@@ -3168,6 +3361,11 @@ mod tests {
             result.extend_from_slice(data);
         }
         result
+    }
+
+    /// A reply whose overall status contradicts a fully successful operation list.
+    fn contradictory_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+        compound_result_with_status(10006, tag, ops)
     }
 
     fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
@@ -3197,6 +3395,17 @@ mod tests {
         result.extend_from_slice(&22u32.to_be_bytes());
         result.extend_from_slice(&0u32.to_be_bytes());
         result.extend_from_slice(&opcode.to_be_bytes());
+        result.extend_from_slice(&status.to_be_bytes());
+        result
+    }
+
+    /// A COMPOUND that failed at PUTFH: the following operation never ran.
+    fn putfh_failure_result(tag: &str, status: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&status.to_be_bytes());
+        xdr_opaque(&mut result, tag.as_bytes());
+        result.extend_from_slice(&1u32.to_be_bytes());
+        result.extend_from_slice(&22u32.to_be_bytes());
         result.extend_from_slice(&status.to_be_bytes());
         result
     }
@@ -3678,6 +3887,581 @@ mod tests {
         let lane = lane.lock().await;
         assert_eq!(lane.next_seqid, 2);
         assert_eq!(lane.stateid, [0xcd; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_confirm_failure_records_every_consumed_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 221, [0xa5; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // seqid=0 probe: the open-owner record survived.
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            // Fallback OPEN(5) succeeds but needs confirmation.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
+            // OPEN_CONFIRM(6) fails with SERVERFAULT, which consumes seqid 6.
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &failed_lock_result("open_confirm", 20, 10006),
+            )
+            .await?;
+            // The lane must now expect 7, not the 6 derived from the OPEN alone.
+            let close = read_record(&mut stream).await?;
+            let expected = [7u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "CLOSE must use the seqid consumed by both OPEN and OPEN_CONFIRM"
+            );
+            reply(&mut stream, &close, &close_result([0xa7; 16])).await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_SERVERFAULT)
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(lane.lock().await.next_seqid, 7);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_confirm_non_consuming_failure_keeps_open_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 223, [0xa5; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
+            // BAD_STATEID does not consume seqid 6.
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &failed_lock_result("open_confirm", 20, 10025),
+            )
+            .await?;
+            // OPEN(5) still consumed its seqid, so the next request uses 6.
+            let close = read_record(&mut stream).await?;
+            let expected = [6u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "CLOSE must keep the seqid consumed by the successful OPEN"
+            );
+            reply(&mut stream, &close, &close_result([0xa7; 16])).await
+        });
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 6);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_does_not_abandon_stateid_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 222, [0xa8; 16], crate::OPEN_READ).await;
+        let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            opened_tx.send(()).ok();
+            // Hold the recovery OPEN reply until after the caller is cancelled.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reply(&mut stream, &open, &open_result(0, [0xb1; 16], b"fh")).await
+        });
+        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
+        tokio::select! {
+            _ = opened_rx.recv() => {}
+            result = &mut read => panic!("read completed before cancellation: {result:?}"),
+        }
+        drop(read);
+        // The detached recovery task must still publish the new stateid and the
+        // consumed owner seqid after the caller is gone.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = {
+                    let guard = lane.lock().await;
+                    guard.stateid == [0xb1; 16] && guard.next_seqid == 1
+                };
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled read abandoned stateid recovery");
+        server.await.unwrap().unwrap();
+    }
+
+    /// RFC 7530 §9.1.7: a sent OPEN or OPEN_CONFIRM consumes its owner seqid
+    /// unless the status is in the exception table. A transmission failure and
+    /// a non-consuming status leave the cursor where it was, and OPEN and
+    /// OPEN_CONFIRM advance it independently.
+    #[tokio::test]
+    async fn fresh_open_seqid_consumption_matrix() {
+        enum OpenStage {
+            Failure(u32),
+            Success { confirm: Option<u32> },
+        }
+        // (label, scripted stage, expected next unconsumed seqid, succeeds)
+        let cases = [
+            ("OPEN ok", OpenStage::Success { confirm: None }, 2u32, true),
+            ("OPEN SERVERFAULT", OpenStage::Failure(10006), 2, false),
+            ("OPEN BAD_SEQID", OpenStage::Failure(10026), 1, false),
+            ("OPEN MOVED", OpenStage::Failure(10019), 1, false),
+            (
+                "CONFIRM ok",
+                OpenStage::Success { confirm: Some(0) },
+                3,
+                true,
+            ),
+            (
+                "CONFIRM SERVERFAULT",
+                OpenStage::Success {
+                    confirm: Some(10006),
+                },
+                3,
+                false,
+            ),
+            (
+                "CONFIRM BAD_STATEID",
+                OpenStage::Success {
+                    confirm: Some(10025),
+                },
+                2,
+                false,
+            ),
+            (
+                "CONFIRM BAD_SEQID",
+                OpenStage::Success {
+                    confirm: Some(10026),
+                },
+                2,
+                false,
+            ),
+            (
+                "CONFIRM MOVED",
+                OpenStage::Success {
+                    confirm: Some(10019),
+                },
+                2,
+                false,
+            ),
+        ];
+        for (label, stage, expected_next, expected_ok) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+                .await
+                .unwrap();
+            let client = rpc::Client::new(mux, None);
+            let open_stateid = [0x11; 16];
+            let confirmed_stateid = [0x12; 16];
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let open = read_record(&mut stream).await?;
+                let open_frame = [
+                    1u32.to_be_bytes().as_slice(),
+                    crate::OPEN_READ.to_be_bytes().as_slice(),
+                    0u32.to_be_bytes().as_slice(),
+                    7u64.to_be_bytes().as_slice(),
+                ]
+                .concat();
+                assert!(
+                    open.windows(open_frame.len())
+                        .any(|wire| wire == open_frame),
+                    "{label}: OPEN must carry seqid 1"
+                );
+                match stage {
+                    OpenStage::Failure(status) => {
+                        return reply(&mut stream, &open, &failed_lock_result("open", 18, status))
+                            .await;
+                    }
+                    OpenStage::Success { confirm } => {
+                        let flags = if confirm.is_some() { 2 } else { 0 };
+                        reply(&mut stream, &open, &open_result(flags, open_stateid, b"fh")).await?;
+                        let Some(status) = confirm else {
+                            return Ok(());
+                        };
+                        let confirm_request = read_record(&mut stream).await?;
+                        let confirm_frame =
+                            [open_stateid.as_slice(), 2u32.to_be_bytes().as_slice()].concat();
+                        assert!(
+                            confirm_request
+                                .windows(confirm_frame.len())
+                                .any(|wire| wire == confirm_frame),
+                            "{label}: OPEN_CONFIRM must carry seqid 2"
+                        );
+                        if status == 0 {
+                            reply(
+                                &mut stream,
+                                &confirm_request,
+                                &compound_result(
+                                    "open_confirm",
+                                    &[(22, &[]), (20, &confirmed_stateid)],
+                                ),
+                            )
+                            .await
+                        } else {
+                            reply(
+                                &mut stream,
+                                &confirm_request,
+                                &failed_lock_result("open_confirm", 20, status),
+                            )
+                            .await
+                        }
+                    }
+                }
+            });
+            let attempt = fresh_open_lane(
+                &client,
+                &Auth::new_null(),
+                &Bytes::from_static(b"dir"),
+                "file",
+                b"owner",
+                crate::OPEN_READ,
+                7,
+                1,
+                "recovery-open",
+            )
+            .await;
+            assert_eq!(attempt.next_seqid, expected_next, "{label}");
+            assert_eq!(attempt.result.is_ok(), expected_ok, "{label}");
+            match attempt.result {
+                Ok(open) => {
+                    let expected_stateid = if expected_next == 3 {
+                        confirmed_stateid
+                    } else {
+                        open_stateid
+                    };
+                    assert_eq!(open.stateid, expected_stateid, "{label}");
+                }
+                Err(error) => assert!(
+                    matches!(error, NfsError::Nfs4(_)),
+                    "{label}: unexpected error {error:?}"
+                ),
+            }
+            server.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_during_open_confirm_still_publishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 224, [0xc1; 16], crate::OPEN_READ).await;
+        let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            // The recovery OPEN needs confirmation, so the caller can be
+            // cancelled between the two consuming stages.
+            reply(&mut stream, &open, &open_result(2, [0xc2; 16], b"fh")).await?;
+            let confirm = read_record(&mut stream).await?;
+            confirm_tx.send(()).ok();
+            // Hold the OPEN_CONFIRM reply until after the caller is cancelled.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("open_confirm", &[(22, &[]), (20, &[0xc3; 16])]),
+            )
+            .await
+        });
+        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
+        tokio::select! {
+            _ = confirm_rx.recv() => {}
+            result = &mut read => panic!("read completed before cancellation: {result:?}"),
+        }
+        drop(read);
+        // The detached recovery task must finish OPEN_CONFIRM and publish both
+        // the confirmed stateid and the seqid consumed by both stages.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = {
+                    let guard = lane.lock().await;
+                    guard.stateid == [0xc3; 16] && guard.next_seqid == 2
+                };
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled read abandoned OPEN_CONFIRM publication");
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_open_putfh_failure_does_not_consume_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let client = rpc::Client::new(mux, None);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &putfh_failure_result("open", 10006)).await
+        });
+        let attempt = fresh_open_lane(
+            &client,
+            &Auth::new_null(),
+            &Bytes::from_static(b"dir"),
+            "file",
+            b"owner",
+            crate::OPEN_READ,
+            7,
+            1,
+            "recovery-open",
+        )
+        .await;
+        assert!(
+            matches!(attempt.result, Err(NfsError::Nfs4(_))),
+            "PUTFH failure must surface the status"
+        );
+        assert_eq!(
+            attempt.next_seqid, 1,
+            "a PUTFH failure never ran OPEN and must not consume seqid 1"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_putfh_failure_keeps_the_lane_cursor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 246, [0xd8; 16], crate::OPEN_BOTH).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            // The recovery probe starts at seqid 0, but a PUTFH failure means
+            // the OPEN never ran: the lane's real cursor must not regress.
+            reply(
+                &mut stream,
+                &open,
+                &putfh_failure_result("recovery-open", 10006),
+            )
+            .await
+        });
+        assert!(
+            mount
+                .refresh_lane_stateid(&lane, [0xd8; 16], StateidRecovery::Bad, "read")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            5,
+            "a non-executed recovery OPEN must keep the lane's existing cursor"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_confirm_putfh_failure_keeps_only_the_open_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let client = rpc::Client::new(mux, None);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0x21; 16], b"fh")).await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &putfh_failure_result("open_confirm", 10006),
+            )
+            .await
+        });
+        let attempt = fresh_open_lane(
+            &client,
+            &Auth::new_null(),
+            &Bytes::from_static(b"dir"),
+            "file",
+            b"owner",
+            crate::OPEN_READ,
+            7,
+            1,
+            "recovery-open",
+        )
+        .await;
+        assert!(attempt.result.is_err());
+        assert_eq!(
+            attempt.next_seqid, 2,
+            "OPEN consumed seqid 1, but a PUTFH-failed CONFIRM did not consume 2"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_putfh_failure_does_not_consume_the_owner_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let stateid = [0xd5; 16];
+        let lane = register_stateid_lane(&mount, 240, stateid, crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &putfh_failure_result("close", 10006)).await?;
+            let retry = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &stateid].concat();
+            assert!(
+                retry.windows(expected.len()).any(|wire| wire == expected),
+                "the retry must reuse seqid 1 that PUTFH never consumed"
+            );
+            reply(&mut stream, &retry, &close_result([0xe5; 16])).await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 1);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_putfh_failure_does_not_consume_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 241, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(&mut stream, &lock, &putfh_failure_result("lock", 10006)).await
+        });
+        assert!(
+            mount
+                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+                .is_err()
+        );
+        let lane = mount.state.by_owner(241).await.unwrap();
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            1,
+            "a PUTFH failure never ran LOCK and must not consume seqid 1"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_overall_status_contradiction_consumes_the_owner_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 244, [0xd6; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // PUTFH and CLOSE both succeeded, but the overall status claims
+            // failure: the CLOSE still ran and consumed its seqid.
+            reply(
+                &mut stream,
+                &close,
+                &contradictory_result("close", &[(22, &[]), (4, &[0x5b; 16])]),
+            )
+            .await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_overall_status_contradiction_consumes_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 245, [0xd7; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &lock,
+                &contradictory_result("lock", &[(22, &[]), (12, &[0x5c; 16])]),
+            )
+            .await
+        });
+        assert!(
+            mount
+                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_probe_putfh_failure_keeps_the_first_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 247, [0xda; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // Overall BAD_STATEID but PUTFH and CLOSE both succeeded: the CLOSE
+            // ran and consumed its seqid, so a BAD_STATEID probe is issued.
+            reply(
+                &mut stream,
+                &close,
+                &compound_result_with_status(10025, "close", &[(22, &[]), (4, &[0xda; 16])]),
+            )
+            .await?;
+            let probe = read_record(&mut stream).await?;
+            // The probe never reached CLOSE and must not erase the first
+            // request's consumption.
+            reply(
+                &mut stream,
+                &probe,
+                &putfh_failure_result("close-probe", 10006),
+            )
+            .await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            2,
+            "an unexecuted probe must not discard the first CLOSE's consumption"
+        );
         server.await.unwrap().unwrap();
     }
 
