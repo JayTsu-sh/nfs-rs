@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
-    OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome, create_succeeded_before_compound_failure,
-    decode_access_response, decode_commit_response, decode_confirm_response,
-    decode_create_response, decode_delegreturn_response,
-    decode_getattr_response as decode_getattr_compound, decode_link_response, decode_lock_response,
-    decode_lockt_response, decode_lookup_getattr_response, decode_open_response,
+    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, LockOpOutcome, NewLockArgs,
+    OpenArgs, OpenOpOutcome, OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome,
+    create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
+    decode_confirm_response, decode_create_response, decode_delegreturn_response,
+    decode_getattr_response as decode_getattr_compound, decode_link_response,
+    decode_lock_op_outcome, decode_lock_response, decode_lockt_response,
+    decode_lookup_getattr_response, decode_open_op_outcome, decode_open_response,
     decode_read_response, decode_readdir_response, decode_readlink_response,
     decode_release_lockowner_response, decode_remove_response, decode_rename_response,
     decode_setattr_response, decode_setclientid_response, decode_stateid_op_outcome,
@@ -112,7 +113,27 @@ async fn query_callback_attributes(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StateidRecovery {
+    Bad,
+    Stale,
     Old,
+}
+
+fn stateid_recovery(error: &NfsError) -> Option<StateidRecovery> {
+    match error {
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID) => Some(StateidRecovery::Bad),
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => Some(StateidRecovery::Stale),
+        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID) => Some(StateidRecovery::Old),
+        _ => None,
+    }
+}
+
+fn stateid_hex(stateid: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(32);
+    for byte in stateid {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 struct Mount40 {
@@ -412,6 +433,259 @@ async fn establish_identity(
     Ok(client_id)
 }
 
+struct FreshOpen {
+    stateid: [u8; 16],
+    next_seqid: u32,
+    fh: Bytes,
+    delegation: Option<DelegationGrant>,
+}
+
+struct FreshOpenAttempt {
+    result: Result<FreshOpen>,
+    /// Next unconsumed open-owner seqid after every OPEN/OPEN_CONFIRM stage
+    /// that was actually sent, whether it succeeded or failed.
+    next_seqid: u32,
+    /// Seqid carried by the OPEN request. When it equals `next_seqid`, no
+    /// stage consumed anything and callers must keep the lane's existing
+    /// cursor instead of regressing it.
+    sent_seqid: u32,
+}
+
+impl FreshOpenAttempt {
+    fn record_consumption(&self, lane: &mut OwnerLane) {
+        if self.next_seqid != self.sent_seqid {
+            lane.next_seqid = self.next_seqid;
+        }
+    }
+}
+
+/// Issue a normal `CLAIM_NULL` OPEN for a lane, without resolving a path again.
+///
+/// RFC 7530 §9.6.3.4.5 allows a client whose reclaim was rejected by the FSAL
+/// to re-establish state with a normal OPEN. The directory handle and name are
+/// the ones retained on the lane at open time.
+#[allow(clippy::too_many_arguments)]
+async fn fresh_open_lane(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    dir_fh: &Bytes,
+    name: &str,
+    owner_wire: &[u8],
+    access: u32,
+    client_id: u64,
+    seqid: u32,
+    operation: &str,
+) -> FreshOpenAttempt {
+    let request = CompoundBuilder::new(operation)
+        .putfh(dir_fh)
+        .open(OpenArgs {
+            seqid,
+            share_access: access,
+            client_id,
+            owner: owner_wire,
+            filename: name,
+            create: false,
+        })
+        .getfh()
+        .encode_with_header(auth);
+    // A transmission failure does not prove that the server consumed the
+    // seqid, so keep the cursor unchanged.
+    let response = match rpc
+        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid: seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
+    let outcome = match decode_open_op_outcome(response) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid: seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
+    // Only an OPEN that actually ran consumed its seqid. A PUTFH failure
+    // reports a non-zero overall status too but must leave the cursor alone.
+    let mut next_seqid = if open_op_consumes_seqid(&outcome) {
+        seqid.wrapping_add(1)
+    } else {
+        seqid
+    };
+    let (opened, fh) = match outcome.into_result() {
+        Ok(value) => value,
+        Err(error) => {
+            return FreshOpenAttempt {
+                result: Err(error),
+                next_seqid,
+                sent_seqid: seqid,
+            };
+        }
+    };
+    let mut stateid = opened.stateid;
+    if opened.confirm_required {
+        let request = CompoundBuilder::new("open_confirm")
+            .putfh(&fh)
+            .open_confirm(&stateid, next_seqid)
+            .encode_with_header(auth);
+        let response = match rpc
+            .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // OPEN_CONFIRM may have reached the server, but only the
+                // already-consumed OPEN seqid is certain.
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        };
+        let confirm = match decode_stateid_op_outcome(response, 20, "OPEN_CONFIRM") {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        };
+        if stateid_op_consumes_seqid(&confirm) {
+            next_seqid = next_seqid.wrapping_add(1);
+        }
+        match confirm.into_result() {
+            Ok(confirmed) => stateid = confirmed,
+            Err(error) => {
+                return FreshOpenAttempt {
+                    result: Err(error),
+                    next_seqid,
+                    sent_seqid: seqid,
+                };
+            }
+        }
+    }
+    FreshOpenAttempt {
+        result: Ok(FreshOpen {
+            stateid,
+            next_seqid,
+            fh,
+            delegation: opened.delegation,
+        }),
+        next_seqid,
+        sent_seqid: seqid,
+    }
+}
+
+/// Fresh OPEN bounded to two attempts: a released open-owner restarts at
+/// seqid 0, while a still-current open-owner expects the lane's next seqid.
+#[allow(clippy::too_many_arguments)]
+async fn fresh_open_lane_with_seqid(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    dir_fh: &Bytes,
+    name: &str,
+    owner_wire: &[u8],
+    access: u32,
+    client_id: u64,
+    next_seqid: u32,
+    operation: &str,
+) -> FreshOpenAttempt {
+    let attempt = fresh_open_lane(
+        rpc, auth, dir_fh, name, owner_wire, access, client_id, 0, operation,
+    )
+    .await;
+    // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
+    // reply; BAD/OLD_STATEID here do not prove that, so only BAD_SEQID
+    // retries with the lane's next_seqid.
+    if matches!(
+        &attempt.result,
+        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID))
+    ) && next_seqid != 0
+    {
+        return fresh_open_lane(
+            rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
+        )
+        .await;
+    }
+    attempt
+}
+
+async fn return_delegation(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+    delegation: Option<DelegationGrant>,
+) -> Result<()> {
+    let Some(delegation) = delegation else {
+        return Ok(());
+    };
+    let response = rpc
+        .call(
+            CompoundBuilder::new("delegreturn")
+                .putfh(fh)
+                .delegreturn(&delegation.stateid)
+                .encode_with_header(auth),
+            ReplayPolicy::ONE_ATTEMPT,
+            METADATA_TIMEOUT,
+        )
+        .await?;
+    decode_delegreturn_response(response)
+}
+
+/// Close a fresh OPEN state that must not be published.
+///
+/// Returns `Some(consumed)` when the reply pins down whether CLOSE consumed the
+/// open-owner seqid, and `None` when the outcome is unknown (transport or
+/// decoding failure). Callers must not replay either seqid in that case.
+async fn close_unpublished_state(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+    seqid: u32,
+    stateid: &[u8; 16],
+) -> Option<bool> {
+    let request = CompoundBuilder::new("close-fresh")
+        .putfh(fh)
+        .close(seqid, stateid)
+        .encode_with_header(auth);
+    let response = match rpc
+        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state failed; its seqid consumption is unknown"
+            );
+            return None;
+        }
+    };
+    match decode_stateid_op_outcome(response, 4, "CLOSE") {
+        Ok(outcome) => Some(stateid_op_consumes_seqid(&outcome)),
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state was not decodable; its seqid consumption is unknown"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RecoveryContext {
     rpc: rpc::Client,
@@ -445,8 +719,19 @@ impl RecoveryContext {
                 .map(Ok::<_, NfsError>),
         )
         .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
+            // Learn the fence while holding the lane only briefly: the fence
+            // must be acquired before the lane to match close_lane's order.
+            let io_fence = {
+                let open = lane.lock().await;
+                Arc::clone(&open.io_fence)
+            };
+            let _in_flight_settled = io_fence.write_owned().await;
             let mut open = lane.lock().await;
-            let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+            if open.closing || !self.state.is_current(open.owner, &lane).await {
+                // Closed or removed while this reclaim waited: do not resurrect
+                // server state the client no longer tracks.
+                return Ok(());
+            }
             let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
             let response = self
                 .rpc
@@ -506,9 +791,26 @@ impl RecoveryContext {
                     let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
                         NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
                     })?;
+                    // Same fence-before-lane order as close_lane and the OPEN
+                    // reclaim loop.
+                    let io_fence = {
+                        let open = open_lane.lock().await;
+                        if open.closing {
+                            continue;
+                        }
+                        Arc::clone(&open.io_fence)
+                    };
+                    let _in_flight_settled = io_fence.write_owned().await;
                     let mut open = open_lane.lock().await;
-                    let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+                    if open.closing || !self.state.is_current(open_owner, &open_lane).await {
+                        continue;
+                    }
                     let mut lock = lane.lock().await;
+                    if !self.locks.is_current(&lock.stateid, &lane).await {
+                        // A LOCKU released this lock while the reclaim waited;
+                        // reclaiming it would resurrect state the caller closed.
+                        continue;
+                    }
                     let response = self
                         .rpc
                         .call(
@@ -534,10 +836,13 @@ impl RecoveryContext {
                     open.next_seqid = open.next_seqid.wrapping_add(1);
                     lock.stateid = new_stateid;
                     lock.next_seqid = 1;
-                    drop(lock);
+                    // Rekey while the lock lane is still held: otherwise a
+                    // concurrent LOCKU can remove the new key and this rekey
+                    // would re-insert a lane whose stateid is already retired.
                     self.locks
                         .rekey(old_stateid, new_stateid, Arc::clone(&lane))
                         .await;
+                    drop(lock);
                 }
                 Ok(())
             })
@@ -596,11 +901,46 @@ fn status_consumes_seqid(status: crate::Nfs4ErrorCode) -> bool {
     )
 }
 
-fn consumes_owner_seqid(result: &Result<impl Sized>) -> bool {
-    match result {
-        Ok(_) | Err(NfsError::LockDenied { .. }) => true,
-        Err(NfsError::Nfs4(status)) => status_consumes_seqid(*status),
-        Err(_) => false,
+fn error_consumes_seqid(error: &NfsError) -> bool {
+    matches!(error, NfsError::Nfs4(status) if status_consumes_seqid(*status))
+}
+
+/// RFC 7530 §9.1.7 consumption of a two-operation `PUTFH + stateid op` reply.
+fn stateid_op_consumes_seqid(outcome: &StateidOpOutcome<[u8; 16]>) -> bool {
+    match outcome {
+        StateidOpOutcome::Completed(_) | StateidOpOutcome::Executed(_) => true,
+        StateidOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        StateidOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn open_op_consumes_seqid(outcome: &OpenOpOutcome) -> bool {
+    match outcome {
+        OpenOpOutcome::Completed(_, _) | OpenOpOutcome::Executed(_) => true,
+        OpenOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        OpenOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn lock_op_consumes_seqid(outcome: &LockOpOutcome) -> bool {
+    match outcome {
+        LockOpOutcome::Granted(_) | LockOpOutcome::Executed(_) | LockOpOutcome::Denied(_) => true,
+        LockOpOutcome::Rejected(error) => error_consumes_seqid(error),
+        LockOpOutcome::NotExecuted(_) => false,
+    }
+}
+
+fn decode_lock_op_call(
+    response: Result<Bytes>,
+    opcode: u32,
+    name: &str,
+) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = lock_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
     }
 }
 
@@ -662,62 +1002,125 @@ impl Mount40 {
         let expected_generation = self.lease.begin_stateful("lock")?;
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = Bytes::from(format!("nfs-rs-lock-{:016x}-{owner:016x}", self.issuer));
-        let rpc = self.rpc.clone();
-        let auth = self.auth.clone();
-        let client_id = self.client_id.load(Ordering::Acquire);
-        let locks = Arc::clone(&self.locks);
-        let lease = Arc::clone(&self.lease);
-        let stateid = tokio::spawn(async move {
-            let mut open = open_lane.lock().await;
-            let open_owner = open.owner;
-            let request = CompoundBuilder::new("lock")
-                .putfh(&fh)
-                .lock_new(NewLockArgs {
-                    lock_type,
-                    reclaim: false,
-                    offset,
-                    length,
-                    open_seqid: open.next_seqid,
-                    open_stateid: &open.stateid,
-                    lock_seqid: 0,
-                    client_id,
-                    owner: &owner_wire,
-                })
-                .encode_with_header(&auth);
-            let (class, ctx) = context("lock", owner, 0, OperationClass::ReplaySensitive);
-            let response = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            let decoded = decode_lock_response(response, 12, "LOCK");
-            if consumes_owner_seqid(&decoded) {
-                open.next_seqid = open.next_seqid.wrapping_add(1);
-            }
-            let stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            let _publication = lease.publication_guard().await;
-            lease.finish_stateful(expected_generation, "lock")?;
-            locks
-                .register(LockLane {
+        // RFC 7530 §9.1.9: OLD_STATEID consumes the lock-owner seqid, so a
+        // retry must advance it instead of reusing lock_seqid 0 (which the
+        // server would treat as a replay and answer from its cache).
+        let mut lock_seqid = 0u32;
+        let mut attempt = 0;
+        loop {
+            let rpc = self.rpc.clone();
+            let auth = self.auth.clone();
+            let client_id = self.client_id.load(Ordering::Acquire);
+            let locks = Arc::clone(&self.locks);
+            let lease = Arc::clone(&self.lease);
+            let open_lane_task = Arc::clone(&open_lane);
+            let fh = fh.clone();
+            let owner_wire = owner_wire.clone();
+            let lock_seqid_for_task = lock_seqid;
+            let used = Arc::new(std::sync::Mutex::new(None));
+            let used_in_task = Arc::clone(&used);
+            // Track the acquisition before spawning. If the caller is
+            // cancelled, the detached task keeps this guard until it has
+            // registered the granted lock, so `release_locks` can wait for it.
+            let acquisition = self.locks.begin_acquisition(fh.clone());
+            let stateid = tokio::spawn(async move {
+                let _acquisition = acquisition;
+                let mut open = open_lane_task.lock().await;
+                let open_owner = open.owner;
+                *used_in_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(open.stateid);
+                let request = CompoundBuilder::new("lock")
+                    .putfh(&fh)
+                    .lock_new(NewLockArgs {
+                        lock_type,
+                        reclaim: false,
+                        offset,
+                        length,
+                        open_seqid: open.next_seqid,
+                        open_stateid: &open.stateid,
+                        lock_seqid: lock_seqid_for_task,
+                        client_id,
+                        owner: &owner_wire,
+                    })
+                    .encode_with_header(&auth);
+                let (class, ctx) = context(
+                    "lock",
                     owner,
-                    open_owner,
-                    owner_wire,
-                    next_seqid: 1,
-                    stateid,
-                    fh,
-                    lock_type,
-                    offset,
-                    length,
-                })
-                .await;
-            if let Err(error) = lease.validate_stateful(expected_generation, "lock") {
-                locks.remove(&stateid).await;
-                return Err(error);
+                    lock_seqid_for_task,
+                    OperationClass::ReplaySensitive,
+                );
+                let (decoded, consumed) = decode_lock_op_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    12,
+                    "LOCK",
+                );
+                if consumed {
+                    open.next_seqid = open.next_seqid.wrapping_add(1);
+                }
+                let stateid =
+                    decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                let _publication = lease.publication_guard().await;
+                // Register before the lifecycle fence: the server may already
+                // have granted the lock, and losing the lane would leak it
+                // until lease expiry. A lost mount removes it below; a Suspect
+                // mount keeps it so the caller can unlock after recovery.
+                locks
+                    .register(LockLane {
+                        owner,
+                        open_owner,
+                        owner_wire,
+                        next_seqid: lock_seqid_for_task.wrapping_add(1),
+                        stateid,
+                        fh,
+                        lock_type,
+                        offset,
+                        length,
+                    })
+                    .await;
+                if let Err(error) = lease.finish_stateful(expected_generation, "lock") {
+                    if lease.generation() != expected_generation {
+                        locks.remove(&stateid).await;
+                    }
+                    return Err(error);
+                }
+                if let Err(error) = lease.validate_stateful(expected_generation, "lock") {
+                    if lease.generation() != expected_generation {
+                        locks.remove(&stateid).await;
+                    }
+                    return Err(error);
+                }
+                Ok::<_, NfsError>(stateid)
+            })
+            .await
+            .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))?;
+            match stateid {
+                Ok(stateid) => return Ok((Bytes::copy_from_slice(&stateid), expected_generation)),
+                Err(error) => {
+                    // The LOCK carries the open stateid; a stateid failure is the
+                    // open lane's to recover before the lock can be created.
+                    let Some(trigger) = stateid_recovery(&error) else {
+                        return Err(error);
+                    };
+                    if attempt == 1 {
+                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
+                    }
+                    let Some(failed_stateid) =
+                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                    else {
+                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
+                    };
+                    self.refresh_lane_stateid(&open_lane, failed_stateid, trigger, "lock")
+                        .await
+                        .map_err(|failure| Self::recovery_failure("lock", trigger, failure))?;
+                    if trigger == StateidRecovery::Old {
+                        lock_seqid = lock_seqid.wrapping_add(1);
+                    }
+                    attempt += 1;
+                }
             }
-            Ok::<_, NfsError>(stateid)
-        })
-        .await
-        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 lock task failed: {error}")))??;
-        Ok((Bytes::copy_from_slice(&stateid), expected_generation))
+        }
     }
 
     async fn open_file(
@@ -868,6 +1271,8 @@ impl Mount40 {
                     next_seqid,
                     stateid,
                     fh: fh.clone(),
+                    dir_fh: dir_fh.clone(),
+                    name: filename.clone(),
                     access,
                     write_verifier: None,
                     io_fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -883,19 +1288,32 @@ impl Mount40 {
                     next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                let response = rpc
-                    .call(
-                        CompoundBuilder::new("delegreturn")
-                            .putfh(&fh)
-                            .delegreturn(&delegation.stateid)
-                            .encode_with_header(&auth),
-                        ReplayPolicy::ONE_ATTEMPT,
-                        METADATA_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-                decode_delegreturn_response(response)
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                let result = async {
+                    let response = rpc
+                        .call(
+                            CompoundBuilder::new("delegreturn")
+                                .putfh(&fh)
+                                .delegreturn(&delegation.stateid)
+                                .encode_with_header(&auth),
+                            ReplayPolicy::ONE_ATTEMPT,
+                            METADATA_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                    decode_delegreturn_response(response)
+                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                }
+                .await;
+                if let Err(error) = result {
+                    // The lane is registered before this follow-up so a failed
+                    // DELEGRETURN stays closeable. If the mount was lost in the
+                    // meantime its maps were cleared, and the lane must not be
+                    // left behind.
+                    if lease.generation() != expected_generation {
+                        state.remove(owner, &fh).await;
+                    }
+                    return Err(error);
+                }
             }
             let delegation_attributes = if callback_state.is_some()
                 && matches!(
@@ -910,18 +1328,33 @@ impl Mount40 {
                 None
             };
             let _publication = lease.publication_guard().await;
-            lease.finish_stateful(expected_generation, "open")?;
-            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
-                callback_state.register_delegation(
+            if let Err(error) = lease.finish_stateful(expected_generation, "open") {
+                // A lost/rotated mount has already cleared its state maps, so
+                // the lane published above would be unreachable. A Suspect or
+                // Reconnecting mount still owns this open, and removing it
+                // would discard the only handle that can close it.
+                if lease.generation() != expected_generation {
+                    state.remove(owner, &fh).await;
+                }
+                return Err(error);
+            }
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation)
+                && let Err(error) = callback_state.register_delegation(
                     fh.clone(),
                     delegation,
                     expected_generation,
                     delegation_attributes,
-                )?;
+                )
+            {
+                // The open itself is valid; keeping the lane lets the caller
+                // close it by file handle after the delegation failure.
+                return Err(error);
             }
             drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
-                state.remove(owner, &fh).await;
+                if lease.generation() != expected_generation {
+                    state.remove(owner, &fh).await;
+                }
                 return Err(error);
             }
             Ok::<_, NfsError>(mount::OpenFile::with_protocol_state(
@@ -966,12 +1399,16 @@ impl Mount40 {
                 lane.closing = true;
                 (lane.fh.clone(), Arc::clone(&lane.io_fence))
             };
-            let _in_flight_settled = io_fence.write_owned().await;
+            // Take the callback I/O gate before the fence. Foreground I/O takes
+            // the gate first and the fence second, so doing the opposite here
+            // would deadlock: close would hold the fence write while waiting
+            // for a reader that is itself waiting on that fence.
             let io_guard = if let Some(callback_state) = &callback_state {
                 Some(callback_state.recall_io(&close_fh).await)
             } else {
                 None
             };
+            let _in_flight_settled = io_fence.write_owned().await;
             let _io_guard = io_guard;
             let mut lane = lane.lock().await;
             let request = CompoundBuilder::new("close")
@@ -1126,12 +1563,254 @@ impl Mount40 {
         Ok(())
     }
 
+    /// Refresh one lane after a stateid error.
+    ///
+    /// The lane lock is held across the fresh OPEN so concurrent I/O observes
+    /// the new stateid instead of racing a second OPEN on the same lane. If the
+    /// stateid already moved (another task recovered first) there is nothing to
+    /// do and the caller simply retries with the current state.
+    async fn refresh_lane_stateid(
+        &self,
+        lane: &Arc<tokio::sync::Mutex<OwnerLane>>,
+        failed_stateid: [u8; 16],
+        trigger: StateidRecovery,
+        operation: &str,
+    ) -> Result<()> {
+        // Capture the generation before spawning: the detached task must not
+        // send a replay-sensitive OPEN, or publish its result, after the mount
+        // was marked lost (which also clears the state maps) or after a newer
+        // recovery began.
+        let expected_generation = self.lease.begin_stateful(operation)?;
+        // Run the whole refresh in its own task. Cancelling the initiating
+        // READ/WRITE after the recovery OPEN reached the server must not drop
+        // the future while the lane still holds the old stateid and an
+        // unpublished owner seqid: the task keeps the lane lock until it
+        // publishes both.
+        let rpc = self.rpc.clone();
+        let auth = self.auth.clone();
+        let issuer = self.issuer;
+        let client_id = Arc::clone(&self.client_id);
+        let lease = Arc::clone(&self.lease);
+        let open_state = Arc::clone(&self.state);
+        let lane = Arc::clone(lane);
+        let operation = operation.to_string();
+        tokio::spawn(async move {
+            Self::refresh_lane_stateid_task(
+                rpc,
+                auth,
+                issuer,
+                client_id,
+                lease,
+                open_state,
+                expected_generation,
+                lane,
+                failed_stateid,
+                trigger,
+                &operation,
+            )
+            .await
+        })
+        .await
+        .map_err(|error| NfsError::Rpc(format!("NFSv4.0 stateid recovery task failed: {error}")))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn refresh_lane_stateid_task(
+        rpc: rpc::Client,
+        auth: Auth,
+        issuer: u64,
+        client_id: Arc<AtomicU64>,
+        lease: Arc<LeaseState>,
+        open_state: Arc<OpenState>,
+        expected_generation: u64,
+        lane: Arc<tokio::sync::Mutex<OwnerLane>>,
+        failed_stateid: [u8; 16],
+        trigger: StateidRecovery,
+        operation: &str,
+    ) -> Result<()> {
+        if trigger == StateidRecovery::Stale {
+            // RFC 7530 §13.1.5.6: a stateid from an earlier server instance
+            // means crash recovery (SETCLIENTID + reclaim of every open). That
+            // is a mount-lifecycle operation: running it inside one I/O call
+            // would race the lease renewal and other lanes, so report a typed
+            // state-lost error and let the caller reopen or the renewal task
+            // drive recovery.
+            return Err(NfsError::LostOpenState(format!(
+                "NFSv4.0 stateid belongs to an earlier server instance during {operation}; reopen the file"
+            )));
+        }
+        let mut open = lane.lock().await;
+        if open.closing {
+            return Err(NfsError::InvalidInput(format!(
+                "NFSv4.0 open state closed during {operation} stateid recovery"
+            )));
+        }
+        if open.stateid != failed_stateid {
+            return Ok(());
+        }
+        // This task may have been queued while the mount was being marked lost,
+        // in which case its state map was already cleared. Do not dispatch a
+        // replay-sensitive OPEN that nothing will track or clean up. This check
+        // is best effort: mark_lost can still win between it and the OPEN
+        // reaching the server, which the publication fence below catches.
+        lease.validate_stateful(expected_generation, operation)?;
+        let old_stateid = open.stateid;
+        // OLD_STATEID does not carry the server's current seqid, so a blind +1
+        // cannot converge when the server advanced by more than one. Fall
+        // through to a fresh OPEN, which re-syncs the stateid authoritatively
+        // regardless of the gap.
+        let current_client_id = client_id.load(Ordering::Acquire);
+        let owner_wire = format!("nfs-rs-{issuer:016x}-{:016x}", open.owner);
+        let attempt = fresh_open_lane_with_seqid(
+            &rpc,
+            &auth,
+            &open.dir_fh,
+            &open.name,
+            owner_wire.as_bytes(),
+            open.access,
+            current_client_id,
+            open.next_seqid,
+            operation,
+        )
+        .await;
+        // RFC 7530 §9.1.7: a definitive OPEN/OPEN_CONFIRM failure consumes its
+        // owner seqid unless the status is in the exception table. The helper
+        // reports the authoritative cursor for every stage that was actually
+        // sent, so record it even when OPEN_CONFIRM (not OPEN) was the failing
+        // stage. If no stage ran (PUTFH failed), keep the lane's existing
+        // cursor and do not regress it to the seqid-0 probe.
+        attempt.record_consumption(&mut open);
+        let fresh = match attempt.result {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        // The OPEN succeeded, so the server consumed its open-owner seqid
+        // regardless of which stateid it returned. Record it before the early
+        // returns below, otherwise the lane would keep a consumed seqid and
+        // every later attempt would replay this OPEN instead of converging.
+        open.next_seqid = fresh.next_seqid;
+        if fresh.fh != open.fh {
+            // The re-open resolved to a different filehandle: release the
+            // freshly created state rather than leak it, then refuse to commit
+            // the recovery. The lane's cursor must still reflect the cleanup
+            // CLOSE: it consumes the seqid it was sent with, so discarding the
+            // reply would make the next owner-sequenced request replay it and
+            // fail with BAD_SEQID. An unknown outcome makes both values unsafe
+            // to replay, so retire the lane instead.
+            match close_unpublished_state(&rpc, &auth, &fresh.fh, fresh.next_seqid, &fresh.stateid)
+                .await
+            {
+                Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
+                Some(false) => {}
+                None => {
+                    open.closing = true;
+                    let owner = open.owner;
+                    let fh = open.fh.clone();
+                    drop(open);
+                    open_state.remove(owner, &fh).await;
+                }
+            }
+            return Err(NfsError::Xdr(
+                "NFSv4.0 stateid recovery opened a different filehandle".into(),
+            ));
+        }
+        if let Err(error) = return_delegation(&rpc, &auth, &fresh.fh, fresh.delegation).await {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "DELEGRETURN after NFSv4.0 stateid recovery failed; the server may hold a delegation it cannot recall"
+            );
+        }
+        if fresh.stateid == failed_stateid {
+            // The OPEN succeeded but kept the stateid that just failed. The
+            // caller has a single retry left and it would send exactly that
+            // stateid again, so report exhaustion instead of claiming a
+            // recovery that did not happen. Do not CLOSE it: the stateid names
+            // the very state the lane must keep.
+            return Err(Self::state_recovery_exhausted(
+                operation,
+                trigger,
+                NfsError::Xdr(
+                    "NFSv4.0 stateid recovery returned the stateid that just failed".into(),
+                ),
+            ));
+        }
+        // Fence publication: if the mount became lost while the recovery OPEN
+        // was in flight, its state maps were cleared and publishing into this
+        // detached lane would leave server state with no tracked cleanup path.
+        // Settle the already-sent OPEN and refuse to commit it.
+        {
+            let publication = lease.publication_guard().await;
+            if let Err(error) = lease.validate_stateful(expected_generation, operation) {
+                drop(publication);
+                match close_unpublished_state(
+                    &rpc,
+                    &auth,
+                    &fresh.fh,
+                    fresh.next_seqid,
+                    &fresh.stateid,
+                )
+                .await
+                {
+                    Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
+                    Some(false) => {}
+                    None => {
+                        open.closing = true;
+                        let owner = open.owner;
+                        let fh = open.fh.clone();
+                        drop(open);
+                        open_state.remove(owner, &fh).await;
+                    }
+                }
+                return Err(error);
+            }
+            open.stateid = fresh.stateid;
+        }
+        tracing::debug!(
+            target: "nfs_rs::stateid",
+            operation,
+            trigger = ?trigger,
+            old_stateid = %stateid_hex(&old_stateid),
+            new_stateid = %stateid_hex(&open.stateid),
+            "NFSv4.0 stateid recovered with a fresh OPEN"
+        );
+        Ok(())
+    }
+
+    /// Classify a failure raised while refreshing a lane.
+    ///
+    /// An authoritative protocol status explains why the lane could not be
+    /// refreshed and keeps its own meaning: busy statuses (GRACE, DELAY) stay
+    /// retryable, and statuses such as NOENT or ACCESS keep their errno
+    /// mapping. Only failures without an authoritative status (transport,
+    /// encoding, closed state) are reported as exhausted recovery.
+    fn recovery_failure(operation: &str, trigger: StateidRecovery, source: NfsError) -> NfsError {
+        // A stateid status raised by the recovery OPEN itself means the
+        // bounded recovery did not restore usable state: report exhaustion
+        // instead of handing callers a status that claims to be recoverable
+        // in place.
+        if stateid_recovery(&source).is_none()
+            && (matches!(&source, NfsError::Nfs4(_))
+                || matches!(&source, NfsError::LostOpenState(_))
+                // A lifecycle/generation gate already carries the right
+                // recovery action (for example Reopen after a lost mount).
+                || matches!(&source, NfsError::OperationOutcome(_)))
+        {
+            return source;
+        }
+        Self::state_recovery_exhausted(operation, trigger, source)
+    }
+
     fn state_recovery_exhausted(
         operation: &str,
         trigger: StateidRecovery,
         source: NfsError,
     ) -> NfsError {
         let status = match trigger {
+            StateidRecovery::Bad => crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
+            StateidRecovery::Stale => crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
             StateidRecovery::Old => crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
         };
         tracing::warn!(
@@ -1553,27 +2232,54 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
-        let (stateid, expected_generation) = match lane {
-            Some(lane) => (
-                lane.lock().await.stateid,
-                Some(self.lease.begin_stateful(operation)?),
-            ),
-            None => ([0; 16], None),
-        };
-        let request = CompoundBuilder::new(operation)
-            .putfh(fh)
-            .setattr(&stateid, bitmap, values)
-            .encode_with_header(&self.auth);
-        let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
-        let response = self
-            .activity_settled_call(request, class, ctx.clone())
-            .await?;
-        decode_setattr_response(response, bitmap)
-            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-        if let Some(generation) = expected_generation {
-            self.lease.finish_stateful(generation, operation)?;
+        let mut attempt = 0;
+        loop {
+            let (stateid, expected_generation) = match &lane {
+                Some(lane) => {
+                    let guard = lane.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    (guard.stateid, Some(self.lease.begin_stateful(operation)?))
+                }
+                None => ([0; 16], None),
+            };
+            let request = CompoundBuilder::new(operation)
+                .putfh(fh)
+                .setattr(&stateid, bitmap, values)
+                .encode_with_header(&self.auth);
+            let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
+            let response = self
+                .activity_settled_call(request, class, ctx.clone())
+                .await?;
+            let result = decode_setattr_response(response, bitmap)
+                .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+            match result {
+                Ok(()) => {
+                    if let Some(generation) = expected_generation {
+                        self.lease.finish_stateful(generation, operation)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let Some(lane) = &lane else {
+                        return Err(error);
+                    };
+                    let Some(trigger) = stateid_recovery(&error) else {
+                        return Err(error);
+                    };
+                    if attempt == 1 {
+                        return Err(Self::state_recovery_exhausted(operation, trigger, error));
+                    }
+                    self.refresh_lane_stateid(lane, stateid, trigger, operation)
+                        .await
+                        .map_err(|failure| Self::recovery_failure(operation, trigger, failure))?;
+                    attempt += 1;
+                }
+            }
         }
-        Ok(())
     }
 }
 
@@ -1605,7 +2311,6 @@ impl Mount40 {
         data: Bytes,
         stable: u32,
     ) -> Result<(u32, u32, [u8; 8])> {
-        let expected_generation = self.lease.begin_stateful("write")?;
         if data.len() > u32::MAX as usize {
             return Err(NfsError::InvalidInput("WRITE data exceeds u32::MAX".into()));
         }
@@ -1614,55 +2319,97 @@ impl Mount40 {
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
             .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
-        let io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
         let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?
         } else {
             false
         };
-        let rpc = self.rpc.clone();
-        let auth = self.auth.clone();
-        let lease = Arc::clone(&self.lease);
-        let lane_for_settlement = Arc::clone(&lane);
-        let fh_for_settlement = fh.clone();
-        let settled = DetachedSettlement::new(async move {
-            let _io_guard = io_guard;
-            let (stateid, owner, next_seqid, _in_flight) = {
-                let guard = lane_for_settlement.lock().await;
-                if guard.closing {
-                    return Err(NfsError::InvalidInput(
-                        "NFSv4.0 open state is closing or closed".into(),
-                    ));
-                }
-                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
-                (guard.stateid, guard.owner, guard.next_seqid, in_flight)
+        let mut attempt = 0;
+        let (count, committed, verifier) = loop {
+            let expected_generation = self.lease.begin_stateful("write")?;
+            let io_guard = if let Some(callback_state) = &self.callback_state {
+                Some(callback_state.foreground_io(&fh).await)
+            } else {
+                None
             };
-            let request = CompoundBuilder::new("write")
-                .putfh(&fh_for_settlement)
-                .write_header(&stateid, offset, stable, data.len() as u32)
-                .encode_with_header(&auth);
-            let (class, ctx) = context("write", owner, next_seqid, OperationClass::ReplaySensitive);
-            let response = call_with_busy_retry(
-                &rpc,
-                request,
-                data.clone(),
-                ReplayPolicy::ONE_ATTEMPT,
-                METADATA_TIMEOUT,
-                ctx.clone(),
-            )
-            .await
-            .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            let (count, committed, verifier) = decode_write_response(response)
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            lease.finish_stateful(expected_generation, "write")?;
-            Ok::<_, NfsError>((count, committed, verifier, data))
-        })
-        .await?;
-        let (count, committed, verifier, data) = settled;
+            let rpc = self.rpc.clone();
+            let auth = self.auth.clone();
+            let lease = Arc::clone(&self.lease);
+            let lane_for_settlement = Arc::clone(&lane);
+            let fh_for_settlement = fh.clone();
+            let data_for_settlement = data.clone();
+            let used = Arc::new(std::sync::Mutex::new(None));
+            let used_in_task = Arc::clone(&used);
+            let settled = DetachedSettlement::new(async move {
+                let _io_guard = io_guard;
+                // Acquire the fence before the lane: close and reclaim take the
+                // fence first, and holding the lane across read_owned() would
+                // invert that order and deadlock.
+                let io_fence = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    Arc::clone(&guard.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
+                let (stateid, owner, next_seqid) = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    (guard.stateid, guard.owner, guard.next_seqid)
+                };
+                *used_in_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stateid);
+                let request = CompoundBuilder::new("write")
+                    .putfh(&fh_for_settlement)
+                    .write_header(&stateid, offset, stable, data_for_settlement.len() as u32)
+                    .encode_with_header(&auth);
+                let (class, ctx) =
+                    context("write", owner, next_seqid, OperationClass::ReplaySensitive);
+                let response = call_with_busy_retry(
+                    &rpc,
+                    request,
+                    data_for_settlement,
+                    ReplayPolicy::ONE_ATTEMPT,
+                    METADATA_TIMEOUT,
+                    ctx.clone(),
+                )
+                .await
+                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                let (count, committed, verifier) = decode_write_response(response)
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                lease.finish_stateful(expected_generation, "write")?;
+                Ok::<_, NfsError>((count, committed, verifier))
+            })
+            .await;
+            match settled {
+                Ok(settled) => break settled,
+                Err(error) => {
+                    let Some(trigger) = stateid_recovery(&error) else {
+                        return Err(error);
+                    };
+                    if attempt == 1 {
+                        return Err(Self::state_recovery_exhausted("write", trigger, error));
+                    }
+                    let Some(recovered) =
+                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                    else {
+                        return Err(Self::state_recovery_exhausted("write", trigger, error));
+                    };
+                    self.refresh_lane_stateid(&lane, recovered, trigger, "write")
+                        .await
+                        .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
+                    attempt += 1;
+                }
+            }
+        };
         if count > data.len() as u32 {
             return Err(NfsError::Xdr("WRITE count exceeds request length".into()));
         }
@@ -2223,7 +2970,7 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        let expected_generation = self.lease.begin_stateful("locku")?;
+        self.lease.begin_teardown("locku")?;
         if lock_stateid.len() != 16 {
             return Err(NfsError::InvalidInput(
                 "lock_stateid must be 16 bytes".into(),
@@ -2237,6 +2984,7 @@ impl Mount for Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let locks = Arc::clone(&self.locks);
+        let lease = Arc::clone(&self.lease);
         let client_id = self.client_id.load(Ordering::Acquire);
         tokio::spawn(async move {
             let mut lane = lane.lock().await;
@@ -2249,52 +2997,207 @@ impl Mount for Mount40 {
                     "LOCKU parameters do not match the acquired lock".into(),
                 ));
             }
-            let request = CompoundBuilder::new("locku")
-                .putfh(&fh)
-                .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
-                .encode_with_header(&auth);
-            let (class, ctx) = context(
+            let original_stateid = lane.stateid;
+            let owner = lane.owner;
+            let owner_wire = lane.owner_wire.clone();
+            let (mut class, mut ctx) = context(
                 "locku",
                 lane.owner,
                 lane.next_seqid,
                 OperationClass::ReplaySensitive,
             );
-            let response = rpc
-                .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            let old_stateid = lane.stateid;
-            let owner = lane.owner;
-            let owner_wire = lane.owner_wire.clone();
-            let decoded = decode_lock_response(response, 14, "LOCKU");
-            if consumes_owner_seqid(&decoded) {
+            let request = CompoundBuilder::new("locku")
+                .putfh(&fh)
+                .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
+                .encode_with_header(&auth);
+            let (mut decoded, consumed) = decode_lock_op_call(
+                rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                    .await,
+                14,
+                "LOCKU",
+            );
+            if consumed {
                 lane.next_seqid = lane.next_seqid.wrapping_add(1);
             }
-            lane.stateid = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            drop(lane);
-            locks.remove(&old_stateid).await;
-            let cleanup = CompoundBuilder::new("release-lockowner")
-                .release_lockowner(client_id, &owner_wire)
-                .encode_with_header(&auth);
-            let (class, ctx) = context(
-                "release_lockowner",
-                owner,
-                0,
-                OperationClass::ReplaySensitive,
-            );
-            let response = rpc
-                .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await
-                .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-            decode_release_lockowner_response(response)
-                .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-            Ok(())
+            // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
+            // current lock seqid, so a blind +1 retry cannot converge when the
+            // server advanced by more than one and would leave the lane holding
+            // a stateid the server never issued. Report the exhaustion and keep
+            // the server-issued stateid untouched; LOCKU has no dir_fh/name to
+            // re-open with, so reopening is the caller's decision.
+            // RFC 7530 §9.1.4.4: BAD_STATEID is also returned when the stateid
+            // seqid is later than the server's, in which case the lock still
+            // exists. Probe once with the previous stateid seqid before
+            // treating the lock as released; a genuine loss just repeats the
+            // status, and BAD_STATEID does not consume the lock-owner seqid.
+            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID)) = &decoded {
+                let seqid = u32::from_be_bytes([
+                    lane.stateid[0],
+                    lane.stateid[1],
+                    lane.stateid[2],
+                    lane.stateid[3],
+                ]);
+                if let Some(previous) = seqid.checked_sub(1) {
+                    let mut probe_stateid = lane.stateid;
+                    probe_stateid[..4].copy_from_slice(&previous.to_be_bytes());
+                    let request = CompoundBuilder::new("locku")
+                        .putfh(&fh)
+                        .locku(lock_type, lane.next_seqid, &probe_stateid, offset, length)
+                        .encode_with_header(&auth);
+                    (class, ctx) = context(
+                        "locku",
+                        lane.owner,
+                        lane.next_seqid,
+                        OperationClass::ReplaySensitive,
+                    );
+                    let (retried, retry_consumed) = decode_lock_op_call(
+                        rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await,
+                        14,
+                        "LOCKU",
+                    );
+                    decoded = retried;
+                    if retry_consumed {
+                        lane.next_seqid = lane.next_seqid.wrapping_add(1);
+                    }
+                }
+            }
+            let decoded = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+            match decoded {
+                Ok(_) => {
+                    // Retire the lane before dropping it so a concurrent
+                    // reclaim cannot see it as current and re-establish a lock
+                    // the caller just released.
+                    lane.stateid = [0; 16];
+                    drop(lane);
+                    locks.remove(&original_stateid).await;
+                    let cleanup = CompoundBuilder::new("release-lockowner")
+                        .release_lockowner(client_id, &owner_wire)
+                        .encode_with_header(&auth);
+                    let (class, ctx) = context(
+                        "release_lockowner",
+                        owner,
+                        0,
+                        OperationClass::ReplaySensitive,
+                    );
+                    // Best effort: the LOCKU reply is authoritative and the
+                    // lane is already retired. A stale client id or transport
+                    // failure here must not turn a successful unlock into an
+                    // error the caller would retry.
+                    let result = async {
+                        let response = rpc
+                            .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                        decode_release_lockowner_response(response)
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        tracing::debug!(
+                            target: "nfs_rs::stateid",
+                            operation = "locku",
+                            owner = owner,
+                            error = %error,
+                            "NFSv4.0 RELEASE_LOCKOWNER failed after LOCKU; lock state is already released"
+                        );
+                    }
+                    lease.record_activity();
+                    Ok(())
+                }
+                Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
+                    // The lock exists with a newer stateid that the status does
+                    // not disclose. Keep the lane (the lock is still held
+                    // server-side) with its last server-issued stateid and let
+                    // the caller decide whether to reopen.
+                    Err(Mount40::state_recovery_exhausted(
+                        "locku",
+                        StateidRecovery::Old,
+                        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID),
+                    ))
+                }
+                // RFC 7530 §9.1.4.3: BAD/STALE mean the lock state no longer
+                // exists server-side, so the unlock is already satisfied. Drop
+                // the lane instead of wedging it on a stateid that can never be
+                // accepted again.
+                Err(error) if error.is_recoverable_state() => {
+                    tracing::debug!(
+                        target: "nfs_rs::stateid",
+                        operation = "locku",
+                        owner = lane.owner,
+                        error = %error,
+                        "NFSv4.0 LOCKU found no server lock state; treating it as released"
+                    );
+                    // Same released sentinel as the success branch: the
+                    // registry entry is removed just after this point, and a
+                    // reclaim must not observe it as current in between.
+                    lane.stateid = [0; 16];
+                    drop(lane);
+                    locks.remove(&original_stateid).await;
+                    // The lock state is gone but the server may still hold the
+                    // lock-owner record. Best-effort release so it does not live
+                    // until lease expiry.
+                    let cleanup = CompoundBuilder::new("release-lockowner")
+                        .release_lockowner(client_id, &owner_wire)
+                        .encode_with_header(&auth);
+                    if let Err(cleanup_error) = rpc
+                        .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await
+                        .and_then(decode_release_lockowner_response)
+                    {
+                        tracing::debug!(
+                            target: "nfs_rs::stateid",
+                            operation = "locku",
+                            error = %cleanup_error,
+                            "NFSv4.0 RELEASE_LOCKOWNER after a released lock failed; ignoring"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))??;
-        self.lease.finish_stateful(expected_generation, "locku")?;
         Ok(())
     }
+    async fn release_locks(&self, fh: Bytes) -> Result<()> {
+        // A cancelled LOCK keeps settling in its detached task and registers
+        // its lane only after the reply arrives. Wait for every acquisition
+        // issued before this cleanup, otherwise the snapshot below misses the
+        // grant and the following CLOSE collides with it (`LOCKS_HELD`).
+        self.locks.wait_for_acquisitions(&fh).await;
+        let lanes = self.locks.for_fh(&fh).await;
+        let mut failure = None;
+        for lane in lanes {
+            let (stateid, lock_type, offset, length) = {
+                let lane = lane.lock().await;
+                (lane.stateid, lane.lock_type, lane.offset, lane.length)
+            };
+            if stateid == [0; 16] {
+                // The lane is being retired by a concurrent LOCKU; the release
+                // is already in progress.
+                continue;
+            }
+            if let Err(error) = self
+                .locku(
+                    fh.clone(),
+                    Bytes::copy_from_slice(&stateid),
+                    lock_type,
+                    offset,
+                    length,
+                )
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
         if token.issuer != self.issuer || token.generation != self.lease.generation() {
             return Err(NfsError::InvalidInput(
@@ -2426,51 +3329,90 @@ impl Mount for Mount40 {
                     .await?,
             );
         };
-        let expected_generation = self.lease.begin_stateful("read")?;
-        let io_guard = if let Some(callback_state) = &self.callback_state {
-            Some(callback_state.foreground_io(&fh).await)
-        } else {
-            None
-        };
-        let rpc = self.rpc.clone();
-        let auth = self.auth.clone();
-        let lease = Arc::clone(&self.lease);
-        let settled = DetachedSettlement::new(async move {
-            let _callback_io = io_guard;
-            let (stateid, _in_flight) = {
-                let guard = lane.lock().await;
-                if guard.closing {
-                    return Err(NfsError::InvalidInput(
-                        "NFSv4.0 open state is closing or closed".into(),
-                    ));
-                }
-                let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
-                (guard.stateid, in_flight)
+        let mut attempt = 0;
+        loop {
+            let expected_generation = self.lease.begin_stateful("read")?;
+            let io_guard = if let Some(callback_state) = &self.callback_state {
+                Some(callback_state.foreground_io(&fh).await)
+            } else {
+                None
             };
-            let request = CompoundBuilder::new("read")
-                .putfh(&fh)
-                .read(&stateid, offset, count)
-                .encode_with_header(&auth);
-            let data = decode_read_response(
-                call_with_busy_retry(
-                    &rpc,
-                    request,
-                    Bytes::new(),
-                    SAFE_REPLAY,
-                    METADATA_TIMEOUT,
-                    RequestContext {
-                        operation: "read".into(),
-                        protocol: NFSVersion::NFSv4p0,
-                        request_id: None,
-                    },
-                )
-                .await?,
-            )?;
-            lease.finish_stateful(expected_generation, "read")?;
-            Ok::<_, NfsError>(data)
-        })
-        .await?;
-        Ok(settled)
+            let rpc = self.rpc.clone();
+            let auth = self.auth.clone();
+            let lease = Arc::clone(&self.lease);
+            let lane_for_settlement = Arc::clone(&lane);
+            let fh_for_settlement = fh.clone();
+            let used = Arc::new(std::sync::Mutex::new(None));
+            let used_in_task = Arc::clone(&used);
+            let settled = DetachedSettlement::new(async move {
+                let _callback_io = io_guard;
+                // Same fence-before-lane order as close and reclaim.
+                let io_fence = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    Arc::clone(&guard.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
+                let stateid = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    guard.stateid
+                };
+                *used_in_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stateid);
+                let request = CompoundBuilder::new("read")
+                    .putfh(&fh_for_settlement)
+                    .read(&stateid, offset, count)
+                    .encode_with_header(&auth);
+                let data = decode_read_response(
+                    call_with_busy_retry(
+                        &rpc,
+                        request,
+                        Bytes::new(),
+                        SAFE_REPLAY,
+                        METADATA_TIMEOUT,
+                        RequestContext {
+                            operation: "read".into(),
+                            protocol: NFSVersion::NFSv4p0,
+                            request_id: None,
+                        },
+                    )
+                    .await?,
+                )?;
+                lease.finish_stateful(expected_generation, "read")?;
+                Ok::<_, NfsError>(data)
+            })
+            .await;
+            match settled {
+                Ok(data) => return Ok(data),
+                Err(error) => {
+                    let Some(trigger) = stateid_recovery(&error) else {
+                        return Err(error);
+                    };
+                    if attempt == 1 {
+                        return Err(Self::state_recovery_exhausted("read", trigger, error));
+                    }
+                    let Some(recovered) =
+                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                    else {
+                        return Err(Self::state_recovery_exhausted("read", trigger, error));
+                    };
+                    self.refresh_lane_stateid(&lane, recovered, trigger, "read")
+                        .await
+                        .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
+                    attempt += 1;
+                }
+            }
+        }
     }
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<mount::WriteOutcome> {
         self.write_how(fh, offset, data, mount::WriteStability::Unstable)
@@ -2707,6 +3649,11 @@ mod tests {
         result
     }
 
+    /// A reply whose overall status contradicts a fully successful operation list.
+    fn contradictory_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
+        compound_result_with_status(10006, tag, ops)
+    }
+
     fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
         let mut denied = Vec::new();
         denied.extend_from_slice(&7u64.to_be_bytes());
@@ -2742,6 +3689,27 @@ mod tests {
         compound_result("close", &[(22, &[]), (4, &stateid)])
     }
 
+    fn read_result(data: &[u8]) -> Vec<u8> {
+        let mut read = Vec::new();
+        read.extend_from_slice(&1u32.to_be_bytes());
+        xdr_opaque(&mut read, data);
+        compound_result("read", &[(22, &[]), (25, &read)])
+    }
+
+    fn write_result(count: u32) -> Vec<u8> {
+        let mut write = Vec::new();
+        write.extend_from_slice(&count.to_be_bytes());
+        write.extend_from_slice(&2u32.to_be_bytes());
+        write.extend_from_slice(&[0x33; 8]);
+        compound_result("write", &[(22, &[]), (38, &write)])
+    }
+
+    fn setattr_result() -> Vec<u8> {
+        let mut attrs = Vec::new();
+        attrs.extend_from_slice(&0u32.to_be_bytes());
+        compound_result("setattr", &[(22, &[]), (34, &attrs)])
+    }
+
     /// A COMPOUND that failed at PUTFH: only the PUTFH result is present, and
     /// the target CLOSE never ran.
     fn putfh_failure_result(tag: &str, status: u32) -> Vec<u8> {
@@ -2767,6 +3735,8 @@ mod tests {
                 next_seqid: 1,
                 stateid,
                 fh: Bytes::from_static(b"fh"),
+                dir_fh: Bytes::from_static(b"dir"),
+                name: "file".into(),
                 access,
                 write_verifier: None,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -3039,6 +4009,11 @@ mod tests {
             error.stateid_failure(),
             Some(crate::StateidFailure::StateRecoveryExhausted)
         );
+        assert!(matches!(
+            error,
+            NfsError::StateRecoveryExhausted(ref failure)
+                if failure.status == crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
+        ));
         // The lane survives (the open state still exists server-side) and stays
         // closeable for the caller's reopen; only the consumed open-owner seqid
         // advanced. The stateid seqid is untouched because the server's current
@@ -3047,6 +4022,1681 @@ mod tests {
         assert!(!lane.closing);
         assert_eq!(lane.next_seqid, 2);
         assert_eq!(lane.stateid, [0xa9; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_returning_same_stateid_reports_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 211, [0xab; 16], crate::OPEN_READ).await;
+        // A lane that already used seqids: the fresh OPEN restarts at seqid 0,
+        // so the recorded value must drop to 1 even though the recovery fails.
+        lane.lock().await.next_seqid = 3;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            // A fresh OPEN that answers with the stateid that just failed must
+            // not be mistaken for a recovered lane; its seqid is consumed all
+            // the same and the lane must record it.
+            reply(&mut stream, &open, &open_result(0, [0xab; 16], b"fh")).await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xab; 16]);
+        assert_eq!(lane.next_seqid, 1);
+        drop(lane);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_old_stateid_is_reported_as_exhaustion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 212, [0xac; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &failed_lock_result("open-recover", 18, 10024),
+            )
+            .await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        // OLD_STATEID from the recovery OPEN itself means the bounded recovery
+        // already failed; it must not surface as recoverable in place.
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        match error {
+            NfsError::StateRecoveryExhausted(failure) => {
+                assert_eq!(failure.operation, "read");
+                assert_eq!(failure.status, crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID);
+                assert!(matches!(
+                    *failure.source,
+                    NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(lane.lock().await.stateid, [0xac; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bad_stateid_read_reopens_once_and_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 201, [0xa1; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // Exactly one fresh OPEN (CLAIM_NULL) is allowed for one recovery.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb2; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            reply(&mut stream, &retry, &read_result(b"data")).await
+        });
+        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"data"));
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xb2; 16]);
+        assert_eq!(lane.next_seqid, 1);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bad_stateid_reopen_falls_back_to_lane_seqid_on_bad_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 215, [0xab; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // The open-owner record survived, so seqid 0 is a BAD_SEQID.
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            // The bounded fallback resends with the lane's next seqid.
+            let open_retry = read_record(&mut stream).await?;
+            reply(&mut stream, &open_retry, &open_result(0, [0xbc; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            reply(&mut stream, &retry, &read_result(b"data")).await
+        });
+        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"data"));
+        assert_eq!(lane.lock().await.stateid, [0xbc; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_stateid_returns_typed_state_lost_without_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 202, [0xa2; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10023)).await?;
+            // Crash recovery (SETCLIENTID + reclaim) is driven by the lease
+            // renewal, never from inside one I/O call: the server must see no
+            // second request here.
+            Ok::<(), std::io::Error>(())
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NfsError::LostOpenState(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.stateid_failure().is_none());
+        assert_eq!(lane.lock().await.stateid, [0xa2; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_stateid_read_recovers_with_fresh_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 203, [0xa3; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10024)).await?;
+            // OLD_STATEID does not carry the server's current seqid, so the lane
+            // is refreshed with exactly one fresh OPEN instead of a blind seqid
+            // increment.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            reply(&mut stream, &retry, &read_result(b"data")).await
+        });
+        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
+        assert_eq!(data, Bytes::from_static(b"data"));
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xb3; 16]);
+        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
+        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds).
+        assert_eq!(lane.next_seqid, 1);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_state_recovery_returns_classified_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 204, [0xa4; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // A malformed OPEN reply has no authoritative status, so the lane
+            // cannot be refreshed and the recovery is reported as exhausted.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, b"malformed-open-reply").await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        match error {
+            NfsError::StateRecoveryExhausted(error) => {
+                assert_eq!(error.operation, "read");
+                assert_eq!(error.status, crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID);
+                assert!(matches!(*error.source, NfsError::Xdr(_)));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // A failed recovery leaves the lane untouched so a later attempt can retry.
+        assert_eq!(lane.lock().await.stateid, [0xa4; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_not_found_is_propagated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 217, [0xcc; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // The name no longer resolves: report the authoritative NOENT
+            // instead of hiding it behind a state-recovery failure.
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &failed_lock_result("open-recover", 18, 2),
+            )
+            .await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NOENT)),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.stateid_failure().is_none());
+        assert_eq!(lane.lock().await.stateid, [0xcc; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_open_grace_after_bad_seqid_stays_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 218, [0xcd; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // The open-owner record survived (seqid 0 is a replay check), then
+            // the server enters grace and refuses the CLAIM_NULL OPEN.
+            let open = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &open,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            let retry = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &retry,
+                &failed_lock_result("open-grace", 18, 10013),
+            )
+            .await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
+            "grace must stay retryable, got {error:?}"
+        );
+        // GRACE is outside the §9.1.7 exception table: the failed OPEN consumed
+        // its seqid, so a later recovery must not replay it.
+        let lane = lane.lock().await;
+        assert_eq!(lane.next_seqid, 2);
+        assert_eq!(lane.stateid, [0xcd; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_confirm_failure_records_every_consumed_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 221, [0xa5; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // seqid=0 probe: the open-owner record survived.
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            // Fallback OPEN(5) succeeds but needs confirmation.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
+            // OPEN_CONFIRM(6) fails with SERVERFAULT, which consumes seqid 6.
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &failed_lock_result("open_confirm", 20, 10006),
+            )
+            .await?;
+            // The lane must now expect 7, not the 6 derived from the OPEN alone.
+            let close = read_record(&mut stream).await?;
+            let expected = [7u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "CLOSE must use the seqid consumed by both OPEN and OPEN_CONFIRM"
+            );
+            reply(&mut stream, &close, &close_result([0xa7; 16])).await
+        });
+        let error = mount
+            .read(Bytes::from_static(b"fh"), 0, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_SERVERFAULT)
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(lane.lock().await.next_seqid, 7);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_confirm_non_consuming_failure_keeps_open_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 223, [0xa5; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
+            // BAD_STATEID does not consume seqid 6.
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &failed_lock_result("open_confirm", 20, 10025),
+            )
+            .await?;
+            // OPEN(5) still consumed its seqid, so the next request uses 6.
+            let close = read_record(&mut stream).await?;
+            let expected = [6u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "CLOSE must keep the seqid consumed by the successful OPEN"
+            );
+            reply(&mut stream, &close, &close_result([0xa7; 16])).await
+        });
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 6);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_replacement_filehandle_records_the_cleanup_close_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 227, [0xe1; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // A released owner restarts at seqid 0.
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            // The retry with the lane cursor opens a *different* filehandle.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xe2; 16], b"other")).await?;
+            // OPEN(5) consumed 5, so the cleanup CLOSE uses 6.
+            let cleanup = read_record(&mut stream).await?;
+            let expected = [6u32.to_be_bytes().as_slice(), &[0xe2; 16]].concat();
+            assert!(
+                cleanup.windows(expected.len()).any(|wire| wire == expected),
+                "cleanup CLOSE must use the seqid after the successful OPEN"
+            );
+            reply(&mut stream, &cleanup, &close_result([0xe2; 16])).await?;
+            // Because cleanup CLOSE(6) succeeded, the server now expects 7.
+            let close = read_record(&mut stream).await?;
+            let expected = [7u32.to_be_bytes().as_slice(), &[0xe1; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "the lane must record the seqid consumed by the cleanup CLOSE"
+            );
+            reply(&mut stream, &close, &close_result([0xe1; 16])).await
+        });
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 7);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_does_not_open_after_the_mount_is_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 228, [0xf1; 16], crate::OPEN_READ).await;
+        let held = lane.lock().await;
+        let refresh = {
+            let mount = Arc::clone(&mount);
+            let lane = Arc::clone(&lane);
+            tokio::spawn(async move {
+                mount
+                    .refresh_lane_stateid(&lane, [0xf1; 16], StateidRecovery::Bad, "read")
+                    .await
+            })
+        };
+        // Let the detached task queue behind the lane lock, then lose the
+        // mount before it can dispatch its recovery OPEN.
+        tokio::task::yield_now().await;
+        mount.lease.mark_lost().await;
+        drop(held);
+        let error = refresh.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, NfsError::OperationOutcome(_)),
+            "a queued refresh must report the lifecycle gate, got {error:?}"
+        );
+        assert_eq!(lane.lock().await.stateid, [0xf1; 16]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "a lost mount must not dispatch a recovery OPEN"
+            );
+            Ok::<(), std::io::Error>(())
+        });
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_result_across_a_generation_fence_is_not_published() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &request, &open_result(0, [0x91; 16], b"fh")).await
+        });
+        let for_open = Arc::clone(&mount);
+        let open = tokio::spawn(async move {
+            for_open
+                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        let error = match open.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("OPEN must not be published across a generation fence"),
+        };
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            crate::RecoveryAction::Reopen
+        );
+        assert!(
+            mount.state.snapshot().await.is_empty(),
+            "a fenced OPEN must not leave a lane behind"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_close_retires_the_recovered_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 231, [0xf2; 16], crate::OPEN_READ).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &open, &open_result(0, [0xf3; 16], b"fh")).await?;
+            let cleanup = read_record(&mut stream).await?;
+            // The recovery OPEN restarts a released owner at seqid 0, so the
+            // cleanup CLOSE carries the next seqid.
+            let expected = [1u32.to_be_bytes().as_slice(), &[0xf3; 16]].concat();
+            assert!(cleanup.windows(expected.len()).any(|wire| wire == expected));
+            // Drop the connection without replying: the cleanup CLOSE outcome
+            // is unknown and the lane must not stay stuck in `closing`.
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let mount_for_refresh = Arc::clone(&mount);
+        let refresh = tokio::spawn(async move {
+            mount_for_refresh
+                .refresh_lane_stateid(&lane, [0xf2; 16], StateidRecovery::Bad, "read")
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        let error = refresh.await.unwrap().unwrap_err();
+        assert!(matches!(error, NfsError::OperationOutcome(_)));
+        assert!(
+            mount
+                .state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
+                .await
+                .is_none(),
+            "an unknown cleanup CLOSE must retire the lane"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspect_open_error_keeps_the_published_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &request, &open_result(0, [0x92; 16], b"fh")).await
+        });
+        let for_open = Arc::clone(&mount);
+        let open = tokio::spawn(async move {
+            for_open
+                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .await
+        });
+        seen_rx.await.unwrap();
+        // Lifecycle changes without a generation bump: the open still exists
+        // and must remain tracked so it can be closed by file handle.
+        mount.lease.mark_reconnecting();
+        let _ = reply_tx.send(());
+        let error = open.await.unwrap().unwrap_err();
+        assert!(matches!(error, NfsError::OperationOutcome(_)));
+        assert!(
+            mount
+                .state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
+                .await
+                .is_some(),
+            "a non-lost mount must keep the published open lane"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_recovers_an_abandoned_lock_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 44, b"fh").await;
+        // Simulate a LOCK that succeeded after its caller was cancelled: the
+        // lock stays registered, but the caller never received the token.
+        register_scripted_lock(&mount, 44, [0x73; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x73; 16]].concat();
+            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x74; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
+        assert!(
+            error.to_string().contains("outstanding locks"),
+            "the abandoned lock must still be visible to CLOSE: {error}"
+        );
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_works_while_the_mount_is_verifying_its_lease() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 45, b"fh").await;
+        register_scripted_lock(&mount, 45, [0x75; 16]).await;
+        // A cancelled LOCK often coincides with a failed RENEW. Teardown must
+        // not be blocked by the lifecycle gate, otherwise close stays wedged.
+        mount.lease.mark_reconnecting();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x75; 16]].concat();
+            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x76; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_ignores_a_failed_release_lockowner() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 48, b"fh").await;
+        register_scripted_lock(&mount, 48, [0x81; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x82; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            // STALE_CLIENTID: the lock state is already gone even though the
+            // cleanup owner release failed.
+            reply(
+                &mut stream,
+                &release,
+                &compound_result_with_status(10022, "release-lockowner", &[]),
+            )
+            .await
+        });
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_accepts_success_when_recovery_starts_mid_release() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 46, b"fh").await;
+        register_scripted_lock(&mount, 46, [0x77; 16]).await;
+        mount.lease.mark_reconnecting();
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x78; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let for_release = Arc::clone(&mount);
+        let release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        seen_rx.await.unwrap();
+        // Recovery starts while the LOCKU is in flight. The successful reply is
+        // authoritative; reporting failure would make callers retry an
+        // already-released lock.
+        mount.lease.mark_recovering();
+        let _ = reply_tx.send(());
+        release.await.unwrap().unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_does_not_abandon_stateid_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 222, [0xa8; 16], crate::OPEN_READ).await;
+        let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            opened_tx.send(()).ok();
+            // Hold the recovery OPEN reply until after the caller is cancelled.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reply(&mut stream, &open, &open_result(0, [0xb1; 16], b"fh")).await
+        });
+        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
+        tokio::select! {
+            _ = opened_rx.recv() => {}
+            result = &mut read => panic!("read completed before cancellation: {result:?}"),
+        }
+        drop(read);
+        // The detached recovery task must still publish the new stateid and the
+        // consumed owner seqid after the caller is gone.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = {
+                    let guard = lane.lock().await;
+                    guard.stateid == [0xb1; 16] && guard.next_seqid == 1
+                };
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled read abandoned stateid recovery");
+        server.await.unwrap().unwrap();
+    }
+
+    /// RFC 7530 §9.1.7: a sent OPEN or OPEN_CONFIRM consumes its owner seqid
+    /// unless the status is in the exception table. A transmission failure and
+    /// a non-consuming status leave the cursor where it was, and OPEN and
+    /// OPEN_CONFIRM advance it independently.
+    #[tokio::test]
+    async fn fresh_open_seqid_consumption_matrix() {
+        enum OpenStage {
+            Failure(u32),
+            Success { confirm: Option<u32> },
+        }
+        // (label, scripted stage, expected next unconsumed seqid, succeeds)
+        let cases = [
+            ("OPEN ok", OpenStage::Success { confirm: None }, 2u32, true),
+            ("OPEN SERVERFAULT", OpenStage::Failure(10006), 2, false),
+            ("OPEN BAD_SEQID", OpenStage::Failure(10026), 1, false),
+            ("OPEN MOVED", OpenStage::Failure(10019), 1, false),
+            (
+                "CONFIRM ok",
+                OpenStage::Success { confirm: Some(0) },
+                3,
+                true,
+            ),
+            (
+                "CONFIRM SERVERFAULT",
+                OpenStage::Success {
+                    confirm: Some(10006),
+                },
+                3,
+                false,
+            ),
+            (
+                "CONFIRM BAD_STATEID",
+                OpenStage::Success {
+                    confirm: Some(10025),
+                },
+                2,
+                false,
+            ),
+            (
+                "CONFIRM BAD_SEQID",
+                OpenStage::Success {
+                    confirm: Some(10026),
+                },
+                2,
+                false,
+            ),
+            (
+                "CONFIRM MOVED",
+                OpenStage::Success {
+                    confirm: Some(10019),
+                },
+                2,
+                false,
+            ),
+        ];
+        for (label, stage, expected_next, expected_ok) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+                .await
+                .unwrap();
+            let client = rpc::Client::new(mux, None);
+            let open_stateid = [0x11; 16];
+            let confirmed_stateid = [0x12; 16];
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let open = read_record(&mut stream).await?;
+                let open_frame = [
+                    1u32.to_be_bytes().as_slice(),
+                    crate::OPEN_READ.to_be_bytes().as_slice(),
+                    0u32.to_be_bytes().as_slice(),
+                    7u64.to_be_bytes().as_slice(),
+                ]
+                .concat();
+                assert!(
+                    open.windows(open_frame.len())
+                        .any(|wire| wire == open_frame),
+                    "{label}: OPEN must carry seqid 1"
+                );
+                match stage {
+                    OpenStage::Failure(status) => {
+                        return reply(&mut stream, &open, &failed_lock_result("open", 18, status))
+                            .await;
+                    }
+                    OpenStage::Success { confirm } => {
+                        let flags = if confirm.is_some() { 2 } else { 0 };
+                        reply(&mut stream, &open, &open_result(flags, open_stateid, b"fh")).await?;
+                        let Some(status) = confirm else {
+                            return Ok(());
+                        };
+                        let confirm_request = read_record(&mut stream).await?;
+                        let confirm_frame =
+                            [open_stateid.as_slice(), 2u32.to_be_bytes().as_slice()].concat();
+                        assert!(
+                            confirm_request
+                                .windows(confirm_frame.len())
+                                .any(|wire| wire == confirm_frame),
+                            "{label}: OPEN_CONFIRM must carry seqid 2"
+                        );
+                        if status == 0 {
+                            reply(
+                                &mut stream,
+                                &confirm_request,
+                                &compound_result(
+                                    "open_confirm",
+                                    &[(22, &[]), (20, &confirmed_stateid)],
+                                ),
+                            )
+                            .await
+                        } else {
+                            reply(
+                                &mut stream,
+                                &confirm_request,
+                                &failed_lock_result("open_confirm", 20, status),
+                            )
+                            .await
+                        }
+                    }
+                }
+            });
+            let attempt = fresh_open_lane(
+                &client,
+                &Auth::new_null(),
+                &Bytes::from_static(b"dir"),
+                "file",
+                b"owner",
+                crate::OPEN_READ,
+                7,
+                1,
+                "recovery-open",
+            )
+            .await;
+            assert_eq!(attempt.next_seqid, expected_next, "{label}");
+            assert_eq!(attempt.result.is_ok(), expected_ok, "{label}");
+            match attempt.result {
+                Ok(open) => {
+                    let expected_stateid = if expected_next == 3 {
+                        confirmed_stateid
+                    } else {
+                        open_stateid
+                    };
+                    assert_eq!(open.stateid, expected_stateid, "{label}");
+                }
+                Err(error) => assert!(
+                    matches!(error, NfsError::Nfs4(_)),
+                    "{label}: unexpected error {error:?}"
+                ),
+            }
+            server.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_during_open_confirm_still_publishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 224, [0xc1; 16], crate::OPEN_READ).await;
+        let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            // The recovery OPEN needs confirmation, so the caller can be
+            // cancelled between the two consuming stages.
+            reply(&mut stream, &open, &open_result(2, [0xc2; 16], b"fh")).await?;
+            let confirm = read_record(&mut stream).await?;
+            confirm_tx.send(()).ok();
+            // Hold the OPEN_CONFIRM reply until after the caller is cancelled.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reply(
+                &mut stream,
+                &confirm,
+                &compound_result("open_confirm", &[(22, &[]), (20, &[0xc3; 16])]),
+            )
+            .await
+        });
+        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
+        tokio::select! {
+            _ = confirm_rx.recv() => {}
+            result = &mut read => panic!("read completed before cancellation: {result:?}"),
+        }
+        drop(read);
+        // The detached recovery task must finish OPEN_CONFIRM and publish both
+        // the confirmed stateid and the seqid consumed by both stages.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = {
+                    let guard = lane.lock().await;
+                    guard.stateid == [0xc3; 16] && guard.next_seqid == 2
+                };
+                if settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled read abandoned OPEN_CONFIRM publication");
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_open_putfh_failure_does_not_consume_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let client = rpc::Client::new(mux, None);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &putfh_failure_result("open", 10006)).await
+        });
+        let attempt = fresh_open_lane(
+            &client,
+            &Auth::new_null(),
+            &Bytes::from_static(b"dir"),
+            "file",
+            b"owner",
+            crate::OPEN_READ,
+            7,
+            1,
+            "recovery-open",
+        )
+        .await;
+        assert!(
+            matches!(attempt.result, Err(NfsError::Nfs4(_))),
+            "PUTFH failure must surface the status"
+        );
+        assert_eq!(
+            attempt.next_seqid, 1,
+            "a PUTFH failure never ran OPEN and must not consume seqid 1"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_putfh_failure_keeps_the_lane_cursor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 246, [0xd8; 16], crate::OPEN_BOTH).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            // The recovery probe starts at seqid 0, but a PUTFH failure means
+            // the OPEN never ran: the lane's real cursor must not regress.
+            reply(
+                &mut stream,
+                &open,
+                &putfh_failure_result("recovery-open", 10006),
+            )
+            .await
+        });
+        assert!(
+            mount
+                .refresh_lane_stateid(&lane, [0xd8; 16], StateidRecovery::Bad, "read")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            5,
+            "a non-executed recovery OPEN must keep the lane's existing cursor"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_confirm_putfh_failure_keeps_only_the_open_consumption() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
+            .await
+            .unwrap();
+        let client = rpc::Client::new(mux, None);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(2, [0x21; 16], b"fh")).await?;
+            let confirm = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &confirm,
+                &putfh_failure_result("open_confirm", 10006),
+            )
+            .await
+        });
+        let attempt = fresh_open_lane(
+            &client,
+            &Auth::new_null(),
+            &Bytes::from_static(b"dir"),
+            "file",
+            b"owner",
+            crate::OPEN_READ,
+            7,
+            1,
+            "recovery-open",
+        )
+        .await;
+        assert!(attempt.result.is_err());
+        assert_eq!(
+            attempt.next_seqid, 2,
+            "OPEN consumed seqid 1, but a PUTFH-failed CONFIRM did not consume 2"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_putfh_failure_does_not_consume_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 241, b"fh").await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(&mut stream, &lock, &putfh_failure_result("lock", 10006)).await
+        });
+        assert!(
+            mount
+                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+                .is_err()
+        );
+        let lane = mount.state.by_owner(241).await.unwrap();
+        assert_eq!(
+            lane.lock().await.next_seqid,
+            1,
+            "a PUTFH failure never ran LOCK and must not consume seqid 1"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_success_while_suspect_keeps_the_granted_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 242, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x91; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        mount.lease.mark_reconnecting();
+        let _ = reply_tx.send(());
+        assert!(lock.await.unwrap().is_err());
+        assert!(
+            mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
+            "a granted lock must stay tracked while the mount is verifying its lease"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_success_across_a_lost_mount_is_not_published() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 243, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x92; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        assert!(lock.await.unwrap().is_err());
+        assert!(
+            !mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
+            "a lost mount must not keep a lock lane it can never unlock"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_waits_for_a_cancelled_lock_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 245, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x9a; 16])]),
+            )
+            .await?;
+            // The grant registered by the detached task must be visible to
+            // release_locks, which then unlocks it.
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x9a; 16]].concat();
+            assert!(
+                locku.windows(expected.len()).any(|wire| wire == expected),
+                "release_locks must unlock the lock whose caller was cancelled"
+            );
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x9b; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        // The caller goes away while the LOCK reply is still pending; its
+        // detached task will register the grant on its own.
+        lock.abort();
+        let for_release = Arc::clone(&mount);
+        let mut release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut release)
+                .await
+                .is_err(),
+            "release_locks returned before the in-flight LOCK settled"
+        );
+        let _ = reply_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .expect("release_locks must finish once the LOCK settles")
+            .unwrap()
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_returns_immediately_without_acquisitions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 246, b"fh").await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            mount.release_locks(Bytes::from_static(b"fh")),
+        )
+        .await
+        .expect("cleanup without in-flight acquisitions must not wait")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_waits_for_a_cancelled_lock_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 247, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10025)).await?;
+            // Nothing was granted, so cleanup must go straight to CLOSE.
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        lock.abort();
+        let for_release = Arc::clone(&mount);
+        let mut release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut release)
+                .await
+                .is_err(),
+            "the failed LOCK must still be tracked as unsettled"
+        );
+        let _ = reply_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .expect("release_locks must finish once the LOCK failed")
+            .unwrap()
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_overall_status_contradiction_consumes_the_owner_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 244, [0xd6; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let close = read_record(&mut stream).await?;
+            // PUTFH and CLOSE both succeeded, but the overall status claims
+            // failure: the CLOSE still ran and consumed its seqid.
+            reply(
+                &mut stream,
+                &close,
+                &contradictory_result("close", &[(22, &[]), (4, &[0x5b; 16])]),
+            )
+            .await
+        });
+        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_overall_status_contradiction_consumes_the_open_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 245, [0xd7; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &lock,
+                &contradictory_result("lock", &[(22, &[]), (12, &[0x5c; 16])]),
+            )
+            .await
+        });
+        assert!(
+            mount
+                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_recovers_bad_stateid_and_retries_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 205, [0xa5; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let write = read_record(&mut stream).await?;
+            reply(&mut stream, &write, &failed_lock_result("write", 38, 10025)).await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb5; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            reply(&mut stream, &retry, &write_result(3)).await
+        });
+        let outcome = mount
+            .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.count, 3);
+        assert_eq!(lane.lock().await.stateid, [0xb5; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setattr_size_recovers_bad_stateid_and_retries_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 206, [0xa6; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let setattr = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &setattr,
+                &failed_lock_result("setattr", 34, 10025),
+            )
+            .await?;
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb6; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            reply(&mut stream, &retry, &setattr_result()).await
+        });
+        mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lane.lock().await.stateid, [0xb6; 16]);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn setattr_without_lane_keeps_the_anonymous_stateid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let setattr = read_record(&mut stream).await?;
+            // Path-based metadata (chmod/truncate) has no open lane: RFC 7530
+            // permits the anonymous stateid for these requests, so no recovery
+            // is attempted.
+            let expected = [0u8; 16];
+            assert!(
+                setattr.windows(16).any(|wire| wire == expected),
+                "stateless SETATTR did not use the anonymous stateid"
+            );
+            reply(&mut stream, &setattr, &setattr_result()).await
+        });
+        mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_recovers_bad_open_stateid_and_retries_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_stateid_lane(&mount, 213, [0xa3; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10025)).await?;
+            // The open stateid is refreshed with exactly one fresh OPEN.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            // BAD_STATEID belongs to the RFC 7530 §9.1.7 exception table, so
+            // neither seqid is consumed: the retry keeps open_seqid 1 and
+            // lock_seqid 0 and only swaps in the refreshed stateid.
+            let expected = [
+                2u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                1u64.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                &[0xb3; 16],
+                0u32.to_be_bytes().as_slice(),
+            ]
+            .concat();
+            assert!(
+                retry.windows(expected.len()).any(|wire| wire == expected),
+                "LOCK retry after BAD_STATEID did not reuse the refreshed stateid"
+            );
+            reply(
+                &mut stream,
+                &retry,
+                &compound_result("lock-retry", &[(22, &[]), (12, &[0xb5; 16])]),
+            )
+            .await
+        });
+        let stateid = mount
+            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(stateid, Bytes::from_static(&[0xb5; 16]));
+        let open_lane = mount.state.by_owner(213).await.unwrap();
+        assert_eq!(open_lane.lock().await.stateid, [0xb3; 16]);
+        assert!(mount.locks.by_stateid(&[0xb5; 16]).await.is_some());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_old_stateid_retries_with_advanced_lock_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let open_lane = register_stateid_lane(&mount, 214, [0xaa; 16], crate::OPEN_BOTH).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10024)).await?;
+            // OLD_STATEID is not in the §9.1.7 exception table, so the rejected
+            // LOCK consumes the open-owner seqid; the lane is then refreshed
+            // with one fresh OPEN, and OLD_STATEID also advances the lock-owner
+            // seqid (0 -> 1) on the retry.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
+            let retry = read_record(&mut stream).await?;
+            let expected = [
+                2u32.to_be_bytes().as_slice(),
+                0u32.to_be_bytes().as_slice(),
+                0u64.to_be_bytes().as_slice(),
+                1u64.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                1u32.to_be_bytes().as_slice(),
+                &[0xb3; 16],
+                1u32.to_be_bytes().as_slice(),
+            ]
+            .concat();
+            assert!(
+                retry.windows(expected.len()).any(|wire| wire == expected),
+                "LOCK retry after OLD_STATEID did not advance the lock seqid or swap the refreshed stateid"
+            );
+            reply(
+                &mut stream,
+                &retry,
+                &compound_result("lock-retry", &[(22, &[]), (12, &[0xb6; 16])]),
+            )
+            .await
+        });
+        let stateid = mount
+            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(stateid, Bytes::from_static(&[0xb6; 16]));
+        let lane = open_lane.lock().await;
+        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
+        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds);
+        // the successful retry LOCK then consumes it once more (1 -> 2).
+        assert_eq!(lane.stateid, [0xb3; 16]);
+        assert_eq!(lane.next_seqid, 2);
+        drop(lane);
+        let lock_lane = mount.locks.by_stateid(&[0xb6; 16]).await.unwrap();
+        assert_eq!(lock_lane.lock().await.next_seqid, 2);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn locku_old_stateid_reports_exhaustion_without_blind_bump() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 211, [0xb1; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            // OLD_STATEID does not disclose the server's lock seqid: answer
+            // once and let the lane survive with the issued stateid.
+            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10024)).await
+        });
+        let error = mount
+            .locku(
+                Bytes::from_static(b"fh"),
+                Bytes::from([0xb1; 16].as_slice()),
+                2,
+                0,
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.stateid_failure(),
+            Some(crate::StateidFailure::StateRecoveryExhausted)
+        );
+        // The lock is still held server-side: the lane must survive with the
+        // stateid the server issued, not a locally fabricated one.
+        let lane = mount.locks.by_stateid(&[0xb1; 16]).await.unwrap();
+        let lane = lane.lock().await;
+        assert_eq!(lane.stateid, [0xb1; 16]);
+        drop(lane);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn locku_bad_stateid_is_treated_as_released() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 212, [0xb4; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10025)).await?;
+            // §9.1.4.4: a seqid ahead of the server's also reports BAD_STATEID,
+            // so one probe with the previous stateid seqid is sent first.
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("locku-probe", 14, 10025),
+            )
+            .await?;
+            // The lock-owner record may outlive the lost lock state; release it.
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        mount
+            .locku(
+                Bytes::from_static(b"fh"),
+                Bytes::from([0xb4; 16].as_slice()),
+                2,
+                0,
+                1,
+            )
+            .await
+            .expect("BAD_STATEID on LOCKU means the lock is already gone");
+        assert!(mount.locks.by_stateid(&[0xb4; 16]).await.is_none());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn locku_bad_stateid_with_ahead_seqid_probes_previous_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_lock(&mount, 219, [0xd0; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10025)).await?;
+            // The lock still exists under the previous stateid seqid: the probe
+            // unlocks it instead of leaking the server-side lock.
+            let probe = read_record(&mut stream).await?;
+            let expected = [
+                1u32.to_be_bytes().as_slice(),
+                &[0xd0, 0xd0, 0xd0, 0xcf],
+                &[0xd0; 12],
+            ]
+            .concat();
+            assert!(
+                probe.windows(expected.len()).any(|wire| wire == expected),
+                "LOCKU probe did not carry the previous stateid seqid"
+            );
+            reply(
+                &mut stream,
+                &probe,
+                &compound_result("locku-probe", &[(22, &[]), (14, &[0xd1; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        mount
+            .locku(
+                Bytes::from_static(b"fh"),
+                Bytes::from([0xd0; 16].as_slice()),
+                2,
+                0,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(mount.locks.by_stateid(&[0xd0; 16]).await.is_none());
         server.await.unwrap().unwrap();
     }
 
@@ -3692,6 +6342,8 @@ mod tests {
                 next_seqid: 1,
                 stateid: [0x75; 16],
                 fh: Bytes::from_static(b"fh"),
+                dir_fh: Bytes::from_static(b"dir"),
+                name: "reclaim-file".into(),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -6093,6 +8745,8 @@ mod tests {
                 next_seqid: 1,
                 stateid: [0x61; 16],
                 fh: Bytes::from_static(fh),
+                dir_fh: Bytes::from_static(b"dir"),
+                name: "scripted-file".into(),
                 access: crate::OPEN_BOTH,
                 write_verifier: None,
                 io_fence: Arc::new(tokio::sync::RwLock::new(())),

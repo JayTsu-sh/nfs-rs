@@ -48,32 +48,34 @@ impl LeaseState {
     }
 
     pub(crate) fn health(&self) -> MountHealth {
+        let lifecycle = match self.lifecycle.load(Ordering::Acquire) {
+            value if value == MountLifecycleState::Ready as u8 => MountLifecycleState::Ready,
+            value if value == MountLifecycleState::Suspect as u8 => MountLifecycleState::Suspect,
+            value if value == MountLifecycleState::Reconnecting as u8 => {
+                MountLifecycleState::Reconnecting
+            }
+            value if value == MountLifecycleState::Recovering as u8 => {
+                MountLifecycleState::Recovering
+            }
+            value if value == MountLifecycleState::Reclaiming as u8 => {
+                MountLifecycleState::Reclaiming
+            }
+            value if value == MountLifecycleState::LostState as u8 => {
+                MountLifecycleState::LostState
+            }
+            value if value == MountLifecycleState::Closing as u8 => MountLifecycleState::Closing,
+            value if value == MountLifecycleState::Closed as u8 => MountLifecycleState::Closed,
+            _ => MountLifecycleState::LostState,
+        };
         MountHealth {
-            lifecycle: match self.lifecycle.load(Ordering::Acquire) {
-                value if value == MountLifecycleState::Ready as u8 => MountLifecycleState::Ready,
-                value if value == MountLifecycleState::Suspect as u8 => {
-                    MountLifecycleState::Suspect
-                }
-                value if value == MountLifecycleState::Reconnecting as u8 => {
-                    MountLifecycleState::Reconnecting
-                }
-                value if value == MountLifecycleState::Recovering as u8 => {
-                    MountLifecycleState::Recovering
-                }
-                value if value == MountLifecycleState::Reclaiming as u8 => {
-                    MountLifecycleState::Reclaiming
-                }
-                value if value == MountLifecycleState::LostState as u8 => {
-                    MountLifecycleState::LostState
-                }
-                value if value == MountLifecycleState::Closing as u8 => {
-                    MountLifecycleState::Closing
-                }
-                value if value == MountLifecycleState::Closed as u8 => MountLifecycleState::Closed,
-                _ => MountLifecycleState::LostState,
-            },
+            lifecycle,
             generation: self.generation.load(Ordering::Acquire),
-            lease_healthy: Some(self.healthy.load(Ordering::Acquire)),
+            // Never report a healthy lease while the lifecycle is not Ready:
+            // mark_ready's post-CAS stores can race with mark_lost, and this is
+            // the only reader of the raw flag.
+            lease_healthy: Some(
+                self.healthy.load(Ordering::Acquire) && lifecycle == MountLifecycleState::Ready,
+            ),
             lease_seconds: Some(self.lease_seconds),
             lease_renewals: self.renewals.load(Ordering::Acquire),
             callback_healthy: None,
@@ -85,30 +87,32 @@ impl LeaseState {
     }
 
     pub(crate) fn gate_stateful(&self, operation: &str) -> crate::Result<()> {
-        let health = self.health();
-        if health.lifecycle == MountLifecycleState::Ready {
+        let lifecycle = self.health().lifecycle;
+        if lifecycle == MountLifecycleState::Ready {
             return Ok(());
         }
-        let recovery = if health.lifecycle == MountLifecycleState::LostState {
+        Err(self.gated(operation, lifecycle))
+    }
+
+    fn gated(&self, operation: &str, lifecycle: MountLifecycleState) -> NfsError {
+        let recovery = if lifecycle == MountLifecycleState::LostState {
             RecoveryAction::Reopen
         } else {
             RecoveryAction::VerifyThenResume
         };
-        Err(NfsError::OperationOutcome(Box::new(
-            OperationOutcomeError::new(
-                OperationOutcome::Uncertain,
-                OperationClass::ReplaySensitive,
-                recovery,
-                RequestContext {
-                    operation: operation.into(),
-                    protocol: NFSVersion::NFSv4p0,
-                    request_id: None,
-                },
-                NfsError::Rpc(format!(
-                    "NFSv4.0 state-dependent operation gated while mount is {:?}",
-                    health.lifecycle
-                )),
-            ),
+        NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+            OperationOutcome::Uncertain,
+            OperationClass::ReplaySensitive,
+            recovery,
+            RequestContext {
+                operation: operation.into(),
+                protocol: NFSVersion::NFSv4p0,
+                request_id: None,
+            },
+            NfsError::Rpc(format!(
+                "NFSv4.0 state-dependent operation gated while mount is {:?}",
+                lifecycle
+            )),
         )))
     }
 
@@ -131,6 +135,25 @@ impl LeaseState {
         self.gate_stateful(operation)
     }
 
+    /// Begin a teardown RPC that only removes state (LOCKU).
+    ///
+    /// Releasing state is safe while the mount is verifying its lease: the
+    /// request can only shrink what the server holds. Refusing here would let a
+    /// cancelled LOCK wedge `close` until the mount is lost. Recovery and
+    /// reclaim stay gated because they are actively re-establishing state.
+    ///
+    /// A successful reply is authoritative even if the lifecycle changes while
+    /// the request is in flight, so there is no matching finish gate.
+    pub(crate) fn begin_teardown(&self, operation: &str) -> crate::Result<u64> {
+        let lifecycle = self.health().lifecycle;
+        match lifecycle {
+            MountLifecycleState::Ready
+            | MountLifecycleState::Suspect
+            | MountLifecycleState::Reconnecting => Ok(self.generation()),
+            _ => Err(self.gated(operation, lifecycle)),
+        }
+    }
+
     pub(crate) fn validate_stateful(&self, generation: u64, operation: &str) -> crate::Result<()> {
         if self.generation() == generation && self.health().lifecycle == MountLifecycleState::Ready
         {
@@ -141,11 +164,37 @@ impl LeaseState {
     }
 
     pub(crate) fn mark_ready(&self) {
+        // A lost/closed mount must stay terminal: its state maps were cleared
+        // and callers were told to reopen, so a later successful RENEW must not
+        // silently resurrect it as Ready.
+        if !self.enter_recovered() {
+            return;
+        }
         self.record_activity();
         self.renewals.fetch_add(1, Ordering::AcqRel);
         self.healthy.store(true, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Ready as u8, Ordering::Release);
+    }
+
+    /// Atomically promote to `Ready` unless the mount already became terminal.
+    fn enter_recovered(&self) -> bool {
+        let lost = MountLifecycleState::LostState as u8;
+        let closing = MountLifecycleState::Closing as u8;
+        let closed = MountLifecycleState::Closed as u8;
+        let mut current = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if current == lost || current == closing || current == closed {
+                return false;
+            }
+            match self.lifecycle.compare_exchange_weak(
+                current,
+                MountLifecycleState::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub(crate) fn record_activity(&self) {
@@ -154,27 +203,48 @@ impl LeaseState {
             .send_replace(tokio::time::Instant::now() + lease_duration);
     }
 
+    /// Move to `next` unless the mount already reached a terminal state.
+    ///
+    /// `mark_ready` has its own CAS (`enter_recovered`); every other lifecycle
+    /// transition goes through here so a late RENEW or recovery attempt cannot
+    /// resurrect a mount whose state maps were already cleared.
+    fn transition(&self, next: MountLifecycleState) -> bool {
+        let next = next as u8;
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            if current == MountLifecycleState::LostState as u8
+                || current == MountLifecycleState::Closing as u8
+                || current == MountLifecycleState::Closed as u8
+            {
+                return false;
+            }
+            if self
+                .lifecycle
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     fn mark_suspect(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Suspect as u8, Ordering::Release);
+        self.transition(MountLifecycleState::Suspect);
     }
 
     pub(crate) fn mark_reconnecting(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Reconnecting as u8, Ordering::Release);
+        self.transition(MountLifecycleState::Reconnecting);
     }
 
     pub(crate) fn mark_recovering(&self) {
         self.healthy.store(false, Ordering::Release);
-        self.lifecycle
-            .store(MountLifecycleState::Recovering as u8, Ordering::Release);
+        self.transition(MountLifecycleState::Recovering);
     }
 
     pub(crate) fn mark_reclaiming(&self) {
-        self.lifecycle
-            .store(MountLifecycleState::Reclaiming as u8, Ordering::Release);
+        self.transition(MountLifecycleState::Reclaiming);
     }
 
     pub(crate) fn mark_closing(&self) {
@@ -365,5 +435,36 @@ mod tests {
             assert!(delay >= Duration::from_secs(27));
             assert!(delay <= Duration::from_secs(33));
         }
+    }
+
+    #[tokio::test]
+    async fn a_lost_mount_cannot_be_promoted_back_to_ready() {
+        let lease = LeaseState::ready(1, 60);
+        lease.mark_lost().await;
+        assert_eq!(lease.generation(), 2);
+        // A late successful RENEW must not resurrect a mount whose state maps
+        // were cleared and whose callers were told to reopen.
+        lease.mark_ready();
+        assert_eq!(
+            lease.health().lifecycle,
+            MountLifecycleState::LostState,
+            "LostState is terminal"
+        );
+        // Late recovery/renewal transitions must be ignored as well, not only
+        // the final promotion to Ready.
+        lease.mark_reconnecting();
+        lease.mark_recovering();
+        lease.mark_reclaiming();
+        assert_eq!(
+            lease.health().lifecycle,
+            MountLifecycleState::LostState,
+            "no lifecycle transition may resurrect a lost mount"
+        );
+        assert_eq!(lease.generation(), 2);
+        assert_eq!(
+            lease.health().lease_healthy,
+            Some(false),
+            "a lost mount must not report a healthy lease"
+        );
     }
 }

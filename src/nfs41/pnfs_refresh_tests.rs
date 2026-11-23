@@ -724,6 +724,20 @@ async fn mixed_ds_reply_order(failure_first: bool) {
         mds_calls.lock().unwrap().is_empty(),
         "MDS must not receive a replay"
     );
+    // The ordering entry is pushed after the reply is written, so the client
+    // may finish before the last hook runs. Wait for both hooks instead of
+    // assuming that the write completing implies they already ran.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let recorded = { order.lock().unwrap().len() };
+            if recorded >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both DS replies must be recorded");
     assert_eq!(
         *order.lock().unwrap(),
         if failure_first {

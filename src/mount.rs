@@ -960,6 +960,30 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         .await
     }
 
+    /// Release every lock still tracked for `fh`.
+    ///
+    /// This is the recovery path for a cancelled LOCK whose token was never
+    /// delivered to the caller: the mount keeps such a lock registered so it is
+    /// never silently dropped, and this call lets the owner of the file handle
+    /// release it before closing.
+    ///
+    /// The NFSv4.0 backend waits for LOCK requests it issued before this call
+    /// that have not settled yet, so a lock granted to a cancelled caller is
+    /// still released. LOCK requests started after this call begins are not
+    /// awaited: callers must not open new locks on `fh` concurrently with this
+    /// cleanup, and must call it before closing. A LOCK whose outcome is
+    /// uncertain (for example a timeout before the reply was received) cannot
+    /// be released here because its server-side stateid was never learned.
+    ///
+    /// Only the NFSv4.0 backend tracks locks by file handle. NFSv4.1 callers
+    /// must retain the token from [`Mount::lock_stateful`] and pass it to
+    /// [`Mount::unlock_stateful`].
+    async fn release_locks(&self, _fh: Bytes) -> Result<()> {
+        Err(NfsError::Unsupported(
+            "releasing tracked locks requires the NFSv4.0 backend".to_string(),
+        ))
+    }
+
     /// Read complete native POSIX access/default ACLs through NFSACL v3.
     ///
     /// Requires an NFSv3 server supporting the optional Sun NFSACL extension.
