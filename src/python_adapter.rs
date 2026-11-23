@@ -1642,6 +1642,11 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
             errno: None,
             recovery: Some("reopen"),
         },
+        NfsError::StateRecoveryExhausted(_) => PythonErrorKind {
+            class_name: "NfsStateRecoveryExhaustedError",
+            errno: None,
+            recovery: Some("reopen"),
+        },
         NfsError::FileClose(_) => PythonErrorKind {
             class_name: "NfsFileCloseError",
             errno: None,
@@ -1666,6 +1671,22 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
             errno: None,
             recovery: Some(recovery_name(details.recovery)),
         },
+    }
+}
+
+/// Structured `(code, code_name)` for a protocol status, including the status a
+/// state-recovery wrapper retained when its source is not a protocol error.
+fn structured_status(error: &NfsError) -> Option<(i64, String)> {
+    match error {
+        NfsError::Nfs3(status) => Some((
+            nfs3_python_mapping::descriptor(status).1,
+            format!("{status:?}"),
+        )),
+        NfsError::Nfs4(status) => Some((*status as i64, format!("{status:?}"))),
+        NfsError::StateRecoveryExhausted(details) => {
+            Some((details.status as i64, format!("{:?}", details.status)))
+        }
+        _ => None,
     }
 }
 
@@ -1735,6 +1756,12 @@ fn nfs_error_with_context(
         completed_bytes = details.completed_bytes;
         cause_protocol = Some(details.context().protocol);
         (error_kind(error), details.source.as_ref())
+    } else if let NfsError::StateRecoveryExhausted(details) = error {
+        // Keep the structured status and chained source of the exhausted
+        // recovery visible at the Python boundary instead of flattening the
+        // wrapper into an opaque error.
+        operation = Some(details.operation.as_str());
+        (error_kind(error), details.source.as_ref())
     } else {
         (error_kind(error), error)
     };
@@ -1747,17 +1774,14 @@ fn nfs_error_with_context(
     };
     let source_kind = error_kind(source);
     recovery = recovery.or(kind.recovery).or(source_kind.recovery);
-    let (code, code_name) = match source {
-        NfsError::Nfs3(status) => {
-            protocol = protocol.or(Some("3"));
-            (
-                Some(nfs3_python_mapping::descriptor(status).1),
-                Some(format!("{status:?}")),
-            )
-        }
-        NfsError::Nfs4(status) => (Some(*status as i64), Some(format!("{status:?}"))),
-        _ => (None, None),
-    };
+    if matches!(source, NfsError::Nfs3(_)) {
+        protocol = protocol.or(Some("3"));
+    }
+    // The exhausted-recovery wrapper's own status is the trigger that failed
+    // and is authoritative even when the source is a transport/XDR error.
+    let (code, code_name) = structured_status(error)
+        .or_else(|| structured_status(source))
+        .unzip();
     let python_error = structured_error(PythonErrorPayload {
         class_name: kind.class_name,
         message: error.to_string(),
@@ -1775,7 +1799,10 @@ fn nfs_error_with_context(
         retry_elapsed_ms: None,
         retry_reason: None,
     });
-    if matches!(error, NfsError::OperationOutcome(_)) {
+    if matches!(
+        error,
+        NfsError::OperationOutcome(_) | NfsError::StateRecoveryExhausted(_)
+    ) {
         let cause = nfs_error_with_context(source, operation, cause_protocol, filename);
         Python::attach(|py| python_error.set_cause(py, Some(cause)));
     }
@@ -6267,5 +6294,38 @@ mod directory_batch_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_state_recovery_maps_to_the_dedicated_python_error() {
+        let error = NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
+            operation: "close".into(),
+            status: crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+            source: Box::new(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)),
+        }));
+
+        let kind = error_kind(&error);
+
+        assert_eq!(kind.class_name, "NfsStateRecoveryExhaustedError");
+        assert_eq!(kind.recovery, Some("reopen"));
+        assert!(kind.errno.is_none());
+        // The Python boundary must expose the triggering stateid status and,
+        // through the source, the chained protocol error.
+        assert_eq!(
+            structured_status(&error),
+            Some((10024, "NFS4ERR_OLD_STATEID".to_string()))
+        );
+        let NfsError::StateRecoveryExhausted(details) = &error else {
+            unreachable!()
+        };
+        assert_eq!(
+            structured_status(&details.source),
+            Some((10024, "NFS4ERR_OLD_STATEID".to_string()))
+        );
     }
 }

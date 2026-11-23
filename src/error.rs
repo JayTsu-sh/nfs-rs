@@ -53,6 +53,29 @@ pub enum RetryExhaustion {
     Deadline,
 }
 
+/// Classification of an NFSv4.0 stateid failure without parsing status codes.
+///
+/// The filehandle is valid in both cases; only the open state differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateidFailure {
+    /// BAD/STALE/OLD stateid: nfs-rs refreshes the lane and retries in place.
+    RecoverableState,
+    /// The bounded recovery attempt did not restore usable open state.
+    StateRecoveryExhausted,
+}
+
+/// An NFSv4.0 open stateid could not be restored within the bounded budget.
+#[derive(Error, Debug)]
+#[error("NFSv4.0 state recovery exhausted during {operation}: {source}")]
+pub struct StateRecoveryError {
+    /// Operation whose stateid recovery failed (`read`, `write`, `setattr`, `close`).
+    pub operation: String,
+    /// Stateid status that triggered recovery (10023, 10024 or 10025).
+    pub status: crate::nfs4::Nfs4ErrorCode,
+    #[source]
+    pub source: Box<NfsError>,
+}
+
 /// A definite temporary server rejection after bounded protocol retries.
 /// The original JUKEBOX, DELAY or GRACE status remains available in `source`.
 #[derive(Error, Debug)]
@@ -248,6 +271,10 @@ pub enum NfsError {
     #[error("{0}")]
     PositionUncertain(String),
 
+    /// NFSv4.0 stateid recovery (fresh OPEN / seqid refresh) was exhausted.
+    #[error(transparent)]
+    StateRecoveryExhausted(Box<StateRecoveryError>),
+
     /// Recovery could not prove that an open resource retained identity and state.
     #[error("{0}")]
     LostOpenState(String),
@@ -324,6 +351,31 @@ impl NfsError {
             _ => false,
         }
     }
+    /// True when the failure is an NFSv4.0 stateid that nfs-rs can refresh in place.
+    #[must_use]
+    pub fn is_recoverable_state(&self) -> bool {
+        matches!(
+            self,
+            Self::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
+            )
+        )
+    }
+
+    /// Classification of a stateid failure without requiring callers to parse status codes.
+    #[must_use]
+    pub fn stateid_failure(&self) -> Option<StateidFailure> {
+        if self.is_recoverable_state() {
+            return Some(StateidFailure::RecoverableState);
+        }
+        match self {
+            Self::StateRecoveryExhausted(_) => Some(StateidFailure::StateRecoveryExhausted),
+            _ => None,
+        }
+    }
+
     fn contains_uncertain_outcome(&self) -> bool {
         match self {
             Self::OperationOutcome(details) => {
@@ -450,6 +502,7 @@ impl NfsError {
             | NfsError::FileClose(_) => std::io::ErrorKind::Other,
             NfsError::RdattrError(_) => std::io::ErrorKind::Other,
             NfsError::OperationOutcome(_) => std::io::ErrorKind::Other,
+            NfsError::StateRecoveryExhausted(_) => std::io::ErrorKind::Other,
         }
     }
 }
@@ -554,6 +607,7 @@ impl From<NfsError> for std::io::Error {
             NfsError::PositionUncertain(msg) | NfsError::LostOpenState(msg) => {
                 std::io::Error::other(msg)
             }
+            error @ NfsError::StateRecoveryExhausted(_) => std::io::Error::other(error),
             NfsError::FileClose(errors) => std::io::Error::other(
                 errors
                     .first()

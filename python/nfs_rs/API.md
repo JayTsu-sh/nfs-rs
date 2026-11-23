@@ -667,6 +667,12 @@ Open state was lost; reopen the file as directed by recovery_action.
 
 Bases: `NfsStateLostError`. Inherits all documented NfsError fields and methods.
 
+### NfsStateRecoveryExhaustedError
+
+NFSv4.0 stateid recovery (fresh OPEN or seqid refresh) was exhausted; reopen the file or remount as directed by recovery_action.
+
+Bases: `NfsStateLostError`. Inherits all documented NfsError fields and methods.
+
 ### NfsClosedResourceError
 
 Operation on a closed resource; also ValueError.

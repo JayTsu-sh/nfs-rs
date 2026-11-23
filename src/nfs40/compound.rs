@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes};
 
 use crate::nfs4::compound::{
     CompoundBuilder as CommonCompoundBuilder, OP_GETFH, OP_PUTFH, check_status, response_ops,
-    take_opaque, take_u32, xdr_opaque, xdr_u32,
+    status_error, take_opaque, take_u32, xdr_opaque, xdr_u32,
 };
 use crate::rpc::auth::Auth;
 use crate::{NfsError, Result};
@@ -898,15 +898,80 @@ pub(crate) fn decode_renew_response(buf: Bytes) -> Result<()> {
 }
 
 pub(crate) fn decode_stateid_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
-    let (count, mut buf) = response_ops(buf)?;
-    if count != 2 {
+    match decode_stateid_op_outcome(buf, opcode, name)? {
+        StateidOpOutcome::Completed(stateid) => Ok(stateid),
+        StateidOpOutcome::Executed(error)
+        | StateidOpOutcome::NotExecuted(error)
+        | StateidOpOutcome::Rejected(error) => Err(error),
+    }
+}
+
+/// Whether the stateid operation of a `PUTFH + <op>` COMPOUND was executed.
+///
+/// A COMPOUND that fails at PUTFH also reports a non-zero overall status, so
+/// the overall status alone cannot tell whether the stateid operation ran and
+/// consumed the owner seqid. Only the per-operation results can.
+pub(crate) enum StateidOpOutcome {
+    /// PUTFH and the stateid operation both succeeded.
+    Completed([u8; 16]),
+    /// The stateid operation ran and consumed its seqid, but the reply cannot
+    /// be trusted because the overall status contradicts a successful
+    /// operation list.
+    Executed(NfsError),
+    /// The COMPOUND failed before the stateid operation (e.g. PUTFH), so the
+    /// server did not consume the owner seqid.
+    NotExecuted(NfsError),
+    /// The stateid operation ran and the server rejected it.
+    Rejected(NfsError),
+}
+
+pub(crate) fn decode_stateid_op_outcome(
+    buf: Bytes,
+    opcode: u32,
+    name: &str,
+) -> Result<StateidOpOutcome> {
+    let mut buf = buf;
+    // The overall COMPOUND status duplicates the failing operation's status,
+    // so parse the results instead of trusting it for sequencing decisions.
+    let overall = take_u32(&mut buf, "COMPOUND status")?;
+    let _tag = take_opaque(&mut buf, "COMPOUND tag")?;
+    let count = take_u32(&mut buf, "COMPOUND result count")?;
+    if !(1..=2).contains(&count) {
         return Err(NfsError::Xdr(format!(
-            "{name} response has {count} operations, expected 2"
+            "{name} response has {count} operations, expected 1 or 2"
         )));
     }
-    expect_op(&mut buf, OP_PUTFH, "PUTFH")?;
-    expect_op(&mut buf, opcode, name)?;
-    take_stateid(&mut buf, name)
+    let putfh_opcode = take_u32(&mut buf, "PUTFH opcode")?;
+    if putfh_opcode != OP_PUTFH {
+        return Err(NfsError::Xdr(format!(
+            "PUTFH opcode {putfh_opcode} does not match {OP_PUTFH}"
+        )));
+    }
+    let putfh_status = take_u32(&mut buf, "PUTFH status")?;
+    if putfh_status != 0 {
+        return Ok(StateidOpOutcome::NotExecuted(status_error(putfh_status)?));
+    }
+    if count == 1 {
+        return Err(NfsError::Xdr(format!(
+            "{name} response stopped after a successful PUTFH"
+        )));
+    }
+    let actual = take_u32(&mut buf, &format!("{name} opcode"))?;
+    if actual != opcode {
+        return Err(NfsError::Xdr(format!(
+            "{name} opcode {actual} does not match {opcode}"
+        )));
+    }
+    let status = take_u32(&mut buf, &format!("{name} status"))?;
+    if status != 0 {
+        return Ok(StateidOpOutcome::Rejected(status_error(status)?));
+    }
+    if overall != 0 {
+        // A successful operation list must be paired with NFS4_OK. Trusting the
+        // per-operation success here could release state the server rejected.
+        return Ok(StateidOpOutcome::Executed(status_error(overall)?));
+    }
+    Ok(StateidOpOutcome::Completed(take_stateid(&mut buf, name)?))
 }
 
 pub(crate) fn decode_read_response(buf: Bytes) -> Result<Bytes> {
@@ -1064,6 +1129,91 @@ mod tests {
         wire.extend_from_slice(&status.to_be_bytes());
         wire.extend_from_slice(data);
         Bytes::from(wire)
+    }
+
+    /// Builds a `PUTFH [+ stateid op]` response with an explicit overall status.
+    fn stateid_op_response(
+        overall_status: u32,
+        putfh_status: u32,
+        op: Option<(u32, u32, [u8; 16])>,
+    ) -> Bytes {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&overall_status.to_be_bytes());
+        xdr_opaque(&mut wire, b"close");
+        wire.extend_from_slice(&(1 + u32::from(op.is_some())).to_be_bytes());
+        wire.extend_from_slice(&OP_PUTFH.to_be_bytes());
+        wire.extend_from_slice(&putfh_status.to_be_bytes());
+        if let Some((opcode, status, stateid)) = op {
+            wire.extend_from_slice(&opcode.to_be_bytes());
+            wire.extend_from_slice(&status.to_be_bytes());
+            wire.extend_from_slice(&stateid);
+        }
+        Bytes::from(wire)
+    }
+
+    /// RFC 7530 §9.1.7 consumption depends on whether the stateid operation
+    /// ran, which the overall COMPOUND status cannot express: a PUTFH failure
+    /// also reports a non-zero overall status but consumes nothing.
+    #[test]
+    fn stateid_op_outcome_classifies_each_operation_result() {
+        let stateid = [0x5a; 16];
+        let completed = decode_stateid_op_outcome(
+            stateid_op_response(0, 0, Some((OP_CLOSE, 0, stateid))),
+            OP_CLOSE,
+            "CLOSE",
+        )
+        .unwrap();
+        assert!(
+            matches!(completed, StateidOpOutcome::Completed(value) if value == stateid),
+            "a successful CLOSE with NFS4_OK must be Completed"
+        );
+
+        let inconsistent = decode_stateid_op_outcome(
+            // A successful operation list contradicts a non-zero overall
+            // status. The CLOSE still ran, but its result is not trustworthy.
+            stateid_op_response(10006, 0, Some((OP_CLOSE, 0, stateid))),
+            OP_CLOSE,
+            "CLOSE",
+        )
+        .unwrap();
+        assert!(
+            matches!(inconsistent, StateidOpOutcome::Executed(NfsError::Nfs4(_))),
+            "an overall status that contradicts successful operations must be Executed"
+        );
+
+        for putfh_status in [10006u32, 10025, 10026, 10019] {
+            let outcome = decode_stateid_op_outcome(
+                stateid_op_response(putfh_status, putfh_status, None),
+                OP_CLOSE,
+                "CLOSE",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    StateidOpOutcome::NotExecuted(NfsError::Nfs4(status))
+                        if status as u32 == putfh_status
+                ),
+                "PUTFH failure {putfh_status} must not report CLOSE as executed"
+            );
+        }
+
+        for close_status in [10006u32, 10025, 10026, 10019] {
+            let outcome = decode_stateid_op_outcome(
+                stateid_op_response(close_status, 0, Some((OP_CLOSE, close_status, [0; 16]))),
+                OP_CLOSE,
+                "CLOSE",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    StateidOpOutcome::Rejected(NfsError::Nfs4(status))
+                        if status as u32 == close_status
+                ),
+                "a rejected CLOSE {close_status} must still count as executed"
+            );
+        }
     }
 
     #[test]
