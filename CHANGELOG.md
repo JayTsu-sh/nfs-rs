@@ -22,6 +22,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   The client owns the socket and the RPC records stay in native code. Only a
   plain `socket.socket` is taken, and at most 16 dial calls run at once.
 
+### Changed
+
+- Rust `StateidFailure` variants were renamed from `RecoverableState` and
+  `StateRecoveryExhausted` to `Recoverable` and `Exhausted`. This is a source
+  breaking change for callers that match the enum exhaustively; the
+  `NfsError::StateRecoveryExhausted` error and the Python exception classes are
+  unchanged.
+
 ### Fixed
 
 - NFSv3 path lookup on Unix preserves a literal backslash filename component

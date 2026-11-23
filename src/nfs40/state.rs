@@ -168,7 +168,11 @@ impl LockState {
     pub(crate) async fn register(&self, lane: LockLane) -> Arc<Mutex<LockLane>> {
         let stateid = lane.stateid;
         let lane = Arc::new(Mutex::new(lane));
-        self.lanes.write().await.insert(stateid, Arc::clone(&lane));
+        let previous = self.lanes.write().await.insert(stateid, Arc::clone(&lane));
+        if let Some(previous) = previous {
+            self.retire_lock_stateid_collision(previous, &lane, stateid)
+                .await;
+        }
         lane
     }
 
@@ -275,7 +279,42 @@ impl LockState {
         let mut aliases = self.aliases.write().await;
         aliases.insert(old_stateid, Arc::clone(&lane));
         lanes.remove(&old_stateid);
-        lanes.insert(new_stateid, lane);
+        let previous = lanes.insert(new_stateid, Arc::clone(&lane));
+        drop(lanes);
+        drop(aliases);
+        if let Some(previous) = previous {
+            self.retire_lock_stateid_collision(previous, &lane, new_stateid)
+                .await;
+        }
+    }
+
+    /// A conforming server never reuses a live lock stateid. If it does, the
+    /// older lane would silently disappear from the registry while tokens
+    /// carrying that stateid now resolve to the newer lock. Retire the stale
+    /// lane so neither a snapshot nor an alias keeps addressing the reused
+    /// stateid.
+    async fn retire_lock_stateid_collision(
+        &self,
+        previous: Arc<Mutex<LockLane>>,
+        current: &Arc<Mutex<LockLane>>,
+        stateid: [u8; 16],
+    ) {
+        if Arc::ptr_eq(&previous, current) {
+            return;
+        }
+        previous.lock().await.stateid = [0; 16];
+        // `lanes` already points at `current`; drop every alias that still
+        // resolves to the retired lane so `by_stateid` cannot hand it back.
+        // Lock order stays `lane -> maps`, matching `locku` and reclaim.
+        self.aliases
+            .write()
+            .await
+            .retain(|_, candidate| !Arc::ptr_eq(candidate, &previous));
+        tracing::warn!(
+            target: "nfs_rs::stateid",
+            stateid = ?stateid,
+            "NFSv4.0 server reused a live lock stateid; retiring the older lock lane"
+        );
     }
 
     pub(crate) async fn clear(&self) {
@@ -484,6 +523,43 @@ mod tests {
 
         state.remove(&[2; 16]).await;
         assert!(state.by_stateid(&[1; 16]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reused_lock_stateid_retires_the_older_lane() {
+        let state = LockState::default();
+        let make = |owner: u64, stateid: [u8; 16]| LockLane {
+            owner,
+            open_owner: 11,
+            owner_wire: Bytes::from_static(b"lock"),
+            next_seqid: 1,
+            stateid,
+            fh: Bytes::from_static(b"fh"),
+            lock_type: 1,
+            offset: 0,
+            length: 0,
+        };
+        let older = state.register(make(7, [1; 16])).await;
+        state.rekey([1; 16], [3; 16], Arc::clone(&older)).await;
+        let newer = state.register(make(8, [3; 16])).await;
+        let current = state.by_stateid(&[3; 16]).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        assert_eq!(
+            older.lock().await.stateid,
+            [0; 16],
+            "the shadowed lane must be retired so a snapshot cannot LOCKU the reused stateid"
+        );
+        assert!(
+            state.by_stateid(&[1; 16]).await.is_none(),
+            "aliases that still resolve to the retired lane must be dropped"
+        );
+
+        // rekey (reclaim) must apply the same policy.
+        let third = state.register(make(9, [2; 16])).await;
+        state.rekey([3; 16], [2; 16], Arc::clone(&newer)).await;
+        let current = state.by_stateid(&[2; 16]).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        assert_eq!(third.lock().await.stateid, [0; 16]);
     }
 
     #[test]

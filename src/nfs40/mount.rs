@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs,
+    CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs, StateidOpOutcome,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
     decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response,
@@ -24,10 +24,9 @@ use super::compound::{
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
 use super::recovery::{
-    FreshOpenSpec, RecoveryContext, StateidRecovery, bump_stateid_seqid, classify_stateid_failure,
-    close_fresh_open, establish_identity, fresh_open_lane_with_seqid, lock_op_consumes_seqid,
-    open_owner_wire, recovery_failure, set_stateid_seqid, state_recovery_exhausted, stateid_hex,
-    stateid_op_consumes_seqid, stateid_seqid,
+    FreshOpenSpec, RecoveryContext, StateidRecovery, classify_stateid_failure, close_fresh_open,
+    establish_identity, fresh_open_lane_with_seqid, lock_op_consumes_seqid, recovery_failure,
+    state_recovery_exhausted, stateid_hex, stateid_op_consumes_seqid, status_consumes_seqid,
 };
 use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
 use crate::dialer::Endpoint;
@@ -414,23 +413,9 @@ fn context(
     )
 }
 
-/// Decodes a `PUTFH + <stateid op>` reply together with whether that request
-/// consumed the owner seqid. A PUTFH failure reports a non-zero overall status
-/// but never ran the operation, so it must not advance the cursor.
-fn decode_stateid_call(
-    response: Result<Bytes>,
-    opcode: u32,
-    name: &str,
-) -> (Result<[u8; 16]>, bool) {
-    match response.and_then(|response| decode_stateid_op_outcome(response, opcode, name)) {
-        Ok(outcome) => {
-            let consumed = stateid_op_consumes_seqid(&outcome);
-            (outcome.into_result(), consumed)
-        }
-        Err(error) => (Err(error), false),
-    }
-}
-
+/// Decodes a `PUTFH + LOCK` reply together with whether that request consumed
+/// the owner seqid. A PUTFH failure reports a non-zero overall status but never
+/// ran the operation, so it must not advance the cursor.
 fn decode_lock_call(response: Result<Bytes>, opcode: u32, name: &str) -> (Result<[u8; 16]>, bool) {
     match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
         Ok(outcome) => {
@@ -438,6 +423,47 @@ fn decode_lock_call(response: Result<Bytes>, opcode: u32, name: &str) -> (Result
             (outcome.into_result(), consumed)
         }
         Err(error) => (Err(error), false),
+    }
+}
+
+/// CLOSE an OPEN that was never published, reporting whether the request
+/// consumed the owner seqid. `None` means the transmission outcome is unknown,
+/// so the caller must not replay either cursor value.
+pub(super) async fn close_unpublished_state(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+    seqid: u32,
+    stateid: &[u8; 16],
+) -> Option<bool> {
+    let request = CompoundBuilder::new("close-fresh")
+        .putfh(fh)
+        .close(seqid, stateid)
+        .encode_with_header(auth);
+    let response = match rpc
+        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state failed; its seqid consumption is unknown"
+            );
+            return None;
+        }
+    };
+    match decode_stateid_op_outcome(response, 4, "CLOSE") {
+        Ok(outcome) => Some(stateid_op_consumes_seqid(&outcome)),
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state was not decodable; its seqid consumption is unknown"
+            );
+            None
+        }
     }
 }
 
@@ -522,7 +548,25 @@ impl Mount40 {
             let acquisition = self.locks.begin_acquisition(fh.clone());
             let stateid = tokio::spawn(async move {
                 let _acquisition = acquisition;
+                // CLOSE sets `closing` and takes the I/O fence. Take the same
+                // fence-before-lane order as READ/WRITE/close so a LOCK cannot
+                // be issued while that open state is being released.
+                let io_fence = {
+                    let open = open_lane_task.lock().await;
+                    if open.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    Arc::clone(&open.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
                 let mut open = open_lane_task.lock().await;
+                if open.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is closing or closed".into(),
+                    ));
+                }
                 let open_owner = open.owner;
                 *used_in_task
                     .lock()
@@ -558,29 +602,12 @@ impl Mount40 {
                 }
                 let stateid =
                     decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
-                let publication = lease.publication_guard().await;
-                if let Err(error) = lease.finish_stateful(expected_generation, "lock") {
-                    // The LOCK was granted but the mount left Ready before it
-                    // could be published: the caller never sees the token, so
-                    // release the lock instead of leaking it until the lease
-                    // expires. Do not hold the publication lock across that
-                    // RPC: it would delay `mark_lost` by a full round trip.
-                    drop(publication);
-                    let request = CompoundBuilder::new("lock-discard")
-                        .putfh(&fh)
-                        .locku(
-                            lock_type,
-                            lock_seqid_for_task.wrapping_add(1),
-                            &stateid,
-                            offset,
-                            length,
-                        )
-                        .encode_with_header(&auth);
-                    let _ = rpc
-                        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await;
-                    return Err(error);
-                }
+                let _publication = lease.publication_guard().await;
+                // Register before the lifecycle fence: the server may already
+                // have granted the lock, and losing the lane would leak it
+                // until lease expiry. A lost mount removes it below; a Suspect
+                // or Reconnecting mount keeps it so cleanup can unlock it after
+                // recovery.
                 locks
                     .register(LockLane {
                         owner,
@@ -813,8 +840,14 @@ impl Mount40 {
                     });
                 if let Err(error) = returned {
                     // The OPEN already succeeded, but the caller never receives
-                    // the handle. Release the state instead of leaking it until
-                    // the lease expires, then report the DELEGRETURN failure.
+                    // the handle, so no later close() can complete it. Retire
+                    // the lane after a best-effort CLOSE rather than leaving an
+                    // unreachable open for recovery to adopt; whatever the
+                    // CLOSE did not release expires with the lease. The
+                    // finish_stateful path below keeps the lane instead because
+                    // there the open was already published before the lifecycle
+                    // gate rejected it, and the existing contract keeps
+                    // published lanes on non-lost mounts.
                     close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
                     state.remove(owner, &fh).await;
                     return Err(error);
@@ -834,12 +867,25 @@ impl Mount40 {
             };
             let publication = lease.publication_guard().await;
             if let Err(error) = lease.finish_stateful(expected_generation, "open") {
-                // The caller never receives the handle, so release the state we
-                // just created instead of leaving an orphan open for the next
-                // recovery pass to adopt.
+                // The lifecycle gate already rejected this open, so release
+                // the guard before the cleanup RPCs: holding it would delay
+                // mark_lost() by a full round trip for no benefit.
                 drop(publication);
-                close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
-                state.remove(owner, &fh).await;
+                // The caller never receives the handle, so the delegation was
+                // not registered with the callback state. Return it before any
+                // CLOSE below: an orphaned delegation would otherwise be
+                // recalled against a stateid the client no longer tracks.
+                let _ = return_delegation(&rpc, &auth, &fh, opened.delegation).await;
+                // A lost/rotated mount has already cleared its state maps, so
+                // the lane published above would be unreachable: release the
+                // state we just created instead of leaving an orphan open for
+                // the next recovery pass to adopt. A Suspect or Reconnecting
+                // mount still owns this open, and removing it would discard the
+                // only handle that can close it.
+                if lease.generation() != expected_generation {
+                    close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
+                    state.remove(owner, &fh).await;
+                }
                 return Err(error);
             }
             if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
@@ -848,11 +894,7 @@ impl Mount40 {
                     delegation,
                     expected_generation,
                     delegation_attributes,
-                )
-            {
-                // The open itself is valid; keeping the lane lets the caller
-                // close it by file handle after the delegation failure.
-                return Err(error);
+                )?;
             }
             drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
@@ -1207,16 +1249,29 @@ impl Mount40 {
         open.next_seqid = fresh.next_seqid;
         if fresh.fh != open.fh {
             // The path now resolves to a different object (replaced or
-            // re-created by another client). The old lane cannot be used any
-            // more, so report it as lost state: callers reopen instead of
-            // treating this as an encoding fault. Release the fresh state and
-            // drop the lane, otherwise both the server open and the map entry
-            // outlive every caller that could still reference them.
-            close_fresh_open(&rpc, &auth, &fresh.fh, &fresh.stateid, fresh.next_seqid).await;
-            let owner = open.owner;
-            let stale_fh = open.fh.clone();
-            drop(open);
-            open_state.remove(owner, &stale_fh).await;
+            // re-created by another client). Release the freshly created state
+            // rather than leak it, then refuse to commit the recovery. The
+            // lane's cursor must still reflect the cleanup CLOSE: it consumes
+            // the seqid it was sent with, so discarding the reply would make
+            // the next owner-sequenced request replay it and fail with
+            // BAD_SEQID. An unknown outcome makes both values unsafe to replay,
+            // so retire the lane instead. The freshly created OPEN may carry a
+            // delegation: return it before closing, otherwise the server keeps
+            // recalling a delegation whose filehandle this lane no longer owns.
+            let _ = return_delegation(&rpc, &auth, &fresh.fh, fresh.delegation).await;
+            match close_unpublished_state(&rpc, &auth, &fresh.fh, fresh.next_seqid, &fresh.stateid)
+                .await
+            {
+                Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
+                Some(false) => {}
+                None => {
+                    open.closing = true;
+                    let owner = open.owner;
+                    let stale_fh = open.fh.clone();
+                    drop(open);
+                    open_state.remove(owner, &stale_fh).await;
+                }
+            }
             return Err(NfsError::LostOpenState(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
@@ -1234,7 +1289,7 @@ impl Mount40 {
             // stateid again, so report exhaustion instead of claiming a
             // recovery that did not happen. Do not CLOSE it: the stateid names
             // the very state the lane must keep.
-            return Err(Self::state_recovery_exhausted(
+            return Err(state_recovery_exhausted(
                 operation,
                 trigger,
                 NfsError::Xdr(
@@ -2632,9 +2687,14 @@ impl Mount for Mount40 {
                 let lane = lane.lock().await;
                 (lane.stateid, lane.lock_type, lane.offset, lane.length)
             };
-            if stateid == [0; 16] {
-                // The lane is being retired by a concurrent LOCKU; the release
-                // is already in progress.
+            // Skip lanes that a concurrent LOCKU/recovery already retired. Do
+            // not use a zero stateid as the retirement marker: a broken server
+            // can return the all-zero stateid for a LOCK, and skipping that
+            // lane would leave it registered, so `close` would reject the fh
+            // forever. A live lane is still the registry entry for its stateid;
+            // releasing it (even with zero) lets the server answer and the lane
+            // is removed normally.
+            if !self.locks.is_current(&stateid, &lane).await {
                 continue;
             }
             if let Err(error) = self

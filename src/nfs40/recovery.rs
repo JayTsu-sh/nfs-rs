@@ -109,7 +109,7 @@ impl FreshOpenAttempt {
 /// the ones retained on the lane at open time. The returned attempt reports the
 /// next unconsumed seqid so a PUTFH failure (which never ran the OPEN) does not
 /// advance the cursor.
-async fn fresh_open_lane(
+pub(super) async fn fresh_open_lane(
     rpc: &rpc::Client,
     auth: &Auth,
     spec: &FreshOpenSpec<'_>,
@@ -223,6 +223,10 @@ async fn fresh_open_lane(
 
 /// Fresh OPEN bounded to two attempts: a released open-owner restarts at
 /// seqid 0, while a still-current open-owner expects the lane's next seqid.
+///
+/// Only NFS4ERR_BAD_SEQID proves the owner is still alive. BAD/OLD_STATEID on a
+/// seqid-0 OPEN do not, so they must not be retried with the lane's cursor: the
+/// lane is refreshed by the caller instead of guessing the server's seqid.
 pub(super) async fn fresh_open_lane_with_seqid(
     rpc: &rpc::Client,
     auth: &Auth,
@@ -232,11 +236,9 @@ pub(super) async fn fresh_open_lane_with_seqid(
 ) -> FreshOpenAttempt {
     let attempt = fresh_open_lane(rpc, auth, spec, 0, operation).await;
     match &attempt.result {
-        Err(NfsError::Nfs4(
-            crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-            | crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-            | crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID,
-        )) if next_seqid != 0 => fresh_open_lane(rpc, auth, spec, next_seqid, operation).await,
+        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID)) if next_seqid != 0 => {
+            fresh_open_lane(rpc, auth, spec, next_seqid, operation).await
+        }
         _ => attempt,
     }
 }
@@ -400,12 +402,8 @@ impl RecoveryContext {
             .map(|lanes| async move {
                 for lane in lanes {
                     match self.reclaim_lock_lane(&lane, renewed_client_id).await {
-                        Ok(Some((old_stateid, new_stateid))) => {
-                            self.locks
-                                .rekey(old_stateid, new_stateid, Arc::clone(&lane))
-                                .await;
-                        }
-                        Ok(None) => {}
+                        Ok(true) => {}
+                        Ok(false) => {}
                         Err(error) if error.is_server_busy() => return Err(error),
                         Err(error) if is_authoritative_lane_loss(&error) => {
                             let (owner, stateid) = {
@@ -462,17 +460,30 @@ impl RecoveryContext {
         lane: &Arc<tokio::sync::Mutex<OwnerLane>>,
         client_id: u64,
     ) -> Result<()> {
+        // Same fence-before-lane order as close_lane: the closer holds the
+        // fence and waits for this lane, so waiting for the fence while holding
+        // the lane would deadlock.
+        let io_fence = {
+            let open = lane.lock().await;
+            if open.closing {
+                return Ok(());
+            }
+            // A pass retried after GRACE/DELAY must not reclaim this lane again:
+            // the owner already exists and a second CLAIM_PREVIOUS with seqid 0
+            // is answered with NFS4ERR_BAD_SEQID, which would drop a usable
+            // lane.
+            if self.lease.open_reclaimed(open.owner) {
+                return Ok(());
+            }
+            Arc::clone(&open.io_fence)
+        };
+        let _in_flight_settled = io_fence.write_owned().await;
         let mut open = lane.lock().await;
-        if open.closing {
+        if open.closing || !self.state.is_current(open.owner, lane).await {
+            // Closed or removed while this reclaim waited: do not resurrect
+            // server state the client no longer tracks.
             return Ok(());
         }
-        // A pass retried after GRACE/DELAY must not reclaim this lane again: the
-        // owner already exists and a second CLAIM_PREVIOUS with seqid 0 is
-        // answered with NFS4ERR_BAD_SEQID, which would drop a usable lane.
-        if self.lease.open_reclaimed(open.owner) {
-            return Ok(());
-        }
-        let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
         let owner_wire = open_owner_wire(self.issuer, open.owner);
         // The first reclaim of a session starts at seqid 0, but a busy reply
         // still consumes that seqid (§9.1.7). Keep the cursor in LeaseState so
@@ -530,11 +541,35 @@ impl RecoveryContext {
                 }
                 open.stateid = reclaimed.stateid;
                 open.next_seqid = reclaim_seqid.wrapping_add(1);
+                // Keep the reclaim ledger aligned with the lane cursor even
+                // though the successful outcome already advanced it above: a
+                // later pass of this session must never resend the
+                // CLAIM_PREVIOUS with a seqid the server already consumed.
+                self.lease
+                    .set_open_reclaim_seqid(open.owner, reclaim_seqid.wrapping_add(1));
             }
-            Ok(_) => {
+            Ok((reclaimed, fh)) => {
+                // The reclaim succeeded, but its state cannot back this lane
+                // (confirmation required, or the path now resolves to a
+                // different object). Re-running a normal OPEN would leave the
+                // reclaimed open and any delegation orphaned on the server.
+                // Return the delegation, release the state the reclaim created,
+                // then report an authoritative per-lane loss so only this open
+                // is dropped.
                 open.next_seqid = reclaim_seqid.wrapping_add(1);
-                self.reopen_after_rejected_reclaim(&mut open, owner_wire.as_bytes(), client_id)
-                    .await?;
+                let _ = return_delegation(&self.rpc, &self.auth, &fh, reclaimed.delegation).await;
+                let cleanup_seqid = self.lease.open_reclaim_seqid(open.owner);
+                let _ = super::mount::close_unpublished_state(
+                    &self.rpc,
+                    &self.auth,
+                    &fh,
+                    cleanup_seqid,
+                    &reclaimed.stateid,
+                )
+                .await;
+                return Err(NfsError::LostOpenState(
+                    "NFSv4.0 reclaim OPEN returned incompatible state".into(),
+                ));
             }
             // RFC 7530 §9.6.3.4.5: only a definitive rejection of the reclaim
             // justifies a normal OPEN. Busy statuses mean the request was not
@@ -573,18 +608,32 @@ impl RecoveryContext {
             access: open.access,
             client_id,
         };
-        let attempt = fresh_open_lane_with_seqid(
-            &self.rpc,
-            &self.auth,
-            &spec,
-            open.next_seqid,
-            "reclaim-fallback-open",
-        )
-        .await;
+        // Busy reclaim attempts consume open-owner seqids and advance the
+        // reclaim ledger without touching the lane cursor. Once this recovery
+        // session consumed anything, the ledger is the authoritative next seqid;
+        // only when nothing was consumed can the pre-loss lane cursor still be
+        // the value the server expects (the owner survived the trigger).
+        let reclaim_cursor = self.lease.open_reclaim_seqid(open.owner);
+        let seed = if reclaim_cursor == 0 {
+            open.next_seqid
+        } else {
+            reclaim_cursor
+        };
+        let attempt =
+            fresh_open_lane_with_seqid(&self.rpc, &self.auth, &spec, seed, "reclaim-fallback-open")
+                .await;
         // RFC 7530 §9.1.7: record only what the last OPEN actually consumed; a
         // PUTFH failure leaves the cursor untouched. Doing this before matching
         // the result keeps the failure path from replaying a consumed seqid.
         attempt.record_consumption(open);
+        if attempt.next_seqid != attempt.sent_seqid {
+            // The fallback OPEN advances the same open-owner sequence the
+            // reclaim ledger tracks. Keep them in sync, otherwise the next
+            // recovery pass resends the CLAIM_PREVIOUS with a seqid the server
+            // already consumed and replays its cached GRACE/DELAY once more.
+            self.lease
+                .set_open_reclaim_seqid(open.owner, open.next_seqid);
+        }
         let fresh = match attempt.result {
             Ok(fresh) => fresh,
             Err(error) => {
@@ -624,10 +673,10 @@ impl RecoveryContext {
         Ok(())
     }
 
-    /// Reclaim one lock lane, returning the stateids so the lock index can be
-    /// re-keyed by the caller.
+    /// Reclaim one lock lane, re-keying the lock index while the lane is still
+    /// held so a concurrent LOCKU cannot retire the new stateid first.
     ///
-    /// `None` means the lane was already reclaimed by an earlier attempt of the
+    /// `false` means the lane was already reclaimed by an earlier attempt of the
     /// same session (a pass retried after GRACE/DELAY). A retry sends the next
     /// unconsumed open/lock seqids: GRACE and DELAY are outside the §9.1.7
     /// exception table, so the failed request already advanced both owners.
@@ -635,22 +684,38 @@ impl RecoveryContext {
         &self,
         lane: &Arc<tokio::sync::Mutex<LockLane>>,
         client_id: u64,
-    ) -> Result<Option<([u8; 16], [u8; 16])>> {
+    ) -> Result<bool> {
         let (open_owner, lock_owner, old_stateid) = {
             let lock = lane.lock().await;
             (lock.open_owner, lock.owner, lock.stateid)
         };
         if self.lease.lock_reclaimed(lock_owner) {
-            return Ok(None);
+            return Ok(false);
         }
         let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
             NfsError::LostOpenState(format!(
                 "NFSv4.0 reclaim LOCK lost its open-owner {open_owner}"
             ))
         })?;
+        // Same fence-before-lane order as close_lane and the OPEN reclaim.
+        let io_fence = {
+            let open = open_lane.lock().await;
+            if open.closing || !self.state.is_current(open_owner, &open_lane).await {
+                return Ok(false);
+            }
+            Arc::clone(&open.io_fence)
+        };
+        let _in_flight_settled = io_fence.write_owned().await;
         let mut open = open_lane.lock().await;
-        let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+        if open.closing || !self.state.is_current(open_owner, &open_lane).await {
+            return Ok(false);
+        }
         let mut lock = lane.lock().await;
+        if !self.locks.is_current(&old_stateid, lane).await {
+            // A LOCKU released this lock while the reclaim waited; reclaiming
+            // it would resurrect state the caller closed.
+            return Ok(false);
+        }
         let open_seqid = open.next_seqid;
         // A reclaim lock owner starts at seqid 0; a consuming busy reply
         // advances the cursor for the retry in the same session.
@@ -704,9 +769,15 @@ impl RecoveryContext {
         };
         lock.stateid = new_stateid;
         lock.next_seqid = lock_seqid.wrapping_add(1);
+        // Re-key while the lane lock is still held: releasing it first would let
+        // a concurrent LOCKU remove the new key, after which this re-key would
+        // resurrect a lane whose stateid is already retired.
+        self.locks
+            .rekey(old_stateid, new_stateid, Arc::clone(lane))
+            .await;
         drop(lock);
         self.lease.mark_lock_reclaimed(lock_owner);
-        Ok(Some((old_stateid, new_stateid)))
+        Ok(true)
     }
 
     pub(super) async fn recover_or_lose(&self) -> Result<()> {
@@ -987,9 +1058,18 @@ pub(super) fn recovery_failure(
     trigger: StateidRecovery,
     source: NfsError,
 ) -> NfsError {
-    if is_authoritative_lane_loss(&source)
-        || is_session_wide_failure(&source)
-        || matches!(source, NfsError::ClosedResource(_))
+    // The lifecycle/generation gate keeps its own action.
+    if matches!(
+        &source,
+        NfsError::OperationOutcome(_) | NfsError::ClosedResource(_)
+    ) {
+        return source;
+    }
+    // A stateid status raised by the recovery attempt itself means the bounded
+    // recovery failed; asking the caller for another in-place refresh would
+    // just repeat the same request.
+    if stateid_recovery(&source).is_none()
+        && (is_authoritative_lane_loss(&source) || is_session_wide_failure(&source))
     {
         return source;
     }
@@ -1042,6 +1122,11 @@ pub(super) fn is_authoritative_lane_loss(error: &NfsError) -> bool {
         // not just this lane. Dropping the lane would silently discard state
         // that a session-level recovery can still reclaim.
         NfsError::Nfs4(status) => !is_session_wide_status(*status),
+        // A DENIED reclaim LOCK is the server's definitive answer for this
+        // lock (for example another client reclaimed the conflicting range
+        // first). It says nothing about the other lanes, so drop only this
+        // lock instead of losing the whole mount.
+        NfsError::LockDenied { .. } => true,
         NfsError::LostOpenState(_) => true,
         _ => false,
     }
@@ -1068,21 +1153,4 @@ fn nfs4_status(error: &NfsError) -> Option<crate::Nfs4ErrorCode> {
         NfsError::FileClose(failures) => failures.iter().find_map(|f| nfs4_status(&f.error)),
         _ => None,
     }
-}
-
-/// Decode the seqid carried by the first four bytes of a stateid.
-pub(super) fn stateid_seqid(stateid: &[u8; 16]) -> u32 {
-    u32::from_be_bytes([stateid[0], stateid[1], stateid[2], stateid[3]])
-}
-
-/// Overwrite a stateid's seqid, keeping the `other` field intact.
-pub(super) fn set_stateid_seqid(stateid: &mut [u8; 16], seqid: u32) {
-    stateid[..4].copy_from_slice(&seqid.to_be_bytes());
-}
-
-/// Advance a stateid's seqid by one, returning the new value.
-pub(super) fn bump_stateid_seqid(stateid: &mut [u8; 16]) -> u32 {
-    let next = stateid_seqid(stateid).wrapping_add(1);
-    set_stateid_seqid(stateid, next);
-    next
 }
