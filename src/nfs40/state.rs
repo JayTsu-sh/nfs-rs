@@ -92,6 +92,38 @@ impl LockState {
         false
     }
 
+    /// Whether `lane` is still the registry entry for `stateid` (it was not
+    /// released by a concurrent LOCKU racing with recovery).
+    pub(crate) async fn is_current(&self, stateid: &[u8; 16], lane: &Arc<Mutex<LockLane>>) -> bool {
+        self.by_stateid(stateid)
+            .await
+            .is_some_and(|current| Arc::ptr_eq(&current, lane))
+    }
+
+    /// Every lock lane currently tracked for `fh`, deduplicated by identity.
+    pub(crate) async fn for_fh(&self, fh: &Bytes) -> Vec<Arc<Mutex<LockLane>>> {
+        let lanes = self
+            .lanes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matched: Vec<Arc<Mutex<LockLane>>> = Vec::new();
+        for lane in lanes {
+            if lane.lock().await.fh != *fh {
+                continue;
+            }
+            if !matched
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &lane))
+            {
+                matched.push(lane);
+            }
+        }
+        matched
+    }
+
     pub(crate) async fn snapshot(&self) -> Vec<Arc<Mutex<LockLane>>> {
         let lanes = self
             .lanes
@@ -145,6 +177,14 @@ impl OpenState {
 
     pub(crate) async fn by_owner(&self, owner: u64) -> Option<Arc<Mutex<OwnerLane>>> {
         self.lanes.read().await.get(&owner).cloned()
+    }
+
+    /// Whether `lane` is still the current owner entry (it was not replaced or
+    /// removed by a close/cleanup racing with recovery).
+    pub(crate) async fn is_current(&self, owner: u64, lane: &Arc<Mutex<OwnerLane>>) -> bool {
+        self.by_owner(owner)
+            .await
+            .is_some_and(|current| Arc::ptr_eq(&current, lane))
     }
 
     pub(crate) async fn for_fh(

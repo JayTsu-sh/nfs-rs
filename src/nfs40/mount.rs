@@ -643,6 +643,49 @@ async fn return_delegation(
     decode_delegreturn_response(response)
 }
 
+/// Close a fresh OPEN state that must not be published.
+///
+/// Returns `Some(consumed)` when the reply pins down whether CLOSE consumed the
+/// open-owner seqid, and `None` when the outcome is unknown (transport or
+/// decoding failure). Callers must not replay either seqid in that case.
+async fn close_unpublished_state(
+    rpc: &rpc::Client,
+    auth: &Auth,
+    fh: &Bytes,
+    seqid: u32,
+    stateid: &[u8; 16],
+) -> Option<bool> {
+    let request = CompoundBuilder::new("close-fresh")
+        .putfh(fh)
+        .close(seqid, stateid)
+        .encode_with_header(auth);
+    let response = match rpc
+        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state failed; its seqid consumption is unknown"
+            );
+            return None;
+        }
+    };
+    match decode_stateid_op_outcome(response, 4, "CLOSE") {
+        Ok(outcome) => Some(stateid_op_consumes_seqid(&outcome)),
+        Err(error) => {
+            tracing::debug!(
+                target: "nfs_rs::stateid",
+                ?error,
+                "CLOSE of an uncommitted OPEN state was not decodable; its seqid consumption is unknown"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RecoveryContext {
     rpc: rpc::Client,
@@ -676,8 +719,19 @@ impl RecoveryContext {
                 .map(Ok::<_, NfsError>),
         )
         .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
+            // Learn the fence while holding the lane only briefly: the fence
+            // must be acquired before the lane to match close_lane's order.
+            let io_fence = {
+                let open = lane.lock().await;
+                Arc::clone(&open.io_fence)
+            };
+            let _in_flight_settled = io_fence.write_owned().await;
             let mut open = lane.lock().await;
-            let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+            if open.closing || !self.state.is_current(open.owner, &lane).await {
+                // Closed or removed while this reclaim waited: do not resurrect
+                // server state the client no longer tracks.
+                return Ok(());
+            }
             let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
             let response = self
                 .rpc
@@ -737,9 +791,26 @@ impl RecoveryContext {
                     let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
                         NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
                     })?;
+                    // Same fence-before-lane order as close_lane and the OPEN
+                    // reclaim loop.
+                    let io_fence = {
+                        let open = open_lane.lock().await;
+                        if open.closing {
+                            continue;
+                        }
+                        Arc::clone(&open.io_fence)
+                    };
+                    let _in_flight_settled = io_fence.write_owned().await;
                     let mut open = open_lane.lock().await;
-                    let _in_flight_settled = Arc::clone(&open.io_fence).write_owned().await;
+                    if open.closing || !self.state.is_current(open_owner, &open_lane).await {
+                        continue;
+                    }
                     let mut lock = lane.lock().await;
+                    if !self.locks.is_current(&lock.stateid, &lane).await {
+                        // A LOCKU released this lock while the reclaim waited;
+                        // reclaiming it would resurrect state the caller closed.
+                        continue;
+                    }
                     let response = self
                         .rpc
                         .call(
@@ -765,10 +836,13 @@ impl RecoveryContext {
                     open.next_seqid = open.next_seqid.wrapping_add(1);
                     lock.stateid = new_stateid;
                     lock.next_seqid = 1;
-                    drop(lock);
+                    // Rekey while the lock lane is still held: otherwise a
+                    // concurrent LOCKU can remove the new key and this rekey
+                    // would re-insert a lane whose stateid is already retired.
                     self.locks
                         .rekey(old_stateid, new_stateid, Arc::clone(&lane))
                         .await;
+                    drop(lock);
                 }
                 Ok(())
             })
@@ -997,7 +1071,10 @@ impl Mount40 {
                 let stateid =
                     decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
                 let _publication = lease.publication_guard().await;
-                lease.finish_stateful(expected_generation, "lock")?;
+                // Register before the lifecycle fence: the server may already
+                // have granted the lock, and losing the lane would leak it
+                // until lease expiry. A lost mount removes it below; a Suspect
+                // mount keeps it so the caller can unlock after recovery.
                 locks
                     .register(LockLane {
                         owner,
@@ -1011,8 +1088,16 @@ impl Mount40 {
                         length,
                     })
                     .await;
+                if let Err(error) = lease.finish_stateful(expected_generation, "lock") {
+                    if lease.generation() != expected_generation {
+                        locks.remove(&stateid).await;
+                    }
+                    return Err(error);
+                }
                 if let Err(error) = lease.validate_stateful(expected_generation, "lock") {
-                    locks.remove(&stateid).await;
+                    if lease.generation() != expected_generation {
+                        locks.remove(&stateid).await;
+                    }
                     return Err(error);
                 }
                 Ok::<_, NfsError>(stateid)
@@ -1212,19 +1297,32 @@ impl Mount40 {
                     next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                let response = rpc
-                    .call(
-                        CompoundBuilder::new("delegreturn")
-                            .putfh(&fh)
-                            .delegreturn(&delegation.stateid)
-                            .encode_with_header(&auth),
-                        ReplayPolicy::ONE_ATTEMPT,
-                        METADATA_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-                decode_delegreturn_response(response)
-                    .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                let result = async {
+                    let response = rpc
+                        .call(
+                            CompoundBuilder::new("delegreturn")
+                                .putfh(&fh)
+                                .delegreturn(&delegation.stateid)
+                                .encode_with_header(&auth),
+                            ReplayPolicy::ONE_ATTEMPT,
+                            METADATA_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                    decode_delegreturn_response(response)
+                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                }
+                .await;
+                if let Err(error) = result {
+                    // The lane is registered before this follow-up so a failed
+                    // DELEGRETURN stays closeable. If the mount was lost in the
+                    // meantime its maps were cleared, and the lane must not be
+                    // left behind.
+                    if lease.generation() != expected_generation {
+                        state.remove(owner, &fh).await;
+                    }
+                    return Err(error);
+                }
             }
             let delegation_attributes = if callback_state.is_some()
                 && matches!(
@@ -1239,18 +1337,33 @@ impl Mount40 {
                 None
             };
             let _publication = lease.publication_guard().await;
-            lease.finish_stateful(expected_generation, "open")?;
-            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
-                callback_state.register_delegation(
+            if let Err(error) = lease.finish_stateful(expected_generation, "open") {
+                // A lost/rotated mount has already cleared its state maps, so
+                // the lane published above would be unreachable. A Suspect or
+                // Reconnecting mount still owns this open, and removing it
+                // would discard the only handle that can close it.
+                if lease.generation() != expected_generation {
+                    state.remove(owner, &fh).await;
+                }
+                return Err(error);
+            }
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation)
+                && let Err(error) = callback_state.register_delegation(
                     fh.clone(),
                     delegation,
                     expected_generation,
                     delegation_attributes,
-                )?;
+                )
+            {
+                // The open itself is valid; keeping the lane lets the caller
+                // close it by file handle after the delegation failure.
+                return Err(error);
             }
             drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
-                state.remove(owner, &fh).await;
+                if lease.generation() != expected_generation {
+                    state.remove(owner, &fh).await;
+                }
                 return Err(error);
             }
             Ok::<_, NfsError>(mount::OpenFile::with_protocol_state(
@@ -1295,12 +1408,16 @@ impl Mount40 {
                 lane.closing = true;
                 (lane.fh.clone(), Arc::clone(&lane.io_fence))
             };
-            let _in_flight_settled = io_fence.write_owned().await;
+            // Take the callback I/O gate before the fence. Foreground I/O takes
+            // the gate first and the fence second, so doing the opposite here
+            // would deadlock: close would hold the fence write while waiting
+            // for a reader that is itself waiting on that fence.
             let io_guard = if let Some(callback_state) = &callback_state {
                 Some(callback_state.recall_io(&close_fh).await)
             } else {
                 None
             };
+            let _in_flight_settled = io_fence.write_owned().await;
             let _io_guard = io_guard;
             let mut lane = lane.lock().await;
             let request = CompoundBuilder::new("close")
@@ -1320,6 +1437,33 @@ impl Mount40 {
                 "CLOSE",
             );
             result = result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+            // A CLOSE whose reply was lost may already have been processed. The
+            // next attempt then sees BAD_SEQID because the server expects the
+            // following open-owner seqid. Advance the cursor once and replay;
+            // the retry either commits the closing or reports a definitive
+            // state status. Bounded to one attempt so a genuine sequencing
+            // conflict cannot loop.
+            if let Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID)) = &result {
+                lane.next_seqid = lane.next_seqid.wrapping_add(1);
+                let request = CompoundBuilder::new("close")
+                    .putfh(&lane.fh)
+                    .close(lane.next_seqid, &lane.stateid)
+                    .encode_with_header(&auth);
+                let (class, ctx) = context(
+                    "close",
+                    lane.owner,
+                    lane.next_seqid,
+                    OperationClass::ReplaySensitive,
+                );
+                let (retry_result, retry_consumed) = decode_stateid_op_call(
+                    rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                        .await,
+                    4,
+                    "CLOSE",
+                );
+                result = retry_result.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
+                close_seqid_consumed |= retry_consumed;
+            }
             // RFC 7530 §9.1.4.4: OLD_STATEID does not disclose the server's
             // current stateid seqid, and the rejected CLOSE consumed the
             // open-owner seqid. A blind +1 retry cannot converge when the
@@ -1435,6 +1579,11 @@ impl Mount40 {
         trigger: StateidRecovery,
         operation: &str,
     ) -> Result<()> {
+        // Capture the generation before spawning: the detached task must not
+        // send a replay-sensitive OPEN, or publish its result, after the mount
+        // was marked lost (which also clears the state maps) or after a newer
+        // recovery began.
+        let expected_generation = self.lease.begin_stateful(operation)?;
         // Run the whole refresh in its own task. Cancelling the initiating
         // READ/WRITE after the recovery OPEN reached the server must not drop
         // the future while the lane still holds the old stateid and an
@@ -1444,6 +1593,8 @@ impl Mount40 {
         let auth = self.auth.clone();
         let issuer = self.issuer;
         let client_id = Arc::clone(&self.client_id);
+        let lease = Arc::clone(&self.lease);
+        let open_state = Arc::clone(&self.state);
         let lane = Arc::clone(lane);
         let operation = operation.to_string();
         tokio::spawn(async move {
@@ -1452,6 +1603,9 @@ impl Mount40 {
                 auth,
                 issuer,
                 client_id,
+                lease,
+                open_state,
+                expected_generation,
                 lane,
                 failed_stateid,
                 trigger,
@@ -1469,6 +1623,9 @@ impl Mount40 {
         auth: Auth,
         issuer: u64,
         client_id: Arc<AtomicU64>,
+        lease: Arc<LeaseState>,
+        open_state: Arc<OpenState>,
+        expected_generation: u64,
         lane: Arc<tokio::sync::Mutex<OwnerLane>>,
         failed_stateid: [u8; 16],
         trigger: StateidRecovery,
@@ -1494,6 +1651,12 @@ impl Mount40 {
         if open.stateid != failed_stateid {
             return Ok(());
         }
+        // This task may have been queued while the mount was being marked lost,
+        // in which case its state map was already cleared. Do not dispatch a
+        // replay-sensitive OPEN that nothing will track or clean up. This check
+        // is best effort: mark_lost can still win between it and the OPEN
+        // reaching the server, which the publication fence below catches.
+        lease.validate_stateful(expected_generation, operation)?;
         let old_stateid = open.stateid;
         // OLD_STATEID does not carry the server's current seqid, so a blind +1
         // cannot converge when the server advanced by more than one. Fall
@@ -1534,14 +1697,24 @@ impl Mount40 {
         if fresh.fh != open.fh {
             // The re-open resolved to a different filehandle: release the
             // freshly created state rather than leak it, then refuse to commit
-            // the recovery. The lane is unusable until the caller reopens.
-            let release = CompoundBuilder::new("close-fresh")
-                .putfh(&fresh.fh)
-                .close(fresh.next_seqid, &fresh.stateid)
-                .encode_with_header(&auth);
-            let _ = rpc
-                .call(release, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                .await;
+            // the recovery. The lane's cursor must still reflect the cleanup
+            // CLOSE: it consumes the seqid it was sent with, so discarding the
+            // reply would make the next owner-sequenced request replay it and
+            // fail with BAD_SEQID. An unknown outcome makes both values unsafe
+            // to replay, so retire the lane instead.
+            match close_unpublished_state(&rpc, &auth, &fresh.fh, fresh.next_seqid, &fresh.stateid)
+                .await
+            {
+                Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
+                Some(false) => {}
+                None => {
+                    open.closing = true;
+                    let owner = open.owner;
+                    let fh = open.fh.clone();
+                    drop(open);
+                    open_state.remove(owner, &fh).await;
+                }
+            }
             return Err(NfsError::Xdr(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
@@ -1567,7 +1740,37 @@ impl Mount40 {
                 ),
             ));
         }
-        open.stateid = fresh.stateid;
+        // Fence publication: if the mount became lost while the recovery OPEN
+        // was in flight, its state maps were cleared and publishing into this
+        // detached lane would leave server state with no tracked cleanup path.
+        // Settle the already-sent OPEN and refuse to commit it.
+        {
+            let publication = lease.publication_guard().await;
+            if let Err(error) = lease.validate_stateful(expected_generation, operation) {
+                drop(publication);
+                match close_unpublished_state(
+                    &rpc,
+                    &auth,
+                    &fresh.fh,
+                    fresh.next_seqid,
+                    &fresh.stateid,
+                )
+                .await
+                {
+                    Some(true) => open.next_seqid = open.next_seqid.wrapping_add(1),
+                    Some(false) => {}
+                    None => {
+                        open.closing = true;
+                        let owner = open.owner;
+                        let fh = open.fh.clone();
+                        drop(open);
+                        open_state.remove(owner, &fh).await;
+                    }
+                }
+                return Err(error);
+            }
+            open.stateid = fresh.stateid;
+        }
         tracing::debug!(
             target: "nfs_rs::stateid",
             operation,
@@ -1593,7 +1796,10 @@ impl Mount40 {
         // in place.
         if stateid_recovery(&source).is_none()
             && (matches!(&source, NfsError::Nfs4(_))
-                || matches!(&source, NfsError::LostOpenState(_)))
+                || matches!(&source, NfsError::LostOpenState(_))
+                // A lifecycle/generation gate already carries the right
+                // recovery action (for example Reopen after a lost mount).
+                || matches!(&source, NfsError::OperationOutcome(_)))
         {
             return source;
         }
@@ -2139,15 +2345,27 @@ impl Mount40 {
             let used_in_task = Arc::clone(&used);
             let settled = DetachedSettlement::new(async move {
                 let _io_guard = io_guard;
-                let (stateid, owner, next_seqid, _in_flight) = {
+                // Acquire the fence before the lane: close and reclaim take the
+                // fence first, and holding the lane across read_owned() would
+                // invert that order and deadlock.
+                let io_fence = {
                     let guard = lane_for_settlement.lock().await;
                     if guard.closing {
                         return Err(NfsError::InvalidInput(
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
-                    let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
-                    (guard.stateid, guard.owner, guard.next_seqid, in_flight)
+                    Arc::clone(&guard.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
+                let (stateid, owner, next_seqid) = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    (guard.stateid, guard.owner, guard.next_seqid)
                 };
                 *used_in_task
                     .lock()
@@ -2755,7 +2973,7 @@ impl Mount for Mount40 {
         offset: u64,
         length: u64,
     ) -> Result<()> {
-        let expected_generation = self.lease.begin_stateful("locku")?;
+        self.lease.begin_teardown("locku")?;
         if lock_stateid.len() != 16 {
             return Err(NfsError::InvalidInput(
                 "lock_stateid must be 16 bytes".into(),
@@ -2769,6 +2987,7 @@ impl Mount for Mount40 {
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let locks = Arc::clone(&self.locks);
+        let lease = Arc::clone(&self.lease);
         let client_id = self.client_id.load(Ordering::Acquire);
         tokio::spawn(async move {
             let mut lane = lane.lock().await;
@@ -2848,8 +3067,11 @@ impl Mount for Mount40 {
             }
             let decoded = decoded.map_err(|error| classify_sent_nfs40_error(class, ctx, error));
             match decoded {
-                Ok(stateid) => {
-                    lane.stateid = stateid;
+                Ok(_) => {
+                    // Retire the lane before dropping it so a concurrent
+                    // reclaim cannot see it as current and re-establish a lock
+                    // the caller just released.
+                    lane.stateid = [0; 16];
                     drop(lane);
                     locks.remove(&original_stateid).await;
                     let cleanup = CompoundBuilder::new("release-lockowner")
@@ -2861,12 +3083,29 @@ impl Mount for Mount40 {
                         0,
                         OperationClass::ReplaySensitive,
                     );
-                    let response = rpc
-                        .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-                        .await
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-                    decode_release_lockowner_response(response)
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
+                    // Best effort: the LOCKU reply is authoritative and the
+                    // lane is already retired. A stale client id or transport
+                    // failure here must not turn a successful unlock into an
+                    // error the caller would retry.
+                    let result = async {
+                        let response = rpc
+                            .call(cleanup, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
+                            .await
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
+                        decode_release_lockowner_response(response)
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        tracing::debug!(
+                            target: "nfs_rs::stateid",
+                            operation = "locku",
+                            owner = owner,
+                            error = %error,
+                            "NFSv4.0 RELEASE_LOCKOWNER failed after LOCKU; lock state is already released"
+                        );
+                    }
+                    lease.record_activity();
                     Ok(())
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
@@ -2892,6 +3131,10 @@ impl Mount for Mount40 {
                         error = %error,
                         "NFSv4.0 LOCKU found no server lock state; treating it as released"
                     );
+                    // Same released sentinel as the success branch: the
+                    // registry entry is removed just after this point, and a
+                    // reclaim must not observe it as current in between.
+                    lane.stateid = [0; 16];
                     drop(lane);
                     locks.remove(&original_stateid).await;
                     // The lock state is gone but the server may still hold the
@@ -2919,9 +3162,40 @@ impl Mount for Mount40 {
         })
         .await
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 unlock task failed: {error}")))??;
-        self.lease.finish_stateful(expected_generation, "locku")?;
         Ok(())
     }
+    async fn release_locks(&self, fh: Bytes) -> Result<()> {
+        let lanes = self.locks.for_fh(&fh).await;
+        let mut failure = None;
+        for lane in lanes {
+            let (stateid, lock_type, offset, length) = {
+                let lane = lane.lock().await;
+                (lane.stateid, lane.lock_type, lane.offset, lane.length)
+            };
+            if stateid == [0; 16] {
+                // The lane is being retired by a concurrent LOCKU; the release
+                // is already in progress.
+                continue;
+            }
+            if let Err(error) = self
+                .locku(
+                    fh.clone(),
+                    Bytes::copy_from_slice(&stateid),
+                    lock_type,
+                    offset,
+                    length,
+                )
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn unlock_stateful(&self, token: crate::LockToken) -> Result<()> {
         if token.issuer != self.issuer || token.generation != self.lease.generation() {
             return Err(NfsError::InvalidInput(
@@ -3070,15 +3344,25 @@ impl Mount for Mount40 {
             let used_in_task = Arc::clone(&used);
             let settled = DetachedSettlement::new(async move {
                 let _callback_io = io_guard;
-                let (stateid, _in_flight) = {
+                // Same fence-before-lane order as close and reclaim.
+                let io_fence = {
                     let guard = lane_for_settlement.lock().await;
                     if guard.closing {
                         return Err(NfsError::InvalidInput(
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
-                    let in_flight = Arc::clone(&guard.io_fence).read_owned().await;
-                    (guard.stateid, in_flight)
+                    Arc::clone(&guard.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
+                let stateid = {
+                    let guard = lane_for_settlement.lock().await;
+                    if guard.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    guard.stateid
                 };
                 *used_in_task
                     .lock()
@@ -3987,6 +4271,386 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_replacement_filehandle_records_the_cleanup_close_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 227, [0xe1; 16], crate::OPEN_READ).await;
+        lane.lock().await.next_seqid = 5;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let read = read_record(&mut stream).await?;
+            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
+            // A released owner restarts at seqid 0.
+            let probe = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &probe,
+                &failed_lock_result("open-recover", 18, 10026),
+            )
+            .await?;
+            // The retry with the lane cursor opens a *different* filehandle.
+            let open = read_record(&mut stream).await?;
+            reply(&mut stream, &open, &open_result(0, [0xe2; 16], b"other")).await?;
+            // OPEN(5) consumed 5, so the cleanup CLOSE uses 6.
+            let cleanup = read_record(&mut stream).await?;
+            let expected = [6u32.to_be_bytes().as_slice(), &[0xe2; 16]].concat();
+            assert!(
+                cleanup.windows(expected.len()).any(|wire| wire == expected),
+                "cleanup CLOSE must use the seqid after the successful OPEN"
+            );
+            reply(&mut stream, &cleanup, &close_result([0xe2; 16])).await?;
+            // Because cleanup CLOSE(6) succeeded, the server now expects 7.
+            let close = read_record(&mut stream).await?;
+            let expected = [7u32.to_be_bytes().as_slice(), &[0xe1; 16]].concat();
+            assert!(
+                close.windows(expected.len()).any(|wire| wire == expected),
+                "the lane must record the seqid consumed by the cleanup CLOSE"
+            );
+            reply(&mut stream, &close, &close_result([0xe1; 16])).await
+        });
+        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
+        assert_eq!(lane.lock().await.next_seqid, 7);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_does_not_open_after_the_mount_is_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 228, [0xf1; 16], crate::OPEN_READ).await;
+        let held = lane.lock().await;
+        let refresh = {
+            let mount = Arc::clone(&mount);
+            let lane = Arc::clone(&lane);
+            tokio::spawn(async move {
+                mount
+                    .refresh_lane_stateid(&lane, [0xf1; 16], StateidRecovery::Bad, "read")
+                    .await
+            })
+        };
+        // Let the detached task queue behind the lane lock, then lose the
+        // mount before it can dispatch its recovery OPEN.
+        tokio::task::yield_now().await;
+        mount.lease.mark_lost().await;
+        drop(held);
+        let error = refresh.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, NfsError::OperationOutcome(_)),
+            "a queued refresh must report the lifecycle gate, got {error:?}"
+        );
+        assert_eq!(lane.lock().await.stateid, [0xf1; 16]);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                    .await
+                    .is_err(),
+                "a lost mount must not dispatch a recovery OPEN"
+            );
+            Ok::<(), std::io::Error>(())
+        });
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_result_across_a_generation_fence_is_not_published() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &request, &open_result(0, [0x91; 16], b"fh")).await
+        });
+        let for_open = Arc::clone(&mount);
+        let open = tokio::spawn(async move {
+            for_open
+                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        let error = match open.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("OPEN must not be published across a generation fence"),
+        };
+        assert_eq!(
+            error.operation_outcome().unwrap().recovery,
+            crate::RecoveryAction::Reopen
+        );
+        assert!(
+            mount.state.snapshot().await.is_empty(),
+            "a fenced OPEN must not leave a lane behind"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_cleanup_close_retires_the_recovered_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 231, [0xf2; 16], crate::OPEN_READ).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let open = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &open, &open_result(0, [0xf3; 16], b"fh")).await?;
+            let cleanup = read_record(&mut stream).await?;
+            // The recovery OPEN restarts a released owner at seqid 0, so the
+            // cleanup CLOSE carries the next seqid.
+            let expected = [1u32.to_be_bytes().as_slice(), &[0xf3; 16]].concat();
+            assert!(cleanup.windows(expected.len()).any(|wire| wire == expected));
+            // Drop the connection without replying: the cleanup CLOSE outcome
+            // is unknown and the lane must not stay stuck in `closing`.
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let mount_for_refresh = Arc::clone(&mount);
+        let refresh = tokio::spawn(async move {
+            mount_for_refresh
+                .refresh_lane_stateid(&lane, [0xf2; 16], StateidRecovery::Bad, "read")
+                .await
+        });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        let error = refresh.await.unwrap().unwrap_err();
+        assert!(matches!(error, NfsError::OperationOutcome(_)));
+        assert!(
+            mount
+                .state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
+                .await
+                .is_none(),
+            "an unknown cleanup CLOSE must retire the lane"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspect_open_error_keeps_the_published_lane() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &request, &open_result(0, [0x92; 16], b"fh")).await
+        });
+        let for_open = Arc::clone(&mount);
+        let open = tokio::spawn(async move {
+            for_open
+                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .await
+        });
+        seen_rx.await.unwrap();
+        // Lifecycle changes without a generation bump: the open still exists
+        // and must remain tracked so it can be closed by file handle.
+        mount.lease.mark_reconnecting();
+        let _ = reply_tx.send(());
+        let error = open.await.unwrap().unwrap_err();
+        assert!(matches!(error, NfsError::OperationOutcome(_)));
+        assert!(
+            mount
+                .state
+                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
+                .await
+                .is_some(),
+            "a non-lost mount must keep the published open lane"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_replays_once_after_bad_seqid() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        let lane = register_stateid_lane(&mount, 229, [0xa4; 16], crate::OPEN_READ).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let first = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0xa4; 16]].concat();
+            assert!(first.windows(expected.len()).any(|wire| wire == expected));
+            reply(&mut stream, &first, &failed_lock_result("close", 4, 10026)).await?;
+            // A lost reply may already have consumed seqid 1, so the replay
+            // advances the open-owner cursor once.
+            let retry = read_record(&mut stream).await?;
+            let expected = [2u32.to_be_bytes().as_slice(), &[0xa4; 16]].concat();
+            assert!(retry.windows(expected.len()).any(|wire| wire == expected));
+            reply(&mut stream, &retry, &close_result([0xa4; 16])).await
+        });
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        assert!(mount.state.snapshot().await.is_empty());
+        server.await.unwrap().unwrap();
+        assert_eq!(lane.lock().await.next_seqid, 3);
+    }
+
+    #[tokio::test]
+    async fn release_locks_recovers_an_abandoned_lock_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 44, b"fh").await;
+        // Simulate a LOCK that succeeded after its caller was cancelled: the
+        // lock stays registered, but the caller never received the token.
+        register_scripted_lock(&mount, 44, [0x73; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x73; 16]].concat();
+            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x74; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
+        assert!(
+            error.to_string().contains("outstanding locks"),
+            "the abandoned lock must still be visible to CLOSE: {error}"
+        );
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_works_while_the_mount_is_verifying_its_lease() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 45, b"fh").await;
+        register_scripted_lock(&mount, 45, [0x75; 16]).await;
+        // A cancelled LOCK often coincides with a failed RENEW. Teardown must
+        // not be blocked by the lifecycle gate, otherwise close stays wedged.
+        mount.lease.mark_reconnecting();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x75; 16]].concat();
+            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x76; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_ignores_a_failed_release_lockowner() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 48, b"fh").await;
+        register_scripted_lock(&mount, 48, [0x81; 16]).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x82; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            // STALE_CLIENTID: the lock state is already gone even though the
+            // cleanup owner release failed.
+            reply(
+                &mut stream,
+                &release,
+                &compound_result_with_status(10022, "release-lockowner", &[]),
+            )
+            .await
+        });
+        mount
+            .release_locks(Bytes::from_static(b"fh"))
+            .await
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_accepts_success_when_recovery_starts_mid_release() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 46, b"fh").await;
+        register_scripted_lock(&mount, 46, [0x77; 16]).await;
+        mount.lease.mark_reconnecting();
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let locku = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x78; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await
+        });
+        let for_release = Arc::clone(&mount);
+        let release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        seen_rx.await.unwrap();
+        // Recovery starts while the LOCKU is in flight. The successful reply is
+        // authoritative; reporting failure would make callers retry an
+        // already-released lock.
+        mount.lease.mark_recovering();
+        let _ = reply_tx.send(());
+        release.await.unwrap().unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_read_does_not_abandon_stateid_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mount = connected_direct_mount(&listener).await;
@@ -4379,6 +5043,72 @@ mod tests {
             lane.lock().await.next_seqid,
             1,
             "a PUTFH failure never ran LOCK and must not consume seqid 1"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_success_while_suspect_keeps_the_granted_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 242, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x91; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        mount.lease.mark_reconnecting();
+        let _ = reply_tx.send(());
+        assert!(lock.await.unwrap().is_err());
+        assert!(
+            mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
+            "a granted lock must stay tracked while the mount is verifying its lease"
+        );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_success_across_a_lost_mount_is_not_published() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 243, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x92; 16])]),
+            )
+            .await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        mount.lease.mark_lost().await;
+        let _ = reply_tx.send(());
+        assert!(lock.await.unwrap().is_err());
+        assert!(
+            !mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
+            "a lost mount must not keep a lock lane it can never unlock"
         );
         server.await.unwrap().unwrap();
     }
