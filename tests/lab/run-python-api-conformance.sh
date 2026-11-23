@@ -46,7 +46,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -m 0700 "$workdir"
+chmod 700 "$workdir"
 cp -f -- "$wheel" "$workdir/"
 cp -f -- "$repo_root/scripts/validate-python-real-api.py" "$workdir/"
 
