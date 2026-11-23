@@ -967,6 +967,14 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// never silently dropped, and this call lets the owner of the file handle
     /// release it before closing.
     ///
+    /// The NFSv4.0 backend waits for LOCK requests it issued before this call
+    /// that have not settled yet, so a lock granted to a cancelled caller is
+    /// still released. LOCK requests started after this call begins are not
+    /// awaited: callers must not open new locks on `fh` concurrently with this
+    /// cleanup, and must call it before closing. A LOCK whose outcome is
+    /// uncertain (for example a timeout before the reply was received) cannot
+    /// be released here because its server-side stateid was never learned.
+    ///
     /// Only the NFSv4.0 backend tracks locks by file handle. NFSv4.1 callers
     /// must retain the token from [`Mount::lock_stateful`] and pass it to
     /// [`Mount::unlock_stateful`].

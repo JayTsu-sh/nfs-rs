@@ -1019,7 +1019,12 @@ impl Mount40 {
             let lock_seqid_for_task = lock_seqid;
             let used = Arc::new(std::sync::Mutex::new(None));
             let used_in_task = Arc::clone(&used);
+            // Track the acquisition before spawning. If the caller is
+            // cancelled, the detached task keeps this guard until it has
+            // registered the granted lock, so `release_locks` can wait for it.
+            let acquisition = self.locks.begin_acquisition(fh.clone());
             let stateid = tokio::spawn(async move {
+                let _acquisition = acquisition;
                 let mut open = open_lane_task.lock().await;
                 let open_owner = open.owner;
                 *used_in_task
@@ -3157,6 +3162,11 @@ impl Mount for Mount40 {
         Ok(())
     }
     async fn release_locks(&self, fh: Bytes) -> Result<()> {
+        // A cancelled LOCK keeps settling in its detached task and registers
+        // its lane only after the reply arrives. Wait for every acquisition
+        // issued before this cleanup, otherwise the snapshot below misses the
+        // grant and the following CLOSE collides with it (`LOCKS_HELD`).
+        self.locks.wait_for_acquisitions(&fh).await;
         let lanes = self.locks.for_fh(&fh).await;
         let mut failure = None;
         for lane in lanes {
@@ -5193,6 +5203,131 @@ mod tests {
             !mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
             "a lost mount must not keep a lock lane it can never unlock"
         );
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_waits_for_a_cancelled_lock_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 245, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(
+                &mut stream,
+                &lock,
+                &compound_result("lock", &[(22, &[]), (12, &[0x9a; 16])]),
+            )
+            .await?;
+            // The grant registered by the detached task must be visible to
+            // release_locks, which then unlocks it.
+            let locku = read_record(&mut stream).await?;
+            let expected = [1u32.to_be_bytes().as_slice(), &[0x9a; 16]].concat();
+            assert!(
+                locku.windows(expected.len()).any(|wire| wire == expected),
+                "release_locks must unlock the lock whose caller was cancelled"
+            );
+            reply(
+                &mut stream,
+                &locku,
+                &compound_result("locku", &[(22, &[]), (14, &[0x9b; 16])]),
+            )
+            .await?;
+            let release = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &release,
+                &compound_result("release-lockowner", &[(39, &[])]),
+            )
+            .await?;
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        // The caller goes away while the LOCK reply is still pending; its
+        // detached task will register the grant on its own.
+        lock.abort();
+        let for_release = Arc::clone(&mount);
+        let mut release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut release)
+                .await
+                .is_err(),
+            "release_locks returned before the in-flight LOCK settled"
+        );
+        let _ = reply_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .expect("release_locks must finish once the LOCK settles")
+            .unwrap()
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_returns_immediately_without_acquisitions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 246, b"fh").await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            mount.release_locks(Bytes::from_static(b"fh")),
+        )
+        .await
+        .expect("cleanup without in-flight acquisitions must not wait")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_locks_waits_for_a_cancelled_lock_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mount = connected_direct_mount(&listener).await;
+        register_scripted_open(&mount, 247, b"fh").await;
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let lock = read_record(&mut stream).await?;
+            let _ = seen_tx.send(());
+            let _ = reply_rx.await;
+            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10025)).await?;
+            // Nothing was granted, so cleanup must go straight to CLOSE.
+            let close = read_record(&mut stream).await?;
+            reply(&mut stream, &close, &close_result([0x61; 16])).await
+        });
+        let for_lock = Arc::clone(&mount);
+        let lock =
+            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
+        seen_rx.await.unwrap();
+        lock.abort();
+        let for_release = Arc::clone(&mount);
+        let mut release =
+            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut release)
+                .await
+                .is_err(),
+            "the failed LOCK must still be tracked as unsettled"
+        );
+        let _ = reply_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), release)
+            .await
+            .expect("release_locks must finish once the LOCK failed")
+            .unwrap()
+            .unwrap();
+        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
+        mount.close(Bytes::from_static(b"fh")).await.unwrap();
         server.await.unwrap().unwrap();
     }
 

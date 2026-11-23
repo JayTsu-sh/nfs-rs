@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 
 #[derive(Debug)]
 pub(crate) struct OwnerLane {
@@ -41,9 +41,130 @@ pub(crate) struct LockLane {
 pub(crate) struct LockState {
     lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
     aliases: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
+    acquisitions: Arc<LockAcquisitions>,
+}
+
+/// Tracks LOCK requests that were issued but have not finished settling in
+/// their detached task.
+///
+/// A LOCK runs in its own task and only registers its lane after the reply
+/// arrives. If the caller is cancelled, that task keeps running, so a cleanup
+/// that snapshots the registry immediately can miss the lock and let a later
+/// CLOSE collide with it (`LOCKS_HELD`). `release_locks` therefore captures a
+/// barrier and waits for every acquisition issued before it.
+struct LockAcquisitions {
+    tickets: std::sync::Mutex<AcquisitionTickets>,
+    settled: watch::Sender<u64>,
+}
+
+impl Default for LockAcquisitions {
+    fn default() -> Self {
+        let (settled, _receiver) = watch::channel(0u64);
+        Self {
+            tickets: std::sync::Mutex::default(),
+            settled,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AcquisitionTickets {
+    next: u64,
+    pending: HashMap<u64, Bytes>,
+}
+
+impl LockAcquisitions {
+    fn begin(self: &Arc<Self>, fh: Bytes) -> LockAcquisition {
+        let mut tickets = self
+            .tickets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ticket = tickets.next;
+        // A wrap only breaks the `ticket < barrier` comparison after 2^64
+        // acquisitions on one mount, which is not reachable in practice.
+        tickets.next = tickets.next.wrapping_add(1);
+        tickets.pending.insert(ticket, fh);
+        LockAcquisition {
+            acquisitions: Arc::clone(self),
+            ticket,
+        }
+    }
+
+    fn barrier(&self) -> u64 {
+        self.tickets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next
+    }
+
+    /// Waits until every acquisition for `fh` with a ticket below `barrier`
+    /// has settled. Acquisitions started after `barrier` are intentionally not
+    /// awaited: cleanup only promises to cover requests already issued.
+    async fn wait_issued_before(&self, barrier: u64, fh: &Bytes) {
+        let mut settled = self.settled.subscribe();
+        loop {
+            let pending = {
+                let tickets = self
+                    .tickets
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tickets
+                    .pending
+                    .iter()
+                    .any(|(ticket, candidate)| *ticket < barrier && candidate == fh)
+            };
+            if !pending {
+                return;
+            }
+            // `send_modify` works without receivers and every waiter subscribes
+            // before checking `pending`, so this cannot happen while `self` is
+            // alive; treat a closed channel as settled and return.
+            if settled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Holds one in-flight LOCK acquisition open until the detached task that owns
+/// the request has registered its result (or failed).
+pub(crate) struct LockAcquisition {
+    acquisitions: Arc<LockAcquisitions>,
+    ticket: u64,
+}
+
+impl Drop for LockAcquisition {
+    fn drop(&mut self) {
+        let removed = {
+            let mut tickets = self
+                .acquisitions
+                .tickets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tickets.pending.remove(&self.ticket).is_some()
+        };
+        if removed {
+            self.acquisitions
+                .settled
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
 }
 
 impl LockState {
+    /// Marks a LOCK as issued. The returned guard must live in the detached
+    /// task that settles it, so cancellation of the caller cannot end the
+    /// acquisition tracking early.
+    #[must_use]
+    pub(crate) fn begin_acquisition(self: &Arc<Self>, fh: Bytes) -> LockAcquisition {
+        self.acquisitions.begin(fh)
+    }
+
+    /// Waits for LOCK acquisitions for `fh` that were issued before this call.
+    pub(crate) async fn wait_for_acquisitions(&self, fh: &Bytes) {
+        let barrier = self.acquisitions.barrier();
+        self.acquisitions.wait_issued_before(barrier, fh).await;
+    }
     pub(crate) async fn register(&self, lane: LockLane) -> Arc<Mutex<LockLane>> {
         let stateid = lane.stateid;
         let lane = Arc::new(Mutex::new(lane));
@@ -154,6 +275,9 @@ impl LockState {
     }
 
     pub(crate) async fn clear(&self) {
+        // In-flight acquisitions are left to their detached tasks; waiting for
+        // them is bounded by the RPC timeout, and their lanes are retired by
+        // the generation check once the reply arrives.
         self.lanes.write().await.clear();
         self.aliases.write().await.clear();
     }
