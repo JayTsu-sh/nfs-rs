@@ -74,6 +74,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/python-conformance-wheel"
           maturin build --locked --out "$RUNNER_TEMP/python-conformance-wheel"
           python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/python-conformance-wheel/*.whl
+          shopt -s nullglob
+          wheels=("$RUNNER_TEMP"/python-conformance-wheel/*.whl)
+          [[ ${#wheels[@]} -eq 1 ]] || { echo "expected exactly one conformance wheel" >&2; exit 1; }
+          echo "NFS_RS_PYTHON_CONFORMANCE_WHEEL=${wheels[0]}" >> "$GITHUB_ENV"
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --all-targets --no-fail-fast
       - name: Validate reliability coverage manifest

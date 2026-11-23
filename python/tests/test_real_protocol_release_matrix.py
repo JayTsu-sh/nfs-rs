@@ -64,6 +64,13 @@ def test_nightly_runs_public_python_api_conformance_on_every_real_protocol() -> 
             "netapp-pnfs-mds|4.1|",
         )
     )
+    # The AFX svm2 data network is unreachable from the runner, so the pNFS
+    # case must be scheduled onto the AFX executor over SSH with the
+    # current-checkout wheel, not run from the runner directly.
+    assert "LAB_AFX_PNFS_DATA" in runner
+    assert "NFS_RS_PYTHON_CONFORMANCE_WHEEL" in runner
+    assert "NFS_RS_PYTHON_CONFORMANCE_WHEEL" in workflow
+    assert "LAB_PNFS_MDS_DATA" not in runner
 
 
 def test_accepted_baseline_encodes_five_of_four_and_ten_percent_policy() -> None:
