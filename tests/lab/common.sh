@@ -15,6 +15,10 @@ LAB_PNFS_MDS_DATA="${LAB_PNFS_MDS_DATA:-10.128.56.160}"
 LAB_PNFS_DS_DATA="${LAB_PNFS_DS_DATA:-10.128.56.161}"
 LAB_PNFS_PRIMARY_EXPORT="${LAB_PNFS_PRIMARY_EXPORT:-/nfsrs_pnfs_a}"
 LAB_PNFS_SECONDARY_EXPORT="${LAB_PNFS_SECONDARY_EXPORT:-/nfsrs_pnfs_b}"
+# AFX svm2 pNFS data network. Unreachable from the runner; reached through
+# the AFX executor (see run-afx-t15-e2e.sh) or manual run-afx-v42-e2e.sh.
+LAB_AFX_PNFS_DATA="${LAB_AFX_PNFS_DATA:-192.168.9.101}"
+LAB_AFX_PNFS_EXPORT="${LAB_AFX_PNFS_EXPORT:-/pnfs_test2}"
 LAB_DXN_V40_DATA="${LAB_DXN_V40_DATA:-10.131.7.201}"
 LAB_DXN_V40_EXPORT="${LAB_DXN_V40_EXPORT:-/jay_nfs}"
 
