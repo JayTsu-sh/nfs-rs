@@ -161,6 +161,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/python-real-protocol"
           flock --wait 10800 /tmp/terrasync-lab-tests.lock env \
             PYTHON="$RUNNER_TEMP/python-wheel-venv/bin/python" \
+            NFS_RS_ARTIFACT_MATRIX_WHEEL="$(ls target/python-release-artifacts/*_x86_64.whl)" \
             tests/lab/run-python-artifact-matrix.sh "$RUN_ID" wheel \
             "$RUNNER_TEMP/python-real-protocol/x86_64-wheel.json"
       - name: Validate wheel rebuilt from final source artifact on every required real protocol
@@ -174,6 +175,7 @@ jobs:
           "$RUNNER_TEMP/python-sdist-venv/bin/python" -m pip install --no-deps "$RUNNER_TEMP"/python-sdist-wheel/*.whl
           flock --wait 10800 /tmp/terrasync-lab-tests.lock env \
             PYTHON="$RUNNER_TEMP/python-sdist-venv/bin/python" \
+            NFS_RS_ARTIFACT_MATRIX_WHEEL="$(ls "$RUNNER_TEMP"/python-sdist-wheel/*.whl)" \
             tests/lab/run-python-artifact-matrix.sh "$RUN_ID" sdist-wheel \
             "$RUNNER_TEMP/python-real-protocol/x86_64-sdist-wheel.json"
       - name: Upload Python real-protocol evidence

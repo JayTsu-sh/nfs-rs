@@ -9,6 +9,9 @@ ROOT = pathlib.Path(__file__).parents[2]
 
 def test_real_protocol_runner_is_fail_closed_and_complete() -> None:
     runner = (ROOT / "tests/lab/run-python-artifact-matrix.sh").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/release-validation.yml").read_text(
+        encoding="utf-8"
+    )
     expected_cases = {
         "linux-source-v3|3|",
         "dxn-v40|4.0|",
@@ -19,6 +22,13 @@ def test_real_protocol_runner_is_fail_closed_and_complete() -> None:
     assert "netapp-pnfs-mds|4.1|" in runner and "|true\"" in runner
     assert "check-python-performance.py" in runner
     assert "continue-on-error" not in runner
+    # The AFX svm2 data network is unreachable from the runner, so the pNFS
+    # case must be scheduled onto the AFX executor over SSH with the release
+    # artifact wheel, not run from the runner directly.
+    assert "LAB_AFX_PNFS_DATA" in runner
+    assert "NFS_RS_ARTIFACT_MATRIX_WHEEL" in runner
+    assert workflow.count("NFS_RS_ARTIFACT_MATRIX_WHEEL") == 2
+    assert "LAB_PNFS_MDS_DATA" not in runner
 
 
 def test_release_validation_requires_both_x86_artifacts_without_an_arm_lab() -> None:

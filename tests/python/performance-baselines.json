@@ -1,14 +1,33 @@
 {
   "schema_version": 1,
   "status": "accepted",
-  "captured_at": "2026-08-28",
+  "captured_at": "2026-11-23",
   "provenance": {
-    "run_id": "nightly-codex-ticket14-20260828",
-    "artifacts": [
-      "production manylinux2014 x86_64 wheel",
-      "wheel rebuilt from the production sdist"
-    ],
-    "selection": "minimum observed median throughput and maximum observed p95 latency"
+    "base": {
+      "captured_at": "2026-08-28",
+      "run_id": "nightly-codex-ticket14-20260828",
+      "cases": [
+        "linux-source-v3",
+        "dxn-v40",
+        "linux-source-v41"
+      ],
+      "artifacts": [
+        "production manylinux2014 x86_64 wheel",
+        "wheel rebuilt from the production sdist"
+      ],
+      "selection": "minimum observed median throughput and maximum observed p95 latency"
+    },
+    "netapp-pnfs-mds": {
+      "captured_at": "2026-11-23",
+      "run_id": "local-baseline-20261123",
+      "endpoint": "nfs://192.168.9.101/pnfs_test2 on AFX svm2, reached through the AFX data-network executor 10.128.56.17",
+      "reason": "the legacy NetApp pNFS SVM no longer advertises pNFS; the pNFS case runs on AFX svm2 from the data-network executor",
+      "artifacts": [
+        "production manylinux2014 x86_64 wheel",
+        "wheel rebuilt from the production sdist"
+      ],
+      "selection": "minimum observed median throughput and maximum observed p95 latency"
+    }
   },
   "policy": {
     "comparable_runs": 5,
@@ -35,10 +54,10 @@
       "read_latency_ms_p95": 16.01852010935545
     },
     "netapp-pnfs-mds": {
-      "write_mib_s_median": 46.72933351201229,
-      "read_mib_s_median": 69.725315167318,
-      "write_latency_ms_p95": 107.53947123885155,
-      "read_latency_ms_p95": 67.36926827579737
+      "write_mib_s_median": 94.56646660770988,
+      "read_mib_s_median": 154.3750971051915,
+      "write_latency_ms_p95": 72.62984896078706,
+      "read_latency_ms_p95": 37.165862042456865
     }
   }
 }
