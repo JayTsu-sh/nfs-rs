@@ -107,10 +107,18 @@ pub(crate) fn check_status(status: u32) -> Result<()> {
     if status == 0 {
         return Ok(());
     }
+    Err(status_error(status)?)
+}
+
+/// Convert a raw non-zero NFSv4 status into its typed error.
+pub(crate) fn status_error(status: u32) -> Result<NfsError> {
+    if status == 0 {
+        return Err(NfsError::Xdr("unexpected success NFSv4 status".into()));
+    }
     let mut wire = Bytes::copy_from_slice(&status.to_be_bytes());
     let status = nfsstat4::try_from(&mut wire)
         .map_err(|error| NfsError::Xdr(format!("invalid NFSv4 status: {error}")))?;
-    Err(NfsError::Nfs4(status))
+    Ok(NfsError::Nfs4(status))
 }
 
 pub(crate) fn response_ops(mut buf: Bytes) -> Result<(u32, Bytes)> {
