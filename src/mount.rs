@@ -663,6 +663,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         self.lookup(dir_fh, filename).await
     }
 
+    /// Open an entry identified by its exact server-side name bytes.
+    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, _access: u32) -> Result<ObjRes> {
+        self.lookup_raw(dir_fh, raw_name).await
+    }
+
     /// Same as [`Mount::open`] but takes a full path instead of dir_fh + filename.
     async fn open_path(&self, path: &str, _access: u32) -> Result<ObjRes> {
         // Default: stateless lookup (NFSv3)
@@ -676,6 +681,17 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
             object: self.open(dir_fh, filename, access).await?,
             state: None,
         })
+    }
+
+    async fn open_stateful_raw(
+        &self,
+        dir_fh: Bytes,
+        raw_name: Bytes,
+        access: u32,
+    ) -> Result<OpenFile> {
+        Ok(OpenFile::from_object(
+            self.open_raw(dir_fh, raw_name, access).await?,
+        ))
     }
 
     /// Stateful form of [`Mount::open_path`].
@@ -1505,6 +1521,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes>;
 
+    /// Look up the exact bytes returned in a directory entry's `raw_name`.
+    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<ObjRes>;
+
     /// Same as [`Mount::lookup`] but instead of taking in a directory file handle and filename, takes in a path for
     /// which directory file handle is obtained by performing one or more LOOKUP procedures for each directory in the
     /// path, in turn.
@@ -1840,6 +1859,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()>;
 
+    /// Remove an entry by its exact server-side name bytes.
+    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()>;
+
     /// Same as [`Mount::remove`] but instead of taking in a directory file handle and filename, takes in a path for
     /// which directory file handle is obtained by performing one or more LOOKUP procedures.
     ///
@@ -1896,6 +1918,15 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         from_filename: &str,
         to_dir_fh: Bytes,
         to_filename: &str,
+    ) -> Result<()>;
+
+    /// Rename using exact server-side name bytes at both ends.
+    async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
     ) -> Result<()>;
 
     /// Same as [`Mount::rename`] but instead of taking in a from directory file handle, from filename, to directory
@@ -2499,6 +2530,8 @@ pub struct SupportedPathconf {
 pub struct ReaddirEntry {
     pub fileid: u64,
     pub file_name: String,
+    /// Exact server-side entry name. Use this for name-based operations.
+    pub raw_name: Bytes,
 }
 
 /// Struct describing a single NFS entry as returned by [`Mount::readdirplus`] and [`Mount::readdirplus_path`].
@@ -2506,6 +2539,8 @@ pub struct ReaddirEntry {
 pub struct ReaddirplusEntry {
     pub fileid: u64,
     pub file_name: String,
+    /// Exact server-side entry name. The display text is not a file identifier.
+    pub raw_name: Bytes,
     pub attr: Option<Attr>,
     pub handle: Bytes,
 }

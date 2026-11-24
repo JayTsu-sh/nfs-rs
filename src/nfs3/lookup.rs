@@ -39,10 +39,15 @@ impl Mount {
     }
 
     pub async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
+        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+
+    pub async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<ObjRes> {
         let args = LOOKUP3args {
             what: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(filename.to_string()),
+                name: filename3(raw_name),
             },
         };
         self._lookup(args).await?.into()

@@ -27,10 +27,15 @@ impl Mount {
     }
 
     pub async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+
+    pub async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
         let args = REMOVE3args {
             object: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(filename.to_string()),
+                name: filename3(raw_name),
             },
         };
         self._remove(args).await?;

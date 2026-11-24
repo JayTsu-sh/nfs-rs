@@ -7,10 +7,15 @@ use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
 
 impl Mount41 {
     pub(crate) async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+
+    pub(crate) async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<mount::ObjRes> {
         let bitmap = standard_getattr_bitmap();
         let resp = self
             .compound("lookup", |b| {
-                b.putfh(&dir_fh).lookup(filename).getfh().getattr(&bitmap)
+                b.putfh(&dir_fh).lookup(&raw_name).getfh().getattr(&bitmap)
             })
             .await?;
         // ops: [SEQUENCE(0), PUTFH(1), LOOKUP(2), GETFH(3), GETATTR(4)]

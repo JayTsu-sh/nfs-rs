@@ -60,7 +60,7 @@ impl Mount {
         let args = CREATE3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(filename.to_string()),
+                name: filename3(Bytes::copy_from_slice(filename.as_bytes())),
             },
             // RFC 1813 §3.3.8: only GUARDED success proves fresh creation.
             how: if guarded {

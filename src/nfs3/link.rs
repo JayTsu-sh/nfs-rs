@@ -37,7 +37,7 @@ impl Mount {
             file: nfs_fh3 { data: src_fh },
             link: diropargs3 {
                 dir: nfs_fh3 { data: dst_dir_fh },
-                name: filename3(dst_filename.to_string()),
+                name: filename3(Bytes::copy_from_slice(dst_filename.as_bytes())),
             },
         };
         let ok = self._link(args).await?;

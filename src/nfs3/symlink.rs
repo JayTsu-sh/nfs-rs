@@ -37,7 +37,7 @@ impl Mount {
         let args = SYMLINK3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dst_dir_fh },
-                name: filename3(dst_filename.to_string()),
+                name: filename3(Bytes::copy_from_slice(dst_filename.as_bytes())),
             },
             symlink: symlinkdata3 {
                 symlink_attributes: sattr3::default(),

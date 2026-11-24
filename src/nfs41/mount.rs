@@ -1848,6 +1848,10 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.lookup(dir_fh, filename).await
     }
+    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
+        self.m.lookup_raw(dir_fh, raw_name).await
+    }
     async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.lookup_path(path).await
@@ -1994,6 +1998,10 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.open(dir_fh, filename, access).await
     }
+    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, access: u32) -> Result<mount::ObjRes> {
+        let _operation = self.core.begin_operation()?;
+        self.m.open_raw(dir_fh, raw_name, access).await
+    }
     async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.open_path(path, access).await
@@ -2047,6 +2055,10 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.remove(dir_fh, filename).await
     }
+    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        self.m.remove_raw(dir_fh, raw_name).await
+    }
     async fn remove_path(&self, path: &str) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.remove_path(path).await
@@ -2074,6 +2086,18 @@ impl crate::Mount for Mount41Wrapper {
     async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rename_path(from_path, to_path).await
+    }
+    async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
+    ) -> Result<()> {
+        let _operation = self.core.begin_operation()?;
+        self.m
+            .rename_raw(from_dir_fh, from_name, to_dir_fh, to_name)
+            .await
     }
     async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &str) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
@@ -2752,7 +2776,7 @@ pub(super) fn decode_fh(data: &mut Bytes) -> Result<Bytes> {
     Ok(fh)
 }
 
-pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<String> {
+pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<(String, Bytes)> {
     if data.remaining() < 4 {
         return Err(NfsError::Xdr("string length truncated".to_string()));
     }
@@ -2761,9 +2785,10 @@ pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<String> {
     if data.remaining() < padded {
         return Err(NfsError::Xdr("string data truncated".to_string()));
     }
-    let s = crate::nfs4::name::display(&data.slice(..len));
+    let raw = Bytes::copy_from_slice(&data[..len]);
+    let s = String::from_utf8_lossy(&raw).into_owned();
     data.advance(padded);
-    Ok(s)
+    Ok((s, raw))
 }
 
 pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {

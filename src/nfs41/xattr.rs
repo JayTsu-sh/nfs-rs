@@ -114,7 +114,7 @@ impl Mount41 {
             create: true,
             create_attrs_mask: vec![1 << 4],
             create_attrs_vals: 0u64.to_be_bytes().to_vec(),
-            claim_file: name.to_string(),
+            claim_file: Bytes::copy_from_slice(name.as_bytes()),
             want_no_delegation: true,
         };
         let resp = self

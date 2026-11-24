@@ -469,7 +469,7 @@ async fn fresh_open_lane(
     rpc: &rpc::Client,
     auth: &Auth,
     dir_fh: &Bytes,
-    name: &str,
+    name: impl AsRef<[u8]>,
     owner_wire: &[u8],
     access: u32,
     client_id: u64,
@@ -483,7 +483,7 @@ async fn fresh_open_lane(
             share_access: access,
             client_id,
             owner: owner_wire,
-            filename: name,
+            filename: name.as_ref(),
             create: false,
         })
         .getfh()
@@ -594,7 +594,7 @@ async fn fresh_open_lane_with_seqid(
     rpc: &rpc::Client,
     auth: &Auth,
     dir_fh: &Bytes,
-    name: &str,
+    name: impl AsRef<[u8]>,
     owner_wire: &[u8],
     access: u32,
     client_id: u64,
@@ -602,7 +602,15 @@ async fn fresh_open_lane_with_seqid(
     operation: &str,
 ) -> FreshOpenAttempt {
     let attempt = fresh_open_lane(
-        rpc, auth, dir_fh, name, owner_wire, access, client_id, 0, operation,
+        rpc,
+        auth,
+        dir_fh,
+        name.as_ref(),
+        owner_wire,
+        access,
+        client_id,
+        0,
+        operation,
     )
     .await;
     // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
@@ -1130,8 +1138,15 @@ impl Mount40 {
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
-        self.open_file_with_create(dir_fh, filename, access, create, false, None)
-            .await
+        self.open_file_with_create(
+            dir_fh,
+            Bytes::copy_from_slice(filename.as_bytes()),
+            access,
+            create,
+            false,
+            None,
+        )
+        .await
     }
 
     async fn open_guarded(
@@ -1142,7 +1157,14 @@ impl Mount40 {
         mode: Option<u32>,
     ) -> Result<mount::OpenFile> {
         match self
-            .open_file_with_create(dir_fh.clone(), filename, access, true, true, mode)
+            .open_file_with_create(
+                dir_fh.clone(),
+                Bytes::copy_from_slice(filename.as_bytes()),
+                access,
+                true,
+                true,
+                mode,
+            )
             .await
         {
             // A definite OPEN attribute rejection has not created a file.
@@ -1152,7 +1174,14 @@ impl Mount40 {
                 if mode.is_some() =>
             {
                 let file = self
-                    .open_file_with_create(dir_fh, filename, access, true, true, None)
+                    .open_file_with_create(
+                        dir_fh,
+                        Bytes::copy_from_slice(filename.as_bytes()),
+                        access,
+                        true,
+                        true,
+                        None,
+                    )
                     .await?;
                 if let Err(error) = self
                     .setattr(file.file_handle(), None, mode, None, None, None, None, None)
@@ -1170,7 +1199,7 @@ impl Mount40 {
     async fn open_file_with_create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: Bytes,
         access: u32,
         create: bool,
         guarded: bool,
@@ -1187,7 +1216,6 @@ impl Mount40 {
         }
         let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
         let owner_wire = format!("nfs-rs-{:016x}-{owner:016x}", self.issuer);
-        let filename = filename.to_string();
         let rpc = self.rpc.clone();
         let auth = self.auth.clone();
         let state = Arc::clone(&self.state);
@@ -1212,7 +1240,7 @@ impl Mount40 {
                 share_access: access,
                 client_id,
                 owner: owner_wire.as_bytes(),
-                filename: &filename,
+                filename: filename.as_ref(),
                 create,
             };
             let builder = if guarded {
@@ -1942,6 +1970,7 @@ impl Mount40 {
                     entry.map(|entry| mount::ReaddirEntry {
                         fileid: entry.attr.fileid,
                         file_name: entry.name,
+                        raw_name: entry.raw_name,
                     })
                 })
                 .collect(),
@@ -1977,6 +2006,7 @@ impl Mount40 {
                         mount::ReaddirplusEntry {
                             fileid: entry.attr.fileid,
                             file_name: entry.name,
+                            raw_name: entry.raw_name,
                             handle: entry.attr.filehandle.clone(),
                             attr: Some(entry.attr),
                         }
@@ -1994,6 +2024,7 @@ impl Mount40 {
 struct DirectoryEntry {
     cookie: u64,
     name: String,
+    raw_name: Bytes,
     attr: mount::Attr,
 }
 
@@ -2074,10 +2105,16 @@ fn decode_directory_entry(data: &mut Bytes, previous_cookie: u64) -> Result<Dire
     if data.remaining() < padded {
         return Err(NfsError::Xdr("READDIR entry name truncated".into()));
     }
-    let name = crate::nfs4::name::display(&data.split_to(name_len));
+    let raw_name = data.split_to(name_len);
+    let name = String::from_utf8_lossy(&raw_name).into_owned();
     data.advance(padded - name_len);
     let attr = decode_getattr_response(data)?;
-    Ok(DirectoryEntry { cookie, name, attr })
+    Ok(DirectoryEntry {
+        cookie,
+        name,
+        raw_name,
+        attr,
+    })
 }
 
 fn validate_readdir_payload(payload: Bytes, maxcount: u32) -> Result<Bytes> {
@@ -2508,6 +2545,12 @@ impl Mount for Mount40 {
     async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
         Ok(self.open_stateful(dir_fh, filename, access).await?.object)
     }
+    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, access: u32) -> Result<mount::ObjRes> {
+        Ok(self
+            .open_stateful_raw(dir_fh, raw_name, access)
+            .await?
+            .object)
+    }
     async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
         Ok(self.open_path_stateful(path, access).await?.object)
     }
@@ -2518,6 +2561,15 @@ impl Mount for Mount40 {
         access: u32,
     ) -> Result<mount::OpenFile> {
         self.open_file(dir_fh, filename, access, false).await
+    }
+    async fn open_stateful_raw(
+        &self,
+        dir_fh: Bytes,
+        raw_name: Bytes,
+        access: u32,
+    ) -> Result<mount::OpenFile> {
+        self.open_file_with_create(dir_fh, raw_name, access, false, false, None)
+            .await
     }
     async fn open_path_stateful(&self, path: &str, access: u32) -> Result<mount::OpenFile> {
         let (dir, name) = crate::split_path(path)?;
@@ -3278,10 +3330,14 @@ impl Mount for Mount40 {
         )
     }
     async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<mount::ObjRes> {
         let bitmap = standard_getattr_bitmap();
         let request = CompoundBuilder::new("lookup")
             .putfh(&dir_fh)
-            .lookup(filename)
+            .lookup(&raw_name)
             .getfh()
             .getattr(&bitmap)
             .encode_with_header(&self.auth);
@@ -3502,9 +3558,13 @@ impl Mount for Mount40 {
         self.mkdir(parent.fh, &name, mode).await
     }
     async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
         let request = CompoundBuilder::new("remove")
             .putfh(&dir_fh)
-            .remove(filename)
+            .remove(&raw_name)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("remove", 0, 0, OperationClass::ReplaySensitive);
         let response = self
@@ -3539,11 +3599,26 @@ impl Mount for Mount40 {
         to_dir_fh: Bytes,
         to_filename: &str,
     ) -> Result<()> {
+        self.rename_raw(
+            from_dir_fh,
+            Bytes::copy_from_slice(from_filename.as_bytes()),
+            to_dir_fh,
+            Bytes::copy_from_slice(to_filename.as_bytes()),
+        )
+        .await
+    }
+    async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
+    ) -> Result<()> {
         let request = CompoundBuilder::new("rename")
             .putfh(&from_dir_fh)
             .savefh()
             .putfh(&to_dir_fh)
-            .rename(from_filename, to_filename)
+            .rename(&from_name, &to_name)
             .encode_with_header(&self.auth);
         let (class, ctx) = context("rename", 0, 0, OperationClass::ReplaySensitive);
         let response = self
@@ -8057,11 +8132,8 @@ mod tests {
         page.extend_from_slice(&1u32.to_be_bytes());
         let (_, entries, eof) = decode_directory_page(&mut Bytes::from(page), 0).unwrap();
         let entry = entries[0].as_ref().unwrap();
-        assert_eq!(entry.name, "~nfs-rs-raw:D6D0CEC4");
-        assert_eq!(
-            crate::nfs4::name::wire(&entry.name).as_ref(),
-            b"\xd6\xd0\xce\xc4"
-        );
+        assert_eq!(entry.name, "����");
+        assert_eq!(entry.raw_name.as_ref(), b"\xd6\xd0\xce\xc4");
         assert!(eof);
     }
 

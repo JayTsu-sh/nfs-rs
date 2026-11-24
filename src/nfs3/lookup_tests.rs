@@ -31,6 +31,14 @@ fn push_opaque(reply: &mut Vec<u8>, value: &[u8]) {
 // Use the real Mount/RPC encoder, as in readlink and retry tests. No mount or
 // portmapper exchange is needed for this isolated LOOKUP name/FH regression.
 async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCall>) {
+    resolve_with_raw(path, fail_first, None).await
+}
+
+async fn resolve_with_raw(
+    path: &str,
+    fail_first: bool,
+    raw_name: Option<Bytes>,
+) -> (Result<ObjRes>, Vec<LookupCall>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, mut stopped) = oneshot::channel();
@@ -89,12 +97,34 @@ async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCal
         rsize: 4096,
         wsize: 4096,
     };
-    let result = timeout(Duration::from_secs(2), mount.lookup_path(path))
-        .await
-        .expect("local LOOKUP fixture timed out");
+    let result = timeout(Duration::from_secs(2), async {
+        if let Some(raw_name) = raw_name {
+            mount.lookup_raw(Bytes::from_static(&[0]), raw_name).await
+        } else {
+            mount.lookup_path(path).await
+        }
+    })
+    .await
+    .expect("local LOOKUP fixture timed out");
     stop.send(()).unwrap();
     let calls = server.await.unwrap();
     (result, calls)
+}
+
+#[tokio::test]
+async fn lookup_raw_distinguishes_non_utf8_from_literal_v3() {
+    for (name, expected) in [
+        (Bytes::from_static(b"\xff"), b"\xff".as_slice()),
+        (
+            Bytes::from_static(b"~nfs-rs-raw:FF"),
+            b"~nfs-rs-raw:FF".as_slice(),
+        ),
+    ] {
+        let (result, calls) = resolve_with_raw("", false, Some(name)).await;
+        assert!(result.is_ok());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, expected);
+    }
 }
 
 async fn assert_resolved(path: &str, names: &[&str]) {

@@ -40,14 +40,30 @@ impl Mount {
         to_dir_fh: Bytes,
         to_filename: &str,
     ) -> Result<()> {
+        self.rename_raw(
+            from_dir_fh,
+            Bytes::copy_from_slice(from_filename.as_bytes()),
+            to_dir_fh,
+            Bytes::copy_from_slice(to_filename.as_bytes()),
+        )
+        .await
+    }
+
+    pub async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
+    ) -> Result<()> {
         let args = RENAME3args {
             from: diropargs3 {
                 dir: nfs_fh3 { data: from_dir_fh },
-                name: filename3(from_filename.to_string()),
+                name: filename3(from_name),
             },
             to: diropargs3 {
                 dir: nfs_fh3 { data: to_dir_fh },
-                name: filename3(to_filename.to_string()),
+                name: filename3(to_name),
             },
         };
         self._rename(args).await?;

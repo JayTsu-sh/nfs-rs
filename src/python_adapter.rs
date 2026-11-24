@@ -32,7 +32,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 // Keep protocol work independent of the GIL and bound queued directory memory.
 const DIRECTORY_BATCH_SIZE: usize = 128;
-type DirectoryEntry = (String, Attr, Bytes);
+type DirectoryEntry = (String, Attr, Bytes, Bytes);
 type DirectoryItem = Result<Vec<DirectoryEntry>>;
 type DirectoryPage = (Vec<DirectoryEntry>, DirectoryCookie, bool);
 
@@ -2023,9 +2023,10 @@ fn directory_batch_dicts(
 ) -> PyResult<Vec<Py<PyDict>>> {
     entries
         .into_iter()
-        .map(|(name, attr, fh)| {
+        .map(|(name, attr, fh, raw_name)| {
             let values = PyDict::new(py);
             values.set_item("name", name)?;
+            values.set_item("raw_name", PyBytes::new(py, &raw_name))?;
             values.set_item("fh", (!fh.is_empty()).then(|| PyBytes::new(py, &fh)))?;
             values.set_item("info", attr_dict(py, &attr)?)?;
             Ok(values.unbind())
@@ -3000,7 +3001,8 @@ fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<D
                 type_: 1,
                 ..Attr::default()
             };
-            (format!("page-entry-{index}"), attr, Bytes::new())
+            let name = format!("page-entry-{index}");
+            (name.clone(), attr, Bytes::new(), Bytes::from(name))
         })
         .collect();
     let next = crate::mount::DirectoryCursor::resume(position).page(
@@ -3027,7 +3029,7 @@ fn directory_entry(entry: ReaddirplusEntry) -> Result<DirectoryEntry> {
     } else {
         entry.handle
     };
-    Ok((entry.file_name, attr, fh))
+    Ok((entry.file_name, attr, fh, entry.raw_name))
 }
 
 fn directory_position(cookie: u64, verifier: Option<Vec<u8>>) -> Result<DirectoryCookie> {
@@ -3150,7 +3152,12 @@ async fn directory_receiver(
                 .and_then(std::result::Result::ok)
                 .unwrap_or_default();
             let entries = futures::stream::iter([
-                Ok(("first".to_string(), first, Bytes::new())),
+                Ok((
+                    "first".to_string(),
+                    first,
+                    Bytes::new(),
+                    Bytes::from_static(b"first"),
+                )),
                 Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM)),
             ]);
             stream_directory_batches(entries, sender, &closing).await;
@@ -3163,7 +3170,8 @@ async fn directory_receiver(
             let _operation = operation;
             let entries = futures::stream::iter(entries.into_iter().map(|(name, attr)| {
                 let fh = attr.filehandle.clone();
-                Ok((name, attr, fh))
+                let raw_name = Bytes::copy_from_slice(name.as_bytes());
+                Ok((name, attr, fh, raw_name))
             }));
             stream_directory_batches(entries, sender, &closing).await;
         });
@@ -6223,7 +6231,13 @@ mod directory_batch_tests {
     }
 
     fn entry(i: usize) -> Result<DirectoryEntry> {
-        Ok((i.to_string(), Attr::default(), Bytes::new()))
+        let name = i.to_string();
+        Ok((
+            name.clone(),
+            Attr::default(),
+            Bytes::new(),
+            Bytes::from(name),
+        ))
     }
 
     #[tokio::test]

@@ -185,6 +185,10 @@ impl crate::Mount for Mount3 {
         self.m.lookup(dir_fh, filename).await
     }
 
+    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<ObjRes> {
+        self.m.lookup_raw(dir_fh, raw_name).await
+    }
+
     async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
         self.m.lookup_path(path).await
     }
@@ -240,6 +244,10 @@ impl crate::Mount for Mount3 {
         self.m.remove(dir_fh, filename).await
     }
 
+    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
+        self.m.remove_raw(dir_fh, raw_name).await
+    }
+
     async fn remove_path(&self, path: &str) -> Result<()> {
         self.m.remove_path(path).await
     }
@@ -261,6 +269,18 @@ impl crate::Mount for Mount3 {
     ) -> Result<()> {
         self.m
             .rename(from_dir_fh, from_filename, to_dir_fh, to_filename)
+            .await
+    }
+
+    async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
+    ) -> Result<()> {
+        self.m
+            .rename_raw(from_dir_fh, from_name, to_dir_fh, to_name)
             .await
     }
 

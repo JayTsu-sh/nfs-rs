@@ -119,6 +119,16 @@ impl Mount41 {
         filename: &str,
         access: u32,
     ) -> Result<mount::ObjRes> {
+        self.open_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()), access)
+            .await
+    }
+
+    pub(crate) async fn open_raw(
+        &self,
+        dir_fh: Bytes,
+        raw_name: Bytes,
+        access: u32,
+    ) -> Result<mount::ObjRes> {
         let access_mode = match access {
             crate::OPEN_READ => AccessMode::Read,
             crate::OPEN_WRITE => AccessMode::Write,
@@ -135,7 +145,7 @@ impl Mount41 {
             create: false,
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
-            claim_file: filename.to_string(),
+            claim_file: raw_name,
             want_no_delegation: !self.retain_delegations,
         };
         let resp = self
@@ -266,7 +276,7 @@ impl Mount41 {
             create: true,
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
-            claim_file: filename.to_string(),
+            claim_file: Bytes::copy_from_slice(filename.as_bytes()),
             want_no_delegation: !self.retain_delegations,
         };
         let resp = self
@@ -366,7 +376,7 @@ impl Mount41 {
                 create: true,
                 create_attrs_mask: mask,
                 create_attrs_vals: values,
-                claim_file: filename.to_string(),
+                claim_file: Bytes::copy_from_slice(filename.as_bytes()),
                 want_no_delegation: !self.retain_delegations,
             };
             // Preserve OPEN progress: a failure in GETFH/GETATTR cannot authorize

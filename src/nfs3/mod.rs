@@ -594,11 +594,11 @@ impl XdrEncode for nfs_fh3 {
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct filename3(pub(crate) String);
+pub(crate) struct filename3(pub(crate) Bytes);
 
 impl XdrEncode for filename3 {
     fn encode(&self, buf: &mut Vec<u8>) {
-        xdr_string(buf, &self.0);
+        xdr_var_bytes(buf, &self.0);
     }
 }
 

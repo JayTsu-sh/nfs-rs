@@ -25,6 +25,7 @@ use futures::stream::Stream;
 pub struct ReaddirEntry {
     pub fileid: u64,
     pub file_name: String,
+    pub raw_name: Bytes,
 }
 
 impl From<ReaddirEntry> for crate::mount::ReaddirEntry {
@@ -32,6 +33,7 @@ impl From<ReaddirEntry> for crate::mount::ReaddirEntry {
         Self {
             fileid: entry.fileid,
             file_name: entry.file_name,
+            raw_name: entry.raw_name,
         }
     }
 }
@@ -53,7 +55,8 @@ impl Mount {
             readdir_at,
             |entry: entry3| ReaddirEntry {
                 fileid: entry.fileid.0,
-                file_name: bytes_to_string(entry.name.0),
+                file_name: bytes_to_string(entry.name.0.clone()),
+                raw_name: entry.name.0,
             },
             "readdir page received"
         )

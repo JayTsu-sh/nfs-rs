@@ -30,7 +30,7 @@ impl Mount {
         let args = RMDIR3args {
             object: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(dirname.to_string()),
+                name: filename3(Bytes::copy_from_slice(dirname.as_bytes())),
             },
         };
         self._rmdir(args).await?;

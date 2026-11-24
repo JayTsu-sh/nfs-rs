@@ -22,15 +22,20 @@ fn parse_change_info(op: &OpResponse) -> Option<(bool, u64, u64)> {
 
 impl Mount41 {
     pub(crate) async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+            .await
+    }
+
+    pub(crate) async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
         let resp = self
-            .compound("remove", |b| b.putfh(&dir_fh).remove(filename))
+            .compound("remove", |b| b.putfh(&dir_fh).remove(&raw_name))
             .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // REMOVE
         if let Some(remove_op) = resp.results.get(2)
             && let Some((atomic, before, after)) = parse_change_info(remove_op)
         {
-            debug!(atomic, before, after, name = filename, "REMOVE change_info");
+            debug!(atomic, before, after, name = ?raw_name, "REMOVE change_info");
         }
         Ok(())
     }
@@ -57,13 +62,29 @@ impl Mount41 {
         to_dir_fh: Bytes,
         to_filename: &str,
     ) -> Result<()> {
+        self.rename_raw(
+            from_dir_fh,
+            Bytes::copy_from_slice(from_filename.as_bytes()),
+            to_dir_fh,
+            Bytes::copy_from_slice(to_filename.as_bytes()),
+        )
+        .await
+    }
+
+    pub(crate) async fn rename_raw(
+        &self,
+        from_dir_fh: Bytes,
+        from_name: Bytes,
+        to_dir_fh: Bytes,
+        to_name: Bytes,
+    ) -> Result<()> {
         // NFSv4 RENAME: PUTFH(src_dir) + SAVEFH + PUTFH(dst_dir) + RENAME(old, new)
         let resp = self
             .compound("rename", |b| {
                 b.putfh(&from_dir_fh)
                     .savefh()
                     .putfh(&to_dir_fh)
-                    .rename(from_filename, to_filename)
+                    .rename(&from_name, &to_name)
             })
             .await?;
         resp.op_ok(1)?; // PUTFH
@@ -86,8 +107,8 @@ impl Mount41 {
                     dst_atomic,
                     dst_before,
                     dst_after,
-                    from = from_filename,
-                    to = to_filename,
+                    from = ?from_name,
+                    to = ?to_name,
                     "RENAME change_info"
                 );
             }

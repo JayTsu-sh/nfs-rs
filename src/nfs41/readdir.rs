@@ -185,7 +185,7 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie; // track for pagination
-            let name = decode_string_from_bytes(&mut data)?;
+            let (name, raw_name) = decode_string_from_bytes(&mut data)?;
             // Decode attrs to extract fileid (NFSv4.1: attr #20)
             let attr = decode_entry_fattr4(&mut data).ok();
             let fileid = attr.as_ref().map(|a| a.fileid).unwrap_or(entry_cookie);
@@ -193,6 +193,7 @@ impl Mount41 {
             entries.push(mount::ReaddirEntry {
                 fileid,
                 file_name: name,
+                raw_name,
             });
         }
 
@@ -252,7 +253,7 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie;
-            let name = decode_string_from_bytes(&mut data)?;
+            let (name, raw_name) = decode_string_from_bytes(&mut data)?;
             let mut attr = match decode_entry_fattr4(&mut data) {
                 Ok(a) => Some(a),
                 Err(e) => {
@@ -279,6 +280,7 @@ impl Mount41 {
             entries.push(mount::ReaddirplusEntry {
                 fileid,
                 file_name: name,
+                raw_name,
                 attr,
                 handle,
             });

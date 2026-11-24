@@ -4,7 +4,6 @@ pub(crate) mod acl;
 pub(crate) mod attrs;
 pub(crate) mod compound;
 pub(crate) mod fastxdr;
-pub(crate) mod name;
 pub(crate) mod stateid;
 
 pub use fastxdr::nfsstat4 as Nfs4ErrorCode;

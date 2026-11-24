@@ -33,7 +33,7 @@ impl Mount {
         let args = MKDIR3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(dirname.to_string()),
+                name: filename3(Bytes::copy_from_slice(dirname.as_bytes())),
             },
             attrs: sattr3 {
                 mode: set_mode3::TRUE(mode),

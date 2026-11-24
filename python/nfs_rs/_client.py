@@ -282,6 +282,7 @@ class DirEntry:
     path: str
     info: FileInfo
     fh: bytes | None = None
+    raw_name: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,7 +457,7 @@ def _directory_page(parent: str, values: dict[str, Any]) -> DirectoryPage:
 
 def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
     path = values["name"] if parent == "." else f"{parent}/{values['name']}"
-    return DirEntry(values["name"], path, _file_info(path, values["info"]), values.get("fh") or None)
+    return DirEntry(values["name"], path, _file_info(path, values["info"]), values.get("fh") or None, values.get("raw_name", values["name"].encode()))
 
 
 def _capabilities(values: dict[str, Any]) -> Capabilities:
