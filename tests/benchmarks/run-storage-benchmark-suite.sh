@@ -55,11 +55,114 @@ run_environment() {
   done
 }
 
-# Executor-marked environments are acquired from a data-network executor host
-# the runner cannot reach directly; skip them in both capture and gate mode.
-while IFS= read -r skipped; do
-  echo "skipping benchmark environment ${skipped} (executor acquisition not wired on this runner)"
-done < <(jq -r '.environments[] | select(.executor != null) | .id' "$manifest")
+# Executor-marked environments point at storage the runner cannot reach
+# directly. The OTS data network (10.30.3.x) is only reachable through the
+# management jump (10.128.134.90) onto the DXN node (10.128.135.141, data IP
+# 10.30.3.141); the benchmark binary is cross-built for glibc 2.17 (the node
+# is glibc 2.28) with the same zig cross-compile path the manylinux2014 wheel
+# uses, shipped to the node, and run there. Without LAB_OTS_SSH_KEY the
+# environments stay executor_pending in the gate report.
+ots_executor_available() {
+  [[ -n "${LAB_OTS_SSH_KEY:-}" && -f "${LAB_OTS_SSH_KEY:-}" ]]
+}
+
+if ots_executor_available; then
+  ots_user="${LAB_OTS_SSH_USER:-root}"
+  ots_jump="${LAB_OTS_JUMP:-10.128.134.90}"
+  ots_node="${LAB_OTS_NODE:-10.128.135.141}"
+  ots_key="$LAB_OTS_SSH_KEY"
+  ots_known="${LAB_OTS_KNOWN_HOSTS:-}"
+  hop_options=(-T -i "$ots_key" -o IdentitiesOnly=yes -o BatchMode=yes
+    -o ConnectTimeout=20)
+  if [[ -n "$ots_known" && -f "$ots_known" ]]; then
+    hop_options+=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ots_known")
+    proxy_host_opts="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$ots_known"
+  else
+    hop_options+=(-o StrictHostKeyChecking=accept-new)
+    proxy_host_opts="-o StrictHostKeyChecking=accept-new"
+  fi
+  remote_dir=""
+  remote_binary_ready=0
+  ssh_ots() {
+    ssh "${hop_options[@]}" \
+      -o "ProxyCommand=ssh -i $ots_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 $proxy_host_opts -W %h:%p $ots_user@$ots_jump" \
+      "$ots_user@$ots_node" "$@"
+  }
+  ots_cleanup() {
+    if [[ -n "$remote_dir" ]]; then
+      ssh_ots "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+    fi
+  }
+  trap ots_cleanup EXIT
+
+  build_ots_benchmark_binary() {
+    local output="$1"
+    local zig_bin="" candidate
+    for candidate in /opt/zig/0.13.0 "$HOME/.local/zig/0.13.0"; do
+      if [[ -x "$candidate/zig" ]]; then
+        zig_bin="$candidate/zig"
+        break
+      fi
+    done
+    if [[ -z "$zig_bin" ]] && command -v zig >/dev/null 2>&1; then
+      zig_bin="$(command -v zig)"
+    fi
+    [[ -n "$zig_bin" ]] || {
+      echo "zig not found; cannot cross-build the OTS benchmark binary" >&2
+      return 1
+    }
+    local target_dir wrapper
+    target_dir="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+    wrapper="$(mktemp "${TMPDIR:-/tmp}/nfsrs-zig-cc.XXXXXX")"
+    printf '#!/usr/bin/env bash\nexec "%s" cc --target=x86_64-linux-gnu.2.17 "$@"\n' \
+      "$zig_bin" > "$wrapper"
+    chmod +x "$wrapper"
+    # glibc 2.17 keeps the binary loadable on the node (glibc 2.28) and any
+    # manylinux2014 host; the runner's own glibc 2.39 build is not portable.
+    RUSTFLAGS="-C linker=$wrapper" cargo build --release --locked \
+      --target x86_64-unknown-linux-gnu --bin nfs-storage-benchmark
+    rm -f -- "$wrapper"
+    cp -f -- "$target_dir/x86_64-unknown-linux-gnu/release/nfs-storage-benchmark" "$output"
+  }
+
+  run_ots_environment() {
+    local environment="$1"
+    local template="$2"
+    local runs="$3"
+    local target="$4"
+    local url="${template//\$\{RUN_ID\}/$run_id}"
+    if ((remote_binary_ready == 0)); then
+      remote_dir="/tmp/nfsrs-bench-$run_id"
+      local binary
+      binary="$(mktemp -d "${TMPDIR:-/tmp}/nfsrs-ots-bench.XXXXXX")/nfs-storage-benchmark"
+      build_ots_benchmark_binary "$binary"
+      ssh_ots "rm -rf -- '$remote_dir' && mkdir -p -- '$remote_dir'"
+      ssh_ots "cat > '$remote_dir/nfs-storage-benchmark'" < "$binary"
+      ssh_ots "chmod 755 '$remote_dir/nfs-storage-benchmark'"
+      rm -rf -- "$(dirname "$binary")"
+      remote_binary_ready=1
+    fi
+    local run suffix
+    for run in $(seq 1 "$runs"); do
+      suffix="-capture-$run"
+      [[ "$mode" == gate ]] && suffix="-run-$run"
+      ssh_ots "$remote_dir/nfs-storage-benchmark --environment $environment \
+        --run-id $run_id-$run --window-id $run_id --commit $commit \
+        --url \"$url\" --samples $samples --payload-mib $payload_mib" \
+        > "$target/$environment$suffix.json"
+    done
+  }
+fi
+
+while IFS=$'\t' read -r environment template executor; do
+  runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
+  [[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
+  if [[ "$executor" == "ots-dxn-node" ]] && ots_executor_available; then
+    run_ots_environment "$environment" "$template" "$runs" "$output"
+  else
+    echo "skipping benchmark environment $environment (executor acquisition not wired on this runner)"
+  fi
+done < <(jq -r '.environments[] | select(.executor != null) | [.id, .url_template, .executor] | @tsv' "$manifest")
 
 while IFS=$'\t' read -r environment template; do
   runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
