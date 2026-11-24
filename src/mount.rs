@@ -447,13 +447,13 @@ async fn finish_open<M: Mount + ?Sized>(
 /// competing creator wins, and retain normal SETATTR ordering for existing files.
 pub(crate) async fn open_path_guarded<M, F, Fut>(
     mount: &M,
-    path: &str,
+    path: &[u8],
     options: OpenOptions,
     create: F,
 ) -> Result<OpenFile>
 where
     M: Mount + ?Sized,
-    F: FnOnce(Bytes, String) -> Fut + Send,
+    F: FnOnce(Bytes, Vec<u8>) -> Fut + Send,
     Fut: std::future::Future<Output = Result<OpenFile>> + Send,
 {
     options.validate()?;
@@ -639,12 +639,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn check_access_for_path(mount: &dyn nfs_rs::Mount, path: &str, mode: u32) -> nfs_rs::Result<bool> {
+    /// async fn check_access_for_path(mount: &dyn nfs_rs::Mount, path: &[u8], mode: u32) -> nfs_rs::Result<bool> {
     ///     let access = mount.access_path(path, mode).await?;
     ///     Ok(mode == access)
     /// }
     /// ```
-    async fn access_path(&self, path: &str, mode: u32) -> Result<u32> {
+    async fn access_path(&self, path: &[u8], mode: u32) -> Result<u32> {
         let res = self.lookup_path(path).await?;
         self.access(res.fh, mode).await
     }
@@ -658,44 +658,28 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///
     /// The returned [`ObjRes`] contains the file handle to use with
     /// [`Mount::read`] / [`Mount::write`]. Call [`Mount::close`] when done.
-    async fn open(&self, dir_fh: Bytes, filename: &str, _access: u32) -> Result<ObjRes> {
+    async fn open(&self, dir_fh: Bytes, filename: &[u8], _access: u32) -> Result<ObjRes> {
         // Default: stateless lookup (NFSv3)
         self.lookup(dir_fh, filename).await
     }
 
-    /// Open an entry identified by its exact server-side name bytes.
-    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, _access: u32) -> Result<ObjRes> {
-        self.lookup_raw(dir_fh, raw_name).await
-    }
-
     /// Same as [`Mount::open`] but takes a full path instead of dir_fh + filename.
-    async fn open_path(&self, path: &str, _access: u32) -> Result<ObjRes> {
+    async fn open_path(&self, path: &[u8], _access: u32) -> Result<ObjRes> {
         // Default: stateless lookup (NFSv3)
         self.lookup_path(path).await
     }
 
     /// Stateful form of [`Mount::open`]. Future protocol engines can attach
     /// owner state without exposing wire stateids in the public API.
-    async fn open_stateful(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<OpenFile> {
+    async fn open_stateful(&self, dir_fh: Bytes, filename: &[u8], access: u32) -> Result<OpenFile> {
         Ok(OpenFile {
             object: self.open(dir_fh, filename, access).await?,
             state: None,
         })
     }
 
-    async fn open_stateful_raw(
-        &self,
-        dir_fh: Bytes,
-        raw_name: Bytes,
-        access: u32,
-    ) -> Result<OpenFile> {
-        Ok(OpenFile::from_object(
-            self.open_raw(dir_fh, raw_name, access).await?,
-        ))
-    }
-
     /// Stateful form of [`Mount::open_path`].
-    async fn open_path_stateful(&self, path: &str, access: u32) -> Result<OpenFile> {
+    async fn open_path_stateful(&self, path: &[u8], access: u32) -> Result<OpenFile> {
         Ok(OpenFile {
             object: self.open_path(path, access).await?,
             state: None,
@@ -714,7 +698,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```no_run
     /// # use nfs_rs::{Mount, OpenOptions, OPEN_WRITE, Result};
     /// # async fn example(mount: &dyn Mount) -> Result<()> {
-    /// let file = mount.open_path_with_options("output.bin", OpenOptions {
+    /// let file = mount.open_path_with_options(b"output.bin", OpenOptions {
     ///     access: OPEN_WRITE,
     ///     create_mode: Some(0o666),
     ///     truncate: true,
@@ -724,7 +708,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    async fn open_path_with_options(&self, path: &str, options: OpenOptions) -> Result<OpenFile> {
+    async fn open_path_with_options(&self, path: &[u8], options: OpenOptions) -> Result<OpenFile> {
         options.validate()?;
         let file = match self.open_path_stateful(path, options.access).await {
             Ok(file) => file,
@@ -810,13 +794,13 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn write_to_path_and_flush(mount: &dyn nfs_rs::Mount, path: &str, offset: u64, data: &[u8]) -> nfs_rs::Result<()> {
+    /// async fn write_to_path_and_flush(mount: &dyn nfs_rs::Mount, path: &[u8], offset: u64, data: &[u8]) -> nfs_rs::Result<()> {
     ///     let obj = mount.lookup_path(path).await?;
     ///     nfs_rs::write_all(mount, obj.fh, offset, bytes::Bytes::copy_from_slice(data)).await?;
     ///     Ok(())
     /// }
     /// ```
-    async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
+    async fn commit_path(&self, path: &[u8], offset: u64, count: u32) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.commit(res.fh, offset, count).await
     }
@@ -829,21 +813,21 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// async fn create_txt(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     let mode = 0o640;
     ///     let filename = format!("{}.txt", name);
-    ///     mount.create(dir_fh, &filename, Some(mode)).await
+    ///     mount.create(dir_fh, filename.as_bytes(), Some(mode)).await
     /// }
     ///
     /// async fn create_sh(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     let mode = 0o750;
     ///     let filename = format!("{}.sh", name);
-    ///     mount.create(dir_fh, &filename, Some(mode)).await
+    ///     mount.create(dir_fh, filename.as_bytes(), Some(mode)).await
     /// }
     ///
     /// async fn create_with_default_mode(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     let filename = format!("{}.txt", name);
-    ///     mount.create(dir_fh, &filename, None).await
+    ///     mount.create(dir_fh, filename.as_bytes(), None).await
     /// }
     /// ```
-    async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes>;
+    async fn create(&self, dir_fh: Bytes, filename: &[u8], mode: Option<u32>) -> Result<ObjRes>;
 
     /// Same as [`Mount::create`] but instead of taking in directory file handle and filename, takes in a path for
     /// which directory file handle is obtained by performing one or more LOOKUP procedures.
@@ -854,24 +838,24 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// async fn create_txt(mount: &dyn nfs_rs::Mount, dir: &str, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     let mode = 0o640;
     ///     let path = format!("{}/{}.txt", dir, name);
-    ///     mount.create_path(&path, Some(mode)).await
+    ///     mount.create_path(path.as_bytes(), Some(mode)).await
     /// }
     ///
     /// async fn create_sh(mount: &dyn nfs_rs::Mount, dir: &str, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     let mode = 0o750;
     ///     let path = format!("{}/{}.sh", dir, name);
-    ///     mount.create_path(&path, Some(mode)).await
+    ///     mount.create_path(path.as_bytes(), Some(mode)).await
     /// }
     ///
-    /// async fn create_path_with_default_mode(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
+    /// async fn create_path_with_default_mode(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     mount.create_path(path, None).await
     /// }
     /// ```
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes>;
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<ObjRes>;
 
     /// Stateful form of [`Mount::create_path`] used when the caller must later
     /// release protocol-owned open state deterministically.
-    async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<OpenFile> {
+    async fn create_path_stateful(&self, path: &[u8], mode: Option<u32>) -> Result<OpenFile> {
         Ok(OpenFile::from_object(self.create_path(path, mode).await?))
     }
 
@@ -879,7 +863,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// Stateless protocol engines may ignore the access after validating it.
     async fn create_path_stateful_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<OpenFile> {
@@ -1016,9 +1000,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///
     /// # async fn example() -> Result<()> {
     /// let mount = parse_url_and_mount("nfs://127.0.0.1/export?version=3").await?;
-    /// let acl = mount.get_posix_acl_path("file.txt").await?;
+    /// let acl = mount.get_posix_acl_path(b"file.txt").await?;
     /// println!("access: {:?}; default: {:?}", acl.access, acl.default);
-    /// mount.set_posix_acl_path("file.txt", &acl).await?;
+    /// mount.set_posix_acl_path(b"file.txt", &acl).await?;
     /// mount.umount().await?;
     /// # Ok(())
     /// # }
@@ -1030,7 +1014,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Resolve a path and read its native POSIX ACL through [`Mount::get_posix_acl`].
-    async fn get_posix_acl_path(&self, path: &str) -> Result<PosixAcl> {
+    async fn get_posix_acl_path(&self, path: &[u8]) -> Result<PosixAcl> {
         let res = self.lookup_path(path).await?;
         self.get_posix_acl(res.fh).await
     }
@@ -1053,7 +1037,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Resolve a path and replace its native POSIX ACL through [`Mount::set_posix_acl`].
-    async fn set_posix_acl_path(&self, path: &str, acl: &PosixAcl) -> Result<()> {
+    async fn set_posix_acl_path(&self, path: &[u8], acl: &PosixAcl) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.set_posix_acl(res.fh, acl).await
     }
@@ -1064,7 +1048,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Retrieve the NFSv4 ACL by path (NFSv4 only; returns Unsupported on NFSv3).
-    async fn getacl_path(&self, path: &str) -> Result<Acl> {
+    async fn getacl_path(&self, path: &[u8]) -> Result<Acl> {
         let res = self.lookup_path(path).await?;
         self.getacl(res.fh).await
     }
@@ -1075,7 +1059,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Set the NFSv4 ACL by path (NFSv4 only; returns Unsupported on NFSv3).
-    async fn setacl_path(&self, path: &str, acl: &Acl) -> Result<()> {
+    async fn setacl_path(&self, path: &[u8], acl: &Acl) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.setacl(res.fh, acl).await
     }
@@ -1085,7 +1069,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Err(NfsError::Unsupported("DACL requires NFSv4.1".to_string()))
     }
 
-    async fn getdacl_path(&self, path: &str) -> Result<NfsAcl41> {
+    async fn getdacl_path(&self, path: &[u8]) -> Result<NfsAcl41> {
         let res = self.lookup_path(path).await?;
         self.getdacl(res.fh).await
     }
@@ -1095,7 +1079,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Err(NfsError::Unsupported("DACL requires NFSv4.1".to_string()))
     }
 
-    async fn setdacl_path(&self, path: &str, acl: &NfsAcl41) -> Result<()> {
+    async fn setdacl_path(&self, path: &[u8], acl: &NfsAcl41) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.setdacl(res.fh, acl).await
     }
@@ -1105,7 +1089,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Err(NfsError::Unsupported("SACL requires NFSv4.1".to_string()))
     }
 
-    async fn getsacl_path(&self, path: &str) -> Result<NfsAcl41> {
+    async fn getsacl_path(&self, path: &[u8]) -> Result<NfsAcl41> {
         let res = self.lookup_path(path).await?;
         self.getsacl(res.fh).await
     }
@@ -1115,7 +1099,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
         Err(NfsError::Unsupported("SACL requires NFSv4.1".to_string()))
     }
 
-    async fn setsacl_path(&self, path: &str, acl: &NfsAcl41) -> Result<()> {
+    async fn setsacl_path(&self, path: &[u8], acl: &NfsAcl41) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.setsacl(res.fh, acl).await
     }
@@ -1217,7 +1201,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Get a named attribute (xattr) value by path.
-    async fn getxattr_path(&self, path: &str, name: &str) -> Result<Bytes> {
+    async fn getxattr_path(&self, path: &[u8], name: &str) -> Result<Bytes> {
         let res = self.lookup_path(path).await?;
         self.getxattr(res.fh, name).await
     }
@@ -1234,7 +1218,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Set a named attribute (xattr) value by path.
-    async fn setxattr_path(&self, path: &str, name: &str, value: Bytes) -> Result<()> {
+    async fn setxattr_path(&self, path: &[u8], name: &str, value: Bytes) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.setxattr(res.fh, name, value).await
     }
@@ -1248,7 +1232,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// List named attribute (xattr) names by path.
-    async fn listxattr_path(&self, path: &str) -> Result<Vec<String>> {
+    async fn listxattr_path(&self, path: &[u8]) -> Result<Vec<String>> {
         let res = self.lookup_path(path).await?;
         self.listxattr(res.fh).await
     }
@@ -1261,7 +1245,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Remove a named attribute (xattr) by path.
-    async fn removexattr_path(&self, path: &str, name: &str) -> Result<()> {
+    async fn removexattr_path(&self, path: &[u8], name: &str) -> Result<()> {
         let res = self.lookup_path(path).await?;
         self.removexattr(res.fh, name).await
     }
@@ -1310,12 +1294,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn has_path_changed_since(mount: &dyn nfs_rs::Mount, path: &str, time: &nfs_rs::Time) -> nfs_rs::Result<bool> {
+    /// async fn has_path_changed_since(mount: &dyn nfs_rs::Mount, path: &[u8], time: &nfs_rs::Time) -> nfs_rs::Result<bool> {
     ///     let attr = mount.getattr_path(path).await?;
     ///     Ok(attr.mtime.seconds != time.seconds || attr.mtime.nseconds != time.nseconds)
     /// }
     /// ```
-    async fn getattr_path(&self, path: &str) -> Result<Attr> {
+    async fn getattr_path(&self, path: &[u8]) -> Result<Attr> {
         let res = self.lookup_path(path).await?;
         self.getattr(res.fh).await
     }
@@ -1362,19 +1346,19 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// async fn chmod_path(mount: &dyn nfs_rs::Mount, path: &str, mode: u32, guard: bool) -> nfs_rs::Result<()> {
+    /// async fn chmod_path(mount: &dyn nfs_rs::Mount, path: &[u8], mode: u32, guard: bool) -> nfs_rs::Result<()> {
     ///     mount.setattr_path(path, guard, Some(mode), None, None, None, None, None).await
     /// }
     ///
-    /// async fn chown_path(mount: &dyn nfs_rs::Mount, path: &str, uid: u32, gid: u32, guard: bool) -> nfs_rs::Result<()> {
+    /// async fn chown_path(mount: &dyn nfs_rs::Mount, path: &[u8], uid: u32, gid: u32, guard: bool) -> nfs_rs::Result<()> {
     ///     mount.setattr_path(path, guard, None, Some(uid), Some(gid), None, None, None).await
     /// }
     ///
-    /// async fn truncate_path(mount: &dyn nfs_rs::Mount, path: &str, size: u64, guard: bool) -> nfs_rs::Result<()> {
+    /// async fn truncate_path(mount: &dyn nfs_rs::Mount, path: &[u8], size: u64, guard: bool) -> nfs_rs::Result<()> {
     ///     mount.setattr_path(path, guard, None, None, None, Some(size), None, None).await
     /// }
     ///
-    /// async fn touch_path(mount: &dyn nfs_rs::Mount, path: &str, now: nfs_rs::Time, guard: bool) -> nfs_rs::Result<()> {
+    /// async fn touch_path(mount: &dyn nfs_rs::Mount, path: &[u8], now: nfs_rs::Time, guard: bool) -> nfs_rs::Result<()> {
     ///     let now_clone = now.clone();
     ///     mount.setattr_path(path, guard, None, None, None, None, Some(now), Some(now_clone)).await
     /// }
@@ -1382,7 +1366,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -1400,11 +1384,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn create_link(mount: &dyn nfs_rs::Mount, src_fh: bytes::Bytes, dst_dir_fh: bytes::Bytes, dst_filename: &str) -> nfs_rs::Result<nfs_rs::Attr> {
+    /// async fn create_link(mount: &dyn nfs_rs::Mount, src_fh: bytes::Bytes, dst_dir_fh: bytes::Bytes, dst_filename: &[u8]) -> nfs_rs::Result<nfs_rs::Attr> {
     ///     mount.link(src_fh, dst_dir_fh, dst_filename).await
     /// }
     /// ```
-    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_filename: &str) -> Result<Attr>;
+    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_filename: &[u8]) -> Result<Attr>;
 
     /// Same as [`Mount::link`] but instead of taking in a source file handle, destination directory file handle,
     /// and destination filename, takes in a source path for which file handle is obtained by performing one or more
@@ -1414,26 +1398,26 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn create_link_path(mount: &dyn nfs_rs::Mount, src_path: &str, dst_path: &str) -> nfs_rs::Result<nfs_rs::Attr> {
+    /// async fn create_link_path(mount: &dyn nfs_rs::Mount, src_path: &[u8], dst_path: &[u8]) -> nfs_rs::Result<nfs_rs::Attr> {
     ///     mount.link_path(src_path, dst_path).await
     /// }
     /// ```
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<Attr>;
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<Attr>;
 
     /// Procedure SYMLINK creates a new symbolic link.
     ///
     /// # Example
     ///
     /// ```
-    /// async fn create_symlink(mount: &dyn nfs_rs::Mount, src_path: &str, dst_dir_fh: bytes::Bytes, dst_filename: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
+    /// async fn create_symlink(mount: &dyn nfs_rs::Mount, src_path: &[u8], dst_dir_fh: bytes::Bytes, dst_filename: &[u8]) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     mount.symlink(src_path, dst_dir_fh, dst_filename).await
     /// }
     /// ```
     async fn symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<ObjRes>;
 
     /// Same as [`Mount::symlink`] but instead of taking in a destination directory file handle and destination
@@ -1443,11 +1427,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn create_symlink(mount: &dyn nfs_rs::Mount, src_path: &str, dst_path: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
+    /// async fn create_symlink(mount: &dyn nfs_rs::Mount, src_path: &[u8], dst_path: &[u8]) -> nfs_rs::Result<nfs_rs::ObjRes> {
     ///     mount.symlink_path(src_path, dst_path).await
     /// }
     /// ```
-    async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes>;
+    async fn symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<ObjRes>;
 
     /// Symbolic link creation with ownership / timestamps applied in the same
     /// network round trip when the backend supports it.
@@ -1465,9 +1449,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn symlink_with_attrs(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
         uid: Option<u32>,
         gid: Option<u32>,
         atime: Option<Time>,
@@ -1486,11 +1470,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn get_symlink_src_path(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes) -> nfs_rs::Result<String> {
+    /// async fn get_symlink_src_path(mount: &dyn nfs_rs::Mount, fh: bytes::Bytes) -> nfs_rs::Result<bytes::Bytes> {
     ///     mount.readlink(fh).await
     /// }
     /// ```
-    async fn readlink(&self, fh: Bytes) -> Result<String>;
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes>;
 
     /// Same as [`Mount::readlink`] but instead of taking in a file handle, takes in a path for which file handle is
     /// obtained by performing one or more LOOKUP procedures.
@@ -1498,11 +1482,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn get_symlink_src_path_for_path(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<String> {
+    /// async fn get_symlink_src_path_for_path(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<bytes::Bytes> {
     ///     mount.readlink_path(path).await
     /// }
     /// ```
-    async fn readlink_path(&self, path: &str) -> Result<String> {
+    async fn readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         let res = self.lookup_path(path).await?;
         self.readlink(res.fh).await
     }
@@ -1513,16 +1497,13 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn is_directory(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, filename: &str) -> nfs_rs::Result<bool> {
+    /// async fn is_directory(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, filename: &[u8]) -> nfs_rs::Result<bool> {
     ///     const TYPE_DIR: u32 = 2;
     ///     let res = mount.lookup(dir_fh, filename).await?;
     ///     Ok(res.attr.map_or(false, |attr| attr.type_ == TYPE_DIR))
     /// }
     /// ```
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes>;
-
-    /// Look up the exact bytes returned in a directory entry's `raw_name`.
-    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<ObjRes>;
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes>;
 
     /// Same as [`Mount::lookup`] but instead of taking in a directory file handle and filename, takes in a path for
     /// which directory file handle is obtained by performing one or more LOOKUP procedures for each directory in the
@@ -1531,13 +1512,13 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn is_path_directory(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<bool> {
+    /// async fn is_path_directory(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<bool> {
     ///     const TYPE_DIR: u32 = 2;
     ///     let res = mount.lookup_path(path).await?;
     ///     Ok(res.attr.map_or(false, |attr| attr.type_ == TYPE_DIR))
     /// }
     /// ```
-    async fn lookup_path(&self, path: &str) -> Result<ObjRes>;
+    async fn lookup_path(&self, path: &[u8]) -> Result<ObjRes>;
 
     /// Resolve an export-relative path, following intermediate and final symlinks.
     /// Relative targets are interpreted from the link's directory; absolute targets
@@ -1545,12 +1526,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// At most 40 links, 4096 cumulative components and 64 KiB of cumulative path
     /// text are accepted. Permission/connection/stale errors propagate unchanged.
     /// This read-only observation does not guarantee later access or namespace stability.
-    async fn resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+    async fn resolve_path(&self, path: &[u8]) -> Result<crate::PathResolution> {
         crate::path_resolution::resolve(self, path).await
     }
 
     /// Blocking version of [`Mount::resolve_path`].
-    fn sync_resolve_path(&self, path: &str) -> Result<crate::PathResolution> {
+    fn sync_resolve_path(&self, path: &[u8]) -> Result<crate::PathResolution> {
         block_on_compat(self.resolve_path(path))
     }
 
@@ -1583,12 +1564,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn chown_allowed_for_path(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<bool> {
+    /// async fn chown_allowed_for_path(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<bool> {
     ///     let conf = mount.pathconf_path(path).await?;
     ///     Ok(!conf.chown_restricted)
     /// }
     /// ```
-    async fn pathconf_path(&self, path: &str) -> Result<Pathconf> {
+    async fn pathconf_path(&self, path: &[u8]) -> Result<Pathconf> {
         let res = self.lookup_path(path).await?;
         self.pathconf(res.fh).await
     }
@@ -1620,7 +1601,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn read_exact_from_path(mount: &dyn nfs_rs::Mount, path: &str, mut offset: u64, mut count: u32) -> nfs_rs::Result<bytes::Bytes> {
+    /// async fn read_exact_from_path(mount: &dyn nfs_rs::Mount, path: &[u8], mut offset: u64, mut count: u32) -> nfs_rs::Result<bytes::Bytes> {
     ///     let mut ret = Vec::new();
     ///     loop {
     ///         let chunk = mount.read_path(path, offset, count).await?;
@@ -1634,7 +1615,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     }
     /// }
     /// ```
-    async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    async fn read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         let res = self.lookup_path(path).await?;
         self.read(res.fh, offset, count).await
     }
@@ -1653,7 +1634,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn write(&self, fh: Bytes, offset: u64, data: Bytes) -> Result<WriteOutcome>;
 
     /// Same as [`Mount::write`] but takes a path resolved via LOOKUP.
-    async fn write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+    async fn write_path(&self, path: &[u8], offset: u64, data: Bytes) -> Result<WriteOutcome> {
         let res = self.lookup_path(path).await?;
         self.write(res.fh, offset, data).await
     }
@@ -1669,7 +1650,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// async fn list_entries(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes) -> nfs_rs::Result<()> {
     ///     let mut stream = mount.readdir(dir_fh).await;
     ///     while let Some(entry) = stream.try_next().await? {
-    ///         println!("{}", entry.file_name);
+    ///         println!("{:?}", entry.file_name);
     ///     }
     ///     Ok(())
     /// }
@@ -1683,15 +1664,15 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///
     /// ```
     /// use futures::TryStreamExt;
-    /// async fn list_entries_in_path(mount: &dyn nfs_rs::Mount, dir_path: &str) -> nfs_rs::Result<()> {
+    /// async fn list_entries_in_path(mount: &dyn nfs_rs::Mount, dir_path: &[u8]) -> nfs_rs::Result<()> {
     ///     let mut stream = mount.readdir_path(dir_path).await?;
     ///     while let Some(entry) = stream.try_next().await? {
-    ///         println!("{}", entry.file_name);
+    ///         println!("{:?}", entry.file_name);
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    async fn readdir_path(&self, dir_path: &str) -> Result<ReaddirStream<'_>> {
+    async fn readdir_path(&self, dir_path: &[u8]) -> Result<ReaddirStream<'_>> {
         let res = self.lookup_path(dir_path).await?;
         Ok(self.readdir(res.fh).await)
     }
@@ -1718,7 +1699,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///                 format!("{}", attr.filesize),
     ///             )
     ///         });
-    ///         println!("{:>5} {:>25} {}", mode, size, entry.file_name);
+    ///         println!("{:>5} {:>25} {:?}", mode, size, entry.file_name);
     ///     }
     ///     Ok(())
     /// }
@@ -1732,7 +1713,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///
     /// ```
     /// use futures::TryStreamExt;
-    /// async fn list_detailed_entries_in_path(mount: &dyn nfs_rs::Mount, dir_path: &str) -> nfs_rs::Result<()> {
+    /// async fn list_detailed_entries_in_path(mount: &dyn nfs_rs::Mount, dir_path: &[u8]) -> nfs_rs::Result<()> {
     ///     println!("{:>5} {:>25} {}", "mode", "size", "name");
     ///     let mut stream = mount.readdirplus_path(dir_path).await?;
     ///     while let Some(entry) = stream.try_next().await? {
@@ -1742,12 +1723,12 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///                 format!("{}", attr.filesize),
     ///             )
     ///         });
-    ///         println!("{:>5} {:>25} {}", mode, size, entry.file_name);
+    ///         println!("{:>5} {:>25} {:?}", mode, size, entry.file_name);
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    async fn readdirplus_path(&self, dir_path: &str) -> Result<ReaddirplusStream<'_>> {
+    async fn readdirplus_path(&self, dir_path: &[u8]) -> Result<ReaddirplusStream<'_>> {
         let res = self.lookup_path(dir_path).await?;
         Ok(self.readdirplus(res.fh).await)
     }
@@ -1814,7 +1795,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn ensure_directory_exists(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, dirname: &str) -> nfs_rs::Result<()> {
+    /// async fn ensure_directory_exists(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, dirname: &[u8]) -> nfs_rs::Result<()> {
     ///     let mode = 0o750;
     ///     let res = mount.mkdir(dir_fh, dirname, mode).await;
     ///     if res.is_err() {
@@ -1826,7 +1807,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     Ok(())
     /// }
     /// ```
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes>;
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes>;
 
     /// Same as [`Mount::mkdir`] but instead of taking in directory file handle and dirname, takes in a path for which
     /// directory file handle is obtained by performing one or more LOOKUP procedures.
@@ -1834,7 +1815,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn ensure_directory_exists_for_path(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<()> {
+    /// async fn ensure_directory_exists_for_path(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<()> {
     ///     let mode = 0o750;
     ///     let res = mount.mkdir_path(path, mode).await;
     ///     if res.is_err() {
@@ -1846,21 +1827,18 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     ///     Ok(())
     /// }
     /// ```
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes>;
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes>;
 
     /// Procedure REMOVE removes (deletes) an entry from a directory.
     ///
     /// # Example
     ///
     /// ```
-    /// async fn delete_file(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, filename: &str) -> nfs_rs::Result<()> {
+    /// async fn delete_file(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, filename: &[u8]) -> nfs_rs::Result<()> {
     ///     mount.remove(dir_fh, filename).await
     /// }
     /// ```
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()>;
-
-    /// Remove an entry by its exact server-side name bytes.
-    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()>;
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()>;
 
     /// Same as [`Mount::remove`] but instead of taking in a directory file handle and filename, takes in a path for
     /// which directory file handle is obtained by performing one or more LOOKUP procedures.
@@ -1868,22 +1846,22 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn delete_file_path(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<()> {
+    /// async fn delete_file_path(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<()> {
     ///     mount.remove_path(path).await
     /// }
     /// ```
-    async fn remove_path(&self, path: &str) -> Result<()>;
+    async fn remove_path(&self, path: &[u8]) -> Result<()>;
 
     /// Procedure RMDIR removes (deletes) a subdirectory from a directory.
     ///
     /// # Example
     ///
     /// ```
-    /// async fn delete_directory(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, dirname: &str) -> nfs_rs::Result<()> {
+    /// async fn delete_directory(mount: &dyn nfs_rs::Mount, dir_fh: bytes::Bytes, dirname: &[u8]) -> nfs_rs::Result<()> {
     ///     mount.rmdir(dir_fh, dirname).await
     /// }
     /// ```
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()>;
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()>;
 
     /// Same as [`Mount::rmdir`] but instead of taking in a directory file handle and directory name, takes in a path
     /// for which directory file handle is obtained by performing one or more LOOKUP procedures.
@@ -1891,11 +1869,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn delete_directory_path(mount: &dyn nfs_rs::Mount, path: &str) -> nfs_rs::Result<()> {
+    /// async fn delete_directory_path(mount: &dyn nfs_rs::Mount, path: &[u8]) -> nfs_rs::Result<()> {
     ///     mount.rmdir_path(path).await
     /// }
     /// ```
-    async fn rmdir_path(&self, path: &str) -> Result<()>;
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()>;
 
     // Procedure RENAME renames an entry.
     ///
@@ -1905,9 +1883,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// async fn mv(
     ///     mount: &dyn nfs_rs::Mount,
     ///     from_dir_fh: bytes::Bytes,
-    ///     from_filename: &str,
+    ///     from_filename: &[u8],
     ///     to_dir_fh: bytes::Bytes,
-    ///     to_filename: &str,
+    ///     to_filename: &[u8],
     /// ) -> nfs_rs::Result<()> {
     ///     mount.rename(from_dir_fh, from_filename, to_dir_fh, to_filename).await
     /// }
@@ -1915,18 +1893,9 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
-    ) -> Result<()>;
-
-    /// Rename using exact server-side name bytes at both ends.
-    async fn rename_raw(
-        &self,
-        from_dir_fh: Bytes,
-        from_name: Bytes,
-        to_dir_fh: Bytes,
-        to_name: Bytes,
+        to_filename: &[u8],
     ) -> Result<()>;
 
     /// Same as [`Mount::rename`] but instead of taking in a from directory file handle, from filename, to directory
@@ -1937,11 +1906,11 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// # Example
     ///
     /// ```
-    /// async fn mv_path(mount: &dyn nfs_rs::Mount, from_path: &str, to_path: &str) -> nfs_rs::Result<()> {
+    /// async fn mv_path(mount: &dyn nfs_rs::Mount, from_path: &[u8], to_path: &[u8]) -> nfs_rs::Result<()> {
     ///     mount.rename_path(from_path, to_path).await
     /// }
     /// ```
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()>;
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()>;
 
     /// Procedure UMOUNT unmounts the mount itself.
     ///
@@ -1984,17 +1953,17 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::access_path`]
-    fn sync_access_path(&self, path: &str, mode: u32) -> Result<u32> {
+    fn sync_access_path(&self, path: &[u8], mode: u32) -> Result<u32> {
         block_on_compat(self.access_path(path, mode))
     }
 
     /// Blocking version of [`Mount::open`]
-    fn sync_open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<ObjRes> {
+    fn sync_open(&self, dir_fh: Bytes, filename: &[u8], access: u32) -> Result<ObjRes> {
         block_on_compat(self.open(dir_fh, filename, access))
     }
 
     /// Blocking version of [`Mount::open_path`]
-    fn sync_open_path(&self, path: &str, access: u32) -> Result<ObjRes> {
+    fn sync_open_path(&self, path: &[u8], access: u32) -> Result<ObjRes> {
         block_on_compat(self.open_path(path, access))
     }
 
@@ -2009,17 +1978,17 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::commit_path`]
-    fn sync_commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
+    fn sync_commit_path(&self, path: &[u8], offset: u64, count: u32) -> Result<()> {
         block_on_compat(self.commit_path(path, offset, count))
     }
 
     /// Blocking version of [`Mount::create`]
-    fn sync_create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes> {
+    fn sync_create(&self, dir_fh: Bytes, filename: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         block_on_compat(self.create(dir_fh, filename, mode))
     }
 
     /// Blocking version of [`Mount::create_path`]
-    fn sync_create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes> {
+    fn sync_create_path(&self, path: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         block_on_compat(self.create_path(path, mode))
     }
 
@@ -2051,7 +2020,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::getattr_path`]
-    fn sync_getattr_path(&self, path: &str) -> Result<Attr> {
+    fn sync_getattr_path(&self, path: &[u8]) -> Result<Attr> {
         block_on_compat(self.getattr_path(path))
     }
 
@@ -2075,7 +2044,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn sync_setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -2093,47 +2062,47 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::link`]
-    fn sync_link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_filename: &str) -> Result<Attr> {
+    fn sync_link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_filename: &[u8]) -> Result<Attr> {
         block_on_compat(self.link(src_fh, dst_dir_fh, dst_filename))
     }
 
     /// Blocking version of [`Mount::link_path`]
-    fn sync_link_path(&self, src_path: &str, dst_path: &str) -> Result<Attr> {
+    fn sync_link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<Attr> {
         block_on_compat(self.link_path(src_path, dst_path))
     }
 
     /// Blocking version of [`Mount::symlink`]
     fn sync_symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<ObjRes> {
         block_on_compat(self.symlink(src_path, dst_dir_fh, dst_filename))
     }
 
     /// Blocking version of [`Mount::symlink_path`]
-    fn sync_symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes> {
+    fn sync_symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<ObjRes> {
         block_on_compat(self.symlink_path(src_path, dst_path))
     }
 
     /// Blocking version of [`Mount::readlink`]
-    fn sync_readlink(&self, fh: Bytes) -> Result<String> {
+    fn sync_readlink(&self, fh: Bytes) -> Result<Bytes> {
         block_on_compat(self.readlink(fh))
     }
 
     /// Blocking version of [`Mount::readlink_path`]
-    fn sync_readlink_path(&self, path: &str) -> Result<String> {
+    fn sync_readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         block_on_compat(self.readlink_path(path))
     }
 
     /// Blocking version of [`Mount::lookup`]
-    fn sync_lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
+    fn sync_lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes> {
         block_on_compat(self.lookup(dir_fh, filename))
     }
 
     /// Blocking version of [`Mount::lookup_path`]
-    fn sync_lookup_path(&self, path: &str) -> Result<ObjRes> {
+    fn sync_lookup_path(&self, path: &[u8]) -> Result<ObjRes> {
         block_on_compat(self.lookup_path(path))
     }
 
@@ -2143,7 +2112,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::pathconf_path`]
-    fn sync_pathconf_path(&self, path: &str) -> Result<Pathconf> {
+    fn sync_pathconf_path(&self, path: &[u8]) -> Result<Pathconf> {
         block_on_compat(self.pathconf_path(path))
     }
 
@@ -2153,7 +2122,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::read_path`]
-    fn sync_read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    fn sync_read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         block_on_compat(self.read_path(path, offset, count))
     }
 
@@ -2163,7 +2132,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::write_path`]
-    fn sync_write_path(&self, path: &str, offset: u64, data: Bytes) -> Result<WriteOutcome> {
+    fn sync_write_path(&self, path: &[u8], offset: u64, data: Bytes) -> Result<WriteOutcome> {
         block_on_compat(self.write_path(path, offset, data))
     }
 
@@ -2173,7 +2142,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::readdir_path`]
-    fn sync_readdir_path(&self, dir_path: &str) -> Result<Vec<ReaddirEntry>> {
+    fn sync_readdir_path(&self, dir_path: &[u8]) -> Result<Vec<ReaddirEntry>> {
         block_on_compat(async { self.readdir_path(dir_path).await?.try_collect().await })
     }
 
@@ -2183,37 +2152,37 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     }
 
     /// Blocking version of [`Mount::readdirplus_path`]
-    fn sync_readdirplus_path(&self, dir_path: &str) -> Result<Vec<ReaddirplusEntry>> {
+    fn sync_readdirplus_path(&self, dir_path: &[u8]) -> Result<Vec<ReaddirplusEntry>> {
         block_on_compat(async { self.readdirplus_path(dir_path).await?.try_collect().await })
     }
 
     /// Blocking version of [`Mount::mkdir`]
-    fn sync_mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
+    fn sync_mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes> {
         block_on_compat(self.mkdir(dir_fh, dirname, mode))
     }
 
     /// Blocking version of [`Mount::mkdir_path`]
-    fn sync_mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes> {
+    fn sync_mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes> {
         block_on_compat(self.mkdir_path(path, mode))
     }
 
     /// Blocking version of [`Mount::remove`]
-    fn sync_remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    fn sync_remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
         block_on_compat(self.remove(dir_fh, filename))
     }
 
     /// Blocking version of [`Mount::remove_path`]
-    fn sync_remove_path(&self, path: &str) -> Result<()> {
+    fn sync_remove_path(&self, path: &[u8]) -> Result<()> {
         block_on_compat(self.remove_path(path))
     }
 
     /// Blocking version of [`Mount::rmdir`]
-    fn sync_rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    fn sync_rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         block_on_compat(self.rmdir(dir_fh, dirname))
     }
 
     /// Blocking version of [`Mount::rmdir_path`]
-    fn sync_rmdir_path(&self, path: &str) -> Result<()> {
+    fn sync_rmdir_path(&self, path: &[u8]) -> Result<()> {
         block_on_compat(self.rmdir_path(path))
     }
 
@@ -2221,15 +2190,15 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     fn sync_rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
         block_on_compat(self.rename(from_dir_fh, from_filename, to_dir_fh, to_filename))
     }
 
     /// Blocking version of [`Mount::rename_path`]
-    fn sync_rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    fn sync_rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         block_on_compat(self.rename_path(from_path, to_path))
     }
 
@@ -2529,18 +2498,14 @@ pub struct SupportedPathconf {
 #[derive(Debug)]
 pub struct ReaddirEntry {
     pub fileid: u64,
-    pub file_name: String,
-    /// Exact server-side entry name. Use this for name-based operations.
-    pub raw_name: Bytes,
+    pub file_name: Bytes,
 }
 
 /// Struct describing a single NFS entry as returned by [`Mount::readdirplus`] and [`Mount::readdirplus_path`].
 #[derive(Debug)]
 pub struct ReaddirplusEntry {
     pub fileid: u64,
-    pub file_name: String,
-    /// Exact server-side entry name. The display text is not a file identifier.
-    pub raw_name: Bytes,
+    pub file_name: Bytes,
     pub attr: Option<Attr>,
     pub handle: Bytes,
 }

@@ -16,7 +16,7 @@ def test_sync_file_supports_raw_io_and_positional_reads() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("fixture.bin")
+    file = client.open(b'fixture.bin')
 
     assert isinstance(file, io.RawIOBase)
     assert file.mode == "rb"
@@ -40,7 +40,7 @@ def test_client_close_closes_registered_sync_file() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("fixture.bin")
+    file = client.open(b'fixture.bin')
     client.close()
     assert file.closed
     for operation in (
@@ -60,7 +60,7 @@ def test_open_rejects_non_binary_modes() -> None:
 
     client = Client.connect("nfs-test://fixture/export")
     with pytest.raises(ValueError, match="mode must be"):
-        client.open("fixture.bin", "r")
+        client.open(b'fixture.bin', "r")
     client.close()
 
 
@@ -69,7 +69,7 @@ def test_async_file_has_relative_and_positional_parity() -> None:
 
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        file = await client.open("fixture.bin")
+        file = await client.open(b'fixture.bin')
 
         assert await file.read(3) == b"abc"
         assert file.tell() == 3
@@ -104,7 +104,7 @@ def test_cancelled_open_finishes_registration_under_client_ownership() -> None:
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
         _internal._arm_open_test_barrier()
-        opening = asyncio.create_task(client.open("__blocked_open__"))
+        opening = asyncio.create_task(client.open(b'__blocked_open__'))
         await _internal._wait_open_test_entered()
         opening.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -122,7 +122,7 @@ def test_cancelled_open_finishes_registration_under_client_ownership() -> None:
 def test_native_readinto_fills_all_chunks_and_preserves_eof_tail(offset, size, expected):
     from nfs_rs import Client
     with Client.connect("nfs-test://fixture/export") as client:
-        with client.open("fixture.bin") as file:
+        with client.open(b'fixture.bin') as file:
             target = bytearray(b"!" * size)
             assert file.readinto_at(target, offset) == expected
             assert target[:expected] == b"abcdefghijklmnopqrstuvwxyz"[offset:offset + expected]
@@ -138,7 +138,7 @@ def test_native_readinto_accepts_typed_and_sliced_writable_buffers():
     from array import array
     from nfs_rs import Client
     with Client.connect("nfs-test://fixture/export") as client:
-        with client.open("fixture.bin") as file:
+        with client.open(b'fixture.bin') as file:
             target = array("I", [0] * 4)
             assert file.readinto(target) == 16
             assert target.tobytes() == b"abcdefghijklmnop"
@@ -155,7 +155,7 @@ def test_cancelled_readinto_releases_buffer_and_prevents_late_writes():
     from nfs_rs import AsyncClient, _internal
     async def scenario():
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
-            async with await client.open("fixture.bin") as file:
+            async with await client.open(b'fixture.bin') as file:
                 target = bytearray(b"!" * 20)
                 _internal._arm_operation_test_barrier("readinto")
                 task = asyncio.create_task(file.readinto(target))
@@ -180,7 +180,7 @@ def test_timed_out_readinto_prevents_late_writes():
     from nfs_rs import AsyncClient, _internal
     async def scenario():
         async with await AsyncClient.connect("nfs-test://fixture/export", operation_timeout=0.05) as client:
-            async with await client.open("fixture.bin") as file:
+            async with await client.open(b'fixture.bin') as file:
                 target = bytearray(b"!" * 20)
                 _internal._arm_operation_test_barrier("readinto")
                 task = asyncio.create_task(file.readinto_at(target, 0))
@@ -205,7 +205,7 @@ def test_bytes_reads_across_chunks_and_eof(size: int) -> None:
     with Client.connect("nfs-test://fixture/export") as client:
         assert not hasattr(client, "read_bytes")
         assert not hasattr(client, "write_bytes")
-        with client.open("read-chunks.bin", "w+b") as file:
+        with client.open(b'read-chunks.bin', "w+b") as file:
             file.write(payload)
             file.seek(2)
             expected = payload[2:] if size == -1 else payload[2:2 + size]
@@ -225,7 +225,7 @@ def test_async_bytes_reads_across_chunks_and_eof(size: int) -> None:
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
             assert not hasattr(client, "read_bytes")
             assert not hasattr(client, "write_bytes")
-            async with await client.open("async-read-chunks.bin", "w+b") as file:
+            async with await client.open(b'async-read-chunks.bin', "w+b") as file:
                 await file.write(payload)
                 await file.seek(2)
                 expected = payload[2:] if size == -1 else payload[2:2 + size]

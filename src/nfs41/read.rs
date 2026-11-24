@@ -21,7 +21,7 @@ impl Mount41 {
         Ok(access)
     }
 
-    pub(crate) async fn access_path(&self, path: &str, mode: u32) -> Result<u32> {
+    pub(crate) async fn access_path(&self, path: &[u8], mode: u32) -> Result<u32> {
         let obj = self.lookup_path(path).await?;
         self.access(obj.fh, mode).await
     }
@@ -77,12 +77,12 @@ impl Mount41 {
         crate::mount::read_reply(data.slice(..data_len), eof)
     }
 
-    pub(crate) async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    pub(crate) async fn read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         let obj = self.lookup_path(path).await?;
         self.read(obj.fh, offset, count).await
     }
 
-    pub(crate) async fn readlink(&self, fh: Bytes) -> Result<String> {
+    pub(crate) async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         let resp = self
             .compound("readlink", |b| b.putfh(&fh).readlink())
             .await?;
@@ -92,12 +92,10 @@ impl Mount41 {
         // RFC 8881 §18.24: preserve target identity; the String interface
         // rejects unrepresentable bytes instead of following a replacement name.
         let link = take_opaque(&mut data, "READLINK target")?;
-        std::str::from_utf8(&link)
-            .map(str::to_owned)
-            .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
+        Ok(link)
     }
 
-    pub(crate) async fn readlink_path(&self, path: &str) -> Result<String> {
+    pub(crate) async fn readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         let obj = self.lookup_path(path).await?;
         self.readlink(obj.fh).await
     }
@@ -111,7 +109,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
-    async fn readlink_preserves_utf8_identity_v41_v42() {
+    async fn readlink_preserves_byte_identity_v41_v42() {
         // RFC 8881 §18.24: READLINK text is interpreted by the client;
         // replacing invalid bytes would silently change the target identity.
         for minor in [MinorVersion::V1, MinorVersion::V2] {
@@ -135,10 +133,7 @@ mod tests {
                 )
                 .await;
                 let result = mount.readlink(Bytes::from_static(b"link")).await;
-                match std::str::from_utf8(target) {
-                    Ok(expected) => assert_eq!(result.unwrap(), expected),
-                    Err(_) => assert!(matches!(result, Err(NfsError::Xdr(_))), "{result:?}"),
-                }
+                assert_eq!(result.unwrap().as_ref(), target);
                 server.abort();
             }
         }

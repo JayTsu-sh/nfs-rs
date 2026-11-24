@@ -185,7 +185,7 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie; // track for pagination
-            let (name, raw_name) = decode_string_from_bytes(&mut data)?;
+            let name = decode_string_from_bytes(&mut data)?;
             // Decode attrs to extract fileid (NFSv4.1: attr #20)
             let attr = decode_entry_fattr4(&mut data).ok();
             let fileid = attr.as_ref().map(|a| a.fileid).unwrap_or(entry_cookie);
@@ -193,7 +193,6 @@ impl Mount41 {
             entries.push(mount::ReaddirEntry {
                 fileid,
                 file_name: name,
-                raw_name,
             });
         }
 
@@ -253,12 +252,12 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie;
-            let (name, raw_name) = decode_string_from_bytes(&mut data)?;
+            let name = decode_string_from_bytes(&mut data)?;
             let mut attr = match decode_entry_fattr4(&mut data) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     tracing::warn!(
-                        "readdirplus: failed to decode attrs for entry '{}': {}",
+                        "readdirplus: failed to decode attrs for entry {:?}: {}",
                         name,
                         e
                     );
@@ -280,7 +279,6 @@ impl Mount41 {
             entries.push(mount::ReaddirplusEntry {
                 fileid,
                 file_name: name,
-                raw_name,
                 attr,
                 handle,
             });
@@ -304,6 +302,57 @@ mod tests {
     use super::*;
     use crate::nfs41::test_support::directory_page as page;
     use crate::nfs41::test_support::{Reply, ok, putfh, serve};
+
+    #[tokio::test]
+    async fn directory_names_are_exact_bytes_in_both_listing_apis() {
+        use crate::nfs4::compound::{xdr_opaque, xdr_u32};
+        let expected = [
+            b"\xff".as_slice(),
+            b"\xfe".as_slice(),
+            "�".as_bytes(),
+            b"~nfs-rs-raw:FF",
+        ];
+        let mut wire = vec![0; 8];
+        for (i, name) in expected.iter().enumerate() {
+            xdr_u32(&mut wire, 1);
+            wire.extend((i as u64 + 1).to_be_bytes());
+            xdr_opaque(&mut wire, name);
+            xdr_u32(&mut wire, 1);
+            xdr_u32(&mut wire, 1 << 20);
+            xdr_opaque(&mut wire, &(i as u64 + 1).to_be_bytes());
+        }
+        xdr_u32(&mut wire, 0);
+        xdr_u32(&mut wire, 1);
+        let (mount, server) = serve(move |_, _| vec![ok(22, vec![]), ok(26, wire.clone())]).await;
+        let entries: Vec<_> = mount
+            .readdir(Bytes::new())
+            .await
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.file_name.as_ref())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let entries: Vec<_> = mount
+            .readdirplus(Bytes::new())
+            .await
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.file_name.as_ref())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn directory_empty_non_eof_is_an_error() {

@@ -15,8 +15,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    Mount, READDIRPLUS3args, READDIRPLUS3resok, Result, bytes_to_string, entryplus3, nfs_fh3,
-    paged_dir_stream, post_op_fh3,
+    Mount, READDIRPLUS3args, READDIRPLUS3resok, Result, entryplus3, nfs_fh3, paged_dir_stream,
+    post_op_fh3,
 };
 use crate::mount::{DirectoryCookie, DirectoryCursor, ReaddirplusPage};
 use bytes::Bytes;
@@ -26,8 +26,7 @@ use futures::stream::Stream;
 #[derive(Debug)]
 pub struct ReaddirplusEntry {
     pub fileid: u64,
-    pub file_name: String,
-    pub raw_name: Bytes,
+    pub file_name: Bytes,
     pub attr: Option<crate::mount::Attr>,
     pub handle: Bytes,
 }
@@ -37,7 +36,6 @@ impl From<ReaddirplusEntry> for crate::mount::ReaddirplusEntry {
         Self {
             fileid: entry.fileid,
             file_name: entry.file_name,
-            raw_name: entry.raw_name,
             attr: entry.attr,
             handle: entry.handle,
         }
@@ -48,7 +46,7 @@ impl From<ReaddirplusEntry> for crate::mount::ReaddirplusEntry {
 impl Mount {
     pub async fn readdirplus_path(
         &self,
-        dir_path: &str,
+        dir_path: &[u8],
     ) -> Result<impl Stream<Item = Result<ReaddirplusEntry>> + '_ + use<'_>> {
         let fh = self.lookup_path(dir_path).await?.fh;
         Ok(self.readdirplus(fh).await)
@@ -99,8 +97,7 @@ impl Mount {
 fn convert_entry(entry: entryplus3) -> ReaddirplusEntry {
     ReaddirplusEntry {
         fileid: entry.fileid.0,
-        file_name: bytes_to_string(entry.name.0.clone()),
-        raw_name: entry.name.0,
+        file_name: entry.name.0,
         attr: entry.name_attributes.into(),
         // A copy: a slice would keep the whole reply (up to the read limit) alive for as long
         // as the caller keeps the handle.
@@ -151,11 +148,28 @@ mod tests {
         READDIRPLUS3resok::try_from(&mut Bytes::from(data)).unwrap()
     }
 
-    fn names(page: &ReaddirplusPage) -> Vec<&str> {
+    fn names(page: &ReaddirplusPage) -> Vec<&[u8]> {
         page.entries
             .iter()
-            .map(|entry| entry.file_name.as_str())
+            .map(|entry| entry.file_name.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn directory_names_remain_distinct_without_utf8_decoding() {
+        let expected = [
+            b"\xff".as_slice(),
+            b"\xfe".as_slice(),
+            "�".as_bytes(),
+            b"~nfs-rs-raw:FF",
+        ];
+        let wire: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (i as u64 + 1, *name))
+            .collect();
+        let page = into_page(reply([1; 8], &wire, true), DirectoryCookie::default()).unwrap();
+        assert_eq!(names(&page), expected);
     }
 
     #[test]
@@ -166,7 +180,7 @@ mod tests {
             false,
         );
         let page = into_page(first, DirectoryCookie::default()).unwrap();
-        assert_eq!(names(&page), ["a", "b"]);
+        assert_eq!(names(&page), [b"a".as_slice(), b"b".as_slice()]);
         assert!(!page.eof);
         let expected = DirectoryCookie {
             cookie: 4,
@@ -175,7 +189,7 @@ mod tests {
         assert_eq!(page.next, expected);
 
         let last = into_page(reply([7; 8], &[(5, b"c")], true), page.next).unwrap();
-        assert_eq!(names(&last), ["c"]);
+        assert_eq!(names(&last), [b"c".as_slice()]);
         assert!(last.eof);
         assert_eq!(last.next.cookie, 5);
 

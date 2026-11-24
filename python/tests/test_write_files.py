@@ -104,7 +104,7 @@ def fake_adapter(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["rb", "wb", "ab", "r+b", "w+b", "a+b"])
 def test_selected_binary_modes_are_accepted(mode: str) -> None:
-    file = Client.connect("nfs://server/export").open("file", mode)
+    file = Client.connect("nfs://server/export").open(b'file', mode)
     assert file.mode == mode
 
 
@@ -113,15 +113,15 @@ def test_selected_binary_modes_are_accepted(mode: str) -> None:
 )
 def test_other_modes_are_rejected_before_native(mode: str) -> None:
     with pytest.raises(ValueError, match="mode must be"):
-        Client.connect("nfs://server/export").open("file", mode)
+        Client.connect("nfs://server/export").open(b'file', mode)
 
 
 def test_permissions_are_enforced_locally() -> None:
-    read_only = Client.connect("nfs://server/export").open("file", "rb")
+    read_only = Client.connect("nfs://server/export").open(b'file', "rb")
     with pytest.raises(io.UnsupportedOperation, match="not writable"):
         read_only.write(b"x")
 
-    write_only = Client.connect("nfs://server/export").open("file", "wb")
+    write_only = Client.connect("nfs://server/export").open(b'file', "wb")
     with pytest.raises(io.UnsupportedOperation, match="not readable"):
         write_only.read()
     with pytest.raises(TypeError):
@@ -129,7 +129,7 @@ def test_permissions_are_enforced_locally() -> None:
 
 
 def test_sync_write_snapshots_input_and_positional_write_preserves_position() -> None:
-    file = Client.connect("nfs://server/export").open("file", "w+b")
+    file = Client.connect("nfs://server/export").open(b'file', "w+b")
     source = bytearray(b"hello")
     assert file.write(source) == 5
     source[:] = b"xxxxx"
@@ -144,7 +144,7 @@ def test_sync_write_snapshots_input_and_positional_write_preserves_position() ->
     file.close()
     assert io.IOBase.closed.__get__(file, type(file))
 
-    append = Client.connect("nfs://server/export").open("file", "a+b")
+    append = Client.connect("nfs://server/export").open(b'file', "a+b")
     with pytest.raises(io.UnsupportedOperation, match="append mode"):
         append.write_at(b"x", 0)
 
@@ -152,7 +152,7 @@ def test_sync_write_snapshots_input_and_positional_write_preserves_position() ->
 def test_async_write_snapshots_before_network_suspension() -> None:
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs://server/export")
-        file = await client.open("file", "w+b")
+        file = await client.open(b'file', "w+b")
         source = bytearray(b"hello")
         writing = asyncio.create_task(file.write(source))
         await file._inner.write_entered.wait()

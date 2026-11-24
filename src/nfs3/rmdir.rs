@@ -20,17 +20,17 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn rmdir_path(&self, path: &str) -> Result<()> {
+    pub async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         let (dir, dirname) = split_path(path)?;
         let dir_fh = self.lookup_path(&dir).await?.fh;
         self.rmdir(dir_fh, &dirname).await
     }
 
-    pub async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    pub async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         let args = RMDIR3args {
             object: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(Bytes::copy_from_slice(dirname.as_bytes())),
+                name: filename3(Bytes::copy_from_slice(dirname)),
             },
         };
         self._rmdir(args).await?;

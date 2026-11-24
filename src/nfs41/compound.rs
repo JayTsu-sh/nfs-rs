@@ -769,14 +769,14 @@ impl CompoundBuilder {
     pub fn create_symlink(
         mut self,
         name: impl AsRef<[u8]>,
-        link_target: &str,
+        link_target: &[u8],
         attrmask: &[u32],
         attr_vals: &[u8],
     ) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK = 5
         // For NF4LNK, linkdata (utf8str) comes before objname
-        xdr_string(&mut args, link_target);
+        xdr_var_bytes(&mut args, link_target);
         xdr_name(&mut args, name);
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
@@ -2077,7 +2077,8 @@ mod tests {
         let mut args = Bytes::from(builder.ops[0].args.clone());
         assert_eq!(args.get_u32(), 2);
         assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xff");
-        let builder = CompoundBuilder::new("symlink").create_symlink(raw, literal, &[], &[]);
+        let builder =
+            CompoundBuilder::new("symlink").create_symlink(raw, (literal).as_bytes(), &[], &[]);
         let mut args = Bytes::from(builder.ops[0].args.clone());
         assert_eq!(args.get_u32(), 5);
         assert_eq!(
@@ -2239,7 +2240,7 @@ mod tests {
 
     #[test]
     fn compound_builder_create_symlink_encode() {
-        let builder = CompoundBuilder::new("t").create_symlink("link", "/target/path", &[], &[]);
+        let builder = CompoundBuilder::new("t").create_symlink("link", b"/target/path", &[], &[]);
         assert_eq!(builder.op_count(), 1);
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);

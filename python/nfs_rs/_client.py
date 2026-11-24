@@ -26,7 +26,7 @@ from ._errors import (
 _CONSTRUCTION_TOKEN = object()
 
 
-async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | None, filename: str | None) -> Any:
+async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | None, filename: bytes | None) -> Any:
     try:
         return await awaitable
     except NfsError as error:
@@ -36,7 +36,7 @@ async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | 
 class _AdapterContext:
     __slots__ = ("_target", "_protocol", "_filename")
 
-    def __init__(self, target: Any, protocol: str | None = None, filename: str | None = None) -> None:
+    def __init__(self, target: Any, protocol: str | None = None, filename: bytes | None = None) -> None:
         object.__setattr__(self, "_target", target)
         object.__setattr__(self, "_protocol", protocol)
         object.__setattr__(self, "_filename", filename)
@@ -56,7 +56,7 @@ class _AdapterContext:
         def contextual_call(*args: Any, **kwargs: Any) -> Any:
             public_operation = args[0] if name == "v42" and args else operation
             filename = args[1] if name == "v42" and len(args) > 1 else self._filename
-            if filename is None and args and isinstance(args[0], str):
+            if filename is None and args and isinstance(args[0], bytes):
                 filename = args[1] if name == "symlink" and len(args) > 1 else args[0]
             try:
                 result = attribute(*args, **kwargs)
@@ -216,7 +216,7 @@ class Health:
 @dataclass(frozen=True, slots=True)
 class RecoveryEvent:
     operation: str
-    path: str | None
+    path: bytes | None
     protocol: str
     outcome: OperationOutcome
     recovery_action: RecoveryAction
@@ -238,7 +238,7 @@ def _recovery_event(values: dict[str, Any]) -> RecoveryEvent:
 
 @dataclass(frozen=True, slots=True)
 class FileInfo:
-    path: str
+    path: bytes
     type: FileType
     mode: int
     nlink: int
@@ -258,7 +258,7 @@ class FileInfo:
 @dataclass(frozen=True, slots=True)
 class PathResolution:
     status: PathResolutionStatus
-    path: str | None
+    path: bytes | None
     info: FileInfo | None
 
     @property
@@ -272,17 +272,16 @@ class PathResolution:
 
 @dataclass(frozen=True, slots=True)
 class DirectoryRef:
-    path: os.PathLike[str] | str
+    path: os.PathLike[bytes] | bytes
     fh: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DirEntry:
-    name: str
-    path: str
+    name: bytes
+    path: bytes
     info: FileInfo
     fh: bytes | None = None
-    raw_name: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,26 +362,26 @@ def _nfs42_attributes(values: dict[str, Any]) -> Nfs42Attributes:
     return Nfs42Attributes(tuple(values["supported_attrs"]), values["clone_blksize"], values["xattr_support"])
 
 
-def _normalize_path(path: os.PathLike[str] | str) -> str:
+def _normalize_path(path: os.PathLike[bytes] | bytes) -> bytes:
     raw = os.fspath(path)
-    if isinstance(raw, bytes):
-        raise TypeError("NFS paths must be strings, not bytes")
-    if "\0" in raw:
+    if not isinstance(raw, bytes):
+        raise TypeError("NFS paths must be bytes; encode text explicitly in the application")
+    if b"\0" in raw:
         raise ValueError("NFS paths may not contain NUL")
-    parts: list[str] = []
-    for part in raw.split("/"):
-        if part in {"", "."}:
+    parts: list[bytes] = []
+    for part in raw.split(b"/"):
+        if part in {b"", b"."}:
             continue
-        if part == "..":
+        if part == b"..":
             if not parts:
                 raise ValueError("NFS path escapes the export root")
             parts.pop()
         else:
             parts.append(part)
-    return "/".join(parts) or "."
+    return b"/".join(parts) or b"."
 
 
-def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
+def _file_info(path: bytes, values: dict[str, Any]) -> FileInfo:
     return FileInfo(
         path=path,
         type=FileType(values["type"]),
@@ -402,13 +401,12 @@ def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
     )
 
 
-def _resolution_path(path: os.PathLike[str] | str) -> str:
+def _resolution_path(path: os.PathLike[bytes] | bytes) -> bytes:
     raw = os.fspath(path)
-    if isinstance(raw, bytes):
-        raise TypeError("NFS paths must be strings, not bytes")
-    if "\0" in raw or raw.startswith("/"):
+    if not isinstance(raw, bytes):
+        raise TypeError("NFS paths must be bytes; encode text explicitly in the application")
+    if b"\0" in raw or raw.startswith(b"/"):
         raise ValueError("resolve requires an export-relative path without NUL")
-    # Preserve .., dots and trailing slashes: their meaning depends on symlinks.
     return raw
 
 
@@ -420,7 +418,7 @@ def _path_resolution(values: dict[str, Any]) -> PathResolution:
     )
 
 
-def _scandir_target(target: DirectoryRef | DirEntry | os.PathLike[str] | str) -> tuple[str, bytes | None]:
+def _scandir_target(target: DirectoryRef | DirEntry | os.PathLike[bytes] | bytes) -> tuple[bytes, bytes | None]:
     if isinstance(target, (DirectoryRef, DirEntry)):
         path, fh = target.path, target.fh
     else:
@@ -447,7 +445,7 @@ def _directory_position(position: DirectoryCookie | None) -> tuple[int, bytes]:
     return cookie, verifier
 
 
-def _directory_page(parent: str, values: dict[str, Any]) -> DirectoryPage:
+def _directory_page(parent: bytes, values: dict[str, Any]) -> DirectoryPage:
     return DirectoryPage(
         tuple(_directory_entry(parent, entry) for entry in values["entries"]),
         DirectoryCookie(values["cookie"], bytes(values["verifier"])),
@@ -455,9 +453,10 @@ def _directory_page(parent: str, values: dict[str, Any]) -> DirectoryPage:
     )
 
 
-def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
-    path = values["name"] if parent == "." else f"{parent}/{values['name']}"
-    return DirEntry(values["name"], path, _file_info(path, values["info"]), values.get("fh") or None, values.get("raw_name", values["name"].encode()))
+def _directory_entry(parent: bytes, values: dict[str, Any]) -> DirEntry:
+    name = values["name"]
+    path = name if parent == b"." else parent + b"/" + name
+    return DirEntry(name, path, _file_info(path, values["info"]), values.get("fh") or None)
 
 
 def _capabilities(values: dict[str, Any]) -> Capabilities:
@@ -729,21 +728,21 @@ class Client(_ClientOptions):
     def close(self) -> None:
         self._inner.close()
 
-    def stat(self, path: os.PathLike[str] | str) -> FileInfo:
+    def stat(self, path: os.PathLike[bytes] | bytes) -> FileInfo:
         normalized = _normalize_path(path)
         return _file_info(normalized, self._inner.stat(normalized))
 
-    def exists(self, path: os.PathLike[str] | str) -> bool:
+    def exists(self, path: os.PathLike[bytes] | bytes) -> bool:
         try:
             self.stat(path)
         except FileNotFoundError:
             return False
         return True
 
-    def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+    def resolve(self, path: os.PathLike[bytes] | bytes) -> PathResolution:
         return _path_resolution(self._inner.resolve(_resolution_path(path)))
 
-    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
+    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[bytes] | bytes = b".") -> Iterator[DirEntry]:
         normalized, fh = _scandir_target(path)
         cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
         def entries() -> Iterator[DirEntry]:
@@ -757,91 +756,91 @@ class Client(_ClientOptions):
 
     def scandir_page(
         self,
-        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        path: DirectoryRef | DirEntry | os.PathLike[bytes] | bytes = b".",
         position: DirectoryCookie | None = None,
     ) -> DirectoryPage:
         normalized, fh = _scandir_target(path)
         cookie, verifier = _directory_position(position)
         return _directory_page(normalized, self._inner.scandir_page(normalized, fh, cookie, verifier))
 
-    def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
+    def listdir(self, path: os.PathLike[bytes] | bytes = b".") -> list[bytes]:
         return self._inner.listdir(_normalize_path(path))
 
-    def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
+    def chmod(self, path: os.PathLike[bytes] | bytes, mode: int) -> None:
         self._inner.chmod(_normalize_path(path), mode)
 
-    def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
+    def chown(self, path: os.PathLike[bytes] | bytes, uid: int, gid: int) -> None:
         self._inner.chown(_normalize_path(path), uid, gid)
 
-    def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+    def utime(self, path: os.PathLike[bytes] | bytes, *, ns: tuple[int, int]) -> None:
         if not isinstance(ns, tuple) or len(ns) != 2:
             raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
         self._inner.utime(_normalize_path(path), ns[0], ns[1])
 
-    def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
+    def truncate(self, path: os.PathLike[bytes] | bytes, size: int) -> None:
         self._inner.truncate_path(_normalize_path(path), size)
 
-    def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+    def access(self, path: os.PathLike[bytes] | bytes, mode: int) -> bool:
         if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(self._inner.access(_normalize_path(path), mode))
 
-    def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+    def getdacl(self, path: os.PathLike[bytes] | bytes) -> NfsAcl41:
         return _acl41(self._inner.getdacl(_normalize_path(path)))
 
-    def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    def setdacl(self, path: os.PathLike[bytes] | bytes, acl: NfsAcl41) -> None:
         flags, aces = _acl41_args(acl)
         self._inner.setdacl(_normalize_path(path), flags, aces)
 
-    def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+    def getsacl(self, path: os.PathLike[bytes] | bytes) -> NfsAcl41:
         return _acl41(self._inner.getsacl(_normalize_path(path)))
 
-    def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    def setsacl(self, path: os.PathLike[bytes] | bytes, acl: NfsAcl41) -> None:
         flags, aces = _acl41_args(acl)
         self._inner.setsacl(_normalize_path(path), flags, aces)
 
-    def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    def allocate(self, path: os.PathLike[bytes] | bytes, offset: int, length: int) -> None:
         self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    def deallocate(self, path: os.PathLike[bytes] | bytes, offset: int, length: int) -> None:
         self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    def seek_content(self, path: os.PathLike[bytes] | bytes, offset: int, what: SeekContent) -> SeekResult:
         if not isinstance(what, SeekContent):
             raise TypeError("what must be a SeekContent")
         values = self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
         return SeekResult(**values)
 
-    def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+    def read_plus(self, path: os.PathLike[bytes] | bytes, offset: int, count: int) -> ReadPlusResult:
         values = self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
         return _read_plus_result(values)
 
-    def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+    def copy_range(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
         values = self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
         return CopyResult(**values)
 
-    def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+    def clone_range(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
         self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
 
-    def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
+    def nfs42_attributes(self, path: os.PathLike[bytes] | bytes = b".") -> Nfs42Attributes:
         values = self._inner.v42("nfs42_attributes", _normalize_path(path))
         return _nfs42_attributes(values)
 
-    def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
+    def getxattr(self, path: os.PathLike[bytes] | bytes, name: str) -> bytes:
         return bytes(self._inner.getxattr(_normalize_path(path), name))
 
-    def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
+    def setxattr(self, path: os.PathLike[bytes] | bytes, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
         if not isinstance(mode, XattrSetMode):
             raise TypeError("mode must be an XattrSetMode")
         if mode is XattrSetMode.EITHER:
             self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
         else:
-            self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
+            self._inner.v42("setxattr", _normalize_path(path), name.encode("utf-8"), int(mode), value=_snapshot_bytes(value))
 
-    def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
+    def listxattr(self, path: os.PathLike[bytes] | bytes) -> list[str]:
         return list(self._inner.listxattr(_normalize_path(path)))
 
-    def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
+    def removexattr(self, path: os.PathLike[bytes] | bytes, name: str) -> None:
         self._inner.removexattr(_normalize_path(path), name)
 
     def fs_info(self) -> FsInfo:
@@ -851,14 +850,14 @@ class Client(_ClientOptions):
         return _fs_stat(self._inner.fs_stat())
 
     def mkdir(
-        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+        self, path: os.PathLike[bytes] | bytes, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         """Create directories non-transactionally when ``parents`` is true."""
         normalized = _normalize_path(path)
         paths = [normalized]
         if parents:
-            parts = normalized.split("/")
-            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+            parts = normalized.split(b"/")
+            paths = [b"/".join(parts[:index]) for index in range(1, len(parts) + 1)]
         for candidate in paths:
             try:
                 self._inner.mkdir(candidate, mode)
@@ -872,7 +871,7 @@ class Client(_ClientOptions):
                 if existing.type is not FileType.DIRECTORY:
                     raise
 
-    def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+    def remove(self, path: os.PathLike[bytes] | bytes, *, missing_ok: bool = False) -> None:
         try:
             self._inner.remove(_normalize_path(path))
         except FileNotFoundError:
@@ -881,27 +880,27 @@ class Client(_ClientOptions):
 
     unlink = remove
 
-    def rmdir(self, path: os.PathLike[str] | str) -> None:
+    def rmdir(self, path: os.PathLike[bytes] | bytes) -> None:
         self._inner.rmdir(_normalize_path(path))
 
-    def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    def rename(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes) -> None:
         self._inner.rename(_normalize_path(source), _normalize_path(destination))
 
-    def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    def link(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes) -> None:
         self._inner.link(_normalize_path(source), _normalize_path(destination))
 
-    def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
+    def symlink(self, target: os.PathLike[bytes] | bytes, link_path: os.PathLike[bytes] | bytes) -> None:
         target_text = os.fspath(target)
-        if isinstance(target_text, bytes):
-            raise TypeError("symlink targets must be strings, not bytes")
-        if "\0" in target_text:
+        if not isinstance(target_text, bytes):
+            raise TypeError("symlink targets must be bytes")
+        if b"\0" in target_text:
             raise ValueError("symlink targets may not contain NUL")
         self._inner.symlink(target_text, _normalize_path(link_path))
 
-    def readlink(self, path: os.PathLike[str] | str) -> str:
+    def readlink(self, path: os.PathLike[bytes] | bytes) -> bytes:
         return self._inner.readlink(_normalize_path(path))
 
-    def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+    def touch(self, path: os.PathLike[bytes] | bytes, *, exist_ok: bool = True) -> None:
         normalized = _normalize_path(path)
         if not exist_ok:
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
@@ -909,7 +908,7 @@ class Client(_ClientOptions):
         now = time.time_ns()
         self.utime(normalized, ns=(now, now))
 
-    def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
+    def open(self, path: os.PathLike[bytes] | bytes, mode: str = "rb") -> File:
         """Open a binary file.
 
         Creating and truncating modes may require multiple NFS operations. Their
@@ -1001,23 +1000,23 @@ class AsyncClient(_ClientOptions):
         self._check_loop()
         await self._inner.close()
 
-    async def stat(self, path: os.PathLike[str] | str) -> FileInfo:
+    async def stat(self, path: os.PathLike[bytes] | bytes) -> FileInfo:
         self._check_loop()
         normalized = _normalize_path(path)
         return _file_info(normalized, await self._inner.stat(normalized))
 
-    async def exists(self, path: os.PathLike[str] | str) -> bool:
+    async def exists(self, path: os.PathLike[bytes] | bytes) -> bool:
         try:
             await self.stat(path)
         except FileNotFoundError:
             return False
         return True
 
-    async def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+    async def resolve(self, path: os.PathLike[bytes] | bytes) -> PathResolution:
         self._check_loop()
         return _path_resolution(await self._inner.resolve(_resolution_path(path)))
 
-    async def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
+    async def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[bytes] | bytes = b".") -> AsyncIterator[DirEntry]:
         self._check_loop()
         normalized, fh = _scandir_target(path)
         cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
@@ -1032,7 +1031,7 @@ class AsyncClient(_ClientOptions):
 
     async def scandir_page(
         self,
-        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        path: DirectoryRef | DirEntry | os.PathLike[bytes] | bytes = b".",
         position: DirectoryCookie | None = None,
     ) -> DirectoryPage:
         self._check_loop()
@@ -1040,104 +1039,104 @@ class AsyncClient(_ClientOptions):
         cookie, verifier = _directory_position(position)
         return _directory_page(normalized, await self._inner.scandir_page(normalized, fh, cookie, verifier))
 
-    async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
+    async def listdir(self, path: os.PathLike[bytes] | bytes = b".") -> list[bytes]:
         self._check_loop()
         return await self._inner.listdir(_normalize_path(path))
 
-    async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
+    async def chmod(self, path: os.PathLike[bytes] | bytes, mode: int) -> None:
         self._check_loop()
         await self._inner.chmod(_normalize_path(path), mode)
 
-    async def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
+    async def chown(self, path: os.PathLike[bytes] | bytes, uid: int, gid: int) -> None:
         self._check_loop()
         await self._inner.chown(_normalize_path(path), uid, gid)
 
-    async def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+    async def utime(self, path: os.PathLike[bytes] | bytes, *, ns: tuple[int, int]) -> None:
         self._check_loop()
         if not isinstance(ns, tuple) or len(ns) != 2:
             raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
         await self._inner.utime(_normalize_path(path), ns[0], ns[1])
 
-    async def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
+    async def truncate(self, path: os.PathLike[bytes] | bytes, size: int) -> None:
         self._check_loop()
         await self._inner.truncate_path(_normalize_path(path), size)
 
-    async def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+    async def access(self, path: os.PathLike[bytes] | bytes, mode: int) -> bool:
         self._check_loop()
         if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
         return bool(await self._inner.access(_normalize_path(path), mode))
 
-    async def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+    async def getdacl(self, path: os.PathLike[bytes] | bytes) -> NfsAcl41:
         self._check_loop()
         return _acl41(await self._inner.getdacl(_normalize_path(path)))
 
-    async def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    async def setdacl(self, path: os.PathLike[bytes] | bytes, acl: NfsAcl41) -> None:
         self._check_loop()
         flags, aces = _acl41_args(acl)
         await self._inner.setdacl(_normalize_path(path), flags, aces)
 
-    async def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+    async def getsacl(self, path: os.PathLike[bytes] | bytes) -> NfsAcl41:
         self._check_loop()
         return _acl41(await self._inner.getsacl(_normalize_path(path)))
 
-    async def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    async def setsacl(self, path: os.PathLike[bytes] | bytes, acl: NfsAcl41) -> None:
         self._check_loop()
         flags, aces = _acl41_args(acl)
         await self._inner.setsacl(_normalize_path(path), flags, aces)
 
-    async def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    async def allocate(self, path: os.PathLike[bytes] | bytes, offset: int, length: int) -> None:
         self._check_loop()
         await self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    async def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    async def deallocate(self, path: os.PathLike[bytes] | bytes, offset: int, length: int) -> None:
         self._check_loop()
         await self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    async def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    async def seek_content(self, path: os.PathLike[bytes] | bytes, offset: int, what: SeekContent) -> SeekResult:
         self._check_loop()
         if not isinstance(what, SeekContent):
             raise TypeError("what must be a SeekContent")
         values = await self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
         return SeekResult(**values)
 
-    async def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+    async def read_plus(self, path: os.PathLike[bytes] | bytes, offset: int, count: int) -> ReadPlusResult:
         self._check_loop()
         values = await self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
         return _read_plus_result(values)
 
-    async def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+    async def copy_range(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
         self._check_loop()
         values = await self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
         return CopyResult(**values)
 
-    async def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+    async def clone_range(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
         self._check_loop()
         await self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
 
-    async def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
+    async def nfs42_attributes(self, path: os.PathLike[bytes] | bytes = b".") -> Nfs42Attributes:
         self._check_loop()
         values = await self._inner.v42("nfs42_attributes", _normalize_path(path))
         return _nfs42_attributes(values)
 
-    async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
+    async def getxattr(self, path: os.PathLike[bytes] | bytes, name: str) -> bytes:
         self._check_loop()
         return bytes(await self._inner.getxattr(_normalize_path(path), name))
 
-    async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
+    async def setxattr(self, path: os.PathLike[bytes] | bytes, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
         self._check_loop()
         if not isinstance(mode, XattrSetMode):
             raise TypeError("mode must be an XattrSetMode")
         if mode is XattrSetMode.EITHER:
             await self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
         else:
-            await self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
+            await self._inner.v42("setxattr", _normalize_path(path), name.encode("utf-8"), int(mode), value=_snapshot_bytes(value))
 
-    async def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
+    async def listxattr(self, path: os.PathLike[bytes] | bytes) -> list[str]:
         self._check_loop()
         return list(await self._inner.listxattr(_normalize_path(path)))
 
-    async def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
+    async def removexattr(self, path: os.PathLike[bytes] | bytes, name: str) -> None:
         self._check_loop()
         await self._inner.removexattr(_normalize_path(path), name)
 
@@ -1150,14 +1149,14 @@ class AsyncClient(_ClientOptions):
         return _fs_stat(await self._inner.fs_stat())
 
     async def mkdir(
-        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+        self, path: os.PathLike[bytes] | bytes, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         self._check_loop()
         normalized = _normalize_path(path)
         paths = [normalized]
         if parents:
-            parts = normalized.split("/")
-            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
+            parts = normalized.split(b"/")
+            paths = [b"/".join(parts[:index]) for index in range(1, len(parts) + 1)]
         for candidate in paths:
             try:
                 await self._inner.mkdir(candidate, mode)
@@ -1171,7 +1170,7 @@ class AsyncClient(_ClientOptions):
                 if existing.type is not FileType.DIRECTORY:
                     raise
 
-    async def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+    async def remove(self, path: os.PathLike[bytes] | bytes, *, missing_ok: bool = False) -> None:
         self._check_loop()
         try:
             await self._inner.remove(_normalize_path(path))
@@ -1181,32 +1180,32 @@ class AsyncClient(_ClientOptions):
 
     unlink = remove
 
-    async def rmdir(self, path: os.PathLike[str] | str) -> None:
+    async def rmdir(self, path: os.PathLike[bytes] | bytes) -> None:
         self._check_loop()
         await self._inner.rmdir(_normalize_path(path))
 
-    async def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    async def rename(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes) -> None:
         self._check_loop()
         await self._inner.rename(_normalize_path(source), _normalize_path(destination))
 
-    async def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    async def link(self, source: os.PathLike[bytes] | bytes, destination: os.PathLike[bytes] | bytes) -> None:
         self._check_loop()
         await self._inner.link(_normalize_path(source), _normalize_path(destination))
 
-    async def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
+    async def symlink(self, target: os.PathLike[bytes] | bytes, link_path: os.PathLike[bytes] | bytes) -> None:
         self._check_loop()
         target_text = os.fspath(target)
-        if isinstance(target_text, bytes):
-            raise TypeError("symlink targets must be strings, not bytes")
-        if "\0" in target_text:
+        if not isinstance(target_text, bytes):
+            raise TypeError("symlink targets must be bytes")
+        if b"\0" in target_text:
             raise ValueError("symlink targets may not contain NUL")
         await self._inner.symlink(target_text, _normalize_path(link_path))
 
-    async def readlink(self, path: os.PathLike[str] | str) -> str:
+    async def readlink(self, path: os.PathLike[bytes] | bytes) -> bytes:
         self._check_loop()
         return await self._inner.readlink(_normalize_path(path))
 
-    async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+    async def touch(self, path: os.PathLike[bytes] | bytes, *, exist_ok: bool = True) -> None:
         self._check_loop()
         normalized = _normalize_path(path)
         if not exist_ok:
@@ -1216,7 +1215,7 @@ class AsyncClient(_ClientOptions):
         now = time.time_ns()
         await self.utime(normalized, ns=(now, now))
 
-    async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
+    async def open(self, path: os.PathLike[bytes] | bytes, mode: str = "rb") -> AsyncFile:
         """Open a binary file with the same non-transactional effects as Client.open()."""
         self._check_loop()
         normalized = _normalize_path(path)
@@ -1275,7 +1274,7 @@ def _snapshot_bytes(source: Any) -> bytes:
 class File(io.RawIOBase):
     __slots__ = ("_inner", "_name", "_mode", "_closing_base")
 
-    def __init__(self, inner: Any, name: str, mode: str, token: object = None) -> None:
+    def __init__(self, inner: Any, name: bytes, mode: str, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("File objects are created only by Client.open()")
         super().__init__()
@@ -1285,7 +1284,7 @@ class File(io.RawIOBase):
         self._closing_base = False
 
     @property
-    def name(self) -> str:
+    def name(self) -> bytes:
         return self._name
 
     @property
@@ -1425,7 +1424,7 @@ class AsyncFile:
     def __init__(
         self,
         inner: Any,
-        name: str,
+        name: bytes,
         mode: str,
         loop: asyncio.AbstractEventLoop,
         token: object = None,
@@ -1442,7 +1441,7 @@ class AsyncFile:
             raise RuntimeError("AsyncFile may only be used from its creating event loop")
 
     @property
-    def name(self) -> str:
+    def name(self) -> bytes:
         return self._name
 
     @property

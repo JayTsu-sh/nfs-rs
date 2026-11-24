@@ -23,17 +23,17 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes> {
+    pub async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes> {
         let (dir, dirname) = split_path(path)?;
         let dir_fh = self.lookup_path(&dir).await?.fh;
         self.mkdir(dir_fh, &dirname, mode).await
     }
 
-    pub async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
+    pub async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes> {
         let args = MKDIR3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(Bytes::copy_from_slice(dirname.as_bytes())),
+                name: filename3(Bytes::copy_from_slice(dirname)),
             },
             attrs: sattr3 {
                 mode: set_mode3::TRUE(mode),

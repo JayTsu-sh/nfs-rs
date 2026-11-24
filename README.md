@@ -90,12 +90,12 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let created = mount.create_path("hello.txt", Some(0o644)).await?;
+    let created = mount.create_path(b"hello.txt", Some(0o644)).await?;
     nfs_rs::write_all(&*mount, created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
         .await?;
     mount.close(created.fh).await?;
 
-    let opened = mount.open_path("hello.txt", OPEN_READ).await?;
+    let opened = mount.open_path(b"hello.txt", OPEN_READ).await?;
     let contents = mount.read(opened.fh.clone(), 0, 9).await?;
     mount.close(opened.fh).await?;
     assert_eq!(&contents[..], b"hello NFS");
@@ -113,7 +113,7 @@ directories; callers do not need to identify the entry type first.
 
 ```rust,no_run
 async fn example(mount: &dyn nfs_rs::Mount) -> nfs_rs::Result<()> {
-    let result = mount.resolve_path("links/latest").await?;
+    let result = mount.resolve_path(b"links/latest").await?;
     match result.exists() {
         Some(true) => {
             // Final export-relative path and final handle/attributes.
@@ -128,16 +128,15 @@ async fn example(mount: &dyn nfs_rs::Mount) -> nfs_rs::Result<()> {
 
 `PathResolutionStatus` distinguishes `Resolved`, `Missing`, `NotDirectory`,
 `OutsideMount` and `TooManySymlinks`. Only `Resolved` includes the final path
-(`.` for root) and object. For example, `links/latest -> ../data/report.csv`
-resolves to `data/report.csv`; `readlink_path` instead returns the original
-`../data/report.csv` text. Ordinary file and directory paths resolve to themselves.
+(`b"."` for root) and object. For example, `links/latest -> ../data/report.csv`
+resolves to `data/report.csv`; `readlink_path` returns the original target bytes.
+Ordinary file and directory paths resolve to themselves.
 
 Relative targets start at the link's directory, and `..` is evaluated after
 preceding links. Absolute targets and traversal above the mounted root return
 `OutsideMount`; this does not prove a target is broken. Resolution follows at most
-40 links and accepts 4096 cumulative components / 64 KiB of cumulative UTF-8 path
-text. Permission, transport, stale-handle and encoding errors propagate. The
-String interface rejects non-UTF-8 targets instead of changing their identity.
+40 links and accepts 4096 cumulative components / 64 KiB of cumulative path
+bytes. Permission, transport, and stale-handle errors propagate.
 Existence is an advisory namespace observation, not an access check or a guarantee
 about a later open. Rust callers can bound the complete walk with a Tokio timeout;
 Python's `operation_timeout` covers its complete `resolve` call.

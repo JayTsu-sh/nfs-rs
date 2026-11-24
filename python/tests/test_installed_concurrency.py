@@ -25,7 +25,7 @@ def test_blocked_sync_file_io_releases_gil() -> None:
     from nfs_rs import Client, _internal
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("fixture.bin", "rb")
+    file = client.open(b'fixture.bin', "rb")
     entered_python = threading.Event()
     _internal._arm_operation_test_barrier("read")
 
@@ -59,7 +59,7 @@ def test_operation_timeout_bounds_blocked_file_io(client_kind: str) -> None:
         client = Client.connect(
             "nfs-test://fixture/export", operation_timeout=0.01
         )
-        file = client.open("fixture.bin", "rb")
+        file = client.open(b'fixture.bin', "rb")
         _internal._arm_operation_test_barrier("read")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             reading = executor.submit(file.read, 1)
@@ -81,7 +81,7 @@ def test_operation_timeout_bounds_blocked_file_io(client_kind: str) -> None:
         client = await AsyncClient.connect(
             "nfs-test://fixture/export", operation_timeout=0.01
         )
-        file = await client.open("fixture.bin", "rb")
+        file = await client.open(b'fixture.bin', "rb")
         _internal._arm_operation_test_barrier("read")
         reading = asyncio.create_task(file.read(1))
         await _internal._wait_operation_test_entered()
@@ -108,7 +108,7 @@ def test_operation_timeout_bounds_blocked_namespace_mutation(client_kind: str) -
         )
         _internal._arm_operation_test_barrier("remove")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            removing = executor.submit(client.remove, "safe-path")
+            removing = executor.submit(client.remove, b'safe-path')
 
             async def wait_until_entered() -> None:
                 await _internal._wait_operation_test_entered()
@@ -127,7 +127,7 @@ def test_operation_timeout_bounds_blocked_namespace_mutation(client_kind: str) -
             "nfs-test://fixture/export", operation_timeout=0.01
         )
         _internal._arm_operation_test_barrier("remove")
-        removing = asyncio.create_task(client.remove("safe-path"))
+        removing = asyncio.create_task(client.remove(b'safe-path'))
         await _internal._wait_operation_test_entered()
         settled = _internal._wait_operation_test_settled()
         try:
@@ -145,7 +145,7 @@ def test_shared_sync_client_survives_32_threads_and_close_races() -> None:
     from nfs_rs import Client, _internal
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("threaded.bin", "w+b")
+    file = client.open(b'threaded.bin', "w+b")
     start = threading.Barrier(32)
 
     def positional_worker(index: int) -> None:
@@ -160,7 +160,7 @@ def test_shared_sync_client_survives_32_threads_and_close_races() -> None:
             future.result(timeout=10)
 
     assert file.tell() == 0
-    relative = client.open("fixture.bin", "rb")
+    relative = client.open(b'fixture.bin', "rb")
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
         reads = [executor.submit(relative.read, 1) for _ in range(32)]
         relative_results = [read.result(timeout=10) for read in reads]
@@ -170,7 +170,7 @@ def test_shared_sync_client_survives_32_threads_and_close_races() -> None:
     assert relative.tell() == 26
     relative.close()
 
-    race_file = client.open("fixture.bin", "rb")
+    race_file = client.open(b'fixture.bin', "rb")
     _internal._arm_operation_test_barrier("read")
 
     async def wait_for_racing_read() -> None:
@@ -199,7 +199,7 @@ def test_independent_sync_files_reach_native_io_concurrently() -> None:
     from nfs_rs import Client, _internal
 
     client = Client.connect("nfs-test://fixture/export")
-    files = [client.open(f"overlap-{index}.bin", "rb") for index in range(2)]
+    files = [client.open(f"overlap-{index}.bin".encode(), "rb") for index in range(2)]
     _internal._arm_operation_test_barrier("read", parties=2)
 
     async def wait_for_both_entries() -> None:
@@ -228,7 +228,7 @@ def test_async_clients_survive_128_tasks_close_races_and_reject_cross_thread_loo
         )
         files = list(
             await asyncio.gather(
-                *(client.open("fixture.bin", "rb") for client in clients for _ in range(4))
+                *(client.open(b'fixture.bin', "rb") for client in clients for _ in range(4))
             )
         )
         _internal._arm_operation_test_barrier("read", parties=2)
@@ -288,7 +288,7 @@ def test_async_clients_survive_128_tasks_close_races_and_reject_cross_thread_loo
 
     def wrong_thread() -> None:
         async def use_foreign_objects() -> None:
-            for operation in (lambda: client.stat("fixture.bin"), lambda: file.read_at(0, 1)):
+            for operation in (lambda: client.stat(b'fixture.bin'), lambda: file.read_at(0, 1)):
                 with pytest.raises(RuntimeError, match="creating event loop"):
                     await operation()
 
@@ -320,13 +320,13 @@ def test_repeated_sync_and_async_lifecycles_converge() -> None:
         await client.close()
 
     asyncio.run(warm_global_async_runtime())
-    baseline_fds = len(os.listdir("/proc/self/fd"))
-    baseline_threads = len(os.listdir("/proc/self/task"))
+    baseline_fds = len(os.listdir(b'/proc/self/fd'))
+    baseline_threads = len(os.listdir(b'/proc/self/task'))
     object_refs: list[weakref.ReferenceType[object]] = []
 
     for _ in range(20):
         client = Client.connect("nfs-test://fixture/export")
-        file = client.open("cycle.bin", "w+b")
+        file = client.open(b'cycle.bin', "w+b")
         object_refs.extend((weakref.ref(client), weakref.ref(file)))
         assert file.write_at(b"sync", 0) == 4
         client.close()
@@ -337,7 +337,7 @@ def test_repeated_sync_and_async_lifecycles_converge() -> None:
     async def async_cycles() -> None:
         for _ in range(20):
             client = await AsyncClient.connect("nfs-test://fixture/export")
-            file = await client.open("cycle.bin", "w+b")
+            file = await client.open(b'cycle.bin', "w+b")
             object_refs.extend((weakref.ref(client), weakref.ref(file)))
             writing = asyncio.create_task(file.write_at(b"async", 0))
             await asyncio.wait_for(writing, timeout=2)
@@ -350,7 +350,7 @@ def test_repeated_sync_and_async_lifecycles_converge() -> None:
             client = await AsyncClient.connect("nfs-test://fixture/export")
             object_refs.append(weakref.ref(client))
             _internal._arm_open_test_barrier()
-            opening = asyncio.create_task(client.open("__blocked_open__", "rb"))
+            opening = asyncio.create_task(client.open(b'__blocked_open__', "rb"))
             settled = _internal._wait_open_test_settled()
             try:
                 await asyncio.wait_for(_internal._wait_open_test_entered(), timeout=2)
@@ -369,7 +369,7 @@ def test_repeated_sync_and_async_lifecycles_converge() -> None:
         for operation in ("read", "close"):
             for _ in range(5):
                 client = await AsyncClient.connect("nfs-test://fixture/export")
-                file = await client.open("cycle.bin", "rb")
+                file = await client.open(b'cycle.bin', "rb")
                 object_refs.extend((weakref.ref(client), weakref.ref(file)))
                 _internal._arm_operation_test_barrier(operation)
                 pending = asyncio.create_task(
@@ -395,8 +395,8 @@ def test_repeated_sync_and_async_lifecycles_converge() -> None:
     asyncio.run(async_cycles())
     gc.collect()
     assert all(reference() is None for reference in object_refs)
-    assert len(os.listdir("/proc/self/fd")) <= baseline_fds
-    assert len(os.listdir("/proc/self/task")) <= baseline_threads
+    assert len(os.listdir(b'/proc/self/fd')) <= baseline_fds
+    assert len(os.listdir(b'/proc/self/task')) <= baseline_threads
 
 
 def test_repeated_lifecycle_rss_reaches_a_bounded_plateau() -> None:
@@ -405,13 +405,13 @@ def test_repeated_lifecycle_rss_reaches_a_bounded_plateau() -> None:
     page_size = os.sysconf("SC_PAGE_SIZE")
 
     def resident_bytes() -> int:
-        with open("/proc/self/statm", encoding="ascii") as statm:
+        with open(b'/proc/self/statm', encoding="ascii") as statm:
             return int(statm.read().split()[1]) * page_size
 
     def run_batch(cycles: int) -> None:
         for _ in range(cycles):
             client = Client.connect("nfs-test://fixture/export")
-            file = client.open("rss-cycle.bin", "w+b")
+            file = client.open(b'rss-cycle.bin', "w+b")
             assert file.write(b"x" * 4096) == 4096
             client.close()
             assert _native_counts(client) == (0, 0, 0)
@@ -442,7 +442,7 @@ def test_flush_waits_for_commit_even_after_writer_cancellation(cancel_writer):
 
     async def scenario():
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
-            async with await client.open("fixture.bin", "w+b") as file:
+            async with await client.open(b'fixture.bin', "w+b") as file:
                 _internal._arm_operation_test_barrier("commit")
                 writing = asyncio.create_task(file.write(b"pending data"))
                 flushing = None
@@ -468,7 +468,7 @@ def test_sync_flush_waits_for_active_commit():
     from nfs_rs import Client, _internal
 
     with Client.connect("nfs-test://fixture/export") as client:
-        with client.open("fixture.bin", "w+b") as file:
+        with client.open(b'fixture.bin', "w+b") as file:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 _internal._arm_operation_test_barrier("commit")
                 writing = executor.submit(file.write, b"pending data")
@@ -494,7 +494,7 @@ def test_flush_waits_for_write_still_settling_after_timeout():
         async with await AsyncClient.connect(
             "nfs-test://fixture/export", operation_timeout=0.05
         ) as client:
-            async with await client.open("fixture.bin", "w+b") as file:
+            async with await client.open(b'fixture.bin', "w+b") as file:
                 _internal._arm_operation_test_barrier("commit")
                 writing = asyncio.create_task(file.write(b"pending data"))
                 try:

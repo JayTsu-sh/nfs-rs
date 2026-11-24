@@ -16,7 +16,7 @@ def test_sync_complete_write_append_positional_and_buffered_io() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("fixture.bin", "w+b")
+    file = client.open(b'fixture.bin', "w+b")
     assert file.write(b"abcdefghij") == 10
     assert file.tell() == 10
     assert file.write_at(b"XY", 2) == 2
@@ -28,16 +28,16 @@ def test_sync_complete_write_append_positional_and_buffered_io() -> None:
     file.close()
     assert io.IOBase.closed.__get__(file, type(file))
 
-    appended = client.open("fixture.bin", "a+b")
+    appended = client.open(b'fixture.bin', "a+b")
     start = appended.tell()
     assert appended.write(b"!") == 1
     assert appended.tell() == start + 1
     appended.close()
-    verify = client.open("fixture.bin", "rb")
+    verify = client.open(b'fixture.bin', "rb")
     assert verify.read() == b"abXYe!"
     verify.close()
 
-    buffered_raw = client.open("buffered.bin", "w+b")
+    buffered_raw = client.open(b'buffered.bin', "w+b")
     buffered = io.BufferedRandom(buffered_raw, buffer_size=8)
     assert buffered.write(b"buffered payload") == 16
     buffered.seek(0)
@@ -50,10 +50,10 @@ def test_native_permissions_are_enforced_even_without_facade() -> None:
     from nfs_rs import _internal
 
     client = _internal.SyncClient.connect("nfs-test://fixture/export")
-    read_only = client.open("fixture.bin", "rb")
+    read_only = client.open(b'fixture.bin', "rb")
     with pytest.raises(RuntimeError, match="not writable"):
         read_only.write(b"x")
-    write_only = client.open("fixture.bin", "wb")
+    write_only = client.open(b'fixture.bin', "wb")
     with pytest.raises(RuntimeError, match="not readable"):
         write_only.read()
     client.close()
@@ -63,7 +63,7 @@ def test_commit_failure_is_reported_by_write():
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("__commit_error__", "w+b")
+    file = client.open(b'__commit_error__', "w+b")
     with pytest.raises(RuntimeError, match="[Uu]ncertain"):
         file.write(b"dirty")
     file.flush()
@@ -76,14 +76,14 @@ def test_partial_and_zero_write_failures_preserve_position_rules() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    partial = client.open("__partial_write_error__", "w+b")
+    partial = client.open(b'__partial_write_error__', "w+b")
     with pytest.raises(RuntimeError):
         partial.write(b"abcde")
     with pytest.raises(RuntimeError, match="uncertain"):
         partial.seek(0, io.SEEK_CUR)
     partial.close()
 
-    zero = client.open("__zero_write__", "w+b")
+    zero = client.open(b'__zero_write__', "w+b")
     with pytest.raises(RuntimeError):
         zero.write(b"x")
     with pytest.raises(RuntimeError, match="uncertain"):
@@ -97,7 +97,7 @@ def test_commit_verifier_change_fails_write():
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("__verifier_change__", "w+b")
+    file = client.open(b'__verifier_change__', "w+b")
     with pytest.raises(RuntimeError, match="[Uu]ncertain"):
         file.write(b"dirty")
     file.flush()
@@ -110,7 +110,7 @@ def test_async_write_positional_flush_and_truncate() -> None:
 
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        file = await client.open("fixture.bin", "w+b")
+        file = await client.open(b'fixture.bin', "w+b")
         assert await file.write(b"abcdefghij") == 10
         await file.seek(0)
         assert await file.read() == b"abcdefghij"

@@ -20,7 +20,7 @@ use crate::split_path;
 use bytes::Bytes;
 
 impl Mount {
-    pub async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<crate::mount::Attr> {
+    pub async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<crate::mount::Attr> {
         let (dst_dir, dst_filename) = split_path(dst_path)?;
         let src_fh = self.lookup_path(src_path).await?.fh;
         let dst_dir_fh = self.lookup_path(&dst_dir).await?.fh;
@@ -31,13 +31,13 @@ impl Mount {
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<crate::mount::Attr> {
         let args = LINK3args {
             file: nfs_fh3 { data: src_fh },
             link: diropargs3 {
                 dir: nfs_fh3 { data: dst_dir_fh },
-                name: filename3(Bytes::copy_from_slice(dst_filename.as_bytes())),
+                name: filename3(Bytes::copy_from_slice(dst_filename)),
             },
         };
         let ok = self._link(args).await?;

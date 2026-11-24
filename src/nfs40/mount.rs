@@ -1134,13 +1134,13 @@ impl Mount40 {
     async fn open_file(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         access: u32,
         create: bool,
     ) -> Result<mount::OpenFile> {
         self.open_file_with_create(
             dir_fh,
-            Bytes::copy_from_slice(filename.as_bytes()),
+            Bytes::copy_from_slice(filename),
             access,
             create,
             false,
@@ -1152,14 +1152,14 @@ impl Mount40 {
     async fn open_guarded(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         access: u32,
         mode: Option<u32>,
     ) -> Result<mount::OpenFile> {
         match self
             .open_file_with_create(
                 dir_fh.clone(),
-                Bytes::copy_from_slice(filename.as_bytes()),
+                Bytes::copy_from_slice(filename),
                 access,
                 true,
                 true,
@@ -1176,7 +1176,7 @@ impl Mount40 {
                 let file = self
                     .open_file_with_create(
                         dir_fh,
-                        Bytes::copy_from_slice(filename.as_bytes()),
+                        Bytes::copy_from_slice(filename),
                         access,
                         true,
                         true,
@@ -1970,7 +1970,6 @@ impl Mount40 {
                     entry.map(|entry| mount::ReaddirEntry {
                         fileid: entry.attr.fileid,
                         file_name: entry.name,
-                        raw_name: entry.raw_name,
                     })
                 })
                 .collect(),
@@ -2006,7 +2005,6 @@ impl Mount40 {
                         mount::ReaddirplusEntry {
                             fileid: entry.attr.fileid,
                             file_name: entry.name,
-                            raw_name: entry.raw_name,
                             handle: entry.attr.filehandle.clone(),
                             attr: Some(entry.attr),
                         }
@@ -2023,8 +2021,7 @@ impl Mount40 {
 #[derive(Debug)]
 struct DirectoryEntry {
     cookie: u64,
-    name: String,
-    raw_name: Bytes,
+    name: Bytes,
     attr: mount::Attr,
 }
 
@@ -2105,16 +2102,10 @@ fn decode_directory_entry(data: &mut Bytes, previous_cookie: u64) -> Result<Dire
     if data.remaining() < padded {
         return Err(NfsError::Xdr("READDIR entry name truncated".into()));
     }
-    let raw_name = data.split_to(name_len);
-    let name = String::from_utf8_lossy(&raw_name).into_owned();
+    let name = data.split_to(name_len);
     data.advance(padded - name_len);
     let attr = decode_getattr_response(data)?;
-    Ok(DirectoryEntry {
-        cookie,
-        name,
-        raw_name,
-        attr,
-    })
+    Ok(DirectoryEntry { cookie, name, attr })
 }
 
 fn validate_readdir_payload(payload: Bytes, maxcount: u32) -> Result<Bytes> {
@@ -2542,43 +2533,30 @@ impl Mount for Mount40 {
         let (_supported, granted) = decode_access_response(response)?;
         Ok(granted)
     }
-    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+    async fn open(&self, dir_fh: Bytes, filename: &[u8], access: u32) -> Result<mount::ObjRes> {
         Ok(self.open_stateful(dir_fh, filename, access).await?.object)
     }
-    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, access: u32) -> Result<mount::ObjRes> {
-        Ok(self
-            .open_stateful_raw(dir_fh, raw_name, access)
-            .await?
-            .object)
-    }
-    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+
+    async fn open_path(&self, path: &[u8], access: u32) -> Result<mount::ObjRes> {
         Ok(self.open_path_stateful(path, access).await?.object)
     }
     async fn open_stateful(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         access: u32,
     ) -> Result<mount::OpenFile> {
         self.open_file(dir_fh, filename, access, false).await
     }
-    async fn open_stateful_raw(
-        &self,
-        dir_fh: Bytes,
-        raw_name: Bytes,
-        access: u32,
-    ) -> Result<mount::OpenFile> {
-        self.open_file_with_create(dir_fh, raw_name, access, false, false, None)
-            .await
-    }
-    async fn open_path_stateful(&self, path: &str, access: u32) -> Result<mount::OpenFile> {
+
+    async fn open_path_stateful(&self, path: &[u8], access: u32) -> Result<mount::OpenFile> {
         let (dir, name) = crate::split_path(path)?;
         let directory = self.lookup_path(&dir).await?;
         self.open_stateful(directory.fh, &name, access).await
     }
     async fn open_path_with_options(
         &self,
-        path: &str,
+        path: &[u8],
         options: mount::OpenOptions,
     ) -> Result<mount::OpenFile> {
         mount::open_path_guarded(self, path, options, |parent, name| async move {
@@ -2663,7 +2641,7 @@ impl Mount for Mount40 {
     async fn create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
         let opened = self
@@ -2696,18 +2674,22 @@ impl Mount for Mount40 {
             attr: Some(attr),
         })
     }
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(path)?;
         let parent = self.lookup_path(&dir).await?;
         self.create(parent.fh, &name, mode).await
     }
-    async fn create_path_stateful(&self, path: &str, mode: Option<u32>) -> Result<mount::OpenFile> {
+    async fn create_path_stateful(
+        &self,
+        path: &[u8],
+        mode: Option<u32>,
+    ) -> Result<mount::OpenFile> {
         self.create_path_stateful_with_access(path, mode, crate::OPEN_BOTH)
             .await
     }
     async fn create_path_stateful_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
@@ -2881,7 +2863,7 @@ impl Mount for Mount40 {
     }
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -3268,7 +3250,7 @@ impl Mount for Mount40 {
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<mount::Attr> {
         let request = CompoundBuilder::new("link")
             .putfh(&src_fh)
@@ -3284,22 +3266,22 @@ impl Mount for Mount40 {
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))?;
         self.getattr(src_fh).await
     }
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<mount::Attr> {
         let source = self.lookup_path(src_path).await?;
         let (dir, name) = crate::split_path(dst_path)?;
         let parent = self.lookup_path(&dir).await?;
         self.link(source.fh, parent.fh, &name).await
     }
-    async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<mount::ObjRes> {
+    async fn symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(dst_path)?;
         let parent = self.lookup_path(&dir).await?;
         self.symlink(src_path, parent.fh, &name).await
     }
     async fn symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<mount::ObjRes> {
         let bitmap = standard_getattr_bitmap();
         let request = CompoundBuilder::new("symlink")
@@ -3319,7 +3301,7 @@ impl Mount for Mount40 {
             attr: Some(decode_getattr_response(&mut data)?),
         })
     }
-    async fn readlink(&self, fh: Bytes) -> Result<String> {
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         let request = CompoundBuilder::new("readlink")
             .putfh(&fh)
             .readlink()
@@ -3329,11 +3311,8 @@ impl Mount for Mount40 {
                 .await?,
         )
     }
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
-        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
-            .await
-    }
-    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<mount::ObjRes> {
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<mount::ObjRes> {
+        let raw_name = Bytes::copy_from_slice(filename);
         let bitmap = standard_getattr_bitmap();
         let request = CompoundBuilder::new("lookup")
             .putfh(&dir_fh)
@@ -3350,12 +3329,13 @@ impl Mount for Mount40 {
             attr: Some(decode_getattr_response(&mut data)?),
         })
     }
-    async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
+
+    async fn lookup_path(&self, path: &[u8]) -> Result<mount::ObjRes> {
         let mut object = mount::ObjRes {
             fh: self.root_fh.clone(),
             attr: None,
         };
-        for component in path.split('/').filter(|part| !part.is_empty()) {
+        for component in crate::path_components(path)? {
             object = self.lookup(object.fh, component).await?;
         }
         Ok(object)
@@ -3522,7 +3502,7 @@ impl Mount for Mount40 {
             mount::DirectoryCursor::resume(position).page(last_cookie, verifier, received, eof)?;
         Ok(mount::ReaddirplusPage { entries, next, eof })
     }
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let bitmap = standard_getattr_bitmap();
         let request = CompoundBuilder::new("mkdir")
             .putfh(&dir_fh)
@@ -3552,16 +3532,13 @@ impl Mount for Mount40 {
         }
         Ok(object)
     }
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(path)?;
         let parent = self.lookup_path(&dir).await?;
         self.mkdir(parent.fh, &name, mode).await
     }
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
-        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
-            .await
-    }
-    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
+        let raw_name = Bytes::copy_from_slice(filename);
         let request = CompoundBuilder::new("remove")
             .putfh(&dir_fh)
             .remove(&raw_name)
@@ -3573,18 +3550,19 @@ impl Mount for Mount40 {
         decode_remove_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
-    async fn remove_path(&self, path: &str) -> Result<()> {
+
+    async fn remove_path(&self, path: &[u8]) -> Result<()> {
         let (dir, name) = crate::split_path(path)?;
         let parent = self.lookup_path(&dir).await?;
         self.remove(parent.fh, &name).await
     }
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         self.remove(dir_fh, dirname).await
     }
-    async fn rmdir_path(&self, path: &str) -> Result<()> {
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         self.remove_path(path).await
     }
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         let (from_dir, from_name) = crate::split_path(from_path)?;
         let (to_dir, to_name) = crate::split_path(to_path)?;
         let from_parent = self.lookup_path(&from_dir).await?;
@@ -3595,25 +3573,12 @@ impl Mount for Mount40 {
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
-        self.rename_raw(
-            from_dir_fh,
-            Bytes::copy_from_slice(from_filename.as_bytes()),
-            to_dir_fh,
-            Bytes::copy_from_slice(to_filename.as_bytes()),
-        )
-        .await
-    }
-    async fn rename_raw(
-        &self,
-        from_dir_fh: Bytes,
-        from_name: Bytes,
-        to_dir_fh: Bytes,
-        to_name: Bytes,
-    ) -> Result<()> {
+        let from_name = Bytes::copy_from_slice(from_filename);
+        let to_name = Bytes::copy_from_slice(to_filename);
         let request = CompoundBuilder::new("rename")
             .putfh(&from_dir_fh)
             .savefh()
@@ -3627,6 +3592,7 @@ impl Mount for Mount40 {
         decode_rename_response(response)
             .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
     }
+
     async fn exports(&self) -> Result<Vec<mount::ExportEntry>> {
         unsupported("EXPORTS")
     }
@@ -4584,7 +4550,7 @@ mod tests {
         let for_open = Arc::clone(&mount);
         let open = tokio::spawn(async move {
             for_open
-                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .open_file(Bytes::from_static(b"dir"), b"file", crate::OPEN_READ, false)
                 .await
         });
         seen_rx.await.unwrap();
@@ -4666,7 +4632,7 @@ mod tests {
         let for_open = Arc::clone(&mount);
         let open = tokio::spawn(async move {
             for_open
-                .open_file(Bytes::from_static(b"dir"), "file", crate::OPEN_READ, false)
+                .open_file(Bytes::from_static(b"dir"), b"file", crate::OPEN_READ, false)
                 .await
         });
         seen_rx.await.unwrap();
@@ -7157,7 +7123,7 @@ mod tests {
         let for_task = Arc::clone(&mount);
         let task = tokio::spawn(async move {
             for_task
-                .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+                .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
                 .await
         });
         seen_rx.await.unwrap();
@@ -7190,7 +7156,7 @@ mod tests {
             Ok::<(), std::io::Error>(())
         });
         let error = mount
-            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
             .await
             .unwrap_err();
         assert_eq!(
@@ -7212,7 +7178,7 @@ mod tests {
             reply(&mut stream, &request, &partial).await
         });
         let error = mount
-            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
             .await
             .unwrap_err();
         assert_eq!(
@@ -7247,7 +7213,7 @@ mod tests {
             .await
         });
         let opened = mount
-            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
             .await
             .unwrap();
         let owner = decode_owner(&opened.into_parts().1.unwrap()).unwrap().1;
@@ -7283,7 +7249,7 @@ mod tests {
             .await
         });
         mount
-            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
             .await
             .unwrap();
         server.await.unwrap().unwrap();
@@ -7321,7 +7287,7 @@ mod tests {
         });
 
         let error = mount
-            .open_stateful(Bytes::from_static(b"root"), "file", crate::OPEN_READ)
+            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
             .await
             .expect_err("OPEN must not publish a delegation the client failed to return");
         assert!(matches!(error, NfsError::Nfs4(_)) || error.operation_outcome().is_some());
@@ -7573,7 +7539,7 @@ mod tests {
         });
 
         let opened = mount
-            .open(Bytes::from_static(b"root"), "file", crate::OPEN_BOTH)
+            .open(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
             .await
             .unwrap();
         let fields = callback_addr
@@ -7965,9 +7931,9 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| entry.file_name.as_str())
+                .map(|entry| entry.file_name.as_ref())
                 .collect::<Vec<_>>(),
-            ["one", "two"]
+            [b"one".as_slice(), b"two".as_slice()]
         );
         server.await.unwrap().unwrap();
     }
@@ -8132,8 +8098,7 @@ mod tests {
         page.extend_from_slice(&1u32.to_be_bytes());
         let (_, entries, eof) = decode_directory_page(&mut Bytes::from(page), 0).unwrap();
         let entry = entries[0].as_ref().unwrap();
-        assert_eq!(entry.name, "����");
-        assert_eq!(entry.raw_name.as_ref(), b"\xd6\xd0\xce\xc4");
+        assert_eq!(entry.name.as_ref(), b"\xd6\xd0\xce\xc4");
         assert!(eof);
     }
 
@@ -8210,7 +8175,7 @@ mod tests {
             Ok::<(), std::io::Error>(())
         });
         let error = mount
-            .remove(Bytes::from_static(b"root"), "victim")
+            .remove(Bytes::from_static(b"root"), b"victim")
             .await
             .unwrap_err();
         assert_eq!(
@@ -8240,7 +8205,7 @@ mod tests {
         let task_mount = Arc::clone(&mount);
         let task = tokio::spawn(async move {
             task_mount
-                .remove(Bytes::from_static(b"root"), "victim")
+                .remove(Bytes::from_static(b"root"), b"victim")
                 .await
         });
         seen_rx.await.unwrap();
@@ -8339,9 +8304,9 @@ mod tests {
         mount
             .rename(
                 Bytes::from_static(b"from"),
-                "old",
+                b"old",
                 Bytes::from_static(b"to"),
-                "new",
+                b"new",
             )
             .await
             .unwrap();
@@ -8349,12 +8314,12 @@ mod tests {
             .link(
                 Bytes::from_static(b"source"),
                 Bytes::from_static(b"target"),
-                "link",
+                b"link",
             )
             .await
             .unwrap();
         mount
-            .remove(Bytes::from_static(b"root"), "file")
+            .remove(Bytes::from_static(b"root"), b"file")
             .await
             .unwrap();
         server.await.unwrap().unwrap();
@@ -8560,17 +8525,17 @@ mod tests {
             .await
         });
         let file = mount
-            .create(Bytes::from_static(b"root"), "file", None)
+            .create(Bytes::from_static(b"root"), b"file", None)
             .await
             .unwrap();
         assert_eq!(file.fh, Bytes::from_static(b"file-fh"));
         let directory = mount
-            .mkdir(Bytes::from_static(b"root"), "dir", 0o755)
+            .mkdir(Bytes::from_static(b"root"), b"dir", 0o755)
             .await
             .unwrap();
         assert_eq!(directory.fh, Bytes::from_static(b"dir-fh"));
         let symlink = mount
-            .symlink("target", Bytes::from_static(b"root"), "link")
+            .symlink(b"target", Bytes::from_static(b"root"), b"link")
             .await
             .unwrap();
         assert_eq!(symlink.fh, Bytes::from_static(b"link-fh"));
@@ -8611,7 +8576,7 @@ mod tests {
 
         assert!(
             mount
-                .create(Bytes::from_static(b"root"), "raced-name", Some(0o600),)
+                .create(Bytes::from_static(b"root"), b"raced-name", Some(0o600),)
                 .await
                 .is_err()
         );
@@ -8644,7 +8609,7 @@ mod tests {
         });
 
         let opened = mount
-            .create_path_stateful_with_access("file", None, crate::OPEN_WRITE)
+            .create_path_stateful_with_access(b"file", None, crate::OPEN_WRITE)
             .await
             .unwrap();
         let fh = opened.file_handle();
@@ -8788,7 +8753,7 @@ mod tests {
             });
             let result = mount
                 .open_path_with_options(
-                    "parent/new",
+                    b"parent/new",
                     crate::OpenOptions {
                         access,
                         create_mode: Some(0o666),

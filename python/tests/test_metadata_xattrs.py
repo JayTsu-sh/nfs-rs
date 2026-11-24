@@ -23,7 +23,7 @@ class SyncInner:
     def chown(self, *args): self.calls.append(("chown", *args))
     def utime(self, *args): self.calls.append(("utime", *args))
     def truncate_path(self, *args): self.calls.append(("truncate", *args))
-    def access(self, path, mode): self.calls.append(("access", path, mode)); return path != "denied"
+    def access(self, path, mode): self.calls.append(("access", path, mode)); return path != b'denied'
     def getdacl(self, path): self.calls.append(("getdacl", path)); return self.dacl
     def setdacl(self, path, flags, aces): self.calls.append(("setdacl", path, flags, aces)); self.dacl = {"flags": flags, "aces": aces}
     def getsacl(self, path): self.calls.append(("getsacl", path)); return self.sacl
@@ -70,20 +70,20 @@ def fake_adapter(monkeypatch): monkeypatch.setitem(sys.modules, "nfs_rs._interna
 
 def test_sync_metadata_xattrs_and_immutable_information():
     client = Client.connect("nfs://server/export")
-    client.chmod("a/./file", 0o640)
-    client.chown("file", 10, 20)
-    client.utime("file", ns=(1_000_000_002, 3_000_000_004))
-    client.truncate("file", 12)
-    assert client.access("file", 4)
-    assert not client.access("denied", 4)
+    client.chmod(b'a/./file', 0o640)
+    client.chown(b'file', 10, 20)
+    client.utime(b'file', ns=(1_000_000_002, 3_000_000_004))
+    client.truncate(b'file', 12)
+    assert client.access(b'file', 4)
+    assert not client.access(b'denied', 4)
     for invalid in (-1, 8, True, "read"):
-        with pytest.raises(ValueError): client.access("file", invalid)
+        with pytest.raises(ValueError): client.access(b'file', invalid)
     source = bytearray(b"value")
-    client.setxattr("file", "user.key", source)
+    client.setxattr(b'file', "user.key", source)
     source[:] = b"other"
-    assert client.getxattr("file", "user.key") == b"value"
-    assert client.listxattr("file") == ["user.key"]
-    client.removexattr("file", "user.key")
+    assert client.getxattr(b'file', "user.key") == b"value"
+    assert client.listxattr(b'file') == ["user.key"]
+    client.removexattr(b'file', "user.key")
     assert client.fs_info().time_delta_ns == 1
     assert client.fs_stat().available_bytes == 500
     assert client.capabilities.named_attributes
@@ -93,8 +93,8 @@ def test_sync_metadata_xattrs_and_immutable_information():
 
 def test_utime_requires_exact_ns_tuple():
     client = Client.connect("nfs://server/export")
-    with pytest.raises(TypeError): client.utime("file", ns=[1, 2])
-    with pytest.raises(TypeError): client.utime("file", ns=(1,))
+    with pytest.raises(TypeError): client.utime(b'file', ns=[1, 2])
+    with pytest.raises(TypeError): client.utime(b'file', ns=(1,))
 
 
 def test_sync_nfsv41_dacl_and_sacl_are_typed_and_immutable():
@@ -103,14 +103,14 @@ def test_sync_nfsv41_dacl_and_sacl_are_typed_and_immutable():
         Acl41Flags.AUTO_INHERIT,
         (NfsAce(AceType.ALLOW, AceFlags.FILE_INHERIT, AceMask.READ_DATA, "EVERYONE@"),),
     )
-    client.setdacl("a/./directory", dacl)
-    assert client.getdacl("a/directory") == dacl
+    client.setdacl(b"a/./directory", dacl)
+    assert client.getdacl(b"a/directory") == dacl
     sacl = NfsAcl41(
         Acl41Flags.PROTECTED,
         (NfsAce(AceType.AUDIT, AceFlags.SUCCESSFUL_ACCESS, AceMask.WRITE_DATA, "EVERYONE@"),),
     )
-    client.setsacl("file", sacl)
-    assert client.getsacl("file") == sacl
+    client.setsacl(b'file', sacl)
+    assert client.getsacl(b'file') == sacl
     with pytest.raises(FrozenInstanceError):
         dacl.flags = Acl41Flags.DEFAULTED
 
@@ -118,23 +118,23 @@ def test_sync_nfsv41_dacl_and_sacl_are_typed_and_immutable():
 def test_async_surface_matches_sync():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        await client.chmod("file", 0o600)
-        await client.chown("file", 1, 2)
-        await client.utime("file", ns=(10, 20))
-        await client.truncate("file", 3)
-        assert await client.access("file", 6)
+        await client.chmod(b'file', 0o600)
+        await client.chown(b'file', 1, 2)
+        await client.utime(b'file', ns=(10, 20))
+        await client.truncate(b'file', 3)
+        assert await client.access(b'file', 6)
         dacl = NfsAcl41(
             Acl41Flags.PROTECTED,
             (NfsAce(AceType.DENY, AceFlags(0), AceMask.WRITE_DATA, "EVERYONE@"),),
         )
-        await client.setdacl("file", dacl)
-        assert await client.getdacl("file") == dacl
-        await client.setsacl("file", NfsAcl41(Acl41Flags(0), ()))
-        assert await client.getsacl("file") == NfsAcl41(Acl41Flags(0), ())
-        await client.setxattr("file", "user.key", memoryview(b"async"))
-        assert await client.getxattr("file", "user.key") == b"async"
-        assert await client.listxattr("file") == ["user.key"]
-        await client.removexattr("file", "user.key")
+        await client.setdacl(b'file', dacl)
+        assert await client.getdacl(b'file') == dacl
+        await client.setsacl(b'file', NfsAcl41(Acl41Flags(0), ()))
+        assert await client.getsacl(b'file') == NfsAcl41(Acl41Flags(0), ())
+        await client.setxattr(b'file', "user.key", memoryview(b"async"))
+        assert await client.getxattr(b'file', "user.key") == b"async"
+        assert await client.listxattr(b'file') == ["user.key"]
+        await client.removexattr(b'file', "user.key")
         assert (await client.fs_info()).max_file_size == 2**40
         assert (await client.fs_stat()).free_files == 60
         assert client.capabilities == Client.connect("nfs://server/export").capabilities

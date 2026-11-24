@@ -81,17 +81,17 @@ impl crate::Mount for Mount3 {
         self.m.commit(fh, offset, count).await
     }
 
-    async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes> {
+    async fn create(&self, dir_fh: Bytes, filename: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         self.m.create(dir_fh, filename, mode).await
     }
 
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes> {
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         self.m.create_path(path, mode).await
     }
 
     async fn open_path_with_options(
         &self,
-        path: &str,
+        path: &[u8],
         options: crate::OpenOptions,
     ) -> Result<crate::OpenFile> {
         crate::mount::open_path_guarded(self, path, options, |parent, name| async move {
@@ -133,7 +133,7 @@ impl crate::Mount for Mount3 {
 
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -155,41 +155,37 @@ impl crate::Mount for Mount3 {
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<crate::mount::Attr> {
         self.m.link(src_fh, dst_dir_fh, dst_filename).await
     }
 
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<crate::mount::Attr> {
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<crate::mount::Attr> {
         self.m.link_path(src_path, dst_path).await
     }
 
     async fn symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<ObjRes> {
         self.m.symlink(src_path, dst_dir_fh, dst_filename).await
     }
 
-    async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes> {
+    async fn symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<ObjRes> {
         self.m.symlink_path(src_path, dst_path).await
     }
 
-    async fn readlink(&self, fh: Bytes) -> Result<String> {
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         self.m.readlink(fh).await
     }
 
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes> {
         self.m.lookup(dir_fh, filename).await
     }
 
-    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<ObjRes> {
-        self.m.lookup_raw(dir_fh, raw_name).await
-    }
-
-    async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
+    async fn lookup_path(&self, path: &[u8]) -> Result<ObjRes> {
         self.m.lookup_path(path).await
     }
 
@@ -232,59 +228,43 @@ impl crate::Mount for Mount3 {
         self.m.readdirplus_page(dir_fh, position).await
     }
 
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes> {
         self.m.mkdir(dir_fh, dirname, mode).await
     }
 
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes> {
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes> {
         self.m.mkdir_path(path, mode).await
     }
 
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
         self.m.remove(dir_fh, filename).await
     }
 
-    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
-        self.m.remove_raw(dir_fh, raw_name).await
-    }
-
-    async fn remove_path(&self, path: &str) -> Result<()> {
+    async fn remove_path(&self, path: &[u8]) -> Result<()> {
         self.m.remove_path(path).await
     }
 
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         self.m.rmdir(dir_fh, dirname).await
     }
 
-    async fn rmdir_path(&self, path: &str) -> Result<()> {
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         self.m.rmdir_path(path).await
     }
 
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
         self.m
             .rename(from_dir_fh, from_filename, to_dir_fh, to_filename)
             .await
     }
 
-    async fn rename_raw(
-        &self,
-        from_dir_fh: Bytes,
-        from_name: Bytes,
-        to_dir_fh: Bytes,
-        to_name: Bytes,
-    ) -> Result<()> {
-        self.m
-            .rename_raw(from_dir_fh, from_name, to_dir_fh, to_name)
-            .await
-    }
-
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         self.m.rename_path(from_path, to_path).await
     }
 
@@ -598,7 +578,7 @@ mod tests {
             });
             let file = mount
                 .open_path_with_options(
-                    "parent/new",
+                    b"parent/new",
                     crate::OpenOptions {
                         access: crate::OPEN_WRITE,
                         create_mode: Some(0o666),

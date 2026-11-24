@@ -765,7 +765,7 @@ async fn default_dot_path_resolves_mount_root_without_invalid_lookup() {
     let (mount, server) = serve_v42(|tag, _| panic!("root path must not send LOOKUP: {tag}")).await;
     for path in ["", ".", "/", "./", "/./"] {
         assert_eq!(
-            mount.lookup_path(path).await.unwrap().fh,
+            mount.lookup_path((path).as_bytes()).await.unwrap().fh,
             Bytes::from_static(b"root")
         );
     }

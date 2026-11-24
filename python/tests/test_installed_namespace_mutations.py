@@ -16,18 +16,18 @@ def test_sync_namespace_and_whole_file_conveniences() -> None:
     from nfs_rs import Client
 
     client = Client.connect("nfs-test://fixture/export")
-    client.mkdir("parent/child", parents=True)
-    client.rename("old", "new")
-    client.link("new", "hard")
-    client.symlink("../raw/target", "sym")
-    assert client.readlink("sym") == "../target"
-    with client.open("whole.bin", "wb") as file:
+    client.mkdir(b'parent/child', parents=True)
+    client.rename(b'old', b'new')
+    client.link(b'new', b'hard')
+    client.symlink(b'../raw/target', b'sym')
+    assert client.readlink(b'sym') == b'../target'
+    with client.open(b'whole.bin', "wb") as file:
         assert file.write(b"contents") == 8
-    with client.open("whole.bin", "rb") as file:
+    with client.open(b'whole.bin', "rb") as file:
         assert file.read() == b"contents"
-    client.touch("empty.bin")
-    client.remove("whole.bin")
-    client.rmdir("parent/child")
+    client.touch(b'empty.bin')
+    client.remove(b'whole.bin')
+    client.rmdir(b'parent/child')
     client.close()
 
 
@@ -36,15 +36,15 @@ def test_namespace_faults_preserve_before_and_after_send_outcomes() -> None:
 
     client = Client.connect("nfs-test://fixture/export")
     with pytest.raises(RuntimeError, match="DefiniteFailure"):
-        client.remove("__before_send__")
+        client.remove(b'__before_send__')
     with pytest.raises(RuntimeError, match="Uncertain"):
-        client.rename("__after_send__", "destination")
+        client.rename(b'__after_send__', b'destination')
     with pytest.raises(NotADirectoryError):
-        client.remove("__notdir__")
+        client.remove(b'__notdir__')
     with pytest.raises(IsADirectoryError):
-        client.remove("__isdir__")
+        client.remove(b'__isdir__')
     with pytest.raises(OSError) as not_empty:
-        client.rmdir("__notempty__")
+        client.rmdir(b'__notempty__')
     assert not_empty.value.errno == errno.ENOTEMPTY
     client.close()
 
@@ -54,17 +54,17 @@ def test_async_namespace_twins() -> None:
 
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        await client.mkdir("async/child", parents=True)
-        await client.rename("from", "to")
-        await client.link("to", "hard")
-        await client.symlink("../../target", "sym")
-        assert await client.readlink("sym") == "../target"
-        async with await client.open("async.bin", "wb") as file:
+        await client.mkdir(b'async/child', parents=True)
+        await client.rename(b'from', b'to')
+        await client.link(b'to', b'hard')
+        await client.symlink(b'../../target', b'sym')
+        assert await client.readlink(b'sym') == b'../target'
+        async with await client.open(b'async.bin', "wb") as file:
             assert await file.write(b"value") == 5
-        async with await client.open("async.bin", "rb") as file:
+        async with await client.open(b'async.bin', "rb") as file:
             assert await file.read() == b"value"
-        await client.remove("async.bin")
-        await client.rmdir("async/child")
+        await client.remove(b'async.bin')
+        await client.rmdir(b'async/child')
         await client.close()
 
     import asyncio

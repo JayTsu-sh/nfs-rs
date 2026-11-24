@@ -30,12 +30,12 @@
 //! )
 //! .await?;
 //!
-//! let created = mount.create_path("hello.txt", Some(0o644)).await?;
+//! let created = mount.create_path(b"hello.txt", Some(0o644)).await?;
 //! nfs_rs::write_all(&*mount, created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
 //!     .await?;
 //! mount.close(created.fh).await?;
 //!
-//! let opened = mount.open_path("hello.txt", OPEN_READ).await?;
+//! let opened = mount.open_path(b"hello.txt", OPEN_READ).await?;
 //! let contents = mount.read(opened.fh.clone(), 0, 9).await?;
 //! mount.close(opened.fh).await?;
 //! assert_eq!(&contents[..], b"hello NFS");
@@ -465,7 +465,7 @@ fn export_listing_url(host: &str) -> String {
 /// ```no_run
 /// async fn example() {
 ///     let mount = nfs_rs::parse_url_and_mount("nfs://127.0.0.1/some/export?version=4.1,4.0,3").await.unwrap();
-///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
+///     if let Some(res) = mount.create_path(b"nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
 ///         let num_bytes_written = nfs_rs::write_all(&*mount, res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
@@ -760,38 +760,49 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
     NfsError::Rpc(msg)
 }
 
-fn split_path(path: &str) -> Result<(String, String)> {
-    let cleaned = path_clean::clean(format!("/=/{}", path));
-    if !cleaned.starts_with("/=/") {
-        return Err(NfsError::InvalidInput("invalid path specified".to_string()));
+/// Normalize export-relative byte components without interpreting a character set.
+fn path_components(path: &[u8]) -> Result<Vec<&[u8]>> {
+    if path.contains(&0) {
+        return Err(NfsError::InvalidInput("NFS path contains NUL".into()));
     }
-    if cleaned.eq(std::path::Path::new("/=/")) {
-        return Ok(("/".to_string(), "".to_string()));
+    let mut parts = Vec::new();
+    for part in path.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                if parts.pop().is_none() {
+                    return Err(NfsError::InvalidInput("invalid path specified".into()));
+                }
+            }
+            _ => parts.push(part),
+        }
     }
-    let dir = cleaned
-        .parent()
-        .map(|x| {
-            let path_str = x.to_string_lossy();
-            let trimmed = &path_str[2..];
-            #[cfg(windows)]
-            {
-                // Windows platform: replace backslashes with forward slashes
-                trimmed.replace('\\', "/")
-            }
-            #[cfg(not(windows))]
-            {
-                // Non-Windows platform: keep original separators
-                trimmed.to_string()
-            }
-        })
-        .ok_or_else(|| NfsError::InvalidInput("invalid path specified".to_string()))?;
+    Ok(parts)
+}
 
-    let name = cleaned
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    Ok((dir, name))
+/// LOOKUP may explicitly address a parent; keep leading parent components.
+fn lookup_components(path: &[u8]) -> Result<Vec<&[u8]>> {
+    if path.contains(&0) {
+        return Err(NfsError::InvalidInput("NFS path contains NUL".into()));
+    }
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in path.split(|byte| *byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." if parts.last().is_some_and(|last| *last != b"..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    Ok(parts)
+}
+
+fn split_path(path: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut parts = path_components(path)?;
+    let name = parts.pop().unwrap_or_default().to_vec();
+    let directory = [b"/".as_slice(), parts.join(&b'/').as_slice()].concat();
+    Ok((directory, name))
 }
 
 #[cfg(test)]
@@ -1287,27 +1298,27 @@ mod tests {
     #[test]
     fn split_path_empty_path() {
         let path = "";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_ok());
         let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/".to_string());
-        assert_eq!(name, "".to_string());
+        assert_eq!(dir, "/".as_bytes().to_vec());
+        assert_eq!(name, "".as_bytes().to_vec());
     }
 
     #[test]
     fn split_path_root_path() {
         let path = "/";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_ok());
         let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/".to_string());
-        assert_eq!(name, "".to_string());
+        assert_eq!(dir, "/".as_bytes().to_vec());
+        assert_eq!(name, "".as_bytes().to_vec());
     }
 
     #[test]
     fn split_path_sneaky_one() {
         let path = "..";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
@@ -1316,7 +1327,7 @@ mod tests {
     #[test]
     fn split_path_sneaky_two() {
         let path = "/first/../..";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
@@ -1325,21 +1336,21 @@ mod tests {
     #[test]
     fn split_path_path_depth_one() {
         let path = "/first/place/";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_ok());
         let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/first".to_string());
-        assert_eq!(name, "place".to_string());
+        assert_eq!(dir, "/first".as_bytes().to_vec());
+        assert_eq!(name, "place".as_bytes().to_vec());
     }
 
     #[test]
     fn split_path_path_depth_two() {
         let path = "/first/place/1999.txt";
-        let res = split_path(path);
+        let res = split_path((path).as_bytes());
         assert!(res.is_ok());
         let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/first/place".to_string());
-        assert_eq!(name, "1999.txt".to_string());
+        assert_eq!(dir, "/first/place".as_bytes().to_vec());
+        assert_eq!(name, "1999.txt".as_bytes().to_vec());
     }
 
     #[test]

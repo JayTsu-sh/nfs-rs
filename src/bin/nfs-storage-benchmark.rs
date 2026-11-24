@@ -143,9 +143,9 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
             let hardlink = format!("{directory}/payload.hardlink");
             let symlink = format!("{directory}/payload.symlink");
             for stale in [&name, &renamed, &hardlink, &symlink] {
-                let _ = mount.remove_path(stale).await;
+                let _ = mount.remove_path((stale).as_bytes()).await;
             }
-            let _ = mount.rmdir_path(&directory).await;
+            let _ = mount.rmdir_path((directory).as_bytes()).await;
 
             let sample_result: AnyResult<Sample> = async {
                 let started = Instant::now();
@@ -158,16 +158,16 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 mount.fsstat().await?;
                 let fsstat_ms = millis(started);
                 let started = Instant::now();
-                let directory_obj = mount.mkdir_path(&directory, 0o700).await?;
+                let directory_obj = mount.mkdir_path((directory).as_bytes(), 0o700).await?;
                 let mkdir_ms = millis(started);
 
                 let started = Instant::now();
-                let created = mount.create_path(&name, Some(0o600)).await?;
+                let created = mount.create_path((name).as_bytes(), Some(0o600)).await?;
                 let create_ms = millis(started);
 
                 let started = Instant::now();
                 mount
-                    .lookup(directory_obj.fh.clone(), "payload.bin")
+                    .lookup(directory_obj.fh.clone(), b"payload.bin")
                     .await?;
                 let lookup_ms = millis(started);
                 let started = Instant::now();
@@ -223,7 +223,7 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 let close_ms = millis(started);
 
                 let started = Instant::now();
-                let opened = mount.open_path(&name, OPEN_READ).await?;
+                let opened = mount.open_path((name).as_bytes(), OPEN_READ).await?;
                 let open_ms = millis(started);
                 let started = Instant::now();
                 let mut actual = BytesMut::with_capacity(payload.len());
@@ -246,13 +246,19 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 }
 
                 let started = Instant::now();
-                mount.rename_path(&name, &renamed).await?;
+                mount
+                    .rename_path((name).as_bytes(), (renamed).as_bytes())
+                    .await?;
                 let rename_ms = millis(started);
                 let started = Instant::now();
-                mount.link_path(&renamed, &hardlink).await?;
+                mount
+                    .link_path((renamed).as_bytes(), (hardlink).as_bytes())
+                    .await?;
                 let link_ms = millis(started);
                 let started = Instant::now();
-                let symlink_obj = mount.symlink_path("renamed.bin", &symlink).await?;
+                let symlink_obj = mount
+                    .symlink_path(b"renamed.bin", (symlink).as_bytes())
+                    .await?;
                 let symlink_ms = millis(started);
                 let started = Instant::now();
                 let target = mount.readlink(symlink_obj.fh).await?;
@@ -265,13 +271,13 @@ async fn run(fas_mode: bool) -> AnyResult<bool> {
                 while entries.try_next().await?.is_some() {}
                 let readdir_ms = millis(started);
 
-                mount.remove_path(&hardlink).await?;
-                mount.remove_path(&symlink).await?;
+                mount.remove_path((hardlink).as_bytes()).await?;
+                mount.remove_path((symlink).as_bytes()).await?;
                 let started = Instant::now();
-                mount.remove_path(&renamed).await?;
+                mount.remove_path((renamed).as_bytes()).await?;
                 let remove_ms = millis(started);
                 let started = Instant::now();
-                mount.rmdir_path(&directory).await?;
+                mount.rmdir_path((directory).as_bytes()).await?;
                 let rmdir_ms = millis(started);
                 Ok(Sample {
                     null_ms,
@@ -579,7 +585,7 @@ async fn cleanup_sample<'a>(
     paths: impl IntoIterator<Item = &'a String>,
 ) {
     for path in paths {
-        let _ = mount.remove_path(path).await;
+        let _ = mount.remove_path((path).as_bytes()).await;
     }
-    let _ = mount.rmdir_path(directory).await;
+    let _ = mount.rmdir_path((directory).as_bytes()).await;
 }

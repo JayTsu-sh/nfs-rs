@@ -1,3 +1,4 @@
+from byte_paths import BytesPath
 import asyncio
 import sys
 from pathlib import Path
@@ -35,29 +36,29 @@ class SyncInner:
         self.closed = True
 
     def stat(self, path):
-        if path == "missing":
+        if path == b'missing':
             raise FileNotFoundError(path)
-        if path == "denied":
+        if path == b'denied':
             raise PermissionError(path)
         return dict(INFO)
 
     def scandir(self, _path, fh=None):
         self.last_scan = (_path, fh)
-        yield [{"name": "first", "info": dict(INFO), "fh": b"child-fh\0"}]
-        if _path == "denied-directory":
+        yield [{"name": b'first', "info": dict(INFO), "fh": b"child-fh\0"}]
+        if _path == b'denied-directory':
             raise PermissionError(_path)
-        yield [{"name": "second", "info": {**INFO, "fileid": 10}}]
+        yield [{"name": b'second', "info": {**INFO, "fileid": 10}}]
 
     def listdir(self, path):
         self.last_listdir = path
-        if path == "denied-directory":
+        if path == b'denied-directory':
             raise PermissionError(path)
-        return ["first", "second"]
+        return [b'first', b'second']
 
     def scandir_page(self, path, fh, cookie, verifier):
         self.last_page = (path, fh, cookie, verifier)
         return {
-            "entries": [{"name": f"entry-{cookie}", "info": dict(INFO), "fh": b"child-fh\0"}],
+            "entries": [{"name": (f"entry-{cookie}").encode("utf-8"), "info": dict(INFO), "fh": b"child-fh\0"}],
             "cookie": cookie + 1,
             "verifier": b"verifier",
             "eof": cookie >= 1,
@@ -83,10 +84,10 @@ class AsyncInner(SyncInner):
 
     async def scandir(self, _path, fh=None):
         self.last_scan = (_path, fh)
-        yield [{"name": "first", "info": dict(INFO), "fh": b"child-fh\0"}]
-        if _path == "denied-directory":
+        yield [{"name": b'first', "info": dict(INFO), "fh": b"child-fh\0"}]
+        if _path == b'denied-directory':
             raise PermissionError(_path)
-        yield [{"name": "second", "info": {**INFO, "fileid": 10}}]
+        yield [{"name": b'second', "info": {**INFO, "fileid": 10}}]
 
 
 fake = ModuleType("nfs_rs._internal")
@@ -109,18 +110,18 @@ def fake_adapter(monkeypatch):
     monkeypatch.setitem(sys.modules, "nfs_rs._internal", fake)
 
 
-@pytest.mark.parametrize("value", ["a/./b", "/a/b", Path("a/b"), "a/c/../b"])
+@pytest.mark.parametrize("value", [b'a/./b', b"/a/b", BytesPath(b'a/b'), b"a/c/../b"])
 def test_paths_normalize_with_export_relative_posix_semantics(value):
     client = Client.connect("nfs://server/export")
     info = client.stat(value)
     assert info.type is FileType.FILE
-    assert info.path == "a/b"
+    assert info.path == b'a/b'
     assert (info.atime, info.mtime, info.ctime) == (1_000_000_002, 3_000_000_004, 5_000_000_006)
     assert info.owner is None
     assert info.group is None
 
 
-@pytest.mark.parametrize("value", [b"bytes", "bad\0name", "../escape", "a/../../escape"])
+@pytest.mark.parametrize("value", ["text", b"bad\0name", b"../escape", b"a/../../escape"])
 def test_invalid_paths_fail_before_adapter(value):
     client = Client.connect("nfs://server/export")
     with pytest.raises((TypeError, ValueError)):
@@ -129,49 +130,49 @@ def test_invalid_paths_fail_before_adapter(value):
 
 def test_exists_suppresses_only_not_found():
     client = Client.connect("nfs://server/export")
-    assert not client.exists("missing")
+    assert not client.exists(b'missing')
     with pytest.raises(PermissionError):
-        client.exists("denied")
+        client.exists(b'denied')
 
 
 def test_sync_scandir_is_lazy_and_entries_carry_metadata():
     client = Client.connect("nfs://server/export")
-    entries = client.scandir("folder")
+    entries = client.scandir(b'folder')
     first = next(entries)
-    assert first.name == "first"
-    assert first.path == "folder/first"
+    assert first.name == b'first'
+    assert first.path == b'folder/first'
     assert first.info.path == first.path
     assert first.info.fileid == 9
-    assert [entry.name for entry in entries] == ["second"]
-    assert client.listdir("folder") == ["first", "second"]
+    assert [entry.name for entry in entries] == [b'second']
+    assert client.listdir(b'folder') == [b'first', b'second']
 
 
 def test_async_operations_match_sync_contract():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        assert (await client.stat("a/../file")).fileid == 9
-        assert not await client.exists("missing")
-        assert [entry.name async for entry in client.scandir("folder")] == ["first", "second"]
-        assert await client.listdir("folder") == ["first", "second"]
+        assert (await client.stat(b'a/../file')).fileid == 9
+        assert not await client.exists(b'missing')
+        assert [entry.name async for entry in client.scandir(b'folder')] == [b'first', b'second']
+        assert await client.listdir(b'folder') == [b'first', b'second']
 
     asyncio.run(scenario())
 
 
 def test_listdir_uses_name_only_adapter_and_normalizes_paths():
     client = Client.connect("nfs://server/export")
-    assert client.listdir(Path("a/./b")) == ["first", "second"]
-    assert client._inner.last_listdir == "a/b"
+    assert client.listdir(BytesPath(b'a/./b')) == [b'first', b'second']
+    assert client._inner.last_listdir == b'a/b'
     assert not hasattr(client._inner, "last_scan")
     with pytest.raises(PermissionError):
-        client.listdir("denied-directory")
+        client.listdir(b'denied-directory')
 
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        assert await client.listdir(Path("a/./b")) == ["first", "second"]
-        assert client._inner.last_listdir == "a/b"
+        assert await client.listdir(BytesPath(b'a/./b')) == [b'first', b'second']
+        assert client._inner.last_listdir == b'a/b'
         assert not hasattr(client._inner, "last_scan")
         with pytest.raises(PermissionError):
-            await client.listdir("denied-directory")
+            await client.listdir(b'denied-directory')
 
     asyncio.run(scenario())
 
@@ -184,18 +185,18 @@ def test_export_discovery_has_matching_sync_and_async_values():
 def test_sync_and_async_permission_and_mid_stream_errors_match():
     sync_client = Client.connect("nfs://server/export")
     with pytest.raises(PermissionError):
-        sync_client.stat("denied")
-    sync_entries = sync_client.scandir("denied-directory")
-    assert next(sync_entries).name == "first"
+        sync_client.stat(b'denied')
+    sync_entries = sync_client.scandir(b'denied-directory')
+    assert next(sync_entries).name == b'first'
     with pytest.raises(PermissionError):
         next(sync_entries)
 
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
         with pytest.raises(PermissionError):
-            await client.stat("denied")
-        entries = client.scandir("denied-directory")
-        assert (await anext(entries)).name == "first"
+            await client.stat(b'denied')
+        entries = client.scandir(b'denied-directory')
+        assert (await anext(entries)).name == b'first'
         with pytest.raises(PermissionError):
             await anext(entries)
 
@@ -206,15 +207,15 @@ def test_sync_and_async_permission_and_mid_stream_errors_match():
 def test_scandir_accepts_directory_reference_and_preserves_child_handles(fh):
     from nfs_rs import DirectoryRef
     client = Client.connect("nfs://server/export")
-    entries = list(client.scandir(DirectoryRef(Path("a/./b"), fh)))
-    assert client._inner.last_scan == ("a/b", fh)
+    entries = list(client.scandir(DirectoryRef(BytesPath(b'a/./b'), fh)))
+    assert client._inner.last_scan == (b'a/b', fh)
     assert entries[0].fh == b"child-fh\0"
-    assert entries[0].path == "a/b/first"
+    assert entries[0].path == b'a/b/first'
     list(client.scandir(entries[0]))
-    assert client._inner.last_scan == ("a/b/first", b"child-fh\0")
+    assert client._inner.last_scan == (b"a/b/first", b"child-fh\0")
     assert entries[1].fh is None
     list(client.scandir(entries[1]))
-    assert client._inner.last_scan == ("a/b/second", None)
+    assert client._inner.last_scan == (b"a/b/second", None)
 
 
 def test_async_scandir_accepts_references_and_returned_entries():
@@ -222,12 +223,12 @@ def test_async_scandir_accepts_references_and_returned_entries():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
         for fh in (None, b"opaque-fh"):
-            entries = [entry async for entry in client.scandir(DirectoryRef("a/./b", fh))]
-            assert client._inner.last_scan == ("a/b", fh)
+            entries = [entry async for entry in client.scandir(DirectoryRef(b'a/./b', fh))]
+            assert client._inner.last_scan == (b'a/b', fh)
             assert entries[0].fh == b"child-fh\0"
             children = [entry async for entry in client.scandir(entries[0])]
-            assert client._inner.last_scan == ("a/b/first", b"child-fh\0")
-            assert children[0].path == "a/b/first/first"
+            assert client._inner.last_scan == (b"a/b/first", b"child-fh\0")
+            assert children[0].path == b'a/b/first/first'
     asyncio.run(scenario())
 
 
@@ -236,11 +237,11 @@ def test_scandir_rejects_invalid_handles(fh, error):
     from nfs_rs import DirectoryRef
     client = Client.connect("nfs://server/export")
     with pytest.raises(error, match="fh"):
-        client.scandir(DirectoryRef("folder", fh))
+        client.scandir(DirectoryRef(b'folder', fh))
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
         with pytest.raises(error, match="fh"):
-            _ = [entry async for entry in client.scandir(DirectoryRef("folder", fh))]
+            _ = [entry async for entry in client.scandir(DirectoryRef(b'folder', fh))]
     asyncio.run(scenario())
 
 
@@ -248,21 +249,21 @@ def test_scandir_page_passes_position_and_returns_resumable_pages():
     from nfs_rs import DirectoryCookie, DirectoryPage, DirectoryRef
 
     client = Client.connect("nfs://server/export")
-    first = client.scandir_page("a/./b")
-    assert client._inner.last_page == ("a/b", None, 0, bytes(8))
+    first = client.scandir_page(b'a/./b')
+    assert client._inner.last_page == (b'a/b', None, 0, bytes(8))
     assert isinstance(first, DirectoryPage)
-    assert [entry.path for entry in first.entries] == ["a/b/entry-0"]
+    assert [entry.path for entry in first.entries] == [b'a/b/entry-0']
     assert first.entries[0].fh == b"child-fh\0"
     assert first.next == DirectoryCookie(1, b"verifier")
     assert not first.eof
-    last = client.scandir_page(DirectoryRef("a/b", b"dir-fh"), first.next)
-    assert client._inner.last_page == ("a/b", b"dir-fh", 1, b"verifier")
+    last = client.scandir_page(DirectoryRef(b'a/b', b"dir-fh"), first.next)
+    assert client._inner.last_page == (b'a/b', b"dir-fh", 1, b"verifier")
     assert last.eof
 
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        page = await client.scandir_page("a/b", DirectoryCookie(1, b"verifier"))
-        assert client._inner.last_page == ("a/b", None, 1, b"verifier")
+        page = await client.scandir_page(b'a/b', DirectoryCookie(1, b"verifier"))
+        assert client._inner.last_page == (b'a/b', None, 1, b"verifier")
         assert page.eof and page.next == DirectoryCookie(2, b"verifier")
 
     asyncio.run(scenario())
@@ -287,5 +288,5 @@ def test_scandir_page_rejects_invalid_positions_before_adapter(position, error):
         position = DirectoryCookie(**position)
     client = Client.connect("nfs://server/export")
     with pytest.raises(error):
-        client.scandir_page("folder", position)
+        client.scandir_page(b'folder', position)
     assert not hasattr(client._inner, "last_page")

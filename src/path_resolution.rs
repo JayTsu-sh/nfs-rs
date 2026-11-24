@@ -35,7 +35,7 @@ pub enum PathResolutionStatus {
 pub struct PathResolution {
     pub status: PathResolutionStatus,
     /// Canonical export-relative path, present only for `Resolved` (`.` for root).
-    pub path: Option<String>,
+    pub path: Option<Bytes>,
     /// Final handle and attributes, present only for `Resolved`.
     pub object: Option<ObjRes>,
 }
@@ -64,8 +64,8 @@ impl PathResolution {
 #[async_trait]
 pub(crate) trait Namespace: Sync {
     async fn root(&self) -> Result<Node>;
-    async fn child(&self, directory: Bytes, name: &str) -> Result<Node>;
-    async fn link_text(&self, fh: Bytes) -> Result<String>;
+    async fn child(&self, directory: Bytes, name: &[u8]) -> Result<Node>;
+    async fn link_text(&self, fh: Bytes) -> Result<Bytes>;
 }
 
 pub(crate) struct Node {
@@ -93,14 +93,14 @@ async fn complete_node<M: Mount + ?Sized>(mount: &M, object: ObjRes) -> Result<N
 impl<M: Mount + ?Sized> Namespace for M {
     async fn root(&self) -> Result<Node> {
         // Empty path selects the mounted root in every protocol engine.
-        complete_node(self, self.lookup_path("").await?).await
+        complete_node(self, self.lookup_path(b"").await?).await
     }
 
-    async fn child(&self, directory: Bytes, name: &str) -> Result<Node> {
+    async fn child(&self, directory: Bytes, name: &[u8]) -> Result<Node> {
         complete_node(self, self.lookup(directory, name).await?).await
     }
 
-    async fn link_text(&self, fh: Bytes) -> Result<String> {
+    async fn link_text(&self, fh: Bytes) -> Result<Bytes> {
         self.readlink(fh).await
     }
 }
@@ -116,45 +116,48 @@ fn unavailable(error: &NfsError) -> Option<PathResolutionStatus> {
 }
 
 fn prepend(
-    text: &str,
-    pending: &mut VecDeque<String>,
+    text: &[u8],
+    pending: &mut VecDeque<Bytes>,
     bytes: &mut usize,
     components: &mut usize,
 ) -> Result<()> {
     *bytes = bytes.saturating_add(text.len());
     if *bytes > MAX_PATH_BYTES {
         return Err(NfsError::InvalidInput(
-            "path resolution exceeds 64 KiB of cumulative path text".into(),
+            "path resolution exceeds 64 KiB of cumulative path bytes".into(),
         ));
     }
-    let count =
-        text.split('/').filter(|part| !part.is_empty()).count() + usize::from(text.ends_with('/'));
+    let count = text
+        .split(|b| *b == b'/')
+        .filter(|part| !part.is_empty())
+        .count()
+        + usize::from(text.ends_with(b"/"));
     *components = components.saturating_add(count);
     if *components > MAX_COMPONENTS {
         return Err(NfsError::InvalidInput(
             "path resolution exceeds 4096 cumulative components".into(),
         ));
     }
-    if text.contains('\0') {
+    if text.contains(&0) {
         return Err(NfsError::InvalidInput(
-            "path resolution text contains NUL".into(),
+            "path resolution path contains NUL".into(),
         ));
     }
     // A trailing slash requires a directory, even when the last name is a link.
-    if text.ends_with('/') {
-        pending.push_front(".".into());
+    if text.ends_with(b"/") {
+        pending.push_front(Bytes::from_static(b"."));
     }
-    for part in text.rsplit('/').filter(|part| !part.is_empty()) {
-        pending.push_front(part.into());
+    for part in text.rsplit(|b| *b == b'/').filter(|part| !part.is_empty()) {
+        pending.push_front(Bytes::copy_from_slice(part));
     }
     Ok(())
 }
 
 pub(crate) async fn resolve<N: Namespace + ?Sized>(
     namespace: &N,
-    path: &str,
+    path: &[u8],
 ) -> Result<PathResolution> {
-    if path.starts_with('/') {
+    if path.starts_with(b"/") {
         return Err(NfsError::InvalidInput(
             "resolve paths must be export-relative".into(),
         ));
@@ -162,7 +165,7 @@ pub(crate) async fn resolve<N: Namespace + ?Sized>(
     let mut pending = VecDeque::new();
     let (mut bytes, mut components) = (0, 0);
     prepend(path, &mut pending, &mut bytes, &mut components)?;
-    let mut stack = vec![(String::new(), namespace.root().await?)];
+    let mut stack = vec![(Bytes::new(), namespace.root().await?)];
     let mut links = 0;
     while let Some(name) = pending.pop_front() {
         let Some((_, directory)) = stack.last() else {
@@ -173,9 +176,9 @@ pub(crate) async fn resolve<N: Namespace + ?Sized>(
                 PathResolutionStatus::NotDirectory,
             ));
         }
-        match name.as_str() {
-            "." => continue,
-            ".." => {
+        match name.as_ref() {
+            b"." => continue,
+            b".." => {
                 if stack.len() == 1 {
                     return Ok(PathResolution::unresolved(
                         PathResolutionStatus::OutsideMount,
@@ -204,7 +207,7 @@ pub(crate) async fn resolve<N: Namespace + ?Sized>(
             prepend(&target, &mut pending, &mut bytes, &mut components)?;
             // Absolute links refer to the client's root namespace, which this
             // userspace mount cannot map. Never reinterpret them as export-relative.
-            if target.starts_with('/') {
+            if target.starts_with(b"/") {
                 return Ok(PathResolution::unresolved(
                     PathResolutionStatus::OutsideMount,
                 ));
@@ -219,9 +222,9 @@ pub(crate) async fn resolve<N: Namespace + ?Sized>(
     let resolved_path = stack
         .iter()
         .skip(1)
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.as_ref())
         .collect::<Vec<_>>()
-        .join("/");
+        .join(&b'/');
     let Some((_, node)) = stack.pop() else {
         return Err(NfsError::Xdr(
             "path resolution lost its final object".into(),
@@ -230,9 +233,9 @@ pub(crate) async fn resolve<N: Namespace + ?Sized>(
     Ok(PathResolution {
         status: PathResolutionStatus::Resolved,
         path: Some(if resolved_path.is_empty() {
-            ".".into()
+            Bytes::from_static(b".")
         } else {
-            resolved_path
+            Bytes::from(resolved_path)
         }),
         object: Some(ObjRes {
             fh: node.fh,

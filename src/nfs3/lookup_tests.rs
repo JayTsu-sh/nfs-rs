@@ -30,12 +30,12 @@ fn push_opaque(reply: &mut Vec<u8>, value: &[u8]) {
 
 // Use the real Mount/RPC encoder, as in readlink and retry tests. No mount or
 // portmapper exchange is needed for this isolated LOOKUP name/FH regression.
-async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCall>) {
+async fn resolve(path: &[u8], fail_first: bool) -> (Result<ObjRes>, Vec<LookupCall>) {
     resolve_with_raw(path, fail_first, None).await
 }
 
 async fn resolve_with_raw(
-    path: &str,
+    path: &[u8],
     fail_first: bool,
     raw_name: Option<Bytes>,
 ) -> (Result<ObjRes>, Vec<LookupCall>) {
@@ -99,7 +99,7 @@ async fn resolve_with_raw(
     };
     let result = timeout(Duration::from_secs(2), async {
         if let Some(raw_name) = raw_name {
-            mount.lookup_raw(Bytes::from_static(&[0]), raw_name).await
+            mount.lookup(Bytes::from_static(&[0]), &raw_name).await
         } else {
             mount.lookup_path(path).await
         }
@@ -120,14 +120,14 @@ async fn lookup_raw_distinguishes_non_utf8_from_literal_v3() {
             b"~nfs-rs-raw:FF".as_slice(),
         ),
     ] {
-        let (result, calls) = resolve_with_raw("", false, Some(name)).await;
+        let (result, calls) = resolve_with_raw(b"", false, Some(name)).await;
         assert!(result.is_ok());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, expected);
     }
 }
 
-async fn assert_resolved(path: &str, names: &[&str]) {
+async fn assert_resolved(path: &[u8], names: &[&str]) {
     let (result, calls) = resolve(path, false).await;
     assert_eq!(
         calls,
@@ -149,7 +149,7 @@ async fn assert_resolved(path: &str, names: &[&str]) {
 async fn lookup_path_preserves_literal_backslash_v3() {
     // RFC 1813 §§3.2/3.3.3: LOOKUP selects the named entry. On Unix a
     // backslash is a Normal path component, not a root separator to skip.
-    assert_resolved("\\", &["\\"]).await;
+    assert_resolved(b"\\", &["\\"]).await;
 }
 
 #[cfg(unix)]
@@ -159,7 +159,7 @@ async fn lookup_path_preserves_nested_backslash_v3() {
         ("/\\/leaf", vec!["\\", "leaf"]),
         ("folder/\\/leaf", vec!["folder", "\\", "leaf"]),
     ] {
-        assert_resolved(path, &names).await;
+        assert_resolved((path).as_bytes(), &names).await;
     }
 }
 
@@ -172,7 +172,7 @@ async fn lookup_path_skips_windows_root_v3() {
 #[tokio::test]
 async fn lookup_path_keeps_existing_normalization_v3() {
     for path in ["", "/", ".", "./", "/./", "folder/.."] {
-        assert_resolved(path, &[]).await;
+        assert_resolved((path).as_bytes(), &[]).await;
     }
     for (path, names) in [
         ("folder/leaf", vec!["folder", "leaf"]),
@@ -180,13 +180,13 @@ async fn lookup_path_keeps_existing_normalization_v3() {
         ("../leaf", vec!["..", "leaf"]),
         ("folder/../../leaf", vec!["..", "leaf"]),
     ] {
-        assert_resolved(path, &names).await;
+        assert_resolved((path).as_bytes(), &names).await;
     }
 }
 
 #[tokio::test]
 async fn lookup_path_preserves_first_error_v3() {
-    let (result, calls) = resolve("missing/leaf", true).await;
+    let (result, calls) = resolve(b"missing/leaf", true).await;
     assert!(matches!(
         result,
         Err(NfsError::Nfs3(super::super::nfsstat3::NFS3ERR_NOENT))
@@ -197,5 +197,25 @@ async fn lookup_path_preserves_first_error_v3() {
             parent: vec![0],
             name: b"missing".to_vec(),
         }]
+    );
+}
+
+#[tokio::test]
+async fn byte_path_lookup_preserves_each_component_without_text_conversion() {
+    let path = b"\xff/\xfe\\line\n";
+    let (result, calls) = resolve(path, false).await;
+    assert!(result.is_ok());
+    assert_eq!(
+        calls,
+        vec![
+            LookupCall {
+                parent: vec![0],
+                name: b"\xff".to_vec()
+            },
+            LookupCall {
+                parent: vec![1],
+                name: b"\xfe\\line\n".to_vec()
+            },
+        ]
     );
 }

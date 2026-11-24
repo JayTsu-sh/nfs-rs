@@ -116,10 +116,10 @@ impl Mount41 {
     pub(crate) async fn open(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         access: u32,
     ) -> Result<mount::ObjRes> {
-        self.open_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()), access)
+        self.open_raw(dir_fh, Bytes::copy_from_slice(filename), access)
             .await
     }
 
@@ -203,7 +203,7 @@ impl Mount41 {
         }
     }
 
-    pub(crate) async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+    pub(crate) async fn open_path(&self, path: &[u8], access: u32) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(path)?;
         let dir_obj = self.lookup_path(&dir).await?;
         self.open(dir_obj.fh, &name, access).await
@@ -241,7 +241,7 @@ impl Mount41 {
     pub(crate) async fn create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
         self.create_with_access(dir_fh, filename, mode, crate::OPEN_BOTH)
@@ -251,7 +251,7 @@ impl Mount41 {
     pub(crate) async fn create_with_access(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::ObjRes> {
@@ -276,7 +276,7 @@ impl Mount41 {
             create: true,
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
-            claim_file: Bytes::copy_from_slice(filename.as_bytes()),
+            claim_file: Bytes::copy_from_slice(filename),
             want_no_delegation: !self.retain_delegations,
         };
         let resp = self
@@ -334,7 +334,11 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    pub(crate) async fn create_path(
+        &self,
+        path: &[u8],
+        mode: Option<u32>,
+    ) -> Result<mount::ObjRes> {
         self.create_path_with_access(path, mode, crate::OPEN_BOTH)
             .await
     }
@@ -342,7 +346,7 @@ impl Mount41 {
     pub(crate) async fn create_guarded(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
@@ -376,7 +380,7 @@ impl Mount41 {
                 create: true,
                 create_attrs_mask: mask,
                 create_attrs_vals: values,
-                claim_file: Bytes::copy_from_slice(filename.as_bytes()),
+                claim_file: Bytes::copy_from_slice(filename),
                 want_no_delegation: !self.retain_delegations,
             };
             // Preserve OPEN progress: a failure in GETFH/GETATTR cannot authorize
@@ -460,7 +464,7 @@ impl Mount41 {
 
     pub(crate) async fn create_path_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::ObjRes> {
@@ -473,7 +477,7 @@ impl Mount41 {
     pub(crate) async fn mkdir(
         &self,
         dir_fh: Bytes,
-        dirname: &str,
+        dirname: &[u8],
         mode: u32,
     ) -> Result<mount::ObjRes> {
         // 不在 CREATE createattrs 传 mode，避免 NFS4ERR_ATTRNOTSUPP；创建后 SETATTR 设置。
@@ -520,7 +524,7 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+    pub(crate) async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let (dir, name) = crate::split_path(path)?;
         let dir_obj = self.lookup_path(&dir).await?;
         self.mkdir(dir_obj.fh, &name, mode).await

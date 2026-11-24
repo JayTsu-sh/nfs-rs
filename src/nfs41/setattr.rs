@@ -50,7 +50,7 @@ impl Mount41 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,

@@ -108,25 +108,26 @@ from nfs_rs import Client
 url = "nfs://server.example.com/export?version=4.1&noresvport=true"
 
 with Client.connect(url, connect_timeout=10, operation_timeout=30) as client:
-    client.mkdir("incoming", parents=True, exist_ok=True)
-    with client.open("incoming/hello.txt", "wb") as file:
+    client.mkdir(b"incoming", parents=True, exist_ok=True)
+    with client.open(b"incoming/hello.txt", "wb") as file:
         written = file.write(b"hello NFS")
     assert written == 9
 
-    info = client.stat("incoming/hello.txt")
+    info = client.stat(b"incoming/hello.txt")
     print(info.size, info.mode, info.uid, info.gid)
     print(info.atime, info.mtime, info.ctime)  # Integer nanoseconds since Unix epoch.
 
-    with client.open("incoming/hello.txt", "rb") as source:
+    with client.open(b"incoming/hello.txt", "rb") as source:
         assert source.read(5) == b"hello"
         assert source.read_at(6, 3) == b"NFS"
 
-    for entry in client.scandir("incoming"):
+    for entry in client.scandir(b"incoming"):
         print(entry.name, entry.info.size)
 ```
 
-Paths are relative to the export root. Absolute paths, `..` escapes, NUL bytes,
-and byte-string paths are rejected. File modes are binary: `rb`, `wb`, `ab`,
+Paths are relative to the export root and use `bytes` or `os.PathLike[bytes]`.
+Text paths, absolute paths, `..` escapes, and NUL bytes are rejected.
+File modes are binary: `rb`, `wb`, `ab`,
 `r+b`, `w+b`, and `a+b`.
 
 `FileInfo.atime`, `mtime`, and `ctime` are integer nanoseconds since the Unix
@@ -143,7 +144,7 @@ final object; ordinary files and directories return their own information.
 from nfs_rs import Client
 
 with Client.connect("nfs://server/export?version=4.1", operation_timeout=10) as client:
-    result = client.resolve("links/latest")
+    result = client.resolve(b"links/latest")
     if result.exists is True:
         print(result.path, result.info.type, result.info.size)
     elif result.exists is False:
@@ -164,17 +165,17 @@ Use `await client.resolve(path)` with `AsyncClient`. `PathResolution` exposes
 | `TOO_MANY_SYMLINKS` | `None` | `None` |
 
 For `links/latest -> ../data/report.csv`, a successful `result.path` is
-`data/report.csv`. `readlink("links/latest")` returns the original
-`../data/report.csv` text. `stat` and `exists` continue to inspect the link itself,
+`b"data/report.csv"`. `readlink(b"links/latest")` returns the original
+`b"../data/report.csv"` target. `stat` and `exists` continue to inspect the link itself,
 so a dangling link can pass `exists`; use `resolve` to check its target.
 
 An absolute target or traversal outside the mounted root is `OUTSIDE_MOUNT`,
 which does not prove that the target is broken. More than 40 links is
 `TOO_MANY_SYMLINKS`, possibly a cycle. Relative targets start at their containing
 directory; `..` and trailing slashes are evaluated during traversal. Limits are
-4096 cumulative components and 64 KiB of cumulative UTF-8 text. Permission,
-connection, timeout, stale-handle and encoding failures raise typed exceptions.
-Non-UTF-8 targets raise `NfsEncodingError` instead of selecting a replacement name.
+4096 cumulative components and 64 KiB of cumulative path bytes. Permission,
+connection, timeout and stale-handle failures raise typed exceptions. Non-UTF-8
+targets remain byte paths and can be passed back to file operations unchanged.
 The result reports existence at observation time; it does not check read/write
 access or guarantee a subsequent open.
 
@@ -267,8 +268,8 @@ buffer = bytearray(40 * 1024 * 1024)  # Caller-selected size, not a library defa
 
 with Client.connect(url, operation_timeout=120) as client:
     print(client.io_limits.max_read, client.io_limits.max_write)
-    with client.open("incoming/source.bin", "rb") as source:
-        with client.open("incoming/copy.bin", "wb") as destination:
+    with client.open(b"incoming/source.bin", "rb") as source:
+        with client.open(b"incoming/copy.bin", "wb") as destination:
             with memoryview(buffer) as view:
                 while (count := source.readinto(buffer)) != 0:
                     with view[:count] as chunk:
@@ -306,14 +307,14 @@ from nfs_rs import AsyncClient, DirectoryRef, FileType
 async def main() -> None:
     url = "nfs://server.example.com/export?version=4.1&noresvport=true"
     async with await AsyncClient.connect(url) as client:
-        await client.mkdir("outgoing", exist_ok=True)
+        await client.mkdir(b"outgoing", exist_ok=True)
         payload = b"x" * (4 * 1024 * 1024)
-        async with await client.open("outgoing/result.bin", "wb") as destination:
+        async with await client.open(b"outgoing/result.bin", "wb") as destination:
             written = await destination.write(payload)
             assert written == len(payload)  # Durable before the await completes.
 
         buffer = bytearray(len(payload))
-        async with await client.open("outgoing/result.bin", "rb") as source:
+        async with await client.open(b"outgoing/result.bin", "rb") as source:
             count = await source.readinto(buffer)
             assert count == len(payload)
             assert buffer == payload
@@ -371,17 +372,17 @@ from nfs_rs import Client, NfsNotFoundError, NfsUncertainOutcomeError
 
 with Client.connect("nfs://server/export?version=4.1") as client:
     try:
-        with client.open("missing.bin", "rb") as file:
+        with client.open(b"missing.bin", "rb") as file:
             data = file.read()
     except NfsNotFoundError:
         data = b""
 
     try:
-        client.rename("staging.bin", "committed.bin")
+        client.rename(b"staging.bin", "committed.bin")
     except NfsUncertainOutcomeError as error:
         # Do not retry blindly: the server may have completed the operation.
         print(error.recovery_action, error.outcome)
-        print(client.exists("committed.bin"))
+        print(client.exists(b"committed.bin"))
 ```
 
 Built-in families such as `FileNotFoundError`, `PermissionError`,

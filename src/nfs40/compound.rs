@@ -382,10 +382,10 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn create_symlink(mut self, name: impl AsRef<[u8]>, target: &str) -> Self {
+    pub(crate) fn create_symlink(mut self, name: impl AsRef<[u8]>, target: &[u8]) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK
-        xdr_opaque(&mut args, target.as_bytes());
+        xdr_opaque(&mut args, target);
         xdr_opaque(&mut args, name.as_ref());
         xdr_u32(&mut args, 0);
         xdr_opaque(&mut args, &[]);
@@ -746,7 +746,7 @@ pub(crate) fn decode_remove_response(buf: Bytes) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<String> {
+pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<Bytes> {
     let (count, mut ops) = response_ops(buf)?;
     if count != 2 {
         return Err(NfsError::Xdr(format!(
@@ -756,8 +756,7 @@ pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<String> {
     expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
     expect_op(&mut ops, OP_READLINK, "READLINK")?;
     let link = take_opaque(&mut ops, "READLINK target")?;
-    String::from_utf8(link.to_vec())
-        .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
+    Ok(link)
 }
 
 pub(crate) fn decode_readdir_response(buf: Bytes) -> Result<Bytes> {
@@ -1860,7 +1859,7 @@ mod tests {
         }
         let (opcode, mut args) = operation_arguments(
             &CompoundBuilder::new("symlink")
-                .create_symlink(raw, "~nfs-rs-raw:FF")
+                .create_symlink(raw, b"~nfs-rs-raw:FF")
                 .encode_body(),
             0,
         );
@@ -1940,7 +1939,7 @@ mod tests {
             ),
             (
                 CompoundBuilder::new("symlink")
-                    .create_symlink("name", "target")
+                    .create_symlink("name", b"target")
                     .encode_body(),
                 OP_CREATE,
                 5,

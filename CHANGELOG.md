@@ -7,6 +7,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Public Rust filename and path APIs now use lossless byte slices and `Bytes`;
+  READDIR, READDIRPLUS, READLINK, and path resolution return the exact server
+  bytes. Python paths and names use `bytes` or `os.PathLike[bytes]`, and error
+  filename context is bytes. This is a breaking API change. Applications choose
+  display text separately from file identity.
+
 ### Added
 
 - Rust `Dialer` trait, `Endpoint`, `TcpDialer`, `MountOptions`, `mount_with`
@@ -24,11 +32,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
-- NFSv4.0/v4.1 READDIR and READDIRPLUS preserve legacy non-UTF-8 directory names as
-  reversible `~nfs-rs-raw:<uppercase hex>` names, allowing subsequent LOOKUP
-  and name-based OPEN, CREATE, REMOVE, RENAME and LINK without losing the
-  original bytes. Literal names with the escape prefix remain distinct.
-  UTF-8 names and symlink target strings remain unchanged.
+- NFSv3/v4.0/v4.1 directory entries preserve distinct non-UTF-8 and UTF-8
+  names through listing and subsequent name-based operations. A literal name
+  beginning with the former escape prefix remains an ordinary byte name.
 
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.

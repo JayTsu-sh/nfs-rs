@@ -135,7 +135,7 @@ impl Config {
 
 async fn write_file(
     mount: &Arc<dyn Mount>,
-    path: &str,
+    path: &[u8],
     config: &Config,
     pattern: &Pattern,
 ) -> Result<()> {
@@ -240,10 +240,10 @@ async fn workload(mount: &Arc<dyn Mount>, config: &Config, phases: &mut Vec<Valu
     let pattern = Arc::new(Pattern::new());
     if config.mode != "read" {
         // A collision must fail before touching an existing seed or another run.
-        mount.mkdir_path(&directory, 0o700).await?;
+        mount.mkdir_path((directory).as_bytes(), 0o700).await?;
         let phase = metrics::start();
         let started = Instant::now();
-        write_file(mount, &path, config, &pattern).await?;
+        write_file(mount, (path).as_bytes(), config, &pattern).await?;
         phases.push(metrics::sample(
             "write",
             &phase,
@@ -251,7 +251,7 @@ async fn workload(mount: &Arc<dyn Mount>, config: &Config, phases: &mut Vec<Valu
         )?);
     }
     if config.mode != "write" {
-        let object = mount.open_path(&path, OPEN_READ).await?;
+        let object = mount.open_path((path).as_bytes(), OPEN_READ).await?;
         let file = Arc::new(BufferedFile::new(mount.clone(), object.fh));
         let result: Result<()> = async {
             if config.wait_for_stdin {

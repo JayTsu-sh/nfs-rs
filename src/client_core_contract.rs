@@ -6,6 +6,7 @@ use crate::{
     RequestTransmission, Result,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -296,7 +297,7 @@ async fn assert_transport_barrier(transmission: RequestTransmission) {
         tokio::spawn(async move {
             core.execute(CoreOperation {
                 name: "injected".to_string(),
-                safe_path: Some("/safe/path".to_string()),
+                safe_path: Some(Bytes::from("/safe/path".to_string())),
             })
             .await
         })
@@ -324,7 +325,7 @@ async fn fake_protocol_stops_at_before_and_after_send_barriers() {
 fn recovery_event(operation: &str) -> crate::client_core::CoreRecoveryEvent {
     crate::client_core::CoreRecoveryEvent {
         operation: operation.to_string(),
-        safe_path: Some("/safe/path".to_string()),
+        safe_path: Some(Bytes::from("/safe/path".to_string())),
         protocol: NFSVersion::NFSv3,
         outcome: OperationOutcome::DefiniteFailure,
         recovery: RecoveryAction::Retry,

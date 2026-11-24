@@ -102,7 +102,7 @@ async fn execute(
         "scan" => {
             let limit = request["max_dirs"].as_u64().ok_or("missing max_dirs")? as usize;
             let start = Instant::now();
-            let mut queue = VecDeque::from([(".".to_string(), mount.lookup_path(".").await?.fh)]);
+            let mut queue = VecDeque::from([(".".to_string(), mount.lookup_path(b".").await?.fh)]);
             let mut dirs = 0;
             let mut records = Vec::new();
             while dirs < limit {
@@ -114,10 +114,12 @@ async fn execute(
                 entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
                 for entry in entries {
                     let attr = entry.attr.ok_or("missing directory attributes")?;
+                    // This benchmark JSON format explicitly requires UTF-8 paths.
+                    let name = String::from_utf8(entry.file_name.to_vec())?;
                     let child = if path == "." {
-                        entry.file_name
+                        name
                     } else {
-                        format!("{path}/{}", entry.file_name)
+                        format!("{path}/{name}")
                     };
                     if attr.type_ == 2 {
                         let fh = if entry.handle.is_empty() {
@@ -143,7 +145,7 @@ async fn execute(
         "write" => {
             let start = Instant::now();
             let file = mount
-                .create_path(field(request, "path")?, Some(0o644))
+                .create_path((field(request, "path")?).as_bytes(), Some(0o644))
                 .await?;
             let result = if let Some(chunk) = request["chunk_bytes"].as_u64() {
                 write_with_limit(
@@ -167,7 +169,9 @@ async fn execute(
         }
         "read" => {
             let start = Instant::now();
-            let file = mount.open_path(field(request, "path")?, OPEN_READ).await?;
+            let file = mount
+                .open_path((field(request, "path")?).as_bytes(), OPEN_READ)
+                .await?;
             let file = BufferedFile::new(mount.clone(), file.fh);
             let data = file.read_at(0, payload.len().try_into()?).await;
             let closed = file.close().await;

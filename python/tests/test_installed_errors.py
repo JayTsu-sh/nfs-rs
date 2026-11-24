@@ -19,12 +19,12 @@ def test_protocol_statuses_have_structured_python_semantics() -> None:
 
     client = Client.connect("nfs-test://fixture/export")
     cases = [
-        ("missing", NfsNotFoundError, 2, "NFS3ERR_NOENT"),
-        ("denied", NfsPermissionError, 13, "NFS3ERR_ACCES"),
-        ("__xdev__", NfsOSError, 18, "NFS3ERR_XDEV"),
-        ("__stale__", NfsStateLostError, 70, "NFS3ERR_STALE"),
-        ("__retry__", NfsRetryableError, 10008, "NFS3ERR_JUKEBOX"),
-        ("__unsupported__", NfsUnsupportedError, 10004, "NFS3ERR_NOTSUPP"),
+        (b"missing", NfsNotFoundError, 2, "NFS3ERR_NOENT"),
+        (b"denied", NfsPermissionError, 13, "NFS3ERR_ACCES"),
+        (b"__xdev__", NfsOSError, 18, "NFS3ERR_XDEV"),
+        (b"__stale__", NfsStateLostError, 70, "NFS3ERR_STALE"),
+        (b"__retry__", NfsRetryableError, 10008, "NFS3ERR_JUKEBOX"),
+        (b"__unsupported__", NfsUnsupportedError, 10004, "NFS3ERR_NOTSUPP"),
     ]
     for path, error_type, code, code_name in cases:
         with pytest.raises(error_type) as caught:
@@ -37,15 +37,15 @@ def test_protocol_statuses_have_structured_python_semantics() -> None:
         assert error.filename == path
     from nfs_rs import NfsBadCookieError
     for path, code, code_name in (
-        ("__bad_cookie__", 10003, "NFS3ERR_BAD_COOKIE"),
-        ("__not_same__", 10027, "NFS4ERR_NOT_SAME"),
+        (b"__bad_cookie__", 10003, "NFS3ERR_BAD_COOKIE"),
+        (b"__not_same__", 10027, "NFS4ERR_NOT_SAME"),
     ):
         with pytest.raises(NfsBadCookieError) as bad_cookie:
             client.stat(path)
         assert bad_cookie.value.code == code
         assert bad_cookie.value.code_name == code_name
     with pytest.raises(NfsOSError) as not_empty:
-        client.stat("__notempty__")
+        client.stat(b'__notempty__')
     assert not_empty.value.errno == errno.ENOTEMPTY
     client.close()
 
@@ -59,7 +59,7 @@ def test_outcomes_completed_bytes_and_recovery_are_authoritative() -> None:
 
     client = Client.connect("nfs-test://fixture/export")
     with pytest.raises(NfsOperationOutcomeError) as before:
-        client.remove("__before_send__")
+        client.remove(b'__before_send__')
     assert before.value.outcome is OperationOutcome.DEFINITE_FAILURE
     assert before.value.recovery_action is RecoveryAction.RETRY
     assert before.value.operation_class is OperationClass.REPLAY_SENSITIVE
@@ -67,16 +67,16 @@ def test_outcomes_completed_bytes_and_recovery_are_authoritative() -> None:
     assert before.value.__cause__.operation == before.value.operation
 
     with pytest.raises(NfsUncertainOutcomeError) as after:
-        client.rename("__after_send__", "destination")
+        client.rename(b'__after_send__', b'destination')
     assert after.value.outcome is OperationOutcome.UNCERTAIN
     assert after.value.recovery_action is RecoveryAction.VERIFY_THEN_RESUME
 
-    partial = client.open("__partial_write_error__", "w+b")
+    partial = client.open(b'__partial_write_error__', "w+b")
     with pytest.raises(NfsOperationOutcomeError) as partial_error:
         partial.write(b"abcde")
     assert partial_error.value.completed_bytes == 2
 
-    uncertain = client.open("__zero_write__", "w+b")
+    uncertain = client.open(b'__zero_write__', "w+b")
     with pytest.raises(NfsUncertainOutcomeError) as zero_error:
         uncertain.write(b"abc")
     assert zero_error.value.completed_bytes == 0
@@ -91,7 +91,7 @@ def test_closed_client_uses_dedicated_public_error() -> None:
     client = Client.connect("nfs-test://fixture/export")
     client.close()
     with pytest.raises(NfsClientClosedError):
-        client.stat("fixture.bin")
+        client.stat(b'fixture.bin')
 
 
 def test_native_invalid_mode_and_read_size_keep_precise_categories() -> None:
@@ -99,8 +99,8 @@ def test_native_invalid_mode_and_read_size_keep_precise_categories() -> None:
 
     client = _internal.SyncClient.connect("nfs-test://fixture/export")
     with pytest.raises(NfsModeError):
-        client.open("fixture.bin", "invalid")
-    file = client.open("fixture.bin", "rb")
+        client.open(b'fixture.bin', "invalid")
+    file = client.open(b'fixture.bin', "rb")
     with pytest.raises(NfsInvalidInputError):
         file.read(-2)
     assert file.tell() == 0
@@ -114,8 +114,8 @@ def test_async_native_invalid_mode_and_read_size_match_sync() -> None:
     async def scenario() -> None:
         client = await _internal.AsyncClient.connect("nfs-test://fixture/export")
         with pytest.raises(NfsModeError):
-            await client.open("fixture.bin", "invalid")
-        file = await client.open("fixture.bin", "rb")
+            await client.open(b'fixture.bin', "invalid")
+        file = await client.open(b'fixture.bin', "rb")
         with pytest.raises(NfsInvalidInputError):
             await file.read(-2)
         assert file.tell() == 0
@@ -131,7 +131,7 @@ def test_local_file_errors_have_dedicated_public_classes() -> None:
     from nfs_rs import Client, NfsClientCloseError, NfsClosedResourceError, NfsFileCloseError, NfsModeError, NfsUncertainOutcomeError
 
     client = Client.connect("nfs-test://fixture/export")
-    file = client.open("fixture.bin", "rb")
+    file = client.open(b'fixture.bin', "rb")
     with pytest.raises(NfsModeError) as mode:
         file.write(b"x")
     assert isinstance(mode.value, io.UnsupportedOperation)
@@ -141,14 +141,14 @@ def test_local_file_errors_have_dedicated_public_classes() -> None:
     client.close()
 
     failed_client = Client.connect("nfs-test://fixture/export")
-    failed = failed_client.open("__commit_close_error__", "w+b")
+    failed = failed_client.open(b'__commit_close_error__', "w+b")
     with pytest.raises(NfsUncertainOutcomeError):
         failed.write(b"dirty")
     with pytest.raises(NfsFileCloseError) as file_close:
         failed.close()
     assert len(file_close.value.errors) == 1
     assert [error.operation for error in file_close.value.errors] == ["close"]
-    second = failed_client.open("__commit_close_error__", "w+b")
+    second = failed_client.open(b'__commit_close_error__', "w+b")
     with pytest.raises(NfsUncertainOutcomeError):
         second.write(b"dirty")
     with pytest.raises(NfsClientCloseError) as client_close:
@@ -162,8 +162,8 @@ def test_async_classification_matches_sync() -> None:
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
         with pytest.raises(NfsNotFoundError) as caught:
-            await client.stat("missing")
-        assert (caught.value.operation, caught.value.protocol, caught.value.filename) == ("stat", "3", "missing")
+            await client.stat(b'missing')
+        assert (caught.value.operation, caught.value.protocol, caught.value.filename) == ("stat", "3", b"missing")
         await client.close()
 
     import asyncio
@@ -171,7 +171,7 @@ def test_async_classification_matches_sync() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("path, reason", [("__busy_exhausted__", "retry_limit"), ("__busy_deadline__", "deadline")])
+@pytest.mark.parametrize("path, reason", [(b"__busy_exhausted__", "retry_limit"), (b"__busy_deadline__", "deadline")])
 def test_native_server_busy_exhaustion_preserves_original_status(path, reason):
     import asyncio
     from nfs_rs import AsyncClient, Client, NfsServerBusyError, RecoveryAction

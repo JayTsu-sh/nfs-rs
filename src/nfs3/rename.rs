@@ -20,7 +20,7 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn rename_path(&self, from: &str, to: &str) -> Result<()> {
+    pub async fn rename_path(&self, from: &[u8], to: &[u8]) -> Result<()> {
         let (from_dir, from_filename) = split_path(from)?;
         let (to_dir, to_filename) = split_path(to)?;
         let from_dir_fh = self.lookup_path(&from_dir).await?.fh;
@@ -36,15 +36,15 @@ impl Mount {
     pub async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
         self.rename_raw(
             from_dir_fh,
-            Bytes::copy_from_slice(from_filename.as_bytes()),
+            Bytes::copy_from_slice(from_filename),
             to_dir_fh,
-            Bytes::copy_from_slice(to_filename.as_bytes()),
+            Bytes::copy_from_slice(to_filename),
         )
         .await
     }

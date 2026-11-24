@@ -210,7 +210,11 @@ impl Mount41 {
         let mut names = Vec::new();
         while let Some(entry) = entries.try_next().await? {
             if entry.file_name != "." && entry.file_name != ".." {
-                names.push(entry.file_name);
+                names.push(
+                    String::from_utf8(entry.file_name.to_vec()).map_err(|error| {
+                        NfsError::Xdr(format!("attribute name is not UTF-8: {error}"))
+                    })?,
+                );
             }
         }
         Ok(names)

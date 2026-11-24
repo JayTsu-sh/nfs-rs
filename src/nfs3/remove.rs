@@ -20,14 +20,14 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn remove_path(&self, path: &str) -> Result<()> {
+    pub async fn remove_path(&self, path: &[u8]) -> Result<()> {
         let (dir, filename) = split_path(path)?;
         let dir_fh = self.lookup_path(&dir).await?.fh;
         self.remove(dir_fh, &filename).await
     }
 
-    pub async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
-        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+    pub async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
+        self.remove_raw(dir_fh, Bytes::copy_from_slice(filename))
             .await
     }
 

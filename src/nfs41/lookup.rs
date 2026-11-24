@@ -6,8 +6,8 @@ use crate::mount;
 use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
 
 impl Mount41 {
-    pub(crate) async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
-        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+    pub(crate) async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<mount::ObjRes> {
+        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename))
             .await
     }
 
@@ -33,11 +33,8 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
-        let components: Vec<&str> = path
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .collect();
+    pub(crate) async fn lookup_path(&self, path: &[u8]) -> Result<mount::ObjRes> {
+        let components = crate::path_components(path)?;
         if components.is_empty() {
             return Ok(mount::ObjRes {
                 fh: self.root_fh.clone(),

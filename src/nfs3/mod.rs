@@ -48,32 +48,6 @@ use crate::error::{NfsError, RequestContext, Result, classify_sent_nfs3_error};
 use crate::{Auth, ObjRes, Time, rpc};
 use bytes::Bytes;
 
-/// Convert NFS byte-string to Rust String. Tries UTF-8 first;
-/// falls back to lossy conversion with a warning for non-UTF-8 filenames.
-pub(crate) fn bytes_to_string(raw: Bytes) -> String {
-    match std::str::from_utf8(&raw) {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            tracing::warn!(raw_hex = %hex_preview(&raw), "NFS name contains invalid UTF-8, using lossy conversion");
-            String::from_utf8_lossy(&raw).into_owned()
-        }
-    }
-}
-
-fn hex_preview(bytes: &[u8]) -> String {
-    let limit = bytes.len().min(32);
-    let hex: String = bytes[..limit]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if bytes.len() > 32 {
-        format!("{}...", hex)
-    } else {
-        hex
-    }
-}
-
 pub(crate) mod fastxdr;
 
 // Re-export fastxdr response types used by procedure files.
@@ -604,11 +578,11 @@ impl XdrEncode for filename3 {
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct nfspath3(pub(crate) String);
+pub(crate) struct nfspath3(pub(crate) Bytes);
 
 impl XdrEncode for nfspath3 {
     fn encode(&self, buf: &mut Vec<u8>) {
-        xdr_string(buf, &self.0);
+        xdr_var_bytes(buf, &self.0);
     }
 }
 
@@ -1376,54 +1350,5 @@ mod tests {
         let mut buf2 = Vec::new();
         xdr_var_bytes(&mut buf2, b"test");
         assert_eq!(buf1, buf2);
-    }
-
-    // ─── bytes_to_string tests ───────────────────────────────────────
-
-    #[test]
-    fn bytes_to_string_valid_utf8() {
-        let b = Bytes::from("hello world");
-        assert_eq!(bytes_to_string(b), "hello world");
-    }
-
-    #[test]
-    fn bytes_to_string_valid_utf8_unicode() {
-        let b = Bytes::from("日本語テスト");
-        assert_eq!(bytes_to_string(b), "日本語テスト");
-    }
-
-    #[test]
-    fn bytes_to_string_empty() {
-        let b = Bytes::new();
-        assert_eq!(bytes_to_string(b), "");
-    }
-
-    #[test]
-    fn bytes_to_string_invalid_utf8_lossy() {
-        let b = Bytes::from_static(&[0xFF, 0xFE, 0x68, 0x69]); // invalid + "hi"
-        let result = bytes_to_string(b);
-        assert!(result.contains("hi"));
-        assert!(result.contains('\u{FFFD}')); // replacement character
-    }
-
-    // ─── hex_preview tests ───────────────────────────────────────────
-
-    #[test]
-    fn hex_preview_short() {
-        assert_eq!(hex_preview(&[0xAB, 0xCD, 0xEF]), "ab cd ef");
-    }
-
-    #[test]
-    fn hex_preview_truncates_at_32() {
-        let data: Vec<u8> = (0..64).collect();
-        let result = hex_preview(&data);
-        assert!(result.ends_with("..."));
-        // 32 bytes * 3 chars ("xx ") - 1 trailing space + 3 "..." = ~98 chars
-        assert!(!result.contains("20")); // byte 0x20 = 32, should be truncated
-    }
-
-    #[test]
-    fn hex_preview_empty() {
-        assert_eq!(hex_preview(&[]), "");
     }
 }

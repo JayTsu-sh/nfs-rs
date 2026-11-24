@@ -16,19 +16,20 @@ from nfs_rs import AsyncClient, Client, DirectoryCookie, FileType, NfsBadCookieE
 def test_mixed_clients_exit_after_async_completion():
     script = '''
 import asyncio
+import os
 import sys
 from nfs_rs import Client, AsyncClient
 
 client = Client.connect(sys.argv[1])
 try:
-    list(client.scandir(sys.argv[2]))
+    list(client.scandir(os.fsencode(sys.argv[2])))
 finally:
     client.close()
 
 async def main():
     client = await AsyncClient.connect(sys.argv[1])
     try:
-        await client.stat(sys.argv[2])
+        await client.stat(os.fsencode(sys.argv[2]))
     finally:
         await client.close()
 
@@ -37,7 +38,7 @@ asyncio.run(main())
     for _ in range(10):
         completed = subprocess.run(
             [sys.executable, "-c", script, REAL_URL,
-             os.environ.get("NFS_RS_PYTHON_REAL_PARENT", ".")],
+             os.environ.get("NFS_RS_PYTHON_REAL_PARENT", '.')],
             capture_output=True, text=True, timeout=60,
         )
         assert completed.returncode == 0, completed.stderr
@@ -45,28 +46,28 @@ asyncio.run(main())
 
 def test_real_server_sync_root_metadata_and_streaming_directory():
     with Client.connect(REAL_URL) as client:
-        root = client.stat(".")
+        root = client.stat(b'.')
         assert root.type is FileType.DIRECTORY
-        entries = client.scandir(".")
+        entries = client.scandir(b'.')
         first = next(entries, None)
         if first is not None:
             assert first.info.fileid > 0
-            assert first.name in client.listdir(".")
+            assert first.name in client.listdir(b'.')
 
 
 def test_real_server_async_root_metadata_and_streaming_directory():
     async def scenario():
         async with await AsyncClient.connect(REAL_URL) as client:
-            root = await client.stat(".")
+            root = await client.stat(b'.')
             assert root.type is FileType.DIRECTORY
-            entries = [entry async for entry in client.scandir(".")]
+            entries = [entry async for entry in client.scandir(b'.')]
             assert all(entry.info.fileid > 0 for entry in entries)
 
     asyncio.run(scenario())
 
 
 def test_real_server_metadata_xattrs_and_filesystem_information():
-    path = f"python-ticket08-{os.getpid()}-{time.time_ns()}"
+    path = f"python-ticket08-{os.getpid()}-{time.time_ns()}".encode()
     with Client.connect(REAL_URL) as client:
         try:
             with client.open(path, "wb") as file:
@@ -98,7 +99,7 @@ def test_real_server_metadata_xattrs_and_filesystem_information():
 def test_real_server_async_metadata_information_parity():
     async def scenario():
         async with await AsyncClient.connect(REAL_URL) as client:
-            assert await client.access(".", os.F_OK | os.R_OK | os.X_OK)
+            assert await client.access(b'.', os.F_OK | os.R_OK | os.X_OK)
             assert (await client.fs_info()).max_file_size > 0
             assert (await client.fs_stat()).total_bytes > 0
             assert client.io_limits.max_write > 0
@@ -110,6 +111,7 @@ def test_real_server_configured_permission_failure():
     denied_path = os.environ.get("NFS_RS_PYTHON_DENIED_PATH")
     if not denied_path:
         pytest.skip("requires NFS_RS_PYTHON_DENIED_PATH")
+    denied_path = os.fsencode(denied_path)
     with Client.connect(REAL_URL) as client:
         assert not client.access(denied_path, os.R_OK)
         with pytest.raises(PermissionError):
@@ -129,13 +131,13 @@ def _read_pages(client, path, position):
 def test_real_server_scandir_page_resumes_on_a_new_client():
     parent = os.environ.get("NFS_RS_PYTHON_REAL_PARENT", "")
     name = f"python-scandir-page-{os.getpid()}-{time.time_ns()}"
-    path = f"{parent}/{name}" if parent else name
-    expected = {f"entry-{index:04d}" for index in range(200)}
+    path = (f"{parent}/{name}" if parent else name).encode()
+    expected = {f"entry-{index:04d}".encode() for index in range(200)}
     with Client.connect(REAL_URL) as client:
         client.mkdir(path)
         try:
             for entry in sorted(expected):
-                client.touch(f"{path}/{entry}")
+                client.touch(path + b"/" + entry)
             pages = _read_pages(client, path, DirectoryCookie())
             listed = [entry for _, names in pages for entry in names]
             assert sorted(listed) == sorted(expected)
@@ -163,5 +165,5 @@ def test_real_server_scandir_page_resumes_on_a_new_client():
             asyncio.run(scenario())
         finally:
             for entry in expected:
-                client.remove(f"{path}/{entry}", missing_ok=True)
+                client.remove(path + b"/" + entry, missing_ok=True)
             client.rmdir(path)

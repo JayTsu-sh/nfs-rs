@@ -23,20 +23,25 @@ use crate::split_path;
 use bytes::Bytes;
 
 impl Mount {
-    pub async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes> {
+    pub async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         let (dir, filename) = split_path(path)?;
         self.create(self.lookup_path(&dir).await?.fh, &filename, mode)
             .await
     }
 
-    pub async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes> {
+    pub async fn create(
+        &self,
+        dir_fh: Bytes,
+        filename: &[u8],
+        mode: Option<u32>,
+    ) -> Result<ObjRes> {
         self.create_with_guard(dir_fh, filename, mode, false).await
     }
 
     pub(crate) async fn create_guarded(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<ObjRes> {
         self.create_with_guard(dir_fh, filename, mode, true).await
@@ -45,7 +50,7 @@ impl Mount {
     async fn create_with_guard(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
         guarded: bool,
     ) -> Result<ObjRes> {
@@ -60,7 +65,7 @@ impl Mount {
         let args = CREATE3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(Bytes::copy_from_slice(filename.as_bytes())),
+                name: filename3(Bytes::copy_from_slice(filename)),
             },
             // RFC 1813 §3.3.8: only GUARDED success proves fresh creation.
             how: if guarded {

@@ -1844,15 +1844,12 @@ impl crate::Mount for Mount41Wrapper {
 
     // ─── Operations — delegate to impl Mount41 in sub-files ───────────
 
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.lookup(dir_fh, filename).await
     }
-    async fn lookup_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<mount::ObjRes> {
-        let _operation = self.core.begin_operation()?;
-        self.m.lookup_raw(dir_fh, raw_name).await
-    }
-    async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
+
+    async fn lookup_path(&self, path: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.lookup_path(path).await
     }
@@ -1860,7 +1857,7 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.getattr(fh).await
     }
-    async fn getattr_path(&self, path: &str) -> Result<mount::Attr> {
+    async fn getattr_path(&self, path: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.getattr_path(path).await
     }
@@ -1868,7 +1865,7 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.access(fh, mode).await
     }
-    async fn access_path(&self, path: &str, mode: u32) -> Result<u32> {
+    async fn access_path(&self, path: &[u8], mode: u32) -> Result<u32> {
         let _operation = self.core.begin_operation()?;
         self.m.access_path(path, mode).await
     }
@@ -1876,22 +1873,22 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.read(fh, offset, count).await
     }
-    async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    async fn read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.read_path(path, offset, count).await
     }
-    async fn readlink(&self, fh: Bytes) -> Result<String> {
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.readlink(fh).await
     }
-    async fn readlink_path(&self, path: &str) -> Result<String> {
+    async fn readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.readlink_path(path).await
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         self.ready_stream(self.m.readdir_owned(self.core.clone(), dir_fh))
     }
-    async fn readdir_path(&self, dir_path: &str) -> Result<mount::ReaddirStream<'_>> {
+    async fn readdir_path(&self, dir_path: &[u8]) -> Result<mount::ReaddirStream<'_>> {
         let _operation = self.core.begin_operation()?;
         let directory = self.m.lookup_path(dir_path).await?;
         Ok(self.ready_stream(self.m.readdir_owned(self.core.clone(), directory.fh)))
@@ -1899,7 +1896,7 @@ impl crate::Mount for Mount41Wrapper {
     async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
         self.ready_stream(self.m.readdirplus_owned(self.core.clone(), dir_fh))
     }
-    async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
+    async fn readdirplus_path(&self, dir_path: &[u8]) -> Result<mount::ReaddirplusStream<'_>> {
         let _operation = self.core.begin_operation()?;
         let directory = self.m.lookup_path(dir_path).await?;
         Ok(self.ready_stream(self.m.readdirplus_owned(self.core.clone(), directory.fh)))
@@ -1994,34 +1991,31 @@ impl crate::Mount for Mount41Wrapper {
         value.unwrap_or_else(|| Err(NfsError::Rpc("WRITE result was already consumed".into())))
     }
 
-    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+    async fn open(&self, dir_fh: Bytes, filename: &[u8], access: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.open(dir_fh, filename, access).await
     }
-    async fn open_raw(&self, dir_fh: Bytes, raw_name: Bytes, access: u32) -> Result<mount::ObjRes> {
-        let _operation = self.core.begin_operation()?;
-        self.m.open_raw(dir_fh, raw_name, access).await
-    }
-    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+
+    async fn open_path(&self, path: &[u8], access: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.open_path(path, access).await
     }
     async fn create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.create(dir_fh, filename, mode).await
     }
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.create_path(path, mode).await
     }
     async fn create_path_stateful_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
@@ -2032,7 +2026,7 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn open_path_with_options(
         &self,
-        path: &str,
+        path: &[u8],
         options: mount::OpenOptions,
     ) -> Result<mount::OpenFile> {
         let _operation = self.core.begin_operation()?;
@@ -2043,88 +2037,74 @@ impl crate::Mount for Mount41Wrapper {
         })
         .await
     }
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.mkdir(dir_fh, dirname, mode).await
     }
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.mkdir_path(path, mode).await
     }
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.remove(dir_fh, filename).await
     }
-    async fn remove_raw(&self, dir_fh: Bytes, raw_name: Bytes) -> Result<()> {
-        let _operation = self.core.begin_operation()?;
-        self.m.remove_raw(dir_fh, raw_name).await
-    }
-    async fn remove_path(&self, path: &str) -> Result<()> {
+
+    async fn remove_path(&self, path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.remove_path(path).await
     }
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rmdir(dir_fh, dirname).await
     }
-    async fn rmdir_path(&self, path: &str) -> Result<()> {
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rmdir_path(path).await
     }
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_name: &str,
+        from_name: &[u8],
         to_dir_fh: Bytes,
-        to_name: &str,
+        to_name: &[u8],
     ) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m
             .rename(from_dir_fh, from_name, to_dir_fh, to_name)
             .await
     }
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rename_path(from_path, to_path).await
     }
-    async fn rename_raw(
-        &self,
-        from_dir_fh: Bytes,
-        from_name: Bytes,
-        to_dir_fh: Bytes,
-        to_name: Bytes,
-    ) -> Result<()> {
-        let _operation = self.core.begin_operation()?;
-        self.m
-            .rename_raw(from_dir_fh, from_name, to_dir_fh, to_name)
-            .await
-    }
-    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &str) -> Result<mount::Attr> {
+
+    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.link(src_fh, dst_dir_fh, dst_name).await
     }
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.link_path(src_path, dst_path).await
     }
     async fn symlink(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_name: &str,
+        dst_name: &[u8],
     ) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.symlink(target, dst_dir_fh, dst_name).await
     }
-    async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
+    async fn symlink_path(&self, target: &[u8], dst_path: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.symlink_path(target, dst_path).await
     }
     async fn symlink_with_attrs(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_name: &str,
+        dst_name: &[u8],
         uid: Option<u32>,
         gid: Option<u32>,
         atime: Option<crate::Time>,
@@ -2153,7 +2133,7 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -2209,7 +2189,7 @@ impl crate::Mount for Mount41Wrapper {
         }
         result
     }
-    async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
+    async fn commit_path(&self, path: &[u8], offset: u64, count: u32) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         let object = self.m.lookup_path(path).await?;
         let _barrier = self.m.writes.barrier(&object.fh).await;
@@ -2747,7 +2727,7 @@ impl crate::Mount for Mount41Wrapper {
             fsid,
         })
     }
-    async fn pathconf_path(&self, path: &str) -> Result<mount::Pathconf> {
+    async fn pathconf_path(&self, path: &[u8]) -> Result<mount::Pathconf> {
         let _operation = self.core.begin_operation()?;
         let obj = self.m.lookup_path(path).await?;
         self.pathconf(obj.fh).await
@@ -2776,7 +2756,7 @@ pub(super) fn decode_fh(data: &mut Bytes) -> Result<Bytes> {
     Ok(fh)
 }
 
-pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<(String, Bytes)> {
+pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<Bytes> {
     if data.remaining() < 4 {
         return Err(NfsError::Xdr("string length truncated".to_string()));
     }
@@ -2786,9 +2766,8 @@ pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<(String, Byte
         return Err(NfsError::Xdr("string data truncated".to_string()));
     }
     let raw = Bytes::copy_from_slice(&data[..len]);
-    let s = String::from_utf8_lossy(&raw).into_owned();
     data.advance(padded);
-    Ok((s, raw))
+    Ok(raw)
 }
 
 pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {

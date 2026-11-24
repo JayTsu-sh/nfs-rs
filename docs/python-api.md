@@ -22,13 +22,12 @@ NFSv4.0 uses an experimental interoperability profile. Server capabilities such
 as named attributes, ACLs, callbacks, locks, delegation retention, and pNFS are
 negotiated and exposed through `client.capabilities`.
 
-On NFSv4.0/v4.1 servers that return non-UTF-8 directory name bytes, listings use
-`~nfs-rs-raw:<uppercase hex bytes>` for that entry. Pass the returned name or
-path unchanged to lookup or directory operations to address the same bytes.
-This includes opening, creating, deleting, renaming and linking the entry.
-Normal UTF-8 names are unchanged. A literal UTF-8 name beginning with
-`~nfs-rs-raw:` is also encoded in listings so it cannot collide with a legacy
-byte name. The encoding uses the server's bytes; it does not guess a locale.
+Directory entry names and paths are Python `bytes`, preserving the exact bytes
+returned by the server. Pass an entry's `name` or `path` to lookup, open, rename,
+remove, or link without text conversion. `readlink()` likewise returns target
+bytes. Applications choose how to render names for people; display text must
+not be used to identify an entry. This also distinguishes invalid UTF-8 names
+from valid UTF-8 names containing the replacement character.
 
 The release pipeline exercises NFSv3, NFSv4.0 and NFSv4.1 using the final
 x86_64 wheel and a wheel rebuilt from the final source distribution against
@@ -172,7 +171,7 @@ class Direct:
 
 
 with Client.connect("nfs://server/export?version=4.1", dialer=Direct()) as client:
-    print(client.listdir("/"))
+    print(client.listdir(b"/"))
 ```
 
 `dial` must return a plain `socket.socket`; a subclass or a wrapper such
@@ -201,31 +200,29 @@ with Client.connect("nfs://server/export?version=4.1") as client:
 
 ### Paths and directories
 
-All paths are relative to the mounted export. `str` and `os.PathLike[str]` are
-accepted. Absolute paths, attempts to escape with `..`, embedded NUL bytes, and
-byte-string paths are rejected before reaching the server.
+All paths are relative to the mounted export. `bytes` and `os.PathLike[bytes]`
+are accepted. Text paths, absolute paths, attempts to escape with `..`, and
+embedded NUL bytes are rejected before reaching the server.
 
 ```python
-from pathlib import Path
-
 from nfs_rs import Client, FileType
 
 with Client.connect("nfs://server/export?version=4.1") as client:
-    client.mkdir("jobs/2026/input", parents=True, exist_ok=True, mode=0o750)
-    client.touch(Path("jobs/2026/input/ready"), exist_ok=True)
+    client.mkdir(b"jobs/2026/input", parents=True, exist_ok=True, mode=0o750)
+    client.touch(b"jobs/2026/input/ready", exist_ok=True)
 
-    assert client.exists("jobs/2026/input/ready")
-    info = client.stat("jobs/2026/input/ready")
+    assert client.exists(b"jobs/2026/input/ready")
+    info = client.stat(b"jobs/2026/input/ready")
     assert info.type is FileType.FILE
     print(info.size, info.mode, info.uid, info.gid, info.mtime)
 
-    print(client.listdir("jobs/2026/input"))
-    for entry in client.scandir("jobs/2026/input"):
+    print(client.listdir(b"jobs/2026/input"))
+    for entry in client.scandir(b"jobs/2026/input"):
         print(entry.name, entry.path, entry.info.type)
 
-    client.rename("jobs/2026/input/ready", "jobs/2026/input/started")
-    client.unlink("jobs/2026/input/started", missing_ok=True)
-    client.rmdir("jobs/2026/input")
+    client.rename(b"jobs/2026/input/ready", b"jobs/2026/input/started")
+    client.unlink(b"jobs/2026/input/started", missing_ok=True)
+    client.rmdir(b"jobs/2026/input")
 ```
 
 `FileInfo.atime`, `mtime`, and `ctime` are Python integers measured in **ns
@@ -236,7 +233,7 @@ creation time. The same fields appear on `DirEntry.info` from `scandir`.
 `utime(ns=(atime, mtime))` continues to take nanosecond values.
 
 `scandir` accepts `DirectoryRef(path, fh=None)` or a previously returned
-`DirEntry`, in addition to a string/path-like value. With `fh`, the adapter calls
+`DirEntry`, in addition to a bytes/path-like value. With `fh`, the adapter calls
 `Mount::readdirplus(fh)` directly; without it, it first calls `lookup_path`.
 `DirEntry.fh` contains the server's opaque handle when supplied, otherwise `None`.
 Use handles from the same mount. The path labels results and errors; it is not
@@ -247,7 +244,7 @@ handle; an empty or non-bytes handle is rejected.
 ```python
 from nfs_rs import DirectoryRef, FileType
 
-for entry in client.scandir(DirectoryRef("jobs", fh=None)):
+for entry in client.scandir(DirectoryRef(b"jobs", fh=None)):
     if entry.info.type == FileType.DIRECTORY:
         for child in client.scandir(entry):
             print(child.path)  # reuses entry.fh when present
@@ -279,7 +276,7 @@ even on a new client of the same server, instead of starting over. Persist
 ```python
 from nfs_rs import Client, DirectoryCookie, NfsBadCookieError
 
-def list_resumably(client: Client, path: str, position: DirectoryCookie) -> None:
+def list_resumably(client: Client, path: bytes, position: DirectoryCookie) -> None:
     while True:
         try:
             page = client.scandir_page(path, position)
@@ -314,16 +311,14 @@ equivalent file-removal operations.
 Available in 0.12.0. `resolve` accepts ordinary file and directory paths as well
 as symbolic links, so no preliminary type check is needed.
 
-`readlink(path)` returns the stored target text. `stat(path)` and `exists(path)`
+`readlink(path)` returns the stored target bytes. `stat(path)` and `exists(path)`
 inspect the link itself; a dangling link can therefore pass `exists`.
-The String-based interface raises `NfsEncodingError` for a non-UTF-8 target;
-it never replaces undecodable bytes with a different filename.
 Use `resolve(path)` to follow intermediate and final links and inspect the target:
 
 ```python
 from nfs_rs import PathResolutionStatus
 
-result = client.resolve("jobs/latest")  # await client.resolve(...) for AsyncClient
+result = client.resolve(b"jobs/latest")  # await client.resolve(...) for AsyncClient
 if result.exists is True:
     print(result.path, result.info.type, result.info.size)
 elif result.exists is False:
@@ -336,13 +331,13 @@ else:
 
 `PathResolution.status` is `RESOLVED`, `MISSING`, `NOT_DIRECTORY`, `OUTSIDE_MOUNT`
 or `TOO_MANY_SYMLINKS`. `path` and `info` are present only for `RESOLVED`;
-`path` is export-relative (`.` for root). `exists` is `True` for `RESOLVED`,
+`path` is export-relative (`b"."` for root). `exists` is `True` for `RESOLVED`,
 `False` for `MISSING`/`NOT_DIRECTORY`, and `None` for the other two states.
 Check with `is True` / `is False` to preserve that distinction.
 
 For example, if `links/latest` stores `../data/report.csv`, a successful
-`client.resolve("links/latest").path` is `data/report.csv`. The original stored
-text remains available through `client.readlink("links/latest")`. Multilevel
+`client.resolve(b"links/latest").path` is `b"data/report.csv"`. The original target
+bytes remain available through `client.readlink(b"links/latest")`. Multilevel
 links resolve to the final target. A non-link path returns its own information.
 
 Relative targets start at the link's directory. `..` is evaluated after following
@@ -353,8 +348,8 @@ absolute link targets also return `OUTSIDE_MOUNT`, because the library cannot ma
 the client's root namespace to this export. This does not mean the target is broken.
 
 The resolver follows at most 40 links and accepts at most 4096 cumulative path
-components / 64 KiB of cumulative UTF-8 path text, including link expansions.
-Oversized or NUL-containing text raises `ValueError`. Permission, connection,
+components / 64 KiB of cumulative path bytes, including link expansions.
+Oversized or NUL-containing paths raise `ValueError`. Permission, connection,
 timeout, stale-handle and other errors propagate instead of becoming a missing
 target. `operation_timeout` covers the complete Python resolution. This is an
 observation of the namespace; it neither checks read/write permissions nor
@@ -366,10 +361,10 @@ guarantees that a later open will see the same object.
 from nfs_rs import Client
 
 with Client.connect("nfs://server/export?version=4.1") as client:
-    with client.open("message.bin", "wb") as file:
+    with client.open(b"message.bin", "wb") as file:
         count = file.write(b"hello")
     assert count == 5
-    with client.open("message.bin", "rb") as file:
+    with client.open(b"message.bin", "rb") as file:
         assert file.read() == b"hello"
 ```
 
@@ -396,7 +391,7 @@ from nfs_rs import Client
 chunk_size = 1024 * 1024
 
 with Client.connect("nfs://server/export?version=4.1") as client:
-    with client.open("large.bin", "w+b") as file:
+    with client.open(b"large.bin", "w+b") as file:
         file.write(b"header")
         file.seek(1024)
         file.write(b"payload")
@@ -536,15 +531,15 @@ async def process() -> None:
         "nfs://server/export?version=4.1",
         operation_timeout=30,
     ) as client:
-        await client.mkdir("results", exist_ok=True)
-        async with await client.open("results/one.bin", "wb") as file:
+        await client.mkdir(b"results", exist_ok=True)
+        async with await client.open(b"results/one.bin", "wb") as file:
             await file.write(b"one")
 
-        async with await client.open("results/one.bin", "r+b") as file:
+        async with await client.open(b"results/one.bin", "r+b") as file:
             await file.write_at(b"ONE", 0)
             assert await file.read_at(0, 3) == b"ONE"
 
-        async for entry in client.scandir("results"):
+        async for entry in client.scandir(b"results"):
             print(entry.name, entry.info.size)
 
 
@@ -582,7 +577,7 @@ from nfs_rs import Client, NfsError, NfsNotFoundError
 
 with Client.connect("nfs://server/export?version=4.1") as client:
     try:
-        client.stat("missing")
+        client.stat(b"missing")
     except NfsNotFoundError as error:
         print(error.filename, error.operation, error.protocol)
     except NfsError as error:

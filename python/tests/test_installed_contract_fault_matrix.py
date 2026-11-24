@@ -30,31 +30,31 @@ class MutationCase:
 
 
 CLIENT_CASES = {
-    "stat": Call("stat", ("file",)),
-    "exists": Call("exists", ("file",)),
-    "scandir": Call("scandir", ("folder",)),
-    "listdir": Call("listdir", ("folder",)),
-    "chmod": Call("chmod", ("file", 0o600)),
-    "chown": Call("chown", ("file", 1, 2)),
-    "utime": Call("utime", ("file",), {"ns": (1, 2)}),
-    "truncate": Call("truncate", ("file", 1)),
-    "access": Call("access", ("file", os.R_OK)),
-    "getxattr": Call("getxattr", ("file", "user.key")),
-    "setxattr": Call("setxattr", ("file", "user.key", b"value")),
-    "listxattr": Call("listxattr", ("file",)),
-    "removexattr": Call("removexattr", ("file", "user.key")),
+    "stat": Call("stat", (b'file',)),
+    "exists": Call("exists", (b'file',)),
+    "scandir": Call("scandir", (b"folder",)),
+    "listdir": Call("listdir", (b"folder",)),
+    "chmod": Call("chmod", (b'file', 0o600)),
+    "chown": Call("chown", (b'file', 1, 2)),
+    "utime": Call("utime", (b'file',), {"ns": (1, 2)}),
+    "truncate": Call("truncate", (b'file', 1)),
+    "access": Call("access", (b'file', os.R_OK)),
+    "getxattr": Call("getxattr", (b'file', "user.key")),
+    "setxattr": Call("setxattr", (b'file', "user.key", b"value")),
+    "listxattr": Call("listxattr", (b'file',)),
+    "removexattr": Call("removexattr", (b'file', "user.key")),
     "fs_info": Call("fs_info"),
     "fs_stat": Call("fs_stat"),
-    "mkdir": Call("mkdir", ("directory",)),
-    "remove": Call("remove", ("file",)),
-    "unlink": Call("unlink", ("file",)),
-    "rmdir": Call("rmdir", ("directory",)),
-    "rename": Call("rename", ("source", "destination")),
-    "link": Call("link", ("source", "destination")),
-    "symlink": Call("symlink", ("target", "link")),
-    "readlink": Call("readlink", ("link",)),
-    "touch": Call("touch", ("file",)),
-    "open": Call("open", ("fixture.bin", "rb")),
+    "mkdir": Call("mkdir", (b"directory",)),
+    "remove": Call("remove", (b'file',)),
+    "unlink": Call("unlink", (b'file',)),
+    "rmdir": Call("rmdir", (b"directory",)),
+    "rename": Call("rename", (b"source", b"destination")),
+    "link": Call("link", (b"source", b"destination")),
+    "symlink": Call("symlink", (b"target", b"link")),
+    "readlink": Call("readlink", (b"link",)),
+    "touch": Call("touch", (b'file',)),
+    "open": Call("open", (b'fixture.bin', "rb")),
 }
 
 FILE_CASES = {
@@ -72,15 +72,15 @@ FILE_CASES = {
 
 MUTATION_CASES = {
     "write": MutationCase("file", Call("write", (b"value",)), "w+b"),
-    "create": MutationCase("client", Call("open", ("contract-create.bin", "w+b"))),
+    "create": MutationCase("client", Call("open", (b"contract-create.bin", "w+b"))),
     "truncate": MutationCase("file", Call("truncate", (7,)), "r+b"),
-    "rename": MutationCase("client", Call("rename", ("source", "destination"))),
-    "remove": MutationCase("client", Call("remove", ("file",))),
-    "mkdir": MutationCase("client", Call("mkdir", ("directory",))),
-    "link": MutationCase("client", Call("link", ("source", "link"))),
-    "symlink": MutationCase("client", Call("symlink", ("target", "link"))),
+    "rename": MutationCase("client", Call("rename", (b"source", b"destination"))),
+    "remove": MutationCase("client", Call("remove", (b'file',))),
+    "mkdir": MutationCase("client", Call("mkdir", (b"directory",))),
+    "link": MutationCase("client", Call("link", (b"source", b"link"))),
+    "symlink": MutationCase("client", Call("symlink", (b"target", b"link"))),
     "commit": MutationCase("file", Call("write", (b"value",)), "w+b"),
-    "open": MutationCase("client", Call("open", ("fixture.bin", "rb"))),
+    "open": MutationCase("client", Call("open", (b'fixture.bin', "rb"))),
 }
 
 FAULT_PHASES = ("before-send", "after-send-before-response")
@@ -131,7 +131,7 @@ async def _run_fault(client_kind: str, operation: str, phase: str) -> BaseExcept
     _internal._arm_fault_test_barrier(operation, phase)
     if client_kind == "sync":
         client = Client.connect("nfs-test://fixture/export")
-        file = client.open(f"contract-{operation}.bin", mutation.mode) if mutation.mode else None
+        file = client.open(f"contract-{operation}.bin".encode(), mutation.mode) if mutation.mode else None
         if mutation.prepare_dirty:
             assert file.write(b"dirty") == 5
         target = file if mutation.target == "file" else client
@@ -147,7 +147,7 @@ async def _run_fault(client_kind: str, operation: str, phase: str) -> BaseExcept
 
     client = await AsyncClient.connect("nfs-test://fixture/export")
     file = (
-        await client.open(f"contract-{operation}.bin", mutation.mode)
+        await client.open(f"contract-{operation}.bin".encode(), mutation.mode)
         if mutation.mode else None
     )
     if mutation.prepare_dirty:
@@ -203,7 +203,7 @@ def test_every_operational_client_method_has_matching_success_and_failure_covera
     if client_kind == "sync":
         client = Client.connect("nfs-test://fixture/export")
         if operation in {"getxattr", "listxattr", "removexattr"}:
-            client.setxattr("file", "user.key", b"value")
+            client.setxattr(b'file', "user.key", b"value")
         result = _invoke_sync(client, case)
         if isinstance(result, File):
             result.close()
@@ -215,7 +215,7 @@ def test_every_operational_client_method_has_matching_success_and_failure_covera
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
         if operation in {"getxattr", "listxattr", "removexattr"}:
-            await client.setxattr("file", "user.key", b"value")
+            await client.setxattr(b'file', "user.key", b"value")
         result = await _invoke_async(client, case)
         if isinstance(result, AsyncFile):
             await result.close()
@@ -236,7 +236,7 @@ def test_every_operational_file_method_has_matching_success_and_failure_coverage
     case = FILE_CASES[operation]
     if client_kind == "sync":
         client = Client.connect("nfs-test://fixture/export")
-        file = client.open("fixture.bin", "r+b")
+        file = client.open(b'fixture.bin', "r+b")
         _invoke_sync(file, case)
         file.close()
         with pytest.raises(NfsClosedResourceError):
@@ -246,7 +246,7 @@ def test_every_operational_file_method_has_matching_success_and_failure_coverage
 
     async def scenario() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
-        file = await client.open("fixture.bin", "r+b")
+        file = await client.open(b'fixture.bin', "r+b")
         await _invoke_async(file, case)
         await file.close()
         with pytest.raises(NfsClosedResourceError):
@@ -260,15 +260,15 @@ def test_every_operational_file_method_has_matching_success_and_failure_coverage
 @pytest.mark.parametrize(
     ("path", "error_name", "outcome", "recovery"),
     (
-        ("__stale__", "NfsStateLostError", None, "remount"),
-        ("__lease_lost__", "NfsStateLostError", None, "reopen"),
-        ("__session_lost__", "NfsStateLostError", None, "reopen"),
-        ("__callback_failure__", "NfsRetryableError", None, "retry"),
-        ("__pnfs_data_path_failure__", "NfsRetryableError", "safe_to_retry", "retry"),
+        (b"__stale__", "NfsStateLostError", None, "remount"),
+        (b"__lease_lost__", "NfsStateLostError", None, "reopen"),
+        (b"__session_lost__", "NfsStateLostError", None, "reopen"),
+        (b"__callback_failure__", "NfsRetryableError", None, "retry"),
+        (b'__pnfs_data_path_failure__', "NfsRetryableError", "safe_to_retry", "retry"),
     ),
 )
 def test_protocol_state_callback_and_pnfs_failures_are_structured(
-    client_kind: str, path: str, error_name: str, outcome: str | None, recovery: str,
+    client_kind: str, path: bytes, error_name: str, outcome: str | None, recovery: str,
 ) -> None:
     import nfs_rs
 
@@ -276,7 +276,7 @@ def test_protocol_state_callback_and_pnfs_failures_are_structured(
         if client_kind == "sync":
             client = nfs_rs.Client.connect("nfs-test://fixture/export")
             try:
-                if path == "__pnfs_data_path_failure__":
+                if path == b'__pnfs_data_path_failure__':
                     with client.open(path, "rb") as file:
                         return await asyncio.to_thread(file.read, 1)
                 return await asyncio.to_thread(client.stat, path)
@@ -286,7 +286,7 @@ def test_protocol_state_callback_and_pnfs_failures_are_structured(
                 client.close()
         client = await nfs_rs.AsyncClient.connect("nfs-test://fixture/export")
         try:
-            if path == "__pnfs_data_path_failure__":
+            if path == b'__pnfs_data_path_failure__':
                 async with await client.open(path, "rb") as file:
                     return await file.read(1)
             return await client.stat(path)
@@ -355,8 +355,8 @@ def test_non_operational_and_module_level_contracts_are_explicit() -> None:
         assert client.capabilities.pnfs is False
         assert client.io_limits.max_read == 4
         assert client.dropped_recovery_event_count == 0
-        with client.open("fixture.bin", "r+b") as file:
-            assert file.name == "fixture.bin"
+        with client.open(b'fixture.bin', "r+b") as file:
+            assert file.name == b'fixture.bin'
             assert file.mode == "r+b"
             assert file.readable() and file.writable() and file.seekable()
             with pytest.raises(NfsModeError):
@@ -367,7 +367,7 @@ def test_non_operational_and_module_level_contracts_are_explicit() -> None:
     assert client.health.lifecycle.value == "closed"
     assert client.capabilities.pnfs is False
     assert client.io_limits.max_read == 4
-    assert file.closed and file.name == "fixture.bin" and file.mode == "r+b"
+    assert file.closed and file.name == b'fixture.bin' and file.mode == "r+b"
     assert client.recovery_events() == ()
     assert client.drain_recovery_events() == ()
 
@@ -382,8 +382,8 @@ def test_non_operational_and_module_level_contracts_are_explicit() -> None:
             assert async_client.health.lifecycle.value == "ready"
             assert async_client.capabilities.pnfs is False
             assert async_client.io_limits.max_write == 4
-            async with await async_client.open("fixture.bin", "r+b") as file:
-                assert file.name == "fixture.bin"
+            async with await async_client.open(b'fixture.bin', "r+b") as file:
+                assert file.name == b'fixture.bin'
                 assert file.mode == "r+b"
                 assert file.readable() and file.writable()
         await async_client.close()
@@ -392,7 +392,7 @@ def test_non_operational_and_module_level_contracts_are_explicit() -> None:
         assert async_client.health.lifecycle.value == "closed"
         assert async_client.capabilities.pnfs is False
         assert async_client.io_limits.max_write == 4
-        assert file.closed and file.name == "fixture.bin" and file.mode == "r+b"
+        assert file.closed and file.name == b'fixture.bin' and file.mode == "r+b"
         assert async_client.recovery_events() == ()
         assert async_client.drain_recovery_events() == ()
 

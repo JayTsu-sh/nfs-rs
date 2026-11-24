@@ -1,3 +1,4 @@
+from byte_paths import BytesPath
 """Exercise the actual Rust resolver through an installed test-support wheel."""
 import asyncio
 import os
@@ -14,8 +15,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("path,status,exists,target", [
     ("file", "resolved", True, "file"),
     ("nested", "resolved", True, "nested"),
-    ("link", "resolved", True, "file"),
-    ("nested/up", "resolved", True, "file"),
+    (b'link', "resolved", True, "file"),
+    (b'nested/up', "resolved", True, "file"),
     ("alias/file", "resolved", True, "nested/file"),
     ("alias/../link", "resolved", True, "file"),
     ("deep-alias/../peer", "resolved", True, "nested/peer"),
@@ -38,6 +39,9 @@ pytestmark = pytest.mark.skipif(
 ])
 def test_native_sync_and_async_resolution(path, status, exists, target):
     from nfs_rs import AsyncClient, Client, PathResolution, PathResolutionStatus
+
+    path = path.encode() if isinstance(path, str) else path
+    target = target.encode() if isinstance(target, str) else target
 
     def verify(result):
         assert isinstance(result, PathResolution)
@@ -63,9 +67,8 @@ def test_native_sync_and_async_resolution(path, status, exists, target):
 def test_native_resolution_preserves_errors_and_context():
     from nfs_rs import AsyncClient, Client, NfsConnectionError, NfsEncodingError, NfsPermissionError, NfsProtocolError, NfsStateLostError
 
-    cases = [("denied", NfsPermissionError), ("disconnected", NfsConnectionError),
-             ("stale", NfsStateLostError), ("readlink-error", NfsProtocolError),
-             ("encoding-error", NfsEncodingError)]
+    cases = [(b"denied", NfsPermissionError), (b"disconnected", NfsConnectionError),
+             (b"stale", NfsStateLostError), (b"readlink-error", NfsProtocolError)]
     with Client.connect("nfs-test://fixture/export") as client:
         for path, error in cases:
             with pytest.raises(error) as caught:
@@ -89,8 +92,8 @@ def test_native_resolution_validates_paths_and_bounds_expansion():
     from nfs_rs import Client
 
     with Client.connect("nfs-test://fixture/export") as client:
-        assert client.resolve(Path("nested/up")).path == "file"
-        for path in [b"bytes", "bad\0name", "/file", "x" * 65537, "./" * 4096, "nul", "long", "many"]:
+        assert client.resolve(BytesPath(b'nested/up')).path == b'file'
+        for path in ["text", b"bad\0name", b"/file", b"x" * 65537, b"./" * 4096, b"nul", b"long", b"many"]:
             with pytest.raises((TypeError, ValueError)):
                 client.resolve(path)
 
@@ -100,24 +103,24 @@ def test_native_resolution_deadline_cancellation_and_closed_client():
 
     client = Client.connect("nfs-test://fixture/export", operation_timeout=0.01)
     with pytest.raises(NfsTimeoutError):
-        client.resolve("slow")
-    assert client.resolve("link").exists is True
+        client.resolve(b'slow')
+    assert client.resolve(b'link').exists is True
     client.close()
     with pytest.raises(NfsClientClosedError):
-        client.resolve("link")
+        client.resolve(b'link')
 
     async def scenario():
         client = await AsyncClient.connect("nfs-test://fixture/export", operation_timeout=0.01)
         with pytest.raises(NfsTimeoutError):
-            await client.resolve("slow")
-        task = asyncio.create_task(client.resolve("slow"))
+            await client.resolve(b'slow')
+        task = asyncio.create_task(client.resolve(b'slow'))
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert (await client.resolve("link")).exists is True
+        assert (await client.resolve(b'link')).exists is True
         await client.close()
         with pytest.raises(NfsClientClosedError):
-            await client.resolve("link")
+            await client.resolve(b'link')
 
     asyncio.run(scenario())

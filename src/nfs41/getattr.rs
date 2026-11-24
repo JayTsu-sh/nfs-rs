@@ -17,7 +17,7 @@ impl Mount41 {
         decode_getattr_response(&mut data)
     }
 
-    pub(crate) async fn getattr_path(&self, path: &str) -> Result<mount::Attr> {
+    pub(crate) async fn getattr_path(&self, path: &[u8]) -> Result<mount::Attr> {
         let obj = self.lookup_path(path).await?;
         self.getattr(obj.fh).await
     }

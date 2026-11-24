@@ -16,30 +16,23 @@
 
 use super::{LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result, diropargs3, filename3, nfs_fh3};
 use bytes::Bytes;
-use std::path::Component;
 
 impl Mount {
-    pub async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
-        tracing::debug!(path, "resolving path");
+    pub async fn lookup_path(&self, path: &[u8]) -> Result<ObjRes> {
         let mut res = Ok(ObjRes {
             fh: self.fh.clone(),
             attr: None,
         });
-        for component in path_clean::clean(path).components() {
-            // Skip path syntax, not filename text: on Unix, `\` is a normal name.
-            if let Ok(ref r) = res
-                && !matches!(component, Component::RootDir | Component::CurDir)
-            {
-                let n = component.as_os_str();
-                tracing::trace!(component = %n.to_string_lossy(), "resolving path component");
-                res = self.lookup(r.fh.clone(), &n.to_string_lossy()).await;
+        for component in crate::lookup_components(path)? {
+            if let Ok(ref object) = res {
+                res = self.lookup(object.fh.clone(), component).await;
             }
         }
         res
     }
 
-    pub async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
-        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename.as_bytes()))
+    pub async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes> {
+        self.lookup_raw(dir_fh, Bytes::copy_from_slice(filename))
             .await
     }
 

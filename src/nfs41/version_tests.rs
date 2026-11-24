@@ -205,7 +205,7 @@ async fn v42_public_mount_recovery_and_teardown_preserve_minor_version() {
             .unwrap();
     assert_eq!(mount.version(), crate::NFSVersion::NFSv4p2);
     assert!(matches!(
-        mount.lookup(mount.getfh().await, "missing").await,
+        mount.lookup(mount.getfh().await, b"missing").await,
         Err(crate::NfsError::Nfs4(
             crate::nfs4::fastxdr::nfsstat4::NFS4ERR_NOENT
         ))
@@ -404,7 +404,7 @@ async fn v42_reconnect_rebind_preserves_minor_version() {
         crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.2&noresvport=true"))
             .await
             .unwrap();
-    let result = mount.lookup(mount.getfh().await, "missing").await;
+    let result = mount.lookup(mount.getfh().await, b"missing").await;
     assert!(
         matches!(
             &result,

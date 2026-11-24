@@ -124,15 +124,15 @@ def fake_adapter(monkeypatch):
 def test_open_rejects_unsupported_modes_before_native(mode):
     client = Client.connect("nfs://server/export")
     with pytest.raises(ValueError, match="mode must be"):
-        client.open("file", mode)
+        client.open(b'file', mode)
 
 
 def test_sync_file_is_raw_io_and_composes_with_buffered_reader():
     client = Client.connect("nfs://server/export")
-    raw = client.open("folder/../file", "rb")
+    raw = client.open(b'folder/../file', "rb")
     assert isinstance(raw, io.RawIOBase)
     assert isinstance(raw, File)
-    assert raw.name == "file"
+    assert raw.name == b'file'
     assert raw.readable() and raw.seekable() and not raw.writable()
     buffered = io.BufferedReader(raw, buffer_size=4)
     assert buffered.read(5) == b"abcde"
@@ -142,7 +142,7 @@ def test_sync_file_is_raw_io_and_composes_with_buffered_reader():
 
 
 def test_sync_relative_and_positional_reads_keep_separate_positions():
-    with Client.connect("nfs://server/export").open("file") as file:
+    with Client.connect("nfs://server/export").open(b'file') as file:
         assert file.read(3) == b"abc"
         assert file.tell() == 3
         assert file.read_at(10, 3) == b"klm"
@@ -156,7 +156,7 @@ def test_sync_relative_and_positional_reads_keep_separate_positions():
 
 
 def test_sync_readinto_pins_target_during_network_work():
-    file = Client.connect("nfs://server/export").open("file")
+    file = Client.connect("nfs://server/export").open(b'file')
     target = bytearray(4)
     original_read = file._inner.readinto
 
@@ -180,7 +180,7 @@ def test_file_finalizer_warns_without_blocking_close():
 def test_async_file_matches_read_seek_and_positional_contract():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        async with await client.open("file") as file:
+        async with await client.open(b'file') as file:
             assert isinstance(file, AsyncFile)
             assert await file.read(3) == b"abc"
             assert file.tell() == 3
@@ -199,7 +199,7 @@ def test_async_file_matches_read_seek_and_positional_contract():
 def test_async_readinto_pins_target_during_suspension():
     async def scenario():
         client = await AsyncClient.connect("nfs://server/export")
-        file = await client.open("file")
+        file = await client.open(b'file')
         target = bytearray(4)
         original_read = file._inner.readinto
 
