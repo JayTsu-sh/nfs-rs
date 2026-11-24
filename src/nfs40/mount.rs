@@ -28,7 +28,9 @@ use super::recovery::{
     establish_identity, fresh_open_lane_with_seqid, lock_op_consumes_seqid, recovery_failure,
     state_recovery_exhausted, stateid_hex, stateid_op_consumes_seqid, status_consumes_seqid,
 };
-use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
+use super::state::{
+    LockLane, LockState, LostLock, OpenState, OwnerLane, decode_owner, encode_owner,
+};
 use crate::dialer::Endpoint;
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
 use crate::mount::{self, MountLifecycleState, NFSVersion};
@@ -110,6 +112,30 @@ async fn query_callback_attributes(
     let response = rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?;
     decode_callback_attributes(decode_getattr_compound(response)?)
 }
+/// The gate error returned while a lost lock has not been reacquired.
+///
+/// Recovery may keep an open after its lock could not be reclaimed. Serving I/O
+/// through it would silently drop the application out of its critical section,
+/// so reads and writes on that handle fail explicitly until the caller
+/// reacquires a lock or closes it.
+fn lost_lock_error(operation: &'static str, lost: &LostLock) -> NfsError {
+    let cause = if lost.status == crate::Nfs4ErrorCode::NFS4ERR_DENIED {
+        NfsError::LockDenied {
+            lock_type: lost.lock_type,
+            offset: lost.offset,
+            length: lost.length,
+            owner: lost.owner.clone(),
+        }
+    } else {
+        NfsError::Nfs4(lost.status)
+    };
+    NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
+        operation: operation.to_string(),
+        status: lost.status,
+        source: Box::new(cause),
+    }))
+}
+
 struct Mount40 {
     rpc: rpc::Client,
     auth: Auth,
@@ -608,6 +634,7 @@ impl Mount40 {
                 // until lease expiry. A lost mount removes it below; a Suspect
                 // or Reconnecting mount keeps it so cleanup can unlock it after
                 // recovery.
+                let gate_fh = fh.clone();
                 locks
                     .register(LockLane {
                         owner,
@@ -633,6 +660,9 @@ impl Mount40 {
                     }
                     return Err(error);
                 }
+                // A granted lock on this handle acknowledges an earlier loss and
+                // lifts the I/O gate.
+                locks.clear_lost(&gate_fh).await;
                 Ok::<_, NfsError>(stateid)
             })
             .await
@@ -1797,6 +1827,9 @@ impl Mount40 {
         data: Bytes,
         stability: mount::WriteStability,
     ) -> Result<mount::WriteOutcome> {
+        if let Some(lost) = self.locks.lost(&fh).await {
+            return Err(lost_lock_error("write", &lost));
+        }
         let (count, committed, verifier) = self
             .write_with_stability(fh, offset, data, stability.stable_how())
             .await?;
@@ -2062,7 +2095,11 @@ impl Mount for Mount40 {
                 ));
             }
         };
-        self.close_lane(lane).await
+        let result = self.close_lane(lane).await;
+        if result.is_ok() && self.state.for_fh(&fh, crate::OPEN_BOTH).await.is_none() {
+            self.locks.clear_lost(&fh).await;
+        }
+        result
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
         let (object, protocol_state) = file.into_parts();
@@ -2088,7 +2125,17 @@ impl Mount for Mount40 {
                 "NFSv4.0 open state filehandle mismatch".into(),
             ));
         }
-        self.close_lane(lane).await
+        let result = self.close_lane(lane).await;
+        if result.is_ok()
+            && self
+                .state
+                .for_fh(&object.fh, crate::OPEN_BOTH)
+                .await
+                .is_none()
+        {
+            self.locks.clear_lost(&object.fh).await;
+        }
+        result
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.commit_with_verifier(fh, offset, count)
@@ -2835,6 +2882,9 @@ impl Mount for Mount40 {
     async fn read(&self, fh: Bytes, offset: u64, count: u32) -> Result<Bytes> {
         if count == 0 {
             return Ok(Bytes::new());
+        }
+        if let Some(lost) = self.locks.lost(&fh).await {
+            return Err(lost_lock_error("read", &lost));
         }
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {

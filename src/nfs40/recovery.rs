@@ -17,7 +17,7 @@ use super::compound::{
 };
 use super::lease::LeaseState;
 use super::mount::{ClientIdentity, METADATA_TIMEOUT, return_delegation};
-use super::state::{LockLane, LockState, OpenState, OwnerLane};
+use super::state::{LockLane, LockState, LostLock, OpenState, OwnerLane};
 use crate::error::{NfsError, OperationClass, RequestContext, Result};
 use crate::mount::{MountLifecycleState, NFSVersion};
 use crate::rpc::auth::Auth;
@@ -342,9 +342,10 @@ impl RecoveryContext {
 
         // One lane's reclaim failing for an authoritative reason (removed,
         // replaced, or not reclaimable) must not discard state that other lanes
-        // can still recover. Busy statuses keep every remaining lane for the
-        // retry. The pass always waits for all lanes: cancelling in-flight
-        // reclaims could leave server state that the lanes never record.
+        // can still recover. Busy statuses and unknown transmission outcomes
+        // keep every remaining lane for the retry. The pass always waits for all
+        // lanes: cancelling in-flight reclaims could leave server state that the
+        // lanes never record.
         let open_results = stream::iter(self.state.snapshot().await)
             .map(|lane| async move {
                 let result = self.reclaim_open_lane(&lane, renewed_client_id).await;
@@ -358,7 +359,7 @@ impl RecoveryContext {
         for (lane, result) in open_results {
             match result {
                 Ok(()) => {}
-                Err(error) if error.is_server_busy() => {
+                Err(error) if is_retryable_recovery(&error) => {
                     busy_error.get_or_insert(error);
                 }
                 Err(error) if is_authoritative_lane_loss(&error) => {
@@ -404,11 +405,31 @@ impl RecoveryContext {
                     match self.reclaim_lock_lane(&lane, renewed_client_id).await {
                         Ok(true) => {}
                         Ok(false) => {}
-                        Err(error) if error.is_server_busy() => return Err(error),
+                        Err(error) if is_retryable_recovery(&error) => return Err(error),
                         Err(error) if is_authoritative_lane_loss(&error) => {
-                            let (owner, stateid) = {
+                            let (owner, stateid, fh, lost) = {
                                 let lock = lane.lock().await;
-                                (lock.owner, lock.stateid)
+                                // A surviving open must not keep serving I/O while
+                                // the application still believes its lock protects
+                                // it. Gate that file handle until the caller
+                                // reacquires a lock or closes it; unrelated
+                                // handles stay usable.
+                                let lost = match &error {
+                                    NfsError::LockDenied { .. } | NfsError::Nfs4(_) => {
+                                        Some(LostLock {
+                                            status: nfs4_status(&error)
+                                                .unwrap_or(crate::Nfs4ErrorCode::NFS4ERR_DENIED),
+                                            lock_type: lock.lock_type,
+                                            offset: lock.offset,
+                                            length: lock.length,
+                                            owner: lock.owner_wire.clone(),
+                                        })
+                                    }
+                                    // The open itself is gone, so I/O already
+                                    // fails with LostOpenState and needs no gate.
+                                    _ => None,
+                                };
+                                (lock.owner, lock.stateid, lock.fh.clone(), lost)
                             };
                             tracing::warn!(
                                 target: "nfs_rs::stateid",
@@ -416,6 +437,9 @@ impl RecoveryContext {
                                 error = %error,
                                 "NFSv4.0 lock reclaim failed for one lane; dropping only that lock"
                             );
+                            if let Some(lost) = lost {
+                                self.locks.mark_lost(&fh, lost).await;
+                            }
                             self.locks.remove(&stateid).await;
                         }
                         Err(error) => return Err(error),
@@ -431,7 +455,7 @@ impl RecoveryContext {
         for result in lock_results {
             match result {
                 Ok(()) => {}
-                Err(error) if error.is_server_busy() => {
+                Err(error) if is_retryable_recovery(&error) => {
                     busy_error.get_or_insert(error);
                 }
                 Err(error) => {
@@ -439,8 +463,9 @@ impl RecoveryContext {
                 }
             }
         }
-        // Same priority as the open pass: a busy reply keeps every lane for the
-        // retry, and a hard failure is only reported when nothing was busy.
+        // Same priority as the open pass: a busy reply or an unknown
+        // transmission outcome keeps every lane for the retry, and a hard
+        // failure is only reported when nothing was retryable.
         if let Some(error) = busy_error {
             return Err(error);
         }
@@ -823,7 +848,7 @@ impl RecoveryContext {
             // lease deadline: recovery is still incomplete and RENEW owns the
             // lost-lease decision. RENEW does not retry on its own, so one task
             // owns the retries until the mount settles.
-            Err(error) if error.is_server_busy() => {
+            Err(error) if is_retryable_recovery(&error) => {
                 if self.lease.claim_retry_task() {
                     tokio::spawn(retry_recovery(self.clone()));
                 }
@@ -834,8 +859,8 @@ impl RecoveryContext {
     }
 
     /// One recovery attempt with the recovery mutex held: on success the mount
-    /// resumes, on a busy server the backoff window is refreshed, and any other
-    /// failure loses the state.
+    /// resumes, on a busy server or an unknown transmission outcome the backoff
+    /// window is refreshed, and any definitive failure loses the state.
     async fn attempt_recovery(&self) -> Result<()> {
         match self.recover().await {
             Ok(()) => {
@@ -864,7 +889,7 @@ impl RecoveryContext {
                 }
                 Ok(())
             }
-            Err(error) if error.is_server_busy() => {
+            Err(error) if is_retryable_recovery(&error) => {
                 let status = nfs4_status(&error).unwrap_or(crate::Nfs4ErrorCode::NFS4ERR_GRACE);
                 self.lease
                     .defer_recovery(tokio::time::Instant::now() + RECOVERY_BACKOFF, status);
@@ -937,7 +962,7 @@ pub(super) async fn retry_recovery(context: RecoveryContext) {
         }
         match context.attempt_recovery().await {
             Ok(()) => return,
-            Err(error) if error.is_server_busy() => continue,
+            Err(error) if is_retryable_recovery(&error) => continue,
             Err(_) => return,
         }
     }
@@ -1076,6 +1101,21 @@ pub(super) fn recovery_failure(
     state_recovery_exhausted(operation, trigger, source)
 }
 
+/// A reclaim whose reply never arrived, or arrived malformed, may still have
+/// executed on the server. Such unknown outcomes must not lose the whole mount:
+/// a later pass reuses the same seqid, so an executed CLAIM_PREVIOUS answers
+/// BAD_SEQID (handled per lane by the fallback OPEN) and an executed reclaim
+/// LOCK is served from the server's reply cache.
+pub(super) fn is_unknown_outcome(error: &NfsError) -> bool {
+    matches!(error, NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_))
+}
+
+/// Busy statuses and unknown transmission outcomes both mean "keep every lane
+/// and try again within the lease window".
+fn is_retryable_recovery(error: &NfsError) -> bool {
+    error.is_server_busy() || is_unknown_outcome(error)
+}
+
 pub(super) fn state_recovery_exhausted(
     operation: &str,
     trigger: StateidRecovery,
@@ -1152,5 +1192,33 @@ fn nfs4_status(error: &NfsError) -> Option<crate::Nfs4ErrorCode> {
         NfsError::OperationOutcome(details) => nfs4_status(&details.source),
         NfsError::FileClose(failures) => failures.iter().find_map(|f| nfs4_status(&f.error)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_outcomes_are_retryable_and_definitive_failures_are_not() {
+        let dropped = NfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed after the request was sent",
+        ));
+        assert!(is_unknown_outcome(&dropped));
+        assert!(is_retryable_recovery(&dropped));
+        assert!(is_unknown_outcome(&NfsError::Rpc("task failed".into())));
+        assert!(is_unknown_outcome(&NfsError::Xdr("truncated".into())));
+        // Busy statuses stay retryable; definitive statuses must still lose state.
+        assert!(is_retryable_recovery(&NfsError::Nfs4(
+            crate::Nfs4ErrorCode::NFS4ERR_GRACE
+        )));
+        assert!(!is_retryable_recovery(&NfsError::Nfs4(
+            crate::Nfs4ErrorCode::NFS4ERR_NOENT
+        )));
+        assert!(!is_unknown_outcome(&NfsError::LostOpenState("gone".into())));
+        assert!(!is_retryable_recovery(&NfsError::ClosedResource(
+            "closing".into()
+        )));
     }
 }

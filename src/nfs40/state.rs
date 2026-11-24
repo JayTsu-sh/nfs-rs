@@ -37,10 +37,26 @@ pub(crate) struct LockLane {
     pub length: u64,
 }
 
+/// The lock state that recovery could not retain for a file handle.
+///
+/// Reads and writes on that handle stay gated with `StateRecoveryExhausted`
+/// until the caller reacquires a lock or closes the handle, so an application
+/// cannot keep writing through an open whose advisory lock is already gone.
+#[derive(Clone, Debug)]
+pub(crate) struct LostLock {
+    pub(crate) status: crate::Nfs4ErrorCode,
+    pub(crate) lock_type: u32,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) owner: bytes::Bytes,
+}
+
 #[derive(Default)]
 pub(crate) struct LockState {
     lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
     aliases: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
+    /// File handles whose lock was lost during recovery and that still gate I/O.
+    lost: RwLock<HashMap<Vec<u8>, LostLock>>,
     acquisitions: Arc<LockAcquisitions>,
 }
 
@@ -302,10 +318,15 @@ impl LockState {
         if Arc::ptr_eq(&previous, current) {
             return;
         }
-        previous.lock().await.stateid = [0; 16];
-        // `lanes` already points at `current`; drop every alias that still
-        // resolves to the retired lane so `by_stateid` cannot hand it back.
-        // Lock order stays `lane -> maps`, matching `locku` and reclaim.
+        // Never await another lane here: `rekey` calls this while holding the
+        // current lane, so two concurrent reclaim groups whose server-assigned
+        // stateids swap would wait on each other forever while the recovery
+        // guard is held. The alias purge below already stops `by_stateid` from
+        // resolving to the retired lane; zeroing only hides it from stale
+        // snapshots, so skipping it under contention is safe.
+        if let Ok(mut previous) = previous.try_lock() {
+            previous.stateid = [0; 16];
+        }
         self.aliases
             .write()
             .await
@@ -317,12 +338,29 @@ impl LockState {
         );
     }
 
+    /// Remember that recovery could not retain a lock for `fh`, so I/O on that
+    /// handle must fail until the caller reacquires or closes it.
+    pub(crate) async fn mark_lost(&self, fh: &[u8], lost: LostLock) {
+        self.lost.write().await.insert(fh.to_vec(), lost);
+    }
+
+    /// The lost-lock record gating I/O on `fh`, if any.
+    pub(crate) async fn lost(&self, fh: &[u8]) -> Option<LostLock> {
+        self.lost.read().await.get(fh).cloned()
+    }
+
+    /// Lift the gate after a successful reacquire on the same handle.
+    pub(crate) async fn clear_lost(&self, fh: &[u8]) {
+        self.lost.write().await.remove(fh);
+    }
+
     pub(crate) async fn clear(&self) {
         // In-flight acquisitions are left to their detached tasks; waiting for
         // them is bounded by the RPC timeout, and their lanes are retired by
         // the generation check once the reply arrives.
         self.lanes.write().await.clear();
         self.aliases.write().await.clear();
+        self.lost.write().await.clear();
     }
 }
 
@@ -560,6 +598,25 @@ mod tests {
         let current = state.by_stateid(&[2; 16]).await.unwrap();
         assert!(Arc::ptr_eq(&current, &newer));
         assert_eq!(third.lock().await.stateid, [0; 16]);
+
+        // A concurrent reclaim group may hold the lane being retired. Retiring
+        // must not wait for it: with swapped server-assigned stateids, two
+        // groups would otherwise deadlock while the recovery guard is held.
+        let held = newer.lock().await;
+        let fourth = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.register(make(10, [2; 16])),
+        )
+        .await
+        .expect("retiring a lane held elsewhere must not block");
+        drop(held);
+        assert!(
+            state
+                .by_stateid(&[2; 16])
+                .await
+                .is_some_and(|lane| Arc::ptr_eq(&lane, &fourth)),
+            "the newer lane must own the reused stateid even when the retired lane was busy"
+        );
     }
 
     #[test]

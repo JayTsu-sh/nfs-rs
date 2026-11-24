@@ -112,6 +112,21 @@ fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
     result
 }
 
+fn succeeded_lock_result(tag: &str, seqid: u32, stateid: [u8; 16]) -> Vec<u8> {
+    let mut result = Vec::new();
+    result.extend_from_slice(&0u32.to_be_bytes());
+    xdr_opaque(&mut result, tag.as_bytes());
+    result.extend_from_slice(&2u32.to_be_bytes());
+    result.extend_from_slice(&22u32.to_be_bytes());
+    result.extend_from_slice(&0u32.to_be_bytes());
+    result.extend_from_slice(&12u32.to_be_bytes());
+    result.extend_from_slice(&0u32.to_be_bytes());
+    result.extend_from_slice(&0u32.to_be_bytes());
+    result.extend_from_slice(&seqid.to_be_bytes());
+    result.extend_from_slice(&stateid);
+    result
+}
+
 fn failed_lock_result(tag: &str, opcode: u32, status: u32) -> Vec<u8> {
     let mut result = Vec::new();
     result.extend_from_slice(&status.to_be_bytes());
@@ -3677,7 +3692,7 @@ async fn recovery_skips_closing_lanes() {
 }
 
 #[tokio::test]
-async fn partial_reclaim_compound_loses_state_with_structured_guidance() {
+async fn partial_reclaim_compound_outcome_is_unknown_and_keeps_state() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
     register_scripted_open(&mount, 79, b"fh").await;
@@ -3722,24 +3737,35 @@ async fn partial_reclaim_compound_loses_state_with_structured_guidance() {
     .recover_or_lose()
     .await
     .unwrap_err();
-    assert_eq!(
-        error.operation_outcome().unwrap().recovery,
-        crate::RecoveryAction::Reopen
+    // The contradictory reclaim reply sends this lane through the fallback OPEN,
+    // which then loses its reply. That outcome is unknown, not a definitive
+    // rejection, so the mount keeps the lane and retries within the lease
+    // window instead of discarding every open state.
+    assert!(
+        matches!(&error, crate::NfsError::Io(_)),
+        "the fallback OPEN failure must stay an unknown outcome: {error:?}"
     );
-    assert_eq!(
+    assert_ne!(
         mount.health().lifecycle,
         crate::MountLifecycleState::LostState
     );
-    assert!(mount.state.snapshot().await.is_empty());
+    assert_eq!(mount.health().generation, 1);
+    assert!(
+        !mount.state.snapshot().await.is_empty(),
+        "an unknown outcome must keep the open lane for the retry"
+    );
     server.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn reclaim_reply_loss_is_not_replayed_and_requires_reopen() {
+async fn reclaim_reply_loss_is_retried_with_the_same_seqid() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
     register_scripted_open(&mount, 80, b"fh").await;
+    let owner_wire = crate::nfs40::recovery::open_owner_wire(mount.issuer, 80);
+    let (seqid_tx, seqid_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        // First pass: the reclaim may have executed, but its reply is lost (RST).
         let (mut stream, _) = listener.accept().await?;
         let identity = read_record(&mut stream).await?;
         let mut identity_data = Vec::new();
@@ -3758,12 +3784,36 @@ async fn reclaim_reply_loss_is_not_replayed_and_requires_reopen() {
             &compound_result("confirm", &[(36, &[])]),
         )
         .await?;
-        let _reclaim = read_record(&mut stream).await?;
+        let reclaim = read_record(&mut stream).await?;
+        let first = open_owner_seqid(&reclaim, &owner_wire);
         socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
         drop(stream);
-        Ok::<(), std::io::Error>(())
+
+        // Second pass: the scheduled retry reconnects and must reuse the seqid.
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&42u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7f; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let reclaim = read_record(&mut stream).await?;
+        let second = open_owner_seqid(&reclaim, &owner_wire);
+        let _ = seqid_tx.send((first, second));
+        reply(&mut stream, &reclaim, &open_result(0, [0x8a; 16], b"fh")).await
     });
-    let error = RecoveryContext {
+    let context = RecoveryContext {
         rpc: mount.rpc.clone(),
         auth: mount.auth.clone(),
         identity: ClientIdentity {
@@ -3776,14 +3826,48 @@ async fn reclaim_reply_loss_is_not_replayed_and_requires_reopen() {
         locks: Arc::clone(&mount.locks),
         lease: Arc::clone(&mount.lease),
         callback_addr: None,
+    };
+    let error = context.recover_or_lose().await.unwrap_err();
+    // A lost reclaim reply may have executed on the server. Keep every lane and
+    // let the scheduled retry resend the same seqid (an executed CLAIM_PREVIOUS
+    // is answered with BAD_SEQID, which the per-lane fallback OPEN handles)
+    // instead of declaring the whole mount lost after one dropped packet.
+    assert!(
+        matches!(&error, crate::NfsError::Io(_)),
+        "a lost reclaim reply must surface as an unknown outcome: {error:?}"
+    );
+    assert_ne!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState
+    );
+    assert_eq!(mount.health().generation, 1);
+    assert!(
+        !mount.state.snapshot().await.is_empty(),
+        "the ramp-up open lane must survive for the retry"
+    );
+    let (first, second) = tokio::time::timeout(Duration::from_secs(15), seqid_rx)
+        .await
+        .expect("the scheduled retry never reached the server")
+        .expect("the retry dropped the seqid channel");
+    assert_eq!(first, 0, "the first reclaim of a session starts at seqid 0");
+    assert_eq!(
+        second, first,
+        "a reclaim whose reply was lost must be retried with the same seqid"
+    );
+    let lane = mount
+        .state
+        .by_owner(80)
+        .await
+        .expect("the recovered lane must stay published");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while mount.health().lifecycle != crate::MountLifecycleState::Ready {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retry never resumed the mount after reclaiming the lane"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    .recover_or_lose()
-    .await
-    .unwrap_err();
-    let outcome = error.operation_outcome().unwrap();
-    assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
-    assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
-    assert_eq!(mount.health().generation, 2);
+    assert_eq!(lane.lock().await.stateid, [0x8a; 16]);
     server.await.unwrap().unwrap();
 }
 
@@ -7526,7 +7610,21 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
         let reclaim = read_record(&mut stream).await?;
         reply(&mut stream, &reclaim, &open_result(0, [0x61; 16], b"fh")).await?;
         let lock = read_record(&mut stream).await?;
-        reply(&mut stream, &lock, &denied_lock_result("reclaim-lock", 12)).await
+        reply(&mut stream, &lock, &denied_lock_result("reclaim-lock", 12)).await?;
+        // The gated READ on the affected handle must fail locally, so the next
+        // record is the unrelated open's READ.
+        let read = read_record(&mut stream).await?;
+        reply(&mut stream, &read, &read_result(&[0x42; 4])).await?;
+        // Reacquiring a lock lifts the gate; the READ that follows succeeds.
+        let relock = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &relock,
+            &succeeded_lock_result("lock", 0, [0xd2; 16]),
+        )
+        .await?;
+        let read = read_record(&mut stream).await?;
+        reply(&mut stream, &read, &read_result(&[0x43; 4])).await
     });
     let context = RecoveryContext {
         rpc: mount.rpc.clone(),
@@ -7552,6 +7650,50 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
         mount.locks.by_stateid(&[0xd1; 16]).await.is_none(),
         "a denied reclaim LOCK must drop only that lock, not lose the mount"
     );
+    // The application must learn that the lock is gone before it touches the
+    // surviving open again: the gate fails locally, without a server round trip.
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.read(Bytes::from_static(b"fh"), 0, 4),
+    )
+    .await
+    .expect("a lock-loss gated READ must fail without reaching the server")
+    .unwrap_err();
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "read");
+    assert!(matches!(
+        details.source.as_ref(),
+        crate::NfsError::LockDenied { .. }
+    ));
+    let write = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"x")),
+    )
+    .await
+    .expect("a lock-loss gated WRITE must fail without reaching the server")
+    .unwrap_err();
+    let crate::NfsError::StateRecoveryExhausted(details) = &write else {
+        panic!("expected a lock-loss recovery error for write, got {write:?}");
+    };
+    assert_eq!(details.operation, "write");
+
+    // Unrelated opens remain usable.
+    register_scripted_open(&mount, 86, b"other").await;
+    let unrelated = mount
+        .read(Bytes::from_static(b"other"), 0, 4)
+        .await
+        .unwrap();
+    assert_eq!(&unrelated[..], &[0x42; 4]);
+
+    // Reacquiring a lock acknowledges the loss and lifts the gate.
+    mount
+        .lock(Bytes::from_static(b"fh"), 2, 0, 1)
+        .await
+        .unwrap();
+    let after = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
+    assert_eq!(&after[..], &[0x43; 4]);
     server.await.unwrap().unwrap();
 }
 
