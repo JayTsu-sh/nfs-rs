@@ -2074,8 +2074,7 @@ fn decode_directory_entry(data: &mut Bytes, previous_cookie: u64) -> Result<Dire
     if data.remaining() < padded {
         return Err(NfsError::Xdr("READDIR entry name truncated".into()));
     }
-    let name = String::from_utf8(data.split_to(name_len).to_vec())
-        .map_err(|error| NfsError::Xdr(format!("READDIR entry name is not UTF-8: {error}")))?;
+    let name = crate::nfs4::name::display(&data.split_to(name_len));
     data.advance(padded - name_len);
     let attr = decode_getattr_response(data)?;
     Ok(DirectoryEntry { cookie, name, attr })
@@ -8040,6 +8039,26 @@ mod tests {
         assert_eq!(entry.cookie, 7);
         assert_eq!(entry.name, "file");
         assert_eq!(entry.attr.fileid, 42);
+        assert!(eof);
+    }
+
+    #[test]
+    fn readdir_page_keeps_non_utf8_name_addressable() {
+        let mut page = Vec::new();
+        page.extend_from_slice(b"verifier");
+        page.extend_from_slice(&1u32.to_be_bytes());
+        page.extend_from_slice(&7u64.to_be_bytes());
+        xdr_opaque(&mut page, b"\xd6\xd0\xce\xc4");
+        page.extend_from_slice(&1u32.to_be_bytes());
+        page.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        page.extend_from_slice(&8u32.to_be_bytes());
+        page.extend_from_slice(&42u64.to_be_bytes());
+        page.extend_from_slice(&0u32.to_be_bytes());
+        page.extend_from_slice(&1u32.to_be_bytes());
+        let (_, entries, eof) = decode_directory_page(&mut Bytes::from(page), 0).unwrap();
+        let entry = entries[0].as_ref().unwrap();
+        assert_eq!(entry.name, "~nfs-rs-raw:D6D0CEC4");
+        assert_eq!(crate::nfs4::name::wire(&entry.name), b"\xd6\xd0\xce\xc4");
         assert!(eof);
     }
 

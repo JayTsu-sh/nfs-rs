@@ -568,7 +568,7 @@ impl CompoundBuilder {
 
     pub fn lookup(mut self, name: &str) -> Self {
         let mut args = Vec::new();
-        xdr_string(&mut args, name);
+        xdr_var_bytes(&mut args, &crate::nfs4::name::wire(name));
         self.ops.push(EncodedOp {
             opcode: OpNum::Lookup,
             args,

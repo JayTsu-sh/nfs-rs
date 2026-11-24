@@ -334,7 +334,7 @@ impl CompoundBuilder {
     }
 
     pub(crate) fn lookup(mut self, name: &str) -> Self {
-        self.inner = self.inner.lookup(name);
+        self.inner = self.inner.lookup_bytes(&crate::nfs4::name::wire(name));
         self
     }
 
@@ -1798,6 +1798,19 @@ mod tests {
         assert!(index < count);
         assert_eq!(index, 0, "test helper only selects the first operation");
         (data.get_u32(), data)
+    }
+
+    #[test]
+    fn lookup_restores_non_utf8_directory_name_bytes() {
+        let body = CompoundBuilder::new("lookup")
+            .lookup("~nfs-rs-raw:D6D0CEC4")
+            .encode_body();
+        let (opcode, mut args) = operation_arguments(&body, 0);
+        assert_eq!(opcode, crate::nfs4::compound::OP_LOOKUP);
+        assert_eq!(
+            take_opaque(&mut args, "name").unwrap().as_ref(),
+            b"\xd6\xd0\xce\xc4"
+        );
     }
 
     #[test]

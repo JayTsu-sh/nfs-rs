@@ -52,9 +52,9 @@ impl CompoundBuilder {
         self.operation(OP_PUTFH, args)
     }
 
-    pub(crate) fn lookup(self, name: &str) -> Self {
+    pub(crate) fn lookup_bytes(self, name: &[u8]) -> Self {
         let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
+        xdr_opaque(&mut args, name);
         self.operation(OP_LOOKUP, args)
     }
 
@@ -159,7 +159,7 @@ mod tests {
     fn minor_zero_navigation_has_canonical_common_opcodes() {
         let actual = CompoundBuilder::new("navigate", 0)
             .putrootfh()
-            .lookup("export")
+            .lookup_bytes(b"export")
             .getfh()
             .encode_body();
         let mut expected = Vec::new();

@@ -2761,7 +2761,7 @@ pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<String> {
     if data.remaining() < padded {
         return Err(NfsError::Xdr("string data truncated".to_string()));
     }
-    let s = String::from_utf8_lossy(&data.slice(..len)).to_string();
+    let s = crate::nfs4::name::display(&data.slice(..len));
     data.advance(padded);
     Ok(s)
 }
