@@ -49,8 +49,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   lock another client may hold (servers enforce only share reservations and
   mandatory locks) while `write` already failed. A zero-length read still
   returns an empty buffer without reaching the server. A size-changing SETATTR
-  without an open lane is refused the same way, while metadata-only SETATTR
-  keeps using the anonymous stateid.
+  is refused the same way, with or without an open lane, while metadata-only
+  SETATTR keeps using the anonymous stateid.
 
 ## [0.12.0] - 2026-11-09
 

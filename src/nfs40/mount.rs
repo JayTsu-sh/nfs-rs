@@ -1762,7 +1762,7 @@ impl Mount40 {
 
     async fn set_encoded_attributes(
         &self,
-        operation: &str,
+        operation: &'static str,
         fh: &Bytes,
         bitmap: &[u32],
         values: &[u8],
@@ -1778,14 +1778,24 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
-        if lane.is_none() && needs_open {
-            // A size change writes the truncated range, so without an open lane
-            // it must not go out with the anonymous stateid while the mount
-            // holds no state: that would bypass the gate READ and WRITE honour.
-            // This decision uses the same lookup as the request below, so a lane
-            // that recovery drops afterwards cannot slip in between.
-            self.lease.gate_stateful(operation)?;
-        }
+        // A truncate writes the truncated range, so like WRITE it keeps its open
+        // lane out of recovery between the lost-lock recheck and the send: a
+        // reclaim publishes the loss under the same lane, and this fence makes
+        // the lock-then-check atomic with respect to that publish. Only size
+        // changes pay for it; metadata-only SETATTR stays on the cheap path.
+        let _truncate_in_flight = if needs_open {
+            match &lane {
+                // Release the lane before waiting on the fence: close and reclaim
+                // take the fence first and the lane second.
+                Some(lane) => {
+                    let fence = Arc::clone(&lane.lock().await.io_fence);
+                    Some(fence.read_owned().await)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut retries = 0u8;
         loop {
             let (stateid, expected_generation) = match &lane {
@@ -1796,9 +1806,27 @@ impl Mount40 {
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
+                    // A truncate writes data, so it observes the lost-lock gate
+                    // READ and WRITE honour even when a lane survived. Both the
+                    // lookup above and this wait queue behind a reclaim that
+                    // publishes a loss while holding the lane, so the answer is
+                    // taken under that same lane, as READ and WRITE do.
+                    if needs_open && let Some(lost) = self.locks.lost(fh).await {
+                        return Err(lost_lock_error(operation, &lost));
+                    }
                     (guard.stateid, Some(self.lease.begin_stateful(operation)?))
                 }
-                None => ([0; 16], None),
+                None => {
+                    if needs_open {
+                        if let Some(lost) = self.locks.lost(fh).await {
+                            return Err(lost_lock_error(operation, &lost));
+                        }
+                        // Without an open lane the request would go out with the
+                        // anonymous stateid while the mount holds no state.
+                        self.lease.gate_stateful(operation)?;
+                    }
+                    ([0; 16], None)
+                }
             };
             let request = CompoundBuilder::new(operation)
                 .putfh(fh)
@@ -2937,6 +2965,12 @@ impl Mount for Mount40 {
         }
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {
+            // `for_fh` waits on every lane mutex it visits, and recovery can
+            // publish a loss while holding one of those lanes, so recheck the
+            // gate after the wait instead of trusting the entry check.
+            if let Some(lost) = self.locks.lost(&fh).await {
+                return Err(lost_lock_error("read", &lost));
+            }
             // An anonymous-stateid READ is legal (RFC 7530 §9.1.4.3), but only
             // while the mount still holds its state. After state loss the
             // caller's locks are gone and this handle has no lane left to gate

@@ -8187,6 +8187,178 @@ async fn setattr_size_after_state_loss_fails_locally_but_metadata_still_works() 
 }
 
 #[tokio::test]
+async fn a_read_that_queued_on_a_lane_sees_a_loss_published_during_the_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), read_record(&mut stream))
+                .await
+                .is_err(),
+            "a gated READ must not reach the server"
+        );
+        Ok::<_, std::io::Error>(())
+    });
+    // Only a WRITE owner remains, so the READ lookup finds no usable lane but
+    // still parks on this lane's mutex.
+    let lane = register_stateid_lane(&mount, 93, [0xc2; 16], crate::OPEN_WRITE).await;
+    let held = lane.lock().await;
+    let read_mount = Arc::clone(&mount);
+    let read = tokio::spawn(async move { read_mount.read(Bytes::from_static(b"fh"), 0, 4).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Recovery publishes the loss while the lookup is parked on that lane.
+    mount
+        .locks
+        .mark_lost(
+            b"fh",
+            LostLock {
+                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                lock_type: 1,
+                offset: 0,
+                length: 4,
+                owner: Bytes::from_static(b"scripted-lock-93"),
+            },
+        )
+        .await;
+    drop(held);
+    let error = read
+        .await
+        .unwrap()
+        .expect_err("a READ that queued on a lane must observe the loss");
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "read");
+    assert_eq!(details.status, crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_truncate_with_a_surviving_open_still_honours_the_lost_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_stateid_lane(&mount, 94, [0xc3; 16], crate::OPEN_WRITE).await;
+    mount
+        .locks
+        .mark_lost(
+            b"fh",
+            LostLock {
+                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                lock_type: 2,
+                offset: 0,
+                length: 4,
+                owner: Bytes::from_static(b"scripted-lock-94"),
+            },
+        )
+        .await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        // The truncate must be refused locally, so the metadata-only SETATTR on
+        // another handle is the only request.
+        let setattr = read_record(&mut stream).await?;
+        assert!(
+            setattr.windows(4).any(|wire| wire == b"meta".as_slice()),
+            "a gated truncate reached the server through a surviving open"
+        );
+        reply(&mut stream, &setattr, &setattr_result()).await
+    });
+    let error = mount
+        .setattr(
+            Bytes::from_static(b"fh"),
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a truncate must honour the lost-lock gate even with an open lane");
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "setattr");
+    assert_eq!(details.status, crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID);
+    mount
+        .setattr(
+            Bytes::from_static(b"meta"),
+            None,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_truncate_waits_for_the_publish_fence_before_sending() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), read_record(&mut stream))
+                .await
+                .is_err(),
+            "a gated truncate must not reach the server"
+        );
+        Ok::<_, std::io::Error>(())
+    });
+    let lane = register_stateid_lane(&mount, 96, [0xc4; 16], crate::OPEN_WRITE).await;
+    let fence = Arc::clone(&lane.lock().await.io_fence);
+    // Hold the fence a reclaim takes before it publishes a loss, so the truncate
+    // must queue behind the publish instead of deciding before it.
+    let published = fence.write_owned().await;
+    let truncate_mount = Arc::clone(&mount);
+    let truncate = tokio::spawn(async move {
+        truncate_mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                None,
+                None,
+                None,
+                None,
+                Some(4),
+                None,
+                None,
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    mount
+        .locks
+        .mark_lost(
+            b"fh",
+            LostLock {
+                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                lock_type: 2,
+                offset: 0,
+                length: 0,
+                owner: Bytes::from_static(b"scripted-lock-96"),
+            },
+        )
+        .await;
+    drop(published);
+    let error = truncate
+        .await
+        .unwrap()
+        .expect_err("a truncate must observe a loss published before its fence");
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "setattr");
+    assert_eq!(details.status, crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn io_queued_behind_a_denied_reclaim_is_gated_at_dispatch() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
