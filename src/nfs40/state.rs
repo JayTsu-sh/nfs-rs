@@ -52,23 +52,18 @@ pub(crate) struct LostLock {
     pub(crate) owner: bytes::Bytes,
 }
 
-/// Whether `granted` restores the protection of a lost lock.
+/// RFC 7530 §16.10: a lock length of `u64::MAX` means "to the end of file".
+const LOCK_TO_EOF: u64 = u64::MAX;
+
+/// Whether a newly granted lock restores the protection of a lost lock.
 ///
 /// A WRITE lock (2) restores a lost READ (1) or WRITE lock; a READ lock does not
-/// restore a lost WRITE lock. A zero length means "to the end of file", which
-/// only another open-ended lock can cover.
+/// restore a lost WRITE lock. The grant must start at or before the lost range
+/// and reach at least as far. `u64::MAX` is NFSv4's end-of-file sentinel, so only
+/// another open-ended lock covers a lost open-ended lock; the public LOCK API
+/// rejects a zero length, which therefore covers nothing.
 fn restores(loss: &LostLock, lock_type: u32, offset: u64, length: u64) -> bool {
-    if lock_type < loss.lock_type {
-        return false;
-    }
-    let end = |start: u64, length: u64| {
-        if length == 0 {
-            None
-        } else {
-            start.checked_add(length)
-        }
-    };
-    if offset > loss.offset {
+    if lock_type < loss.lock_type || offset > loss.offset {
         return false;
     }
     match (end(offset, length), end(loss.offset, loss.length)) {
@@ -77,6 +72,14 @@ fn restores(loss: &LostLock, lock_type: u32, offset: u64, length: u64) -> bool {
         (None, _) => true,
         (_, None) => false,
     }
+}
+
+/// One past the last byte the lock covers, or `None` when it runs to EOF.
+///
+/// A finite range that overflows `u64` saturates instead of being mistaken for
+/// the sentinel; such a range is invalid and a conforming server rejects it.
+fn end(offset: u64, length: u64) -> Option<u64> {
+    (length != LOCK_TO_EOF).then(|| offset.saturating_add(length))
 }
 
 #[derive(Default)]
@@ -687,7 +690,7 @@ mod tests {
         let write = loss(2, 0, 4096);
         assert!(restores(&write, 2, 0, 4096), "the same lock");
         assert!(restores(&write, 2, 0, 8192), "a wider lock");
-        assert!(restores(&write, 2, 0, 0), "a lock to EOF");
+        assert!(restores(&write, 2, 0, LOCK_TO_EOF), "a lock to EOF");
         assert!(!restores(&write, 2, 4096, 1), "a disjoint lock");
         assert!(!restores(&write, 2, 0, 1), "a partial overlap");
         assert!(
@@ -699,14 +702,31 @@ mod tests {
             restores(&read, 2, 0, 4096),
             "a WRITE lock over a lost READ lock"
         );
-        assert!(!restores(&loss(2, 0, 0), 2, 0, 4096), "a lost lock to EOF");
+        // RFC 7530 §16.10: u64::MAX, not zero, is the end-of-file sentinel.
+        let tail = loss(2, 4096, LOCK_TO_EOF);
         assert!(
-            restores(&loss(2, 0, 0), 2, 0, 0),
-            "only a lock to EOF covers it"
+            restores(&tail, 2, 0, LOCK_TO_EOF),
+            "the whole file covers a tail lock"
         );
         assert!(
-            !restores(&loss(2, u64::MAX - 1, 8), 2, 0, u64::MAX),
-            "an overflowing range is never reported as covered"
+            !restores(&tail, 2, 0, 4096 + 8),
+            "a finite lock leaves the tail uncovered"
+        );
+        assert!(
+            !restores(&tail, 2, 4096, LOCK_TO_EOF - 1),
+            "a shorter finite tail is not a cover"
+        );
+        assert!(
+            !restores(&loss(2, 0, LOCK_TO_EOF), 2, 0, 4096),
+            "a finite lock does not cover a lock to EOF"
+        );
+        assert!(
+            !restores(&loss(2, 0, 8), 2, 0, 0),
+            "a zero length covers nothing"
+        );
+        assert!(
+            !restores(&loss(2, u64::MAX - 1, 8), 2, 0, 8),
+            "an overflowing finite range saturates instead of covering EOF"
         );
     }
 }

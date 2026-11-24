@@ -5558,7 +5558,14 @@ async fn register_scripted_open(mount: &Mount40, owner: u64, fh: &'static [u8]) 
         .await;
 }
 
-async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) {
+async fn register_scripted_lock_range(
+    mount: &Mount40,
+    owner: u64,
+    stateid: [u8; 16],
+    lock_type: u32,
+    offset: u64,
+    length: u64,
+) {
     mount
         .locks
         .register(LockLane {
@@ -5568,11 +5575,15 @@ async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) 
             next_seqid: 1,
             stateid,
             fh: Bytes::from_static(b"fh"),
-            lock_type: 2,
-            offset: 0,
-            length: 1,
+            lock_type,
+            offset,
+            length,
         })
         .await;
+}
+
+async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) {
+    register_scripted_lock_range(mount, owner, stateid, 2, 0, 1).await;
 }
 
 #[tokio::test]
@@ -7587,7 +7598,9 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
     register_scripted_open(&mount, 85, b"fh").await;
-    register_scripted_lock(&mount, 85, [0xd1; 16]).await;
+    // A WRITE lock from 4096 to the end of file; u64::MAX is the RFC 7530
+    // end-of-file sentinel and the only form the public LOCK API can express.
+    register_scripted_lock_range(&mount, 85, [0xd1; 16], 2, 4096, u64::MAX).await;
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
         let identity = read_record(&mut stream).await?;
@@ -7691,11 +7704,11 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
     assert_eq!(&unrelated[..], &[0x42; 4]);
 
     // A disjoint lock and a weaker READ lock do not restore a lost WRITE lock
-    // over [0, 1): neither may acknowledge the loss. Only the covering WRITE
-    // lock does.
-    for (lock_type, offset) in [(2, 4096), (1, 0), (2, 0)] {
+    // over [4096, EOF): neither may acknowledge the loss. Only the covering
+    // WRITE lock over [0, EOF) does.
+    for (lock_type, offset, length) in [(2, 0, 4096), (1, 0, u64::MAX), (2, 0, u64::MAX)] {
         mount
-            .lock(Bytes::from_static(b"fh"), lock_type, offset, 1)
+            .lock(Bytes::from_static(b"fh"), lock_type, offset, length)
             .await
             .unwrap();
         let gated = tokio::time::timeout(
@@ -7703,7 +7716,7 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
             mount.read(Bytes::from_static(b"fh"), 0, 4),
         )
         .await;
-        if offset == 0 && lock_type == 2 {
+        if lock_type == 2 && offset == 0 && length == u64::MAX {
             let after = gated
                 .expect("the covering lock must lift the gate")
                 .unwrap();
@@ -7718,6 +7731,458 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
             );
         }
     }
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_lock_released_during_open_recovery_does_not_gate_io() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    // The lock's open lane is already gone, so the reclaim branch that cannot
+    // find an open owner is the one under test.
+    register_scripted_lock(&mount, 92, [0xb8; 16]).await;
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        // Hold the LOCKU reply so the lane stays held (and registered) while
+        // recovery snapshots it and blocks on its mutex.
+        let locku = read_record(&mut stream).await?;
+        let _ = seen_tx.send(());
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&22u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7c; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let _ = release_rx.await;
+        reply(
+            &mut stream,
+            &locku,
+            &compound_result("locku", &[(22, &[]), (14, &[0xb9; 16])]),
+        )
+        .await?;
+        let cleanup = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &cleanup,
+            &compound_result("release-lockowner", &[(39, &[])]),
+        )
+        .await?;
+        // The next request is the caller's stateless READ: a reclaim of the
+        // released lock would arrive here first and fail to decode as one.
+        let read = read_record(&mut stream).await?;
+        reply(&mut stream, &read, &read_result(&[0x55; 4])).await
+    });
+    let unlock_mount = Arc::clone(&mount);
+    let unlock = tokio::spawn(async move {
+        unlock_mount
+            .locku(
+                Bytes::from_static(b"fh"),
+                Bytes::from_static(&[0xb8; 16]),
+                2,
+                0,
+                1,
+            )
+            .await
+    });
+    seen_rx.await.unwrap();
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5d; 8],
+            owner: "scripted-released-lock".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let recovery = tokio::spawn(async move { context.recover_or_lose().await });
+    // Give recovery time to snapshot the lock and queue on its mutex before the
+    // LOCKU reply retires it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = release_tx.send(());
+    recovery.await.unwrap().unwrap();
+    unlock.await.unwrap().unwrap();
+    assert!(
+        mount.locks.lost(&Bytes::from_static(b"fh")).await.is_none(),
+        "a lock the caller already released must not gate I/O"
+    );
+    // With the gate absent the handle still has no open lane, so this is the
+    // stateless path.
+    let data = mount
+        .read(Bytes::from_static(b"fh"), 0, 4)
+        .await
+        .expect("I/O on a handle whose released lock recovery skipped must proceed");
+    assert_eq!(&data[..], &[0x55; 4]);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_lock_whose_open_recovery_dropped_still_gates_io_until_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 88, b"fh").await;
+    register_scripted_lock(&mount, 88, [0xf1; 16]).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&21u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7b; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        // Both the reclaim and its CLAIM_NULL fallback are rejected, so recovery
+        // drops the open lane and the lock it carried can never be reclaimed.
+        let reclaim = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &reclaim,
+            &failed_lock_result("reclaim-open", 18, 10038),
+        )
+        .await?;
+        let fallback = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &fallback,
+            &failed_lock_result("reclaim-fallback-open", 18, 10038),
+        )
+        .await?;
+        // The gated I/O never reaches the server; once CLOSE lifts the gate the
+        // handle has no open lane left, so a stateless READ is the next record.
+        let read = read_record(&mut stream).await?;
+        reply(&mut stream, &read, &read_result(&[0x44; 4])).await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5c; 8],
+            owner: "scripted-open-reclaim-loss".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    context.recover_or_lose().await.unwrap();
+    assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+    assert!(
+        mount.state.by_owner(88).await.is_none(),
+        "a rejected reclaim must drop the open lane"
+    );
+    assert!(
+        mount.locks.by_stateid(&[0xf1; 16]).await.is_none(),
+        "a lock whose open is gone must be dropped instead of reclaimed"
+    );
+    // The lock died with its open, so I/O must fail even though no open lane
+    // remains to gate it at dispatch: otherwise READ would fall back to the
+    // stateless path and run outside the protection the caller still expects.
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.read(Bytes::from_static(b"fh"), 0, 4),
+    )
+    .await
+    .expect("a gated READ must fail without reaching the server")
+    .unwrap_err();
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "read");
+    assert_eq!(details.status, crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID);
+    let write = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"x")),
+    )
+    .await
+    .expect("a gated WRITE must fail without reaching the server")
+    .unwrap_err();
+    let crate::NfsError::StateRecoveryExhausted(details) = &write else {
+        panic!("expected a lock-loss recovery error for write, got {write:?}");
+    };
+    assert_eq!(details.operation, "write");
+    // CLOSE releases nothing on the server but must lift the gate, otherwise a
+    // handle whose open recovery dropped could never be retired.
+    mount.close(Bytes::from_static(b"fh")).await.unwrap();
+    let data = mount
+        .read(Bytes::from_static(b"fh"), 0, 4)
+        .await
+        .expect("a closed handle must be readable through the stateless path");
+    assert_eq!(&data[..], &[0x44; 4]);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn close_stateful_lifts_the_gate_when_recovery_dropped_the_last_open() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 91, b"fh").await;
+    register_scripted_lock(&mount, 91, [0xb7; 16]).await;
+    let fh = Bytes::from_static(b"fh");
+    // Reproduce what recovery leaves behind when it rejects an open reclaim and
+    // drops the lock that depended on it: no lane, but a published lock gate.
+    mount.state.remove(91, &fh).await;
+    mount.locks.remove(&[0xb7; 16]).await;
+    mount
+        .locks
+        .mark_lost(
+            &fh,
+            LostLock {
+                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                lock_type: 2,
+                offset: 0,
+                length: 1,
+                owner: Bytes::from_static(b"scripted-lock-91"),
+            },
+        )
+        .await;
+    assert!(!mount.locks.has_fh(&fh).await);
+    // CLOSE releases nothing on the server, but the owner token still names the
+    // dropped lane; it must succeed and lift the gate, or the handle could never
+    // be retired after its open recovery failed.
+    let opened = mount::OpenFile::with_protocol_state(
+        mount::ObjRes {
+            fh: fh.clone(),
+            attr: None,
+        },
+        encode_owner(mount.issuer, 91),
+    );
+    mount.close_stateful(opened).await.unwrap();
+    assert!(
+        mount.locks.lost(&fh).await.is_none(),
+        "a successful CLOSE must lift the lock gate"
+    );
+    // Without the gate the same stale token is still a programming error.
+    let stale = mount::OpenFile::with_protocol_state(
+        mount::ObjRes {
+            fh: fh.clone(),
+            attr: None,
+        },
+        encode_owner(mount.issuer, 91),
+    );
+    assert!(matches!(
+        mount.close_stateful(stale).await,
+        Err(NfsError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_stateless_read_after_total_state_loss_fails_locally() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 89, b"fh").await;
+    register_scripted_lock(&mount, 89, [0xa5; 16]).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&22u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7c; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        // A session-wide status cannot be a per-lane loss, so recovery gives up
+        // and drops every lane instead of resuming the mount.
+        let reclaim = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &reclaim,
+            &failed_lock_result("reclaim-open", 18, 10022),
+        )
+        .await?;
+        // Neither the READ nor its zero-length lease probe may be sent.
+        if let Ok(record) =
+            tokio::time::timeout(Duration::from_millis(500), read_record(&mut stream)).await
+        {
+            panic!(
+                "I/O reached the server after state loss: {} bytes",
+                record.unwrap().len()
+            );
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5d; 8],
+            owner: "scripted-total-loss".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    context.recover_or_lose().await.unwrap_err();
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState
+    );
+    assert!(
+        mount.state.by_owner(89).await.is_none(),
+        "a lost mount must not keep reclaimable lanes"
+    );
+    assert!(mount.locks.by_stateid(&[0xa5; 16]).await.is_none());
+    // With every lane dropped, this handle has no open state and no lock record
+    // left, so nothing but the lifecycle check can stop the anonymous-stateid
+    // READ from running outside the lock the caller still believes it holds.
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.read(Bytes::from_static(b"fh"), 0, 4),
+    )
+    .await
+    .expect("a stateless READ after state loss must fail locally")
+    .unwrap_err();
+    let details = error
+        .operation_outcome()
+        .expect("expected the lifecycle gate error");
+    assert_eq!(details.recovery, crate::RecoveryAction::Reopen);
+    // A zero-length READ never reaches the server, so it stays available.
+    let probe = mount.read(Bytes::from_static(b"fh"), 0, 0).await.unwrap();
+    assert!(probe.is_empty());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn setattr_size_after_state_loss_fails_locally_but_metadata_still_works() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 90, b"fh").await;
+    register_scripted_lock(&mount, 90, [0xa6; 16]).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&23u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7d; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let reclaim = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &reclaim,
+            &failed_lock_result("reclaim-open", 18, 10022),
+        )
+        .await?;
+        // Only the metadata-only SETATTR may arrive: a truncated handle has no
+        // open lane left, so its anonymous-stateid size change must be refused
+        // locally instead of writing outside the lost lock protection.
+        let setattr = read_record(&mut stream).await?;
+        assert!(
+            !setattr.windows(5).any(|wire| wire == b"gated".as_slice()),
+            "a gated truncate reached the server"
+        );
+        assert!(
+            setattr.windows(4).any(|wire| wire == b"meta".as_slice()),
+            "the metadata-only SETATTR did not reach the server"
+        );
+        reply(&mut stream, &setattr, &setattr_result()).await
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5e; 8],
+            owner: "scripted-truncate-loss".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    context.recover_or_lose().await.unwrap_err();
+    assert_eq!(
+        mount.health().lifecycle,
+        crate::MountLifecycleState::LostState
+    );
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        mount.setattr(
+            Bytes::from_static(b"gated"),
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("a lane-less truncate must fail locally")
+    .unwrap_err();
+    let details = error
+        .operation_outcome()
+        .expect("expected the lifecycle gate error");
+    assert_eq!(details.recovery, crate::RecoveryAction::Reopen);
+    // Metadata-only changes address the file without an open, so chmod keeps
+    // using the anonymous stateid even after the mount lost its state.
+    mount
+        .setattr(
+            Bytes::from_static(b"meta"),
+            None,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     server.await.unwrap().unwrap();
 }
 

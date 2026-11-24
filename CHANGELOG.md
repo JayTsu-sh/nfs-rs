@@ -43,6 +43,14 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   and I/O continued outside the application's critical section.
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.
+- NFSv4.0 `read` no longer falls back to an anonymous-stateid READ while the
+  mount is not `Ready`: after state loss its locks are gone and the handle has
+  no open lane to gate at dispatch, so that read could run outside a byte-range
+  lock another client may hold (servers enforce only share reservations and
+  mandatory locks) while `write` already failed. A zero-length read still
+  returns an empty buffer without reaching the server. A size-changing SETATTR
+  without an open lane is refused the same way, while metadata-only SETATTR
+  keeps using the anonymous stateid.
 
 ## [0.12.0] - 2026-11-09
 

@@ -1767,6 +1767,7 @@ impl Mount40 {
         bitmap: &[u32],
         values: &[u8],
         invalidate_cached_attributes: bool,
+        needs_open: bool,
     ) -> Result<()> {
         let _io_guard = if let Some(callback_state) = &self.callback_state {
             Some(callback_state.foreground_io(fh).await)
@@ -1777,6 +1778,14 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
+        if lane.is_none() && needs_open {
+            // A size change writes the truncated range, so without an open lane
+            // it must not go out with the anonymous stateid while the mount
+            // holds no state: that would bypass the gate READ and WRITE honour.
+            // This decision uses the same lookup as the request below, so a lane
+            // that recovery drops afterwards cannot slip in between.
+            self.lease.gate_stateful(operation)?;
+        }
         let mut retries = 0u8;
         loop {
             let (stateid, expected_generation) = match &lane {
@@ -2095,6 +2104,14 @@ impl Mount for Mount40 {
         }
         let lane = match self.state.for_fh(&fh, crate::OPEN_BOTH).await {
             Some(lane) => lane,
+            // Recovery dropped this handle's open state, so there is nothing to
+            // release on the server. CLOSE must still succeed: the handle may be
+            // gated on a lock that died with the open, and with no lane there is
+            // no other way to lift that gate.
+            None if self.locks.lost(&fh).await.is_some() => {
+                self.locks.clear_lost(&fh).await;
+                return Ok(());
+            }
             // A failed recovery already dropped the lane; the server cannot
             // hold state either, so CLOSE is satisfied instead of surfacing a
             // programming error.
@@ -2127,9 +2144,28 @@ impl Mount for Mount40 {
                 "open file belongs to another mount generation".into(),
             ));
         }
-        let lane = self.state.by_owner(owner).await.ok_or_else(|| {
-            NfsError::InvalidInput("NFSv4.0 open state is closed or stale".into())
-        })?;
+        let lane = match self.state.by_owner(owner).await {
+            Some(lane) => lane,
+            // Recovery dropped this handle's open lane, so the server holds no
+            // state to release. CLOSE must still succeed when it was the last
+            // open: the handle may be gated on a lock that died with the open,
+            // and closing it is the only way to lift that gate.
+            None if self.locks.lost(&object.fh).await.is_some()
+                && self
+                    .state
+                    .for_fh(&object.fh, crate::OPEN_BOTH)
+                    .await
+                    .is_none() =>
+            {
+                self.locks.clear_lost(&object.fh).await;
+                return Ok(());
+            }
+            None => {
+                return Err(NfsError::InvalidInput(
+                    "NFSv4.0 open state is closed or stale".into(),
+                ));
+            }
+        };
         if lane.lock().await.fh != object.fh {
             return Err(NfsError::InvalidInput(
                 "NFSv4.0 open state filehandle mismatch".into(),
@@ -2359,7 +2395,7 @@ impl Mount for Mount40 {
     async fn setacl(&self, fh: Bytes, acl_value: &mount::Acl) -> Result<()> {
         let (bitmap, values) = acl::encode_setattr_acl(acl_value);
         let result = self
-            .set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
+            .set_encoded_attributes("setacl", &fh, &bitmap, &values, false, false)
             .await;
         acl::attrnotsupp_as_unsupported("SETACL", result)
     }
@@ -2395,7 +2431,10 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true)
+        // A size change writes the truncated range and therefore needs the open
+        // gate when no lane exists; metadata-only changes stay allowed, since
+        // chmod/utimes legitimately address the file without an open.
+        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true, size.is_some())
             .await?;
         self.refresh_callback_attributes(&fh).await;
         Ok(())
@@ -2898,6 +2937,13 @@ impl Mount for Mount40 {
         }
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {
+            // An anonymous-stateid READ is legal (RFC 7530 §9.1.4.3), but only
+            // while the mount still holds its state. After state loss the
+            // caller's locks are gone and this handle has no lane left to gate
+            // at dispatch, so serving bytes here would hide the loss and could
+            // read a range another client now protects with an advisory lock
+            // (servers enforce only share reservations and mandatory locks).
+            self.lease.gate_stateful("read")?;
             let request = CompoundBuilder::new("read")
                 .putfh(&fh)
                 .read(&[0; 16], offset, count)

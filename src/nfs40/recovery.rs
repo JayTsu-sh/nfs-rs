@@ -697,11 +697,36 @@ impl RecoveryContext {
         if self.lease.lock_reclaimed(lock_owner) {
             return Ok(false);
         }
-        let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
-            NfsError::LostOpenState(format!(
+        let Some(open_lane) = self.state.by_owner(open_owner).await else {
+            // The open lane is gone because its own reclaim was rejected, so
+            // this lock can never be reclaimed and the server no longer holds
+            // it. Publish the gate before the lane is dropped: a handle with no
+            // open lane reaches I/O through the stateless READ fallback, which
+            // has no lane to recheck the gate at dispatch.
+            let lock = lane.lock().await;
+            // A LOCKU zeroes the stateid while still holding the lane, then
+            // retires the registry entry. Either marker means the caller already
+            // gave the protection up, so gating I/O on it would block the handle
+            // for no reason.
+            if lock.stateid != old_stateid || !self.locks.is_current(&old_stateid, lane).await {
+                return Ok(false);
+            }
+            self.locks
+                .mark_lost(
+                    &lock.fh,
+                    LostLock {
+                        status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                        lock_type: lock.lock_type,
+                        offset: lock.offset,
+                        length: lock.length,
+                        owner: lock.owner_wire.clone(),
+                    },
+                )
+                .await;
+            return Err(NfsError::LostOpenState(format!(
                 "NFSv4.0 reclaim LOCK lost its open-owner {open_owner}"
-            ))
-        })?;
+            )));
+        };
         // Same fence-before-lane order as close_lane and the OPEN reclaim.
         let io_fence = {
             let open = open_lane.lock().await;
@@ -1094,6 +1119,11 @@ pub(super) fn recovery_failure(
 /// BAD_SEQID (handled per lane by the fallback OPEN) and an executed reclaim
 /// LOCK is served from the server's reply cache.
 pub(super) fn is_unknown_outcome(error: &NfsError) -> bool {
+    // `OperationOutcome` wrappers are deliberately excluded: reclaim requests
+    // bypass the sent-request classifier, so the only wrapped `Uncertain` error
+    // on this path is the terminal one `attempt_recovery` builds after it has
+    // already marked the mount lost. Retrying that would re-run a decision that
+    // is already final.
     matches!(error, NfsError::Io(_) | NfsError::Rpc(_) | NfsError::Xdr(_))
 }
 
@@ -1139,8 +1169,9 @@ fn is_busy_status(status: crate::Nfs4ErrorCode) -> bool {
 /// The lock loss to gate I/O on when the server definitively refused a reclaim.
 ///
 /// A surviving open must not keep serving I/O while the application still
-/// believes its lock protects it. When the open itself is gone, I/O already
-/// fails with `LostOpenState` and needs no gate.
+/// believes its lock protects it. When the open itself is gone, the reclaim
+/// branch that cannot find an open owner publishes the gate before dropping the
+/// lock lane, so this helper only ever sees a surviving open.
 fn lost_lock(error: &NfsError, lock: &LockLane) -> Option<LostLock> {
     if !is_authoritative_lane_loss(error) {
         return None;
