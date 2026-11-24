@@ -8058,7 +8058,10 @@ mod tests {
         let (_, entries, eof) = decode_directory_page(&mut Bytes::from(page), 0).unwrap();
         let entry = entries[0].as_ref().unwrap();
         assert_eq!(entry.name, "~nfs-rs-raw:D6D0CEC4");
-        assert_eq!(crate::nfs4::name::wire(&entry.name), b"\xd6\xd0\xce\xc4");
+        assert_eq!(
+            crate::nfs4::name::wire(&entry.name).as_ref(),
+            b"\xd6\xd0\xce\xc4"
+        );
         assert!(eof);
     }
 

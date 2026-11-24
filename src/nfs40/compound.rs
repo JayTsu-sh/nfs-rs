@@ -198,7 +198,7 @@ impl CompoundBuilder {
             xdr_u32(&mut args, 0); // OPEN4_NOCREATE
         }
         xdr_u32(&mut args, 0); // CLAIM_NULL
-        xdr_opaque(&mut args, open.filename.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(open.filename));
         self.inner = self.inner.operation(OP_OPEN, args);
         self
     }
@@ -375,7 +375,7 @@ impl CompoundBuilder {
     pub(crate) fn create_directory(mut self, name: &str) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 2); // NF4DIR
-        xdr_opaque(&mut args, name.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(name));
         xdr_u32(&mut args, 0); // empty createattrs bitmap
         xdr_opaque(&mut args, &[]);
         self.inner = self.inner.operation(OP_CREATE, args);
@@ -386,7 +386,7 @@ impl CompoundBuilder {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK
         xdr_opaque(&mut args, target.as_bytes());
-        xdr_opaque(&mut args, name.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(name));
         xdr_u32(&mut args, 0);
         xdr_opaque(&mut args, &[]);
         self.inner = self.inner.operation(OP_CREATE, args);
@@ -400,15 +400,15 @@ impl CompoundBuilder {
 
     pub(crate) fn rename(mut self, from: &str, to: &str) -> Self {
         let mut args = Vec::new();
-        xdr_opaque(&mut args, from.as_bytes());
-        xdr_opaque(&mut args, to.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(from));
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(to));
         self.inner = self.inner.operation(OP_RENAME, args);
         self
     }
 
     pub(crate) fn link(mut self, name: &str) -> Self {
         let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(name));
         self.inner = self.inner.operation(OP_LINK, args);
         self
     }
@@ -441,7 +441,7 @@ impl CompoundBuilder {
 
     pub(crate) fn remove(mut self, name: &str) -> Self {
         let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
+        xdr_opaque(&mut args, &crate::nfs4::name::wire(name));
         self.inner = self.inner.operation(OP_REMOVE, args);
         self
     }
@@ -1814,6 +1814,68 @@ mod tests {
     }
 
     #[test]
+    fn mutating_names_preserve_raw_and_literal_collision() {
+        let raw = "~nfs-rs-raw:FF";
+        let literal = crate::nfs4::name::display(raw.as_bytes());
+        let cases = [
+            (
+                CompoundBuilder::new("remove").remove(raw).encode_body(),
+                OP_REMOVE,
+                vec![&b"\xff"[..]],
+            ),
+            (
+                CompoundBuilder::new("remove")
+                    .remove(&literal)
+                    .encode_body(),
+                OP_REMOVE,
+                vec![raw.as_bytes()],
+            ),
+            (
+                CompoundBuilder::new("rename")
+                    .rename(raw, &literal)
+                    .encode_body(),
+                OP_RENAME,
+                vec![&b"\xff"[..], raw.as_bytes()],
+            ),
+            (
+                CompoundBuilder::new("link").link(raw).encode_body(),
+                OP_LINK,
+                vec![&b"\xff"[..]],
+            ),
+            (
+                CompoundBuilder::new("mkdir")
+                    .create_directory(raw)
+                    .encode_body(),
+                OP_CREATE,
+                vec![&b"\xff"[..]],
+            ),
+        ];
+        for (body, expected_opcode, names) in cases {
+            let (opcode, mut args) = operation_arguments(&body, 0);
+            assert_eq!(opcode, expected_opcode);
+            if opcode == OP_CREATE {
+                assert_eq!(args.get_u32(), 2);
+            }
+            for name in names {
+                assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), name);
+            }
+        }
+        let (opcode, mut args) = operation_arguments(
+            &CompoundBuilder::new("symlink")
+                .create_symlink(raw, "~nfs-rs-raw:FF")
+                .encode_body(),
+            0,
+        );
+        assert_eq!(opcode, OP_CREATE);
+        assert_eq!(args.get_u32(), 5);
+        assert_eq!(
+            take_opaque(&mut args, "target").unwrap().as_ref(),
+            raw.as_bytes()
+        );
+        assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xff");
+    }
+
+    #[test]
     fn metadata_operation_arguments_match_rfc7530_vectors() {
         let cases = [
             (
@@ -1936,6 +1998,23 @@ mod tests {
             .concat()
         }));
         assert!(args.ends_with(&[4u32.to_be_bytes().as_slice(), b"file"].concat()));
+    }
+
+    #[test]
+    fn open_uses_raw_filename_bytes() {
+        let body = CompoundBuilder::new("open")
+            .open(OpenArgs {
+                seqid: 0,
+                share_access: 1,
+                client_id: 1,
+                owner: b"owner",
+                filename: "~nfs-rs-raw:FF",
+                create: false,
+            })
+            .encode_body();
+        let (opcode, args) = operation_arguments(&body, 0);
+        assert_eq!(opcode, OP_OPEN);
+        assert!(args.ends_with(&[1u32.to_be_bytes().as_slice(), b"\xff", &[0, 0, 0]].concat()));
     }
 
     #[test]

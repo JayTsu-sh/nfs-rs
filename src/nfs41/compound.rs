@@ -181,6 +181,10 @@ fn xdr_string(buf: &mut Vec<u8>, s: &str) {
     xdr_var_bytes(buf, s.as_bytes());
 }
 
+fn xdr_name(buf: &mut Vec<u8>, name: &str) {
+    xdr_var_bytes(buf, &crate::nfs4::name::wire(name));
+}
+
 fn xdr_bitmap(buf: &mut Vec<u8>, bitmap: &[u32]) {
     xdr_u32(buf, bitmap.len() as u32);
     for &word in bitmap {
@@ -568,7 +572,7 @@ impl CompoundBuilder {
 
     pub fn lookup(mut self, name: &str) -> Self {
         let mut args = Vec::new();
-        xdr_var_bytes(&mut args, &crate::nfs4::name::wire(name));
+        xdr_name(&mut args, name);
         self.ops.push(EncodedOp {
             opcode: OpNum::Lookup,
             args,
@@ -745,7 +749,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, objtype); // nfs_ftype4
         // CREATE4args: objtype + objname + createattrs
         // For NF4BLK/NF4CHR, specdata would go here (not implemented yet)
-        xdr_string(&mut args, name);
+        xdr_name(&mut args, name);
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
         self.ops.push(EncodedOp {
@@ -767,7 +771,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, 5); // NF4LNK = 5
         // For NF4LNK, linkdata (utf8str) comes before objname
         xdr_string(&mut args, link_target);
-        xdr_string(&mut args, name);
+        xdr_name(&mut args, name);
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
         self.ops.push(EncodedOp {
@@ -779,7 +783,7 @@ impl CompoundBuilder {
 
     pub fn remove(mut self, name: &str) -> Self {
         let mut args = Vec::new();
-        xdr_string(&mut args, name);
+        xdr_name(&mut args, name);
         self.ops.push(EncodedOp {
             opcode: OpNum::Remove,
             args,
@@ -789,8 +793,8 @@ impl CompoundBuilder {
 
     pub fn rename(mut self, oldname: &str, newname: &str) -> Self {
         let mut args = Vec::new();
-        xdr_string(&mut args, oldname);
-        xdr_string(&mut args, newname);
+        xdr_name(&mut args, oldname);
+        xdr_name(&mut args, newname);
         self.ops.push(EncodedOp {
             opcode: OpNum::Rename,
             args,
@@ -800,7 +804,7 @@ impl CompoundBuilder {
 
     pub fn link(mut self, newname: &str) -> Self {
         let mut args = Vec::new();
-        xdr_string(&mut args, newname);
+        xdr_name(&mut args, newname);
         self.ops.push(EncodedOp {
             opcode: OpNum::Link,
             args,
@@ -1272,7 +1276,7 @@ impl OpenArgs {
         }
         // open_claim4: CLAIM_NULL = 0
         xdr_u32(buf, 0);
-        xdr_string(buf, &self.claim_file);
+        xdr_name(buf, &self.claim_file);
     }
 }
 
@@ -1980,6 +1984,7 @@ fn skip_create_session_result(buf: &mut Bytes) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nfs4::compound::take_opaque;
 
     // ─── XDR encoding helper tests ─────────────────────────────────────
 
@@ -2036,6 +2041,44 @@ mod tests {
         assert_eq!(buf.len(), 8); // length(4) + "hi"(2) + pad(2)
         assert_eq!(&buf[0..4], &2u32.to_be_bytes());
         assert_eq!(&buf[4..6], b"hi");
+    }
+
+    #[test]
+    fn mutating_names_preserve_raw_and_literal_collision() {
+        let raw = "~nfs-rs-raw:FF";
+        let literal = crate::nfs4::name::display(raw.as_bytes());
+        for (builder, expected) in [
+            (
+                CompoundBuilder::new("remove").remove(raw),
+                vec![&b"\xff"[..]],
+            ),
+            (
+                CompoundBuilder::new("remove").remove(&literal),
+                vec![raw.as_bytes()],
+            ),
+            (
+                CompoundBuilder::new("rename").rename(raw, &literal),
+                vec![&b"\xff"[..], raw.as_bytes()],
+            ),
+            (CompoundBuilder::new("link").link(raw), vec![&b"\xff"[..]]),
+        ] {
+            let mut args = Bytes::from(builder.ops[0].args.clone());
+            for name in expected {
+                assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), name);
+            }
+        }
+        let builder = CompoundBuilder::new("create").create(2, raw, &[], &[]);
+        let mut args = Bytes::from(builder.ops[0].args.clone());
+        assert_eq!(args.get_u32(), 2);
+        assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xff");
+        let builder = CompoundBuilder::new("symlink").create_symlink(raw, raw, &[], &[]);
+        let mut args = Bytes::from(builder.ops[0].args.clone());
+        assert_eq!(args.get_u32(), 5);
+        assert_eq!(
+            take_opaque(&mut args, "target").unwrap().as_ref(),
+            raw.as_bytes()
+        );
+        assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xff");
     }
 
     #[test]
@@ -2150,6 +2193,28 @@ mod tests {
         };
         assert_eq!(encode_access(true), 0x0403);
         assert_eq!(encode_access(false), 0x0203);
+    }
+
+    #[test]
+    fn open_uses_raw_filename_bytes() {
+        let args = OpenArgs {
+            seqid: 0,
+            share_access: 1,
+            share_deny: 0,
+            client_id: 1,
+            owner: Bytes::new(),
+            create: false,
+            create_attrs_mask: Vec::new(),
+            create_attrs_vals: Vec::new(),
+            claim_file: "~nfs-rs-raw:FF".to_string(),
+            want_no_delegation: true,
+        };
+        let builder = CompoundBuilder::new("open").open(&args);
+        assert!(
+            builder.ops[0]
+                .args
+                .ends_with(&[1u32.to_be_bytes().as_slice(), b"\xff", &[0, 0, 0]].concat())
+        );
     }
 
     #[test]

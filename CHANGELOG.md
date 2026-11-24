@@ -26,7 +26,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - NFSv4.0/v4.1 READDIR and READDIRPLUS preserve legacy non-UTF-8 directory names as
   reversible `~nfs-rs-raw:<uppercase hex>` names, allowing subsequent LOOKUP
-  without losing the original bytes. UTF-8 names remain unchanged.
+  and name-based OPEN, CREATE, REMOVE, RENAME and LINK without losing the
+  original bytes. Literal names with the escape prefix remain distinct.
+  UTF-8 names and symlink target strings remain unchanged.
 
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.

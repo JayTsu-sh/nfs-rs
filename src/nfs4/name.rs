@@ -4,6 +4,9 @@
 //! return arbitrary bytes; losing those bytes would make LOOKUP ambiguous.
 
 const PREFIX: &str = "~nfs-rs-raw:";
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+use std::borrow::Cow;
 
 pub(crate) fn display(raw: &[u8]) -> String {
     if let Ok(name) = std::str::from_utf8(raw)
@@ -11,30 +14,39 @@ pub(crate) fn display(raw: &[u8]) -> String {
     {
         return name.to_owned();
     }
-    let mut result = String::from(PREFIX);
+    let mut result = String::with_capacity(PREFIX.len() + 2 * raw.len());
+    result.push_str(PREFIX);
     for byte in raw {
-        use std::fmt::Write;
-        let _ = write!(result, "{byte:02X}");
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
     }
     result
 }
 
-pub(crate) fn wire(name: &str) -> Vec<u8> {
+pub(crate) fn wire(name: &str) -> Cow<'_, [u8]> {
     let Some(hex) = name.strip_prefix(PREFIX) else {
-        return name.as_bytes().to_vec();
+        return Cow::Borrowed(name.as_bytes());
     };
     if hex.is_empty() || hex.len() % 2 != 0 {
-        return name.as_bytes().to_vec();
+        return Cow::Borrowed(name.as_bytes());
     }
-    let decoded: Option<Vec<u8>> = hex
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let text = std::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(text, 16).ok()
-        })
-        .collect();
-    decoded.unwrap_or_else(|| name.as_bytes().to_vec())
+    let mut decoded = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let (Some(high), Some(low)) = (nibble(pair[0]), nibble(pair[1])) else {
+            return Cow::Borrowed(name.as_bytes());
+        };
+        decoded.push((high << 4) | low);
+    }
+    Cow::Owned(decoded)
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +67,10 @@ mod tests {
             display(b"\xd6\xd0\xce\xc4"),
             display("~nfs-rs-raw:D6D0CEC4".as_bytes())
         );
-        assert_eq!(wire("~nfs-rs-raw:literal"), b"~nfs-rs-raw:literal");
+        assert_eq!(wire("~nfs-rs-raw:literal").as_ref(), b"~nfs-rs-raw:literal");
+        assert!(matches!(wire("ordinary.txt"), Cow::Borrowed(_)));
+        assert!(matches!(wire("~nfs-rs-raw:FF"), Cow::Owned(_)));
+        assert_eq!(wire("~nfs-rs-raw:ff").as_ref(), b"\xff");
+        assert_eq!(wire("~nfs-rs-raw:FG").as_ref(), b"~nfs-rs-raw:FG");
     }
 }

@@ -25,6 +25,7 @@ negotiated and exposed through `client.capabilities`.
 On NFSv4.0/v4.1 servers that return non-UTF-8 directory name bytes, listings use
 `~nfs-rs-raw:<uppercase hex bytes>` for that entry. Pass the returned name or
 path unchanged to lookup or directory operations to address the same bytes.
+This includes opening, creating, deleting, renaming and linking the entry.
 Normal UTF-8 names are unchanged. A literal UTF-8 name beginning with
 `~nfs-rs-raw:` is also encoded in listings so it cannot collide with a legacy
 byte name. The encoding uses the server's bytes; it does not guess a locale.
