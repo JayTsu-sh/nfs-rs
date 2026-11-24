@@ -407,39 +407,19 @@ impl RecoveryContext {
                         Ok(false) => {}
                         Err(error) if is_retryable_recovery(&error) => return Err(error),
                         Err(error) if is_authoritative_lane_loss(&error) => {
-                            let (owner, stateid, fh, lost) = {
+                            let (owner, stateid) = {
                                 let lock = lane.lock().await;
-                                // A surviving open must not keep serving I/O while
-                                // the application still believes its lock protects
-                                // it. Gate that file handle until the caller
-                                // reacquires a lock or closes it; unrelated
-                                // handles stay usable.
-                                let lost = match &error {
-                                    NfsError::LockDenied { .. } | NfsError::Nfs4(_) => {
-                                        Some(LostLock {
-                                            status: nfs4_status(&error)
-                                                .unwrap_or(crate::Nfs4ErrorCode::NFS4ERR_DENIED),
-                                            lock_type: lock.lock_type,
-                                            offset: lock.offset,
-                                            length: lock.length,
-                                            owner: lock.owner_wire.clone(),
-                                        })
-                                    }
-                                    // The open itself is gone, so I/O already
-                                    // fails with LostOpenState and needs no gate.
-                                    _ => None,
-                                };
-                                (lock.owner, lock.stateid, lock.fh.clone(), lost)
+                                (lock.owner, lock.stateid)
                             };
+                            // The gate for a surviving open was published by
+                            // `reclaim_lock_lane` while it still held the open
+                            // lane, before this lock lane was dropped.
                             tracing::warn!(
                                 target: "nfs_rs::stateid",
                                 owner,
                                 error = %error,
                                 "NFSv4.0 lock reclaim failed for one lane; dropping only that lock"
                             );
-                            if let Some(lost) = lost {
-                                self.locks.mark_lost(&fh, lost).await;
-                            }
                             self.locks.remove(&stateid).await;
                         }
                         Err(error) => return Err(error),
@@ -788,6 +768,13 @@ impl RecoveryContext {
                 if consumed {
                     self.lease
                         .set_lock_reclaim_seqid(lock_owner, lock_seqid.wrapping_add(1));
+                }
+                // Publish the loss while the open lane is still held. READ and
+                // WRITE recheck the gate under that same lane right before they
+                // dispatch, so an operation that queued behind this reclaim
+                // cannot slip through once the mount resumes.
+                if let Some(lost) = lost_lock(&error, &lock) {
+                    self.locks.mark_lost(&lock.fh, lost).await;
                 }
                 return Err(error);
             }
@@ -1147,6 +1134,27 @@ fn is_busy_status(status: crate::Nfs4ErrorCode) -> bool {
         status,
         crate::Nfs4ErrorCode::NFS4ERR_DELAY | crate::Nfs4ErrorCode::NFS4ERR_GRACE
     )
+}
+
+/// The lock loss to gate I/O on when the server definitively refused a reclaim.
+///
+/// A surviving open must not keep serving I/O while the application still
+/// believes its lock protects it. When the open itself is gone, I/O already
+/// fails with `LostOpenState` and needs no gate.
+fn lost_lock(error: &NfsError, lock: &LockLane) -> Option<LostLock> {
+    if !is_authoritative_lane_loss(error) {
+        return None;
+    }
+    match error {
+        NfsError::LockDenied { .. } | NfsError::Nfs4(_) => Some(LostLock {
+            status: nfs4_status(error).unwrap_or(crate::Nfs4ErrorCode::NFS4ERR_DENIED),
+            lock_type: lock.lock_type,
+            offset: lock.offset,
+            length: lock.length,
+            owner: lock.owner_wire.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// A definitive reply that invalidates the state this lane represents.

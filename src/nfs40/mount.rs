@@ -660,9 +660,12 @@ impl Mount40 {
                     }
                     return Err(error);
                 }
-                // A granted lock on this handle acknowledges an earlier loss and
-                // lifts the I/O gate.
-                locks.clear_lost(&gate_fh).await;
+                // Only a lock that restores the lost protection resolves it: a
+                // disjoint or weaker lock on the same handle acknowledges
+                // nothing, and other losses on the handle stay gated.
+                locks
+                    .resolve_lost(&gate_fh, lock_type, offset, length)
+                    .await;
                 Ok::<_, NfsError>(stateid)
             })
             .await
@@ -1883,6 +1886,7 @@ impl Mount40 {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
             let lease = Arc::clone(&self.lease);
+            let locks = Arc::clone(&self.locks);
             let lane_for_settlement = Arc::clone(&lane);
             let fh_for_settlement = fh.clone();
             let data_for_settlement = data.clone();
@@ -1909,6 +1913,12 @@ impl Mount40 {
                         return Err(NfsError::InvalidInput(
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
+                    }
+                    // The waits above can span a whole reclaim. Recovery
+                    // publishes a lost lock while it holds this lane, so
+                    // rechecking here cannot miss it.
+                    if let Some(lost) = locks.lost(&fh_for_settlement).await {
+                        return Err(lost_lock_error("write", &lost));
                     }
                     (guard.stateid, guard.owner, guard.next_seqid)
                 };
@@ -2908,6 +2918,7 @@ impl Mount for Mount40 {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
             let lease = Arc::clone(&self.lease);
+            let locks = Arc::clone(&self.locks);
             let lane_for_settlement = Arc::clone(&lane);
             let fh_for_settlement = fh.clone();
             let used = Arc::new(std::sync::Mutex::new(None));
@@ -2931,6 +2942,12 @@ impl Mount for Mount40 {
                         return Err(NfsError::InvalidInput(
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
+                    }
+                    // The waits above can span a whole reclaim. Recovery
+                    // publishes a lost lock while it holds this lane, so
+                    // rechecking here cannot miss it.
+                    if let Some(lost) = locks.lost(&fh_for_settlement).await {
+                        return Err(lost_lock_error("read", &lost));
                     }
                     guard.stateid
                 };

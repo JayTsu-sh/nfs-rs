@@ -7615,14 +7615,17 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
         // record is the unrelated open's READ.
         let read = read_record(&mut stream).await?;
         reply(&mut stream, &read, &read_result(&[0x42; 4])).await?;
-        // Reacquiring a lock lifts the gate; the READ that follows succeeds.
-        let relock = read_record(&mut stream).await?;
-        reply(
-            &mut stream,
-            &relock,
-            &succeeded_lock_result("lock", 0, [0xd2; 16]),
-        )
-        .await?;
+        // Only a lock that restores the lost protection lifts the gate. A
+        // disjoint lock, then a weaker READ lock, then the covering WRITE lock.
+        for _ in 0..3 {
+            let relock = read_record(&mut stream).await?;
+            reply(
+                &mut stream,
+                &relock,
+                &succeeded_lock_result("lock", 0, [0xd2; 16]),
+            )
+            .await?;
+        }
         let read = read_record(&mut stream).await?;
         reply(&mut stream, &read, &read_result(&[0x43; 4])).await
     });
@@ -7687,13 +7690,148 @@ async fn denied_reclaim_lock_drops_only_that_lock() {
         .unwrap();
     assert_eq!(&unrelated[..], &[0x42; 4]);
 
-    // Reacquiring a lock acknowledges the loss and lifts the gate.
-    mount
-        .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-        .await
-        .unwrap();
-    let after = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
-    assert_eq!(&after[..], &[0x43; 4]);
+    // A disjoint lock and a weaker READ lock do not restore a lost WRITE lock
+    // over [0, 1): neither may acknowledge the loss. Only the covering WRITE
+    // lock does.
+    for (lock_type, offset) in [(2, 4096), (1, 0), (2, 0)] {
+        mount
+            .lock(Bytes::from_static(b"fh"), lock_type, offset, 1)
+            .await
+            .unwrap();
+        let gated = tokio::time::timeout(
+            Duration::from_secs(1),
+            mount.read(Bytes::from_static(b"fh"), 0, 4),
+        )
+        .await;
+        if offset == 0 && lock_type == 2 {
+            let after = gated
+                .expect("the covering lock must lift the gate")
+                .unwrap();
+            assert_eq!(&after[..], &[0x43; 4]);
+        } else {
+            let error = gated
+                .expect("a lock that does not restore the loss must keep I/O gated")
+                .unwrap_err();
+            assert!(
+                matches!(&error, crate::NfsError::StateRecoveryExhausted(_)),
+                "expected the gate to hold, got {error:?}"
+            );
+        }
+    }
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn io_queued_behind_a_denied_reclaim_is_gated_at_dispatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 87, b"fh").await;
+    register_scripted_lock(&mount, 87, [0xe1; 16]).await;
+    let (held_tx, held_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let identity = read_record(&mut stream).await?;
+        let mut identity_data = Vec::new();
+        identity_data.extend_from_slice(&20u64.to_be_bytes());
+        identity_data.extend_from_slice(&[0x7a; 8]);
+        reply(
+            &mut stream,
+            &identity,
+            &compound_result("identity", &[(35, &identity_data)]),
+        )
+        .await?;
+        let confirm = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &confirm,
+            &compound_result("confirm", &[(36, &[])]),
+        )
+        .await?;
+        let reclaim = read_record(&mut stream).await?;
+        reply(&mut stream, &reclaim, &open_result(0, [0x61; 16], b"fh")).await?;
+        // Hold the DENIED reply so I/O can queue on the open lane this reclaim
+        // holds, after passing the entry check while no loss is recorded yet.
+        let lock = read_record(&mut stream).await?;
+        held_tx.send(()).ok();
+        release_rx.await.ok();
+        reply(&mut stream, &lock, &denied_lock_result("reclaim-lock", 12)).await?;
+        // The queued operations must fail locally: nothing else may arrive.
+        if let Ok(record) =
+            tokio::time::timeout(Duration::from_millis(500), read_record(&mut stream)).await
+        {
+            panic!(
+                "queued I/O reached the server after the denied reclaim: {} bytes",
+                record.unwrap().len()
+            );
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let context = RecoveryContext {
+        rpc: mount.rpc.clone(),
+        auth: mount.auth.clone(),
+        identity: ClientIdentity {
+            verifier: [0x5b; 8],
+            owner: "queued-io-behind-denied-reclaim".into(),
+        },
+        client_id: Arc::clone(&mount.client_id),
+        issuer: mount.issuer,
+        state: Arc::clone(&mount.state),
+        locks: Arc::clone(&mount.locks),
+        lease: Arc::clone(&mount.lease),
+        callback_addr: None,
+    };
+    let recovery = tokio::spawn(async move { context.recover_or_lose().await });
+    held_rx.await.unwrap();
+    let read = tokio::spawn({
+        let mount = Arc::clone(&mount);
+        async move {
+            mount
+                .read(Bytes::from_static(b"fh"), 0, 4)
+                .await
+                .map(|data| data.len())
+        }
+    });
+    let write = tokio::spawn({
+        let mount = Arc::clone(&mount);
+        async move {
+            mount
+                .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"x"))
+                .await
+                .map(|outcome| outcome.count as usize)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !read.is_finished() && !write.is_finished(),
+        "both operations must be parked on the open lane the reclaim holds"
+    );
+    release_tx.send(()).unwrap();
+    recovery.await.unwrap().unwrap();
+    assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
+    for (operation, result) in [
+        (
+            "read",
+            tokio::time::timeout(Duration::from_secs(2), read).await,
+        ),
+        (
+            "write",
+            tokio::time::timeout(Duration::from_secs(2), write).await,
+        ),
+    ] {
+        let error = result
+            .expect("a queued operation stayed blocked after recovery")
+            .expect("a queued operation panicked")
+            .unwrap_err();
+        let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+            panic!("queued {operation} bypassed the lost-lock gate: {error:?}");
+        };
+        assert_eq!(details.operation, operation);
+        assert!(
+            matches!(details.source.as_ref(), crate::NfsError::LockDenied { .. }),
+            "the gate must report the lost lock, got {error:?}"
+        );
+    }
     server.await.unwrap().unwrap();
 }
 

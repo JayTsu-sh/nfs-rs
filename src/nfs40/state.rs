@@ -40,8 +40,9 @@ pub(crate) struct LockLane {
 /// The lock state that recovery could not retain for a file handle.
 ///
 /// Reads and writes on that handle stay gated with `StateRecoveryExhausted`
-/// until the caller reacquires a lock or closes the handle, so an application
-/// cannot keep writing through an open whose advisory lock is already gone.
+/// until a new lock restores the lost protection or the handle is closed, so an
+/// application cannot keep writing through an open whose advisory lock is
+/// already gone.
 #[derive(Clone, Debug)]
 pub(crate) struct LostLock {
     pub(crate) status: crate::Nfs4ErrorCode,
@@ -51,12 +52,41 @@ pub(crate) struct LostLock {
     pub(crate) owner: bytes::Bytes,
 }
 
+/// Whether `granted` restores the protection of a lost lock.
+///
+/// A WRITE lock (2) restores a lost READ (1) or WRITE lock; a READ lock does not
+/// restore a lost WRITE lock. A zero length means "to the end of file", which
+/// only another open-ended lock can cover.
+fn restores(loss: &LostLock, lock_type: u32, offset: u64, length: u64) -> bool {
+    if lock_type < loss.lock_type {
+        return false;
+    }
+    let end = |start: u64, length: u64| {
+        if length == 0 {
+            None
+        } else {
+            start.checked_add(length)
+        }
+    };
+    if offset > loss.offset {
+        return false;
+    }
+    match (end(offset, length), end(loss.offset, loss.length)) {
+        (Some(granted_end), Some(lost_end)) => granted_end >= lost_end,
+        // A lock to EOF covers any lost range; a lost lock to EOF needs one.
+        (None, _) => true,
+        (_, None) => false,
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LockState {
     lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
     aliases: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
-    /// File handles whose lock was lost during recovery and that still gate I/O.
-    lost: RwLock<HashMap<Vec<u8>, LostLock>>,
+    /// File handles with locks that recovery could not retain and that still
+    /// gate I/O. Several locks on one handle can be lost independently, so each
+    /// unresolved loss is kept until a new lock restores its protection.
+    lost: RwLock<HashMap<Vec<u8>, Vec<LostLock>>>,
     acquisitions: Arc<LockAcquisitions>,
 }
 
@@ -341,15 +371,34 @@ impl LockState {
     /// Remember that recovery could not retain a lock for `fh`, so I/O on that
     /// handle must fail until the caller reacquires or closes it.
     pub(crate) async fn mark_lost(&self, fh: &[u8], lost: LostLock) {
-        self.lost.write().await.insert(fh.to_vec(), lost);
+        self.lost
+            .write()
+            .await
+            .entry(fh.to_vec())
+            .or_default()
+            .push(lost);
     }
 
-    /// The lost-lock record gating I/O on `fh`, if any.
+    /// An unresolved lost-lock record gating I/O on `fh`, if any.
     pub(crate) async fn lost(&self, fh: &[u8]) -> Option<LostLock> {
-        self.lost.read().await.get(fh).cloned()
+        self.lost.read().await.get(fh)?.first().cloned()
     }
 
-    /// Lift the gate after a successful reacquire on the same handle.
+    /// Resolve only the losses that a newly granted lock restores: its type must
+    /// be at least as strong and its range must cover the lost range. A disjoint
+    /// or weaker lock acknowledges nothing, and other losses on the handle stay.
+    pub(crate) async fn resolve_lost(&self, fh: &[u8], lock_type: u32, offset: u64, length: u64) {
+        let mut lost = self.lost.write().await;
+        let Some(unresolved) = lost.get_mut(fh) else {
+            return;
+        };
+        unresolved.retain(|loss| !restores(loss, lock_type, offset, length));
+        if unresolved.is_empty() {
+            lost.remove(fh);
+        }
+    }
+
+    /// Lift the gate once the handle has no open state left.
     pub(crate) async fn clear_lost(&self, fh: &[u8]) {
         self.lost.write().await.remove(fh);
     }
@@ -624,5 +673,40 @@ mod tests {
         let encoded = encode_owner(9, 0x0102_0304_0506_0708);
         assert_eq!(decode_owner(&encoded), Some((9, 0x0102_0304_0506_0708)));
         assert_eq!(decode_owner(&Bytes::from_static(b"bad")), None);
+    }
+
+    #[test]
+    fn only_a_lock_that_restores_the_lost_protection_resolves_a_loss() {
+        let loss = |lock_type, offset, length| LostLock {
+            status: crate::Nfs4ErrorCode::NFS4ERR_DENIED,
+            lock_type,
+            offset,
+            length,
+            owner: Bytes::new(),
+        };
+        let write = loss(2, 0, 4096);
+        assert!(restores(&write, 2, 0, 4096), "the same lock");
+        assert!(restores(&write, 2, 0, 8192), "a wider lock");
+        assert!(restores(&write, 2, 0, 0), "a lock to EOF");
+        assert!(!restores(&write, 2, 4096, 1), "a disjoint lock");
+        assert!(!restores(&write, 2, 0, 1), "a partial overlap");
+        assert!(
+            !restores(&write, 1, 0, 4096),
+            "a READ lock over a lost WRITE lock"
+        );
+        let read = loss(1, 0, 4096);
+        assert!(
+            restores(&read, 2, 0, 4096),
+            "a WRITE lock over a lost READ lock"
+        );
+        assert!(!restores(&loss(2, 0, 0), 2, 0, 4096), "a lost lock to EOF");
+        assert!(
+            restores(&loss(2, 0, 0), 2, 0, 0),
+            "only a lock to EOF covers it"
+        );
+        assert!(
+            !restores(&loss(2, u64::MAX - 1, 8), 2, 0, u64::MAX),
+            "an overflowing range is never reported as covered"
+        );
     }
 }

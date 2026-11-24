@@ -35,9 +35,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - A lock that NFSv4.0 state recovery cannot reclaim no longer leaves the
   surviving open usable: `read` and `write` on that file handle fail with
   `NfsError::StateRecoveryExhausted` (operation `read`/`write`, source
-  `LockDenied`) until the caller reacquires a lock or closes the handle, while
-  unrelated file handles keep working. Previously the mount resumed and I/O
-  continued outside the application's critical section.
+  `LockDenied`) until the caller reacquires a lock that restores the lost
+  protection (at least as strong, covering the lost range) or closes the handle,
+  while unrelated file handles keep working. A disjoint or weaker lock on the
+  same handle does not lift the gate, and I/O that was already waiting when the
+  loss was recorded is rechecked before it is sent. Previously the mount resumed
+  and I/O continued outside the application's critical section.
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.
 
