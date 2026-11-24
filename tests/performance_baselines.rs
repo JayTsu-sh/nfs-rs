@@ -509,6 +509,165 @@ fn gate_retests_only_a_numeric_failure_and_accepts_soft_jitter_as_a_warning() {
 }
 
 #[test]
+fn gate_report_treats_pending_executors_as_warnings() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "nfsrs-executor-performance-gate-{}",
+        std::process::id()
+    ));
+    let report_dir = fixture_dir.join("report");
+    fs::create_dir_all(&fixture_dir).expect("temporary gate directory must be created");
+    let direct_baseline = fixture_dir.join("direct.json");
+    fs::write(
+        &direct_baseline,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "accepted",
+            "capture_runs": 45,
+            "capture_windows": 9,
+            "endpoint": "127.0.0.1:/direct",
+            "protocol": "4.1",
+            "capabilities": {"pathconf": "pass"},
+            "thresholds": {
+                "throughput_regression_percent": 15,
+                "p95_latency_regression_percent": 30,
+                "metadata_p95_absolute_floor_ms": 10
+            },
+            "benchmarks": {"storage_path": {
+                "write_mib_s": {"median": 10.0},
+                "read_mib_s": {"median": 10.0},
+                "write_ms": {"p95": 1.0, "window_p95": {"p95": 1.0}}
+            }}
+        }))
+        .expect("direct baseline must serialize"),
+    )
+    .expect("direct baseline must be written");
+    let pending_baseline = fixture_dir.join("pendexec.json");
+    fs::write(
+        &pending_baseline,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": "capturing",
+            "capture_runs": 5,
+            "capture_windows": 1,
+            "endpoint": "10.30.3.154:/direct",
+            "protocol": "4.1",
+            "capabilities": {"pathconf": "pass"},
+            "thresholds": {
+                "throughput_regression_percent": 15,
+                "p95_latency_regression_percent": 30,
+                "metadata_p95_absolute_floor_ms": 10
+            },
+            "benchmarks": {"storage_path": {}}
+        }))
+        .expect("pending baseline must serialize"),
+    )
+    .expect("pending baseline must be written");
+    let manifest_path = fixture_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "minimum_capture_runs": 45,
+            "minimum_capture_windows": 9,
+            "environments": [
+                {
+                    "id": "direct",
+                    "endpoint": "127.0.0.1:/direct",
+                    "protocol": "4.1",
+                    "baseline": direct_baseline.to_string_lossy()
+                },
+                {
+                    "id": "pendexec",
+                    "endpoint": "10.30.3.154:/direct",
+                    "protocol": "4.1",
+                    "baseline": pending_baseline.to_string_lossy(),
+                    "executor": "ots-dxn-node"
+                }
+            ]
+        }))
+        .expect("manifest must serialize"),
+    )
+    .expect("manifest must be written");
+    for run in 1..=5 {
+        fs::write(
+            fixture_dir.join(format!("direct-run-{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "pass",
+                "lifs": [{"summary": {
+                    "write_median_mib_s": 10.0,
+                    "read_median_mib_s": 10.0
+                }, "samples": [{
+                    "pathconf_status": "pass",
+                    "write_mib_s": 10.0,
+                    "read_mib_s": 10.0,
+                    "write_ms": 0.5
+                }]}]
+            }))
+            .expect("gate run must serialize"),
+        )
+        .expect("gate run must be written");
+    }
+    let gate_path = fixture_dir.join("gate.json");
+    let gate_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/check-performance-baselines.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--output")
+        .arg(&gate_path)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("performance gate should start");
+    assert_eq!(gate_status.code(), Some(0));
+    let gate: Value =
+        serde_json::from_slice(&fs::read(&gate_path).expect("gate report must be generated"))
+            .expect("gate report must be JSON");
+    assert_eq!(gate["status"], "pass_with_warnings");
+    let gate_environments = gate["environments"]
+        .as_array()
+        .expect("gate environments must be an array");
+    let by_id = |id: &str| {
+        gate_environments
+            .iter()
+            .find(|entry| entry["environment"] == id)
+            .unwrap_or_else(|| panic!("gate result must cover {id}"))
+    };
+    assert_eq!(by_id("direct")["status"], "pass");
+    assert_eq!(by_id("pendexec")["status"], "executor_pending");
+
+    let report_status = Command::new("python3")
+        .arg(workspace_path(
+            "tests/benchmarks/generate-baseline-report.py",
+        ))
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--results-dir")
+        .arg(&fixture_dir)
+        .arg("--gate-result")
+        .arg(&gate_path)
+        .arg("--output-dir")
+        .arg(&report_dir)
+        .current_dir(workspace_path("."))
+        .status()
+        .expect("performance report should start");
+    assert_eq!(
+        report_status.code(),
+        Some(0),
+        "gate report must not fail the release gate while an executor is pending"
+    );
+    let markdown = fs::read_to_string(report_dir.join("performance-baselines.md"))
+        .expect("gate Markdown report must be generated");
+    assert!(markdown.contains("Overall status: `complete_with_warnings`"));
+    assert!(markdown.contains("executor_pending"));
+    assert!(
+        !markdown
+            .lines()
+            .any(|line| line.contains("| `baseline_missing` |")),
+        "no environment row may remain baseline_missing while an executor is pending"
+    );
+}
+
+#[test]
 fn scheduled_capture_and_candidate_release_gate_use_the_global_performance_lock() {
     let capture = fs::read_to_string(workspace_path(
         ".github/workflows/performance-baselines.yml",

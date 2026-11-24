@@ -101,7 +101,7 @@ for environment in manifest["environments"]:
         current_runs = [load(path) for path in result_paths]
     if gate_row:
         row_status = gate_row["status"]
-        if row_status == "warning":
+        if row_status in ("warning", "executor_pending"):
             has_warnings = True
         elif row_status != "pass":
             complete = False
