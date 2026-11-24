@@ -5586,6 +5586,24 @@ async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) 
     register_scripted_lock_range(mount, owner, stateid, 2, 0, 1).await;
 }
 
+/// Publishes the loss of a whole-file write lock on `fh`, the way recovery does
+/// when a reclaim is refused.
+async fn publish_lost_whole_file(mount: &Mount40, fh: &[u8]) {
+    mount
+        .locks
+        .mark_lost(
+            fh,
+            LostLock {
+                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
+                lock_type: 2,
+                offset: 0,
+                length: u64::MAX,
+                owner: Bytes::from_static(b"scripted-lost"),
+            },
+        )
+        .await;
+}
+
 #[tokio::test]
 async fn public_typed_lock_blocks_close_until_exact_unlock() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6157,6 +6175,88 @@ async fn cancelled_read_keeps_its_close_fence_until_rpc_settlement() {
     read_seen_rx.await.unwrap();
     read.abort();
     let _ = read.await;
+    mount.close(Bytes::from_static(b"fh")).await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_truncate_keeps_its_close_fence_until_rpc_settlement() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 70, b"fh").await;
+    let (setattr_seen_tx, setattr_seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let setattr = read_record(&mut stream).await?;
+        let _ = setattr_seen_tx.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .is_err(),
+            "CLOSE overtook a cancelled truncate that was still settling"
+        );
+        reply(&mut stream, &setattr, &setattr_result()).await?;
+        let close = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &close,
+            &compound_result("close", &[(22, &[]), (4, &[0x9b; 16])]),
+        )
+        .await
+    });
+
+    let truncating_mount = Arc::clone(&mount);
+    let truncate = tokio::spawn(async move {
+        truncating_mount
+            .setattr(
+                Bytes::from_static(b"fh"),
+                None,
+                None,
+                None,
+                None,
+                Some(4),
+                None,
+                None,
+            )
+            .await
+    });
+    setattr_seen_rx.await.unwrap();
+    truncate.abort();
+    let _ = truncate.await;
+    mount.close(Bytes::from_static(b"fh")).await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_write_keeps_its_close_fence_until_rpc_settlement() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 71, b"fh").await;
+    let (write_seen_tx, write_seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let write = read_record(&mut stream).await?;
+        let _ = write_seen_tx.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .is_err(),
+            "CLOSE overtook a cancelled WRITE that was still settling"
+        );
+        reply(&mut stream, &write, &write_result(1)).await?;
+        let close = read_record(&mut stream).await?;
+        reply(&mut stream, &close, &close_result([0x9c; 16])).await
+    });
+
+    let writing_mount = Arc::clone(&mount);
+    let write = tokio::spawn(async move {
+        writing_mount
+            .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"x"))
+            .await
+    });
+    write_seen_rx.await.unwrap();
+    write.abort();
+    let _ = write.await;
     mount.close(Bytes::from_static(b"fh")).await.unwrap();
     server.await.unwrap().unwrap();
 }
@@ -8208,19 +8308,7 @@ async fn a_read_that_queued_on_a_lane_sees_a_loss_published_during_the_wait() {
     let read = tokio::spawn(async move { read_mount.read(Bytes::from_static(b"fh"), 0, 4).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     // Recovery publishes the loss while the lookup is parked on that lane.
-    mount
-        .locks
-        .mark_lost(
-            b"fh",
-            LostLock {
-                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-                lock_type: 1,
-                offset: 0,
-                length: 4,
-                owner: Bytes::from_static(b"scripted-lock-93"),
-            },
-        )
-        .await;
+    publish_lost_whole_file(&mount, b"fh").await;
     drop(held);
     let error = read
         .await
@@ -8239,19 +8327,7 @@ async fn a_truncate_with_a_surviving_open_still_honours_the_lost_gate() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
     register_stateid_lane(&mount, 94, [0xc3; 16], crate::OPEN_WRITE).await;
-    mount
-        .locks
-        .mark_lost(
-            b"fh",
-            LostLock {
-                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-                lock_type: 2,
-                offset: 0,
-                length: 4,
-                owner: Bytes::from_static(b"scripted-lock-94"),
-            },
-        )
-        .await;
+    publish_lost_whole_file(&mount, b"fh").await;
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
         // The truncate must be refused locally, so the metadata-only SETATTR on
@@ -8276,6 +8352,59 @@ async fn a_truncate_with_a_surviving_open_still_honours_the_lost_gate() {
         )
         .await
         .expect_err("a truncate must honour the lost-lock gate even with an open lane");
+    let crate::NfsError::StateRecoveryExhausted(details) = &error else {
+        panic!("expected a lock-loss recovery error, got {error:?}");
+    };
+    assert_eq!(details.operation, "setattr");
+    assert_eq!(details.status, crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID);
+    mount
+        .setattr(
+            Bytes::from_static(b"meta"),
+            None,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    server.await.unwrap().unwrap();
+}
+
+/// The anonymous-stateid truncate path: no open lane exists for the handle, the
+/// mount is `Ready`, and only the lost gate stands between the truncate and the
+/// wire. Reachable through the path API, which never opens a lane.
+#[tokio::test]
+async fn a_truncate_without_any_open_lane_still_honours_the_lost_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        // The truncate must be refused locally, so the metadata-only SETATTR on
+        // another handle is the only request.
+        let setattr = read_record(&mut stream).await?;
+        assert!(
+            setattr.windows(4).any(|wire| wire == b"meta".as_slice()),
+            "an anonymous-stateid truncate reached the server despite the lost gate"
+        );
+        reply(&mut stream, &setattr, &setattr_result()).await
+    });
+    let error = mount
+        .setattr(
+            Bytes::from_static(b"fh"),
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an anonymous-stateid truncate must honour the lost gate");
     let crate::NfsError::StateRecoveryExhausted(details) = &error else {
         panic!("expected a lock-loss recovery error, got {error:?}");
     };
@@ -8332,19 +8461,7 @@ async fn a_truncate_waits_for_the_publish_fence_before_sending() {
             .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    mount
-        .locks
-        .mark_lost(
-            b"fh",
-            LostLock {
-                status: crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-                lock_type: 2,
-                offset: 0,
-                length: 0,
-                owner: Bytes::from_static(b"scripted-lock-96"),
-            },
-        )
-        .await;
+    publish_lost_whole_file(&mount, b"fh").await;
     drop(published);
     let error = truncate
         .await
@@ -8669,6 +8786,237 @@ async fn zero_lock_stateid_rejected_by_the_server_still_unblocks_close() {
     assert!(
         !mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
         "a rejected zero stateid must still retire the lane so close() can proceed"
+    );
+    server.await.unwrap().unwrap();
+}
+
+/// Rows 1 and 7 of `docs/nfs40-recovery-invariants.md`: a covering LOCK is the
+/// way out of the gate, and LOCK itself is never blocked by it.
+#[tokio::test]
+async fn a_covering_lock_lifts_the_gate_and_io_resumes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 97, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let lock = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &lock,
+            &succeeded_lock_result("lock", 0, [0xd3; 16]),
+        )
+        .await?;
+        let read = read_record(&mut stream).await?;
+        reply(&mut stream, &read, &read_result(b"x")).await
+    });
+
+    let gated = mount
+        .read(Bytes::from_static(b"fh"), 0, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(gated, crate::NfsError::StateRecoveryExhausted(_)),
+        "the handle must be gated before the lock, got {gated:?}"
+    );
+    mount
+        .lock(Bytes::from_static(b"fh"), 2, 0, u64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        mount.locks.lost(b"fh").await.is_none(),
+        "a covering lock must lift the gate"
+    );
+    let data = mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap();
+    assert_eq!(data, Bytes::from_static(b"x"));
+    server.await.unwrap().unwrap();
+}
+
+/// Row 8: releasing a lock cannot lift the gate, otherwise the release itself
+/// would become a way to bypass the lost protection.
+#[tokio::test]
+async fn locku_does_not_clear_the_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 98, b"fh").await;
+    register_scripted_lock_range(&mount, 98, [0xd4; 16], 1, 8, 8).await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let locku = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &locku,
+            &compound_result("locku", &[(22, &[]), (14, &[0xd4; 16])]),
+        )
+        .await
+    });
+
+    mount
+        .locku(
+            Bytes::from_static(b"fh"),
+            Bytes::copy_from_slice(&[0xd4; 16]),
+            1,
+            8,
+            8,
+        )
+        .await
+        .unwrap();
+    assert!(
+        mount.locks.lost(b"fh").await.is_some(),
+        "LOCKU must not lift the gate"
+    );
+    server.await.unwrap().unwrap();
+}
+
+/// Row 9: COMMIT carries no stateid in NFSv4.0 and only flushes data that was
+/// already written, so a lost lock must not block it.
+#[tokio::test]
+async fn commit_is_not_gated_by_a_lost_lock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 99, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let commit = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &commit,
+            &compound_result("commit", &[(22, &[]), (5, &[0x33; 8])]),
+        )
+        .await
+    });
+
+    mount
+        .commit(Bytes::from_static(b"fh"), 0, 1)
+        .await
+        .expect("COMMIT must not be gated by a lost lock");
+    server.await.unwrap().unwrap();
+}
+
+/// Row 11: LOCKT installs no state, so the gate must not stop it; a server
+/// denial proves the request actually left the client.
+#[tokio::test]
+async fn lockt_is_not_gated_by_a_lost_lock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 100, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let lockt = read_record(&mut stream).await?;
+        reply(&mut stream, &lockt, &denied_lock_result("lockt", 13)).await
+    });
+
+    let error = mount
+        .lock_test(Bytes::from_static(b"fh"), 2, 0, 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::NfsError::LockDenied { .. }),
+        "LOCKT must reach the server instead of being gated locally, got {error:?}"
+    );
+    server.await.unwrap().unwrap();
+}
+
+/// Zero-length READ short-circuits before any lookup, the gate or the wire.
+#[tokio::test]
+async fn a_zero_length_read_short_circuits_before_the_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 101, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
+                .await
+                .is_err(),
+            "a zero-length READ must not reach the server"
+        );
+        Ok::<(), std::io::Error>(())
+    });
+
+    let data = mount.read(Bytes::from_static(b"fh"), 0, 0).await.unwrap();
+    assert!(data.is_empty());
+    server.await.unwrap().unwrap();
+}
+
+/// The gate is cleared by CLOSE even when the open lane still exists, i.e. the
+/// loss came from a sibling owner on the same handle.
+#[tokio::test]
+async fn close_with_a_surviving_lane_lifts_the_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 102, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let close = read_record(&mut stream).await?;
+        reply(&mut stream, &close, &close_result([0x9e; 16])).await
+    });
+
+    mount.close(Bytes::from_static(b"fh")).await.unwrap();
+    assert!(
+        mount.locks.lost(b"fh").await.is_none(),
+        "CLOSE must lift the gate once no open lane is left"
+    );
+    server.await.unwrap().unwrap();
+}
+
+/// Row 12: metadata has no stateid attached, so the gate must not stop it.
+#[tokio::test]
+async fn metadata_is_not_gated_by_a_lost_lock() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 103, b"fh").await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let getattr = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &getattr,
+            &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
+        )
+        .await
+    });
+
+    mount
+        .getattr(Bytes::from_static(b"fh"))
+        .await
+        .expect("GETATTR must not be gated by a lost lock");
+    server.await.unwrap().unwrap();
+}
+
+/// Tearing down lanes is not one of the gate-clearing events: only CLOSE,
+/// a covering LOCK and a session-wide loss are.
+#[tokio::test]
+async fn release_locks_does_not_lift_the_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    register_scripted_open(&mount, 104, b"fh").await;
+    register_scripted_lock_range(&mount, 104, [0xd5; 16], 2, 0, u64::MAX).await;
+    publish_lost_whole_file(&mount, b"fh").await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let locku = read_record(&mut stream).await?;
+        reply(
+            &mut stream,
+            &locku,
+            &compound_result("locku", &[(22, &[]), (14, &[0xd5; 16])]),
+        )
+        .await
+    });
+
+    mount
+        .release_locks(Bytes::from_static(b"fh"))
+        .await
+        .unwrap();
+    assert!(
+        mount.locks.lost(b"fh").await.is_some(),
+        "releasing lanes must not lift the gate"
     );
     server.await.unwrap().unwrap();
 }

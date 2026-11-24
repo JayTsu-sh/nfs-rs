@@ -136,6 +136,45 @@ fn lost_lock_error(operation: &'static str, lost: &LostLock) -> NfsError {
     }))
 }
 
+/// How a data request carries its state: through a lane's stateid, or through
+/// the anonymous stateid when the handle has no lane left.
+#[derive(PartialEq, Eq)]
+enum DispatchState {
+    /// The request uses a lane stateid, so `begin_stateful` checks the
+    /// lifecycle for it.
+    Stateful,
+    /// The request uses the anonymous stateid, which is legal (RFC 7530
+    /// §9.1.4.3) but only while the mount still holds its state.
+    Anonymous,
+}
+
+/// The single admission rule for data I/O on a handle.
+///
+/// A handle carries data I/O only while no lock loss is published for it, and
+/// an anonymous dispatch additionally needs the mount to be `Ready`. Every
+/// READ/WRITE/truncate path goes through here so that adding a new operation
+/// cannot silently skip one of the two checks.
+///
+/// Callers must invoke it at the authoritative point: a stateful request while
+/// holding the lane it will use, because recovery publishes the loss under that
+/// lane; an anonymous request after the blocking lookup returned no lane. Calls
+/// at an operation's entry are only a fast path and never the final word.
+async fn admit_data_io(
+    locks: &LockState,
+    lease: &LeaseState,
+    operation: &'static str,
+    fh: &Bytes,
+    dispatch: DispatchState,
+) -> Result<()> {
+    if let Some(lost) = locks.lost(fh).await {
+        return Err(lost_lock_error(operation, &lost));
+    }
+    if dispatch == DispatchState::Anonymous {
+        lease.gate_stateful(operation)?;
+    }
+    Ok(())
+}
+
 struct Mount40 {
     rpc: rpc::Client,
     auth: Auth,
@@ -499,7 +538,22 @@ async fn settled_call(
     class: OperationClass,
     ctx: RequestContext,
 ) -> Result<Bytes> {
+    settled_call_holding(rpc, request, class, ctx, None).await
+}
+
+async fn settled_call_holding(
+    rpc: rpc::Client,
+    request: Vec<u8>,
+    class: OperationClass,
+    ctx: RequestContext,
+    in_flight: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+) -> Result<Bytes> {
     tokio::spawn(crate::retry::inherit(async move {
+        // The caller's fence travels with the settlement. Cancelling the caller
+        // drops only its handle, while this task keeps the request (and its busy
+        // retries) on the wire; CLOSE or recovery must not overtake it, so the
+        // fence has to live here rather than in the caller's future.
+        let _in_flight = in_flight;
         call_with_busy_retry(
             &rpc,
             request,
@@ -1760,6 +1814,18 @@ impl Mount40 {
         Ok(response)
     }
 
+    async fn activity_settled_call_holding(
+        &self,
+        request: Vec<u8>,
+        class: OperationClass,
+        context: RequestContext,
+        in_flight: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Bytes> {
+        let response =
+            settled_call_holding(self.rpc.clone(), request, class, context, in_flight).await?;
+        Ok(response)
+    }
+
     async fn set_encoded_attributes(
         &self,
         operation: &'static str,
@@ -1778,26 +1844,23 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
-        // A truncate writes the truncated range, so like WRITE it keeps its open
-        // lane out of recovery between the lost-lock recheck and the send: a
-        // reclaim publishes the loss under the same lane, and this fence makes
-        // the lock-then-check atomic with respect to that publish. Only size
-        // changes pay for it; metadata-only SETATTR stays on the cheap path.
-        let _truncate_in_flight = if needs_open {
-            match &lane {
+        let mut retries = 0u8;
+        loop {
+            // A truncate writes the truncated range, so like WRITE it keeps its
+            // open lane out of recovery between the lost-lock recheck and the
+            // send. The fence is taken before the check and its guard moves into
+            // the settlement task, so cancelling this caller cannot release it
+            // while the request is still on the wire. Only size changes pay for
+            // it; metadata-only SETATTR stays on the cheap path.
+            let truncate_in_flight = match &lane {
                 // Release the lane before waiting on the fence: close and reclaim
                 // take the fence first and the lane second.
-                Some(lane) => {
+                Some(lane) if needs_open => {
                     let fence = Arc::clone(&lane.lock().await.io_fence);
                     Some(fence.read_owned().await)
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let mut retries = 0u8;
-        loop {
+                _ => None,
+            };
             let (stateid, expected_generation) = match &lane {
                 Some(lane) => {
                     let guard = lane.lock().await;
@@ -1806,24 +1869,35 @@ impl Mount40 {
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
-                    // A truncate writes data, so it observes the lost-lock gate
-                    // READ and WRITE honour even when a lane survived. Both the
-                    // lookup above and this wait queue behind a reclaim that
-                    // publishes a loss while holding the lane, so the answer is
-                    // taken under that same lane, as READ and WRITE do.
-                    if needs_open && let Some(lost) = self.locks.lost(fh).await {
-                        return Err(lost_lock_error(operation, &lost));
+                    // A truncate writes data, so it observes the same gate as
+                    // READ and WRITE even when a lane survived. Both the lookup
+                    // above and this wait queue behind a reclaim that publishes
+                    // a loss while holding the lane, so the answer is taken
+                    // under that same lane.
+                    if needs_open {
+                        admit_data_io(
+                            &self.locks,
+                            &self.lease,
+                            operation,
+                            fh,
+                            DispatchState::Stateful,
+                        )
+                        .await?;
                     }
                     (guard.stateid, Some(self.lease.begin_stateful(operation)?))
                 }
                 None => {
+                    // Without an open lane the request goes out with the
+                    // anonymous stateid, so it needs both checks.
                     if needs_open {
-                        if let Some(lost) = self.locks.lost(fh).await {
-                            return Err(lost_lock_error(operation, &lost));
-                        }
-                        // Without an open lane the request would go out with the
-                        // anonymous stateid while the mount holds no state.
-                        self.lease.gate_stateful(operation)?;
+                        admit_data_io(
+                            &self.locks,
+                            &self.lease,
+                            operation,
+                            fh,
+                            DispatchState::Anonymous,
+                        )
+                        .await?;
                     }
                     ([0; 16], None)
                 }
@@ -1834,7 +1908,7 @@ impl Mount40 {
                 .encode_with_header(&self.auth);
             let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
             let response = self
-                .activity_settled_call(request, class, ctx.clone())
+                .activity_settled_call_holding(request, class, ctx.clone(), truncate_in_flight)
                 .await?;
             let result = decode_setattr_response(response, bitmap)
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
@@ -1867,9 +1941,14 @@ impl Mount40 {
         data: Bytes,
         stability: mount::WriteStability,
     ) -> Result<mount::WriteOutcome> {
-        if let Some(lost) = self.locks.lost(&fh).await {
-            return Err(lost_lock_error("write", &lost));
-        }
+        admit_data_io(
+            &self.locks,
+            &self.lease,
+            "write",
+            &fh,
+            DispatchState::Stateful,
+        )
+        .await?;
         let (count, committed, verifier) = self
             .write_with_stability(fh, offset, data, stability.stable_how())
             .await?;
@@ -1954,9 +2033,14 @@ impl Mount40 {
                     // The waits above can span a whole reclaim. Recovery
                     // publishes a lost lock while it holds this lane, so
                     // rechecking here cannot miss it.
-                    if let Some(lost) = locks.lost(&fh_for_settlement).await {
-                        return Err(lost_lock_error("write", &lost));
-                    }
+                    admit_data_io(
+                        &locks,
+                        &lease,
+                        "write",
+                        &fh_for_settlement,
+                        DispatchState::Stateful,
+                    )
+                    .await?;
                     (guard.stateid, guard.owner, guard.next_seqid)
                 };
                 *used_in_task
@@ -2960,24 +3044,31 @@ impl Mount for Mount40 {
         if count == 0 {
             return Ok(Bytes::new());
         }
-        if let Some(lost) = self.locks.lost(&fh).await {
-            return Err(lost_lock_error("read", &lost));
-        }
+        admit_data_io(
+            &self.locks,
+            &self.lease,
+            "read",
+            &fh,
+            DispatchState::Stateful,
+        )
+        .await?;
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {
             // `for_fh` waits on every lane mutex it visits, and recovery can
-            // publish a loss while holding one of those lanes, so recheck the
-            // gate after the wait instead of trusting the entry check.
-            if let Some(lost) = self.locks.lost(&fh).await {
-                return Err(lost_lock_error("read", &lost));
-            }
-            // An anonymous-stateid READ is legal (RFC 7530 §9.1.4.3), but only
-            // while the mount still holds its state. After state loss the
-            // caller's locks are gone and this handle has no lane left to gate
-            // at dispatch, so serving bytes here would hide the loss and could
-            // read a range another client now protects with an advisory lock
-            // (servers enforce only share reservations and mandatory locks).
-            self.lease.gate_stateful("read")?;
+            // publish a loss while holding one of those lanes, so the gate is
+            // rechecked after the wait instead of trusting the entry check.
+            // Serving bytes through the anonymous stateid would also hide a
+            // loss from the caller and could read a range another client now
+            // protects with an advisory lock (servers enforce only share
+            // reservations and mandatory locks).
+            admit_data_io(
+                &self.locks,
+                &self.lease,
+                "read",
+                &fh,
+                DispatchState::Anonymous,
+            )
+            .await?;
             let request = CompoundBuilder::new("read")
                 .putfh(&fh)
                 .read(&[0; 16], offset, count)
@@ -3026,9 +3117,14 @@ impl Mount for Mount40 {
                     // The waits above can span a whole reclaim. Recovery
                     // publishes a lost lock while it holds this lane, so
                     // rechecking here cannot miss it.
-                    if let Some(lost) = locks.lost(&fh_for_settlement).await {
-                        return Err(lost_lock_error("read", &lost));
-                    }
+                    admit_data_io(
+                        &locks,
+                        &lease,
+                        "read",
+                        &fh_for_settlement,
+                        DispatchState::Stateful,
+                    )
+                    .await?;
                     guard.stateid
                 };
                 *used_in_task
