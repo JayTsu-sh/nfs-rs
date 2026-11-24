@@ -154,6 +154,27 @@ jobs:
           python scripts/verify-python-artifacts.py \
             --wheel target/python-release-artifacts/*_x86_64.whl \
             --sdist target/python-release-artifacts/nfs_rs-*.tar.gz
+      - name: Prepare OTS pNFS executor SSH credentials
+        env:
+          OTS_SSH_KEY: ${{ secrets.NFS_RS_OTS_SSH_KEY }}
+        run: |
+          key_dir="$RUNNER_TEMP/ots-executor-ssh"
+          mkdir -p "$key_dir"
+          printf '%s\n' "$OTS_SSH_KEY" > "$key_dir/key"
+          chmod 600 "$key_dir/key"
+          touch "$key_dir/known_hosts"
+          probe_options=(-i "$key_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes
+            -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$key_dir/known_hosts"
+            -o ConnectTimeout=15)
+          # Trust-on-first-use probe for both hops; the executor scripts then
+          # enforce StrictHostKeyChecking=yes against this known_hosts file.
+          ssh "${probe_options[@]}" root@10.128.134.90 true
+          ssh "${probe_options[@]}" \
+            -o "ProxyCommand=ssh -i $key_dir/key -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$key_dir/known_hosts -W %h:%p root@10.128.134.90" \
+            root@10.128.135.141 true
+          echo "LAB_OTS_SSH_KEY=$key_dir/key" >> "$GITHUB_ENV"
+          echo "LAB_OTS_KNOWN_HOSTS=$key_dir/known_hosts" >> "$GITHUB_ENV"
+
       - name: Validate final x86_64 wheel on every required real protocol
         run: |
           python -m venv "$RUNNER_TEMP/python-wheel-venv"

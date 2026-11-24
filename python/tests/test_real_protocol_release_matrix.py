@@ -13,10 +13,10 @@ def test_real_protocol_runner_is_fail_closed_and_complete() -> None:
         "linux-source-v3|3|",
         "dxn-v40|4.0|",
         "linux-source-v41|4.1|",
-        "netapp-pnfs-mds|4.1|",
+        "ots-pnfs-mds|4.1|",
     }
     assert all(case in runner for case in expected_cases)
-    assert "netapp-pnfs-mds|4.1|" in runner and "|true\"" in runner
+    assert "ots-pnfs-mds|4.1|" in runner and "|true\"" in runner
     assert "check-python-performance.py" in runner
     assert "continue-on-error" not in runner
 
@@ -61,13 +61,14 @@ def test_nightly_runs_public_python_api_conformance_on_every_real_protocol() -> 
             "linux-source-v3|3|",
             "dxn-v40|4.0|",
             "linux-source-v41|4.1|",
-            "netapp-pnfs-mds|4.1|",
+            "ots-pnfs-mds|4.1|",
         )
     )
-    # The AFX svm2 data network is unreachable from the runner, so the pNFS
-    # case must be scheduled onto the AFX executor over SSH with the
-    # current-checkout wheel, not run from the runner directly.
-    assert "LAB_AFX_PNFS_DATA" in runner
+    # The OTS data network (10.30.3.x) is unreachable from the runner, so the
+    # pNFS case must be scheduled onto the DXN executor node over the
+    # management jump with the current-checkout wheel, not run from the
+    # runner directly.
+    assert "LAB_OTS_PNFS_DATA" in runner
     assert "NFS_RS_PYTHON_CONFORMANCE_WHEEL" in runner
     assert "NFS_RS_PYTHON_CONFORMANCE_WHEEL" in workflow
     assert "LAB_PNFS_MDS_DATA" not in runner
@@ -87,5 +88,5 @@ def test_accepted_baseline_encodes_five_of_four_and_ten_percent_policy() -> None
         "linux-source-v3",
         "dxn-v40",
         "linux-source-v41",
-        "netapp-pnfs-mds",
+        "ots-pnfs-mds",
     }
