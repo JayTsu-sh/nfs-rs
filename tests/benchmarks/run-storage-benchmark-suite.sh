@@ -90,7 +90,7 @@ if ots_executor_available; then
   }
   ots_cleanup() {
     if [[ -n "$remote_dir" ]]; then
-      ssh_ots "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+      ssh_ots "rm -r -- '$remote_dir'" >/dev/null 2>&1 || true
     fi
   }
   trap ots_cleanup EXIT
@@ -136,10 +136,10 @@ if ots_executor_available; then
       local binary
       binary="$(mktemp -d "${TMPDIR:-/tmp}/nfsrs-ots-bench.XXXXXX")/nfs-storage-benchmark"
       build_ots_benchmark_binary "$binary"
-      ssh_ots "rm -rf -- '$remote_dir' && mkdir -p -- '$remote_dir'"
+      ssh_ots "rm -r -- '$remote_dir' && mkdir -p -- '$remote_dir'"
       ssh_ots "cat > '$remote_dir/nfs-storage-benchmark'" < "$binary"
       ssh_ots "chmod 755 '$remote_dir/nfs-storage-benchmark'"
-      rm -rf -- "$(dirname "$binary")"
+      rm -r -- "$(dirname "$binary")"
       remote_binary_ready=1
     fi
     local run suffix
