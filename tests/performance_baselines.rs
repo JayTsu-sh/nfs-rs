@@ -29,8 +29,8 @@ fn every_real_storage_protocol_has_an_independent_baseline() {
         "dxn-v40",
         "fas2750-v40-lif-a",
         "fas2750-v40-lif-b",
-        "netapp-pnfs-mds",
-        "netapp-pnfs-ds",
+        "ots-pnfs-mds",
+        "ots-pnfs-ds",
     ]);
     let observed = entries
         .iter()
@@ -90,13 +90,19 @@ fn report_accepts_every_fully_captured_environment() {
     assert_eq!(status.code(), Some(0));
     let markdown = fs::read_to_string(output_dir.join("performance-baselines.md"))
         .expect("Markdown report must be generated for accepted baselines");
-    assert!(markdown.contains("Overall status: `complete`"));
+    assert!(markdown.contains("Overall status: `complete_with_warnings`"));
     assert!(markdown.contains(
         "| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 30.834 | 88.967 |"
     ));
     assert!(
-        markdown
-            .contains("| netapp-pnfs-ds | `10.128.56.161:/nfsrs_pnfs_b` | 4.1 | `accepted` | 45 |")
+        markdown.contains(
+            "| ots-pnfs-mds | `10.30.3.154:/nfsrs_pnfs_a` | 4.1 | `executor_pending` | 5 |"
+        )
+    );
+    assert!(
+        markdown.contains(
+            "| ots-pnfs-ds | `10.30.3.155:/nfsrs_pnfs_b` | 4.1 | `executor_pending` | 5 |"
+        )
     );
     assert!(markdown.contains("## Baseline analysis summary"));
     assert!(markdown.contains("### Linux protocol comparison"));
@@ -119,7 +125,7 @@ fn report_accepts_every_fully_captured_environment() {
     .expect("performance baseline report must be JSON");
     assert_eq!(
         json["analysis"]["write_throughput_ranking"][0]["environment"],
-        "netapp-pnfs-ds"
+        "fas2750-v40-lif-a"
     );
     assert_eq!(
         json["analysis"]["protocol_comparisons"]

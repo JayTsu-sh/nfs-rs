@@ -74,8 +74,14 @@ for environment in manifest["environments"]:
         and baseline.get("capture_runs", 0) >= manifest["minimum_capture_runs"]
         and baseline.get("capture_windows", 0) >= manifest["minimum_capture_windows"]
     )
-    if not accepted:
-        complete = False
+    if environment.get("executor"):
+        # Executor-marked environments wait for data-network executor
+        # acquisition; they do not gate the runner-direct report.
+        row_status = "executor_pending"
+    else:
+        if not accepted:
+            complete = False
+        row_status = "accepted" if accepted else "baseline_missing"
     gate_row = gate_by_environment.get(environment["id"])
     current_runs = []
     if results_root:
@@ -93,13 +99,14 @@ for environment in manifest["environments"]:
         )
         result_paths = sorted(current_root.glob(f'{environment["id"]}*.json'))
         current_runs = [load(path) for path in result_paths]
-    row_status = "accepted" if accepted else "baseline_missing"
     if gate_row:
         row_status = gate_row["status"]
         if row_status == "warning":
             has_warnings = True
         elif row_status != "pass":
             complete = False
+    if row_status == "executor_pending":
+        has_warnings = True
     rows.append({
         "id": environment["id"],
         "endpoint": environment["endpoint"],
@@ -455,6 +462,7 @@ html_lines = [
     "    .complete, .accepted, .pass { background: #153d2b; color: #70e1a1; }",
     "    .complete_with_warnings, .warning { background: #4b3b12; color: #ffd166; }",
     "    .baseline_missing { background: #4a251d; color: #ff9b82; }",
+    "    .executor_pending { background: #1d324a; color: #9fc5ff; }",
     "    .table-wrap { overflow-x: auto; border: 1px solid #26324a; border-radius: 10px; }",
     "    table { width: 100%; border-collapse: collapse; background: #11182a; }",
     "    th, td { padding: 9px 12px; border-bottom: 1px solid #26324a; text-align: left; white-space: nowrap; }",

@@ -126,7 +126,18 @@ for environment in manifest["environments"]:
         and baseline.get("capture_runs", 0) >= manifest["minimum_capture_runs"]
         and baseline.get("capture_windows", 0) >= manifest["minimum_capture_windows"]
     )
-    if accepted:
+    if environment.get("executor"):
+        # Executor-marked environments are acquired from a data-network
+        # executor host the runner cannot reach directly. They wait for
+        # executor acquisition and an accepted baseline, and report
+        # executor_pending (a warning) instead of gating the release.
+        row = {
+            "status": "executor_pending",
+            "valid_runs": 0,
+            "violations": [],
+            "warnings": [],
+        }
+    elif accepted:
         row = evaluate_runs(
             baseline,
             sorted(results_root.glob(f'{environment["id"]}-run-*.json')),
@@ -159,9 +170,9 @@ for environment in manifest["environments"]:
             row.update(accepted_test)
     row["environment"] = environment["id"]
     status = row["status"]
-    if status == "warning":
+    if status in ("warning", "executor_pending"):
         has_warnings = True
-    if status not in ("pass", "warning"):
+    if status not in ("pass", "warning", "executor_pending"):
         complete = False
     rows.append(row)
 
