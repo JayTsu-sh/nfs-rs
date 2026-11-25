@@ -96,7 +96,7 @@ class RefusingDialer:
 def _expected_exports():
     from nfs_rs import ExportEntry
 
-    return (ExportEntry("/data", ("team",)),)
+    return (ExportEntry(b"/data", (b"team",)),)
 
 
 def test_list_exports_dials_every_connection_through_the_dialer():

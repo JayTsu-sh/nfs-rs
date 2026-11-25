@@ -2218,7 +2218,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
     /// ```
     /// async fn print_exports(mount: &dyn nfs_rs::Mount) -> nfs_rs::Result<()> {
     ///     for entry in mount.exports().await? {
-    ///         println!("{} {:?}", entry.path, entry.groups);
+    ///         println!("{:?} {:?}", entry.path, entry.groups);
     ///     }
     ///     Ok(())
     /// }
@@ -2235,8 +2235,8 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 /// allowed client groups (empty = unrestricted / world-accessible).
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct ExportEntry {
-    pub path: String,
-    pub groups: Vec<String>,
+    pub path: Bytes,
+    pub groups: Vec<Bytes>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

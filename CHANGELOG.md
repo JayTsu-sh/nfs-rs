@@ -9,6 +9,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Python public paths now reject a leading `/` as documented. NFSv3 MOUNT
+  export paths and access groups are returned as lossless bytes in Rust and
+  Python; callers decode them only for display. NFSv4 server name rejection
+  remains a protocol error without automatic charset conversion.
 - Public Rust filename and path APIs now use lossless byte slices and `Bytes`;
   READDIR, READDIRPLUS, READLINK, and path resolution return the exact server
   bytes. Python paths and names use `bytes` or `os.PathLike[bytes]`, and error

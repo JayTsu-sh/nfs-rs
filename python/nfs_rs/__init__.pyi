@@ -220,8 +220,8 @@ class DirectoryPage:
 
 @dataclass(frozen=True)
 class ExportEntry:
-    path: str
-    groups: tuple[str, ...]
+    path: bytes
+    groups: tuple[bytes, ...]
 
 @dataclass(frozen=True)
 class FsInfo:

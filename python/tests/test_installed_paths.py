@@ -150,11 +150,11 @@ def test_installed_export_discovery_matches_sync_and_async():
     sync_values = list_exports("nfs-test://fixture/")
     async_values = asyncio.run(list_exports_async("nfs-test://fixture/"))
     assert sync_values == async_values
-    assert sync_values[0].path == '/data'
-    assert sync_values[0].groups == ("team",)
+    assert sync_values[0].path == b'/data'
+    assert sync_values[0].groups == (b"team",)
 
 
-@pytest.mark.parametrize("path", ["text", b"bad\0name", b"../escape"])
+@pytest.mark.parametrize("path", ["text", b"bad\0name", b"/absolute", b"../escape"])
 def test_installed_invalid_paths_never_reach_native_adapter(path):
     client = Client.connect("nfs-test://fixture/export")
     with pytest.raises((TypeError, ValueError)):

@@ -299,8 +299,8 @@ class DirectoryPage:
 
 @dataclass(frozen=True, slots=True)
 class ExportEntry:
-    path: str
-    groups: tuple[str, ...]
+    path: bytes
+    groups: tuple[bytes, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +368,8 @@ def _normalize_path(path: os.PathLike[bytes] | bytes) -> bytes:
         raise TypeError("NFS paths must be bytes; encode text explicitly in the application")
     if b"\0" in raw:
         raise ValueError("NFS paths may not contain NUL")
+    if raw.startswith(b"/"):
+        raise ValueError("NFS paths must be export-relative")
     parts: list[bytes] = []
     for part in raw.split(b"/"):
         if part in {b"", b"."}:

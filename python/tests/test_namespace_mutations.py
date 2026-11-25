@@ -90,7 +90,9 @@ def test_sync_namespace_paths_targets_and_conveniences():
     client = Client.connect("nfs://server/export")
     client.mkdir(b'a/./b/c', parents=True)
     assert client._inner.calls[:3] == [("mkdir", b"a", 0o777), ("mkdir", b'a/b', 0o777), ("mkdir", b"a/b/c", 0o777)]
-    client.rename(b'a/../old', b'/new')
+    with pytest.raises(ValueError, match="export-relative"):
+        client.rename(b'a/../old', b'/new')
+    client.rename(b'a/../old', b'new')
     client.link(b'new', b'links/item')
     client.symlink(b'../raw/./target', b'links/sym')
     assert ("symlink", b'../raw/./target', b'links/sym') in client._inner.calls

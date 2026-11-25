@@ -21,8 +21,8 @@ use crate::error::{NfsError, Result};
 use crate::mount::ExportEntry;
 use crate::rpc;
 
-/// Decode one XDR variable-length string from `bytes`, consuming the data and its 4-byte padding.
-fn decode_xdr_string(bytes: &mut Bytes) -> Result<String> {
+/// RFC 1813 MOUNT EXPORT strings are opaque XDR bytes; do not assume UTF-8.
+fn decode_xdr_string(bytes: &mut Bytes) -> Result<Bytes> {
     if bytes.remaining() < 4 {
         return Err(NfsError::Xdr(
             "response truncated (string length)".to_string(),
@@ -35,11 +35,9 @@ fn decode_xdr_string(bytes: &mut Bytes) -> Result<String> {
             "response truncated (string data)".to_string(),
         ));
     }
-    let s = std::str::from_utf8(&bytes[..len])
-        .map_err(|e| NfsError::Xdr(e.to_string()))?
-        .to_string();
-    bytes.advance(len + pad);
-    Ok(s)
+    let value = bytes.split_to(len);
+    bytes.advance(pad);
+    Ok(value)
 }
 
 /// Decode the XDR optional-linked-list body returned by MOUNT EXPORT (procedure 5).
@@ -144,7 +142,7 @@ mod tests {
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].path, "/vol/data");
+        assert_eq!(result[0].path, Bytes::from_static(b"/vol/data"));
         assert!(result[0].groups.is_empty());
     }
 
@@ -154,8 +152,14 @@ mod tests {
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].path, "/exports/share");
-        assert_eq!(result[0].groups, vec!["client1", "10.0.0.0/24"]);
+        assert_eq!(result[0].path, Bytes::from_static(b"/exports/share"));
+        assert_eq!(
+            result[0].groups,
+            vec![
+                Bytes::from_static(b"client1"),
+                Bytes::from_static(b"10.0.0.0/24")
+            ]
+        );
     }
 
     #[test]
@@ -168,12 +172,15 @@ mod tests {
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].path, "/vol/home");
-        assert_eq!(result[0].groups, vec!["@trusted"]);
-        assert_eq!(result[1].path, "/vol/data");
+        assert_eq!(result[0].path, Bytes::from_static(b"/vol/home"));
+        assert_eq!(result[0].groups, vec![Bytes::from_static(b"@trusted")]);
+        assert_eq!(result[1].path, Bytes::from_static(b"/vol/data"));
         assert!(result[1].groups.is_empty());
-        assert_eq!(result[2].path, "/vol/backup");
-        assert_eq!(result[2].groups, vec!["host-a", "host-b"]);
+        assert_eq!(result[2].path, Bytes::from_static(b"/vol/backup"));
+        assert_eq!(
+            result[2].groups,
+            vec![Bytes::from_static(b"host-a"), Bytes::from_static(b"host-b")]
+        );
     }
 
     #[test]
@@ -182,5 +189,25 @@ mod tests {
         let raw = 1u32.to_be_bytes();
         let mut bytes = Bytes::from(raw.to_vec());
         assert!(decode_exports(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn decode_exports_preserves_non_utf8_path_and_group() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.extend_from_slice(&4u32.to_be_bytes());
+        raw.extend_from_slice(b"/\xff/a");
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.extend_from_slice(&2u32.to_be_bytes());
+        raw.extend_from_slice(b"\xfeX\0\0");
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&1u32.to_be_bytes());
+        raw.extend(build_xdr_string("/valid"));
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        let result = decode_exports(&mut Bytes::from(raw)).unwrap();
+        assert_eq!(result[0].path, Bytes::from_static(b"/\xff/a"));
+        assert_eq!(result[0].groups, vec![Bytes::from_static(b"\xfeX")]);
+        assert_eq!(result[1].path, Bytes::from_static(b"/valid"));
     }
 }

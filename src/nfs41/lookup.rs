@@ -68,3 +68,39 @@ impl Mount41 {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NfsError;
+    use crate::nfs4::Nfs4ErrorCode;
+    use crate::nfs4::compound::take_opaque;
+    use crate::nfs41::test_support::{Reply, ok, putfh, serve};
+    use bytes::Buf;
+
+    #[tokio::test]
+    async fn lookup_preserves_server_rejection_of_raw_name() {
+        let (mount, server) = serve(|tag, mut args| {
+            assert_eq!(tag, "lookup");
+            putfh(&mut args);
+            assert_eq!(args.get_u32(), 15);
+            assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xff");
+            vec![
+                ok(22, vec![]),
+                Reply {
+                    opcode: 15,
+                    status: 10040,
+                    data: vec![],
+                },
+            ]
+        })
+        .await;
+        let error = mount.lookup(Bytes::new(), b"\xff").await.unwrap_err();
+        assert!(matches!(
+            error,
+            NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_BADCHAR)
+        ));
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
+}

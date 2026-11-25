@@ -408,7 +408,7 @@ Frozen MOUNT export-list entry. This is export discovery information, not proof 
 | Member | Type / value | Meaning |
 |---|---|---|
 | `ExportEntry.path` | `bytes` | Server-advertised export path (normally absolute). |
-| `ExportEntry.groups` | `tuple[str, ...]` | Tuple of server-advertised export access groups/hosts. |
+| `ExportEntry.groups` | `tuple[bytes, ...]` | Server-advertised access groups/hosts, preserved as XDR bytes. |
 
 ### FsInfo
 

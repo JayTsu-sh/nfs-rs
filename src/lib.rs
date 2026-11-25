@@ -493,7 +493,7 @@ pub async fn parse_url_and_mount(url: &str) -> Result<Box<dyn Mount>> {
 /// async fn example() {
 ///     let exports = nfs_rs::list_exports("192.168.1.1").await.unwrap();
 ///     for e in exports {
-///         println!("{} {:?}", e.path, e.groups);
+///         println!("{:?} {:?}", e.path, e.groups);
 ///     }
 /// }
 /// ```

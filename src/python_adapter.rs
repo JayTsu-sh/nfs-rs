@@ -2246,7 +2246,7 @@ fn finish_v42_open<T>(result: Result<T>, close: Result<()>) -> Result<T> {
 fn v42_recovery_path(operation: &str, path: &[u8], other: Option<&[u8]>) -> Option<Bytes> {
     match operation {
         "copy_range" | "clone_range" => other.map(Bytes::copy_from_slice),
-        _ => Some(Bytes::copy_from_slice(&path)),
+        _ => Some(Bytes::copy_from_slice(path)),
     }
 }
 
@@ -2983,10 +2983,7 @@ async fn directory_names(
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM));
         }
         if let Some(entries) = test_directory_entries(&path) {
-            return Ok(entries
-                .into_iter()
-                .map(|(name, _)| Bytes::from(name))
-                .collect());
+            return Ok(entries.into_iter().map(|(name, _)| name).collect());
         }
         let mount = mount.ok_or_else(|| {
             NfsError::Unsupported("listdir requires a connected protocol engine".to_string())
@@ -3216,7 +3213,7 @@ async fn directory_receiver(
             let _operation = operation;
             let entries = futures::stream::iter(entries.into_iter().map(|(name, attr)| {
                 let fh = attr.filehandle.clone();
-                Ok((Bytes::from(name), attr, fh))
+                Ok((name, attr, fh))
             }));
             stream_directory_batches(entries, sender, &closing).await;
         });
@@ -4446,11 +4443,14 @@ impl AsyncFile {
     }
 }
 
+type ExportValues = Vec<(Bytes, Vec<Bytes>)>;
+type PythonExportValues = Vec<(Py<PyBytes>, Vec<Py<PyBytes>>)>;
+
 async fn export_values(
     host: &str,
     timeout: Option<Duration>,
     dialer: Option<Arc<dyn crate::Dialer>>,
-) -> Result<Vec<(String, Vec<String>)>> {
+) -> Result<ExportValues> {
     let exports = async {
         match dialer {
             Some(dialer) => crate::list_exports_with(host, dialer).await,
@@ -4470,14 +4470,33 @@ async fn export_values(
         .collect())
 }
 
+fn python_export_values(py: Python<'_>, values: ExportValues) -> PythonExportValues {
+    values
+        .into_iter()
+        .map(|(path, groups)| {
+            (
+                PyBytes::new(py, &path).unbind(),
+                groups
+                    .into_iter()
+                    .map(|group| PyBytes::new(py, &group).unbind())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(feature = "python-test-support")]
-fn test_export_values(host: &str) -> Option<Vec<(String, Vec<String>)>> {
-    host.starts_with("nfs-test://")
-        .then(|| vec![("/data".to_string(), vec!["team".to_string()])])
+fn test_export_values(host: &str) -> Option<ExportValues> {
+    host.starts_with("nfs-test://").then(|| {
+        vec![(
+            Bytes::from_static(b"/data"),
+            vec![Bytes::from_static(b"team")],
+        )]
+    })
 }
 
 #[cfg(not(feature = "python-test-support"))]
-fn test_export_values(_host: &str) -> Option<Vec<(String, Vec<String>)>> {
+fn test_export_values(_host: &str) -> Option<ExportValues> {
     None
 }
 
@@ -4486,9 +4505,9 @@ fn python_list_exports(
     py: Python<'_>,
     host: String,
     options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<(String, Vec<String>)>> {
+) -> PyResult<PythonExportValues> {
     if let Some(values) = test_export_values(&host) {
-        return Ok(values);
+        return Ok(python_export_values(py, values));
     }
     let timeout = timeout_option(options, "connect_timeout")?;
     let dialer = dialer::dialer_option(options)?;
@@ -4498,8 +4517,10 @@ fn python_list_exports(
         .thread_name("nfs-rs-python-exports")
         .build()
         .map_err(python_error)?;
-    py.detach(|| runtime.block_on(export_values(&host, timeout, dialer)))
-        .map_err(nfs_error)
+    let values = py
+        .detach(|| runtime.block_on(export_values(&host, timeout, dialer)))
+        .map_err(nfs_error)?;
+    Ok(python_export_values(py, values))
 }
 
 #[pyfunction(name = "async_list_exports", signature = (host, **options))]
@@ -4509,14 +4530,17 @@ fn python_async_list_exports<'py>(
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if let Some(values) = test_export_values(&host) {
-        return completion::future_into_py(py, async move { Ok(values) });
+        return completion::future_into_py(py, async move {
+            Ok(Python::attach(|py| python_export_values(py, values)))
+        });
     }
     let timeout = timeout_option(options, "connect_timeout")?;
     let dialer = dialer::dialer_option(options)?;
     completion::future_into_py(py, async move {
-        export_values(&host, timeout, dialer)
+        let values = export_values(&host, timeout, dialer)
             .await
-            .map_err(nfs_error)
+            .map_err(nfs_error)?;
+        Ok(Python::attach(|py| python_export_values(py, values)))
     })
 }
 

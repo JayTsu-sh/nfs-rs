@@ -93,11 +93,11 @@ class AsyncInner(SyncInner):
 fake = ModuleType("nfs_rs._internal")
 fake.SyncClient = SyncInner
 fake.AsyncClient = AsyncInner
-fake.list_exports = lambda *_args, **_kwargs: [{"path": "/data", "groups": ["team"]}]
+fake.list_exports = lambda *_args, **_kwargs: [{"path": b"/data", "groups": [b"team"]}]
 
 
 async def async_exports(*_args, **_kwargs):
-    return [{"path": "/data", "groups": ["team"]}]
+    return [{"path": b"/data", "groups": [b"team"]}]
 
 
 fake.async_list_exports = async_exports
@@ -110,7 +110,7 @@ def fake_adapter(monkeypatch):
     monkeypatch.setitem(sys.modules, "nfs_rs._internal", fake)
 
 
-@pytest.mark.parametrize("value", [b'a/./b', b"/a/b", BytesPath(b'a/b'), b"a/c/../b"])
+@pytest.mark.parametrize("value", [b'a/./b', BytesPath(b'a/b'), b"a/c/../b"])
 def test_paths_normalize_with_export_relative_posix_semantics(value):
     client = Client.connect("nfs://server/export")
     info = client.stat(value)
@@ -121,7 +121,7 @@ def test_paths_normalize_with_export_relative_posix_semantics(value):
     assert info.group is None
 
 
-@pytest.mark.parametrize("value", ["text", b"bad\0name", b"../escape", b"a/../../escape"])
+@pytest.mark.parametrize("value", ["text", b"bad\0name", b"/a/b", b"/", b"../escape", b"a/../../escape"])
 def test_invalid_paths_fail_before_adapter(value):
     client = Client.connect("nfs://server/export")
     with pytest.raises((TypeError, ValueError)):
@@ -178,7 +178,7 @@ def test_listdir_uses_name_only_adapter_and_normalizes_paths():
 
 
 def test_export_discovery_has_matching_sync_and_async_values():
-    assert list_exports("nfs://server/")[0].groups == ("team",)
+    assert list_exports("nfs://server/")[0].groups == (b"team",)
     assert asyncio.run(list_exports_async("nfs://server/")) == list_exports("nfs://server/")
 
 

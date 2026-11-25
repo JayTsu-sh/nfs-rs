@@ -148,6 +148,15 @@ for export in list_exports("nfs://server/"):
 
 Use `await list_exports_async(...)` in async code. It is not NFSv4 namespace
 discovery; availability depends on the server exposing the MOUNT service.
+Export paths and access groups are raw `bytes`, even when a server advertises
+non-UTF-8 values. Decode them only for display using a known charset.
+
+NFSv3 and NFSv4 do not promise identical filename acceptance. Directory
+entries returned by a server retain their exact bytes, including invalid
+UTF-8, and the same bytes are sent for subsequent name operations. A server
+may reject an operation with a protocol error such as `NFS4ERR_BADCHAR` or
+`NFS4ERR_BADNAME`; the client reports that error without changing the name or
+retrying with another encoding. Valid UTF-8 names follow the same byte path.
 
 ## Custom connections
 
