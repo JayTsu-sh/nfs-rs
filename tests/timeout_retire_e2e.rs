@@ -193,7 +193,7 @@ async fn write_file(
     path: &str,
     value: u8,
 ) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
-    let file = mount.create_path(path, Some(0o600)).await?;
+    let file = mount.create_path(path.as_bytes(), Some(0o600)).await?;
     nfs_rs::write_all(
         mount,
         file.fh.clone(),
@@ -211,13 +211,35 @@ async fn write_file(
 async fn assert_payload(
     mount: &dyn nfs_rs::Mount,
     path: &str,
+    value: u8,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let file = mount.lookup_path(path).await?;
-    let attrs = mount.getattr(file.fh).await?;
+    let file = mount.lookup_path(path.as_bytes()).await?;
+    let attrs = mount.getattr(file.fh.clone()).await?;
     assert_eq!(
         attrs.filesize, PAYLOAD_BYTES as u64,
         "{path} must contain the replayed payload"
     );
+
+    let mut data = Vec::with_capacity(PAYLOAD_BYTES);
+    while data.len() < PAYLOAD_BYTES {
+        let remaining = PAYLOAD_BYTES - data.len();
+        let chunk = mount
+            .read(file.fh.clone(), data.len() as u64, remaining as u32)
+            .await?;
+        assert!(
+            !chunk.is_empty(),
+            "{path} ended after {} bytes instead of {PAYLOAD_BYTES}",
+            data.len()
+        );
+        data.extend_from_slice(&chunk);
+    }
+
+    if let Some(position) = data.iter().position(|byte| *byte != value) {
+        panic!(
+            "{path} content mismatch at byte {position}: expected 0x{value:02x}, got 0x{:02x}",
+            data[position]
+        );
+    }
     Ok(())
 }
 
@@ -244,7 +266,7 @@ async fn v3_stalled_write_retires_connection() -> Result<(), Box<dyn Error + Sen
     // Create first: `create_path` performs a LOOKUP, and arming earlier would
     // hit that metadata call instead of the WRITE we want to stall.
     let stalled = mount
-        .create_path(&format!("{prefix}/stalled.bin"), Some(0o600))
+        .create_path(format!("{prefix}/stalled.bin").as_bytes(), Some(0o600))
         .await?;
     proxy.arm();
     let started = Instant::now();
@@ -278,7 +300,7 @@ async fn v3_stalled_write_retires_connection() -> Result<(), Box<dyn Error + Sen
         recovery_elapsed < Duration::from_secs(6),
         "the next file reused the stalled connection and took {recovery_elapsed:?}"
     );
-    assert_payload(&*mount, &format!("{prefix}/recovered.bin")).await?;
+    assert_payload(&*mount, &format!("{prefix}/recovered.bin"), 3).await?;
 
     drop(mount);
     let _ = std::fs::remove_dir_all(&directory);
@@ -309,7 +331,7 @@ async fn v40_stalled_setattr_retires_connection() -> Result<(), Box<dyn Error + 
     // `Mount40::settled_call` maps SETATTR to `ONE_ATTEMPT`, so a swallowed
     // metadata reply must retire the connection just like the v3 WRITE.
     let stalled = mount
-        .create_path(&format!("{prefix}/stalled.bin"), Some(0o600))
+        .create_path(format!("{prefix}/stalled.bin").as_bytes(), Some(0o600))
         .await?;
     proxy.arm();
     let started = Instant::now();
@@ -346,7 +368,7 @@ async fn v40_stalled_setattr_retires_connection() -> Result<(), Box<dyn Error + 
         recovery_elapsed < Duration::from_secs(6),
         "the next v4.0 file reused the stalled connection and took {recovery_elapsed:?}"
     );
-    assert_payload(&*mount, &format!("{prefix}/recovered.bin")).await?;
+    assert_payload(&*mount, &format!("{prefix}/recovered.bin"), 3).await?;
 
     drop(mount);
     let _ = std::fs::remove_dir_all(&directory);
@@ -378,7 +400,7 @@ async fn v41_stalled_compound_preserves_evidence_and_rebinds()
     // Every v4.1 COMPOUND uses `NFS_REPLAY`, so the transport must not retire
     // the link after the final timeout; it must still report Sent evidence.
     let stalled = mount
-        .create_path(&format!("{prefix}/stalled.bin"), Some(0o600))
+        .create_path(format!("{prefix}/stalled.bin").as_bytes(), Some(0o600))
         .await?;
     proxy.arm();
     let started = Instant::now();
@@ -419,7 +441,7 @@ async fn v41_stalled_compound_preserves_evidence_and_rebinds()
         recovery_elapsed < Duration::from_secs(6),
         "v4.1 session rebind did not recover in time: {recovery_elapsed:?}"
     );
-    assert_payload(&*mount, &format!("{prefix}/recovered.bin")).await?;
+    assert_payload(&*mount, &format!("{prefix}/recovered.bin"), 3).await?;
 
     drop(mount);
     let _ = std::fs::remove_dir_all(&directory);
@@ -452,7 +474,7 @@ async fn v3_concurrent_retire_keeps_sent_evidence_when_redial_is_refused()
 
     let readable = write_file(&*mount, &format!("{prefix}/read.bin"), 7).await?;
     let writable = mount
-        .create_path(&format!("{prefix}/write.bin"), Some(0o600))
+        .create_path(format!("{prefix}/write.bin").as_bytes(), Some(0o600))
         .await?;
 
     proxy.arm();
