@@ -54,7 +54,7 @@ refusal from hiding ordinary file attributes; explicit ACL failures are preserve
 
 ```toml
 [dependencies]
-nfs-rs = "0.13.1"
+nfs-rs = "0.13.2"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```

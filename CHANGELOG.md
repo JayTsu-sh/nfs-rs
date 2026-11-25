@@ -7,7 +7,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-## [0.13.1] - 2026-11-25
+## [0.13.2] - 2026-11-25
 
 ### Changed
 
@@ -45,6 +45,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   plain `socket.socket` is taken, and at most 16 dial calls run at once.
 
 ### Fixed
+
+- Updated the URL parser to 2.5.9 to address RUSTSEC-2026-0592.
 
 - A lock that NFSv4.0 state recovery cannot reclaim no longer leaves the
   surviving open usable: `read` and `write` on that file handle fail with
