@@ -37,9 +37,9 @@ built in an isolated temporary directory; no running application was replaced.
 | `cargo fmt --all -- --check` | Passed |
 | `cargo check --locked --all-targets` | Passed |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed |
-| `cargo test --locked --all-targets --no-fail-fast` | 909 passed, 33 ignored lab tests; benchmark test mode passed |
+| `cargo test --locked --all-targets --no-fail-fast` | 911 passed, 33 ignored lab tests; benchmark test mode passed |
 | `python3.11 scripts/check-reliability-test-results.py --results <rust-log>` | Concrete test mappings passed; existing partial/unmapped scenarios remain reported |
-| `cargo test --locked --features python-bindings --lib -q` | 872 passed |
+| `cargo test --locked --features python-bindings --lib -q` | 874 passed |
 | `cargo test --locked --doc -q` | 49 passed |
 | `cargo clippy --locked --features python-bindings --lib -- -D warnings` | Passed |
 | `cargo check --locked --features python-extension` | Passed |
@@ -70,7 +70,56 @@ non-UTF-8 subtree through its percent-encoded URL. NFSv3's subtree MNT was
 rejected with `MNT3ERR_ACCES`; the client preserved that error. NFSv4.1 and
 NFSv4.2 were rejected by that server with minor-version mismatch. Their raw
 namespace behavior is covered by deterministic protocol fixtures, not claimed
-as physical-server verification. Test-owned files and directories were cleaned.
+as physical-server verification on that server. The new Linux server validation
+below supplies the v4.1/v4.2 physical coverage. Test-owned files and directories
+were cleaned.
+
+### Linux v4.1/v4.2 follow-up on 2026-11-25
+
+- Server: `10.131.6.79`, Rocky Linux 9.4, kernel `5.14.0-427.13.1.el9_4.x86_64`,
+  knfsd reports `+3 +4 +4.1 +4.2`.
+  Created a dedicated `/srv/nfsrs-lisa4413` export, writable only by
+  `10.131.7.194`, using AUTH_SYS, sync and reserved source ports. Existing
+  exports were not replaced and the NFS service was not restarted.
+- Client: `10.131.7.194`, Rocky Linux 9.7. A temporary Linux mount with exact
+  `vers=4.2` succeeded before testing the library. A separately rebuilt
+  production wheel without `python-test-support` connected directly to the
+  server with exact `version=4.1` and `version=4.2`.
+- Initial v4.1 namespace checks passed. Initial v4.2 failed at EXCHANGE_ID with
+  `NFS4ERR_INVAL`, before filesystem operations. Wire evidence showed request
+  flags `0x20004`; removing only optional FENCE_OPS (`0x4`) in a diagnostic
+  relay allowed v4.2 setup. That relay result is diagnosis, not final validation.
+- RFC 7862 §14.1 recommends requesting FENCE_OPS, but this client does not
+  depend on fencing support. The session layer now retries once without that
+  bit only after a definite, single-operation EXCHANGE_ID INVAL rejection.
+  Owner, verifier, requested minor version and MDS/DS role remain unchanged.
+  Repeated INVAL, access errors, minor-version mismatch and transport errors
+  are not suppressed or converted into an unbounded fallback.
+- The regression failed before the session change and passed after it. Wire
+  tests assert unchanged identity/version, bounded repeated rejection, and
+  preservation of v4.1 INVAL and v4.2 ACCESS errors. The existing exact-version
+  rejection and recovery tests also pass.
+- Final direct-server production-wheel tests passed for **both v4.1 and v4.2**:
+  create/write/list/read, rename, hard link, symlink/readlink, remove,
+  mkdir/rmdir and percent-encoded non-UTF-8 subtree mount. Names include
+  UTF-8 Chinese, GBK bytes, invalid UTF-8, newline/backslash and a literal
+  former-prefix sibling; removing/renaming the raw entry preserves that sibling.
+  Linux `os.listdir(bytes_path)` supplies the independent raw-byte oracle.
+  Both versions also enumerated 1,500 long non-UTF-8 names with no missing or
+  duplicate entries; the returned byte set matched the Linux mount exactly.
+- Production wheel SHA-256:
+  `3237bd015420db5369f80b27849ecdc303e5a129df2b6e0d022866addf5726d7`.
+- All UUID-owned test files were removed. The dedicated server export remains
+  available for follow-up verification; credentials and raw wire captures are
+  outside the repository. Both exact Linux v4.1 and v4.2 mounts succeeded;
+  temporary client mounts were unmounted and their empty mount directory removed.
+  No physical restart/state-loss injection was run.
+
+Final logs on 194: `/tmp/nfs679-rust.log`, `/tmp/nfs679-doc.log`,
+`/tmp/nfs679-clippy.log`, `/tmp/nfs679-regression-before.log`,
+`/tmp/nfs679-regression-after.log`, `/tmp/nfs679-live-final.log`,
+`/tmp/nfs679-pages-final.log`, `/tmp/nfs679-bindings.log`,
+`/tmp/nfs679-python.log`, `/tmp/nfs679-stubtest.log` and `/tmp/nfs679-smoke.log`.
 
 No service restart, physical state-loss injection, or cross-environment
 performance release gate was performed in this round. The previous
@@ -86,3 +135,8 @@ replay rules and recovery ownership remain in their existing engines. Display
 decoding stays in callers. Regression tests live with the affected protocol
 modules, and the ordinary-versus-explicit-resolution distinction is documented
 at the public Rust/Python boundaries.
+
+The optional FENCE_OPS negotiation belongs in the existing shared v4.1/v4.2
+session bootstrap, so MDS and DS do not acquire separate compatibility rules.
+It changes no filename encoding, transport replay policy or mutation retry
+semantics, and the client continues to treat uncertain operations conservatively.

@@ -9,6 +9,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- NFSv4.2 EXCHANGE_ID retries once without the optional FENCE_OPS request bit
+  after a definite INVAL rejection, retaining the same client identity and
+  minor version for compatibility with Linux knfsd. Other errors and uncertain
+  outcomes are not converted into capability fallback.
 - Export URL paths are percent-decoded into raw bytes through NFSv3 MNT/UMNT
   and NFSv4 export LOOKUP traversal, allowing EXPORT results with non-UTF-8
   paths to be mounted without a text conversion. Encoded separators and NUL

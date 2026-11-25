@@ -636,7 +636,7 @@ async fn exchange_id_step(
 ) -> Result<(u64, u32, u32)> {
     // RFC 7862 §14.1: request fencing support; uncertainty semantics stay
     // conservative because we do not rely on the server's returned fence flag.
-    let flags = flags
+    let requested_flags = flags
         | if client_identity.minor_version == MinorVersion::V2 {
             0x4
         } else {
@@ -648,12 +648,35 @@ async fn exchange_id_step(
     let builder = CompoundBuilder::new("exchange_id").exchange_id(
         verifier,
         owner_id,
-        flags,
+        requested_flags,
         "nfs-rs",
         "nfs-rs NFSv4.1/v4.2 client",
     );
 
-    let resp = send_compound_no_session(rpc, auth, builder, client_identity.minor_version).await?;
+    let mut resp =
+        send_compound_no_session(rpc, auth, builder, client_identity.minor_version).await?;
+    // RFC 7862 §14.1 makes fencing a requested capability, not a prerequisite.
+    // Some Linux knfsd versions reject that optional bit with INVAL. Retry
+    // only a definite EXCHANGE_ID rejection, once, with the same identity and
+    // minor version. Never replay an uncertain result or downgrade the protocol.
+    if requested_flags != flags
+        && matches!(
+            resp.check_status(),
+            Err(NfsError::Nfs4(crate::nfs4::Nfs4ErrorCode::NFS4ERR_INVAL))
+        )
+        && resp.results.len() == 1
+        && resp.results[0].opcode == 42
+        && resp.results[0].status == crate::nfs4::Nfs4ErrorCode::NFS4ERR_INVAL
+    {
+        let builder = CompoundBuilder::new("exchange_id").exchange_id(
+            verifier,
+            owner_id,
+            flags,
+            "nfs-rs",
+            "nfs-rs NFSv4.1/v4.2 client",
+        );
+        resp = send_compound_no_session(rpc, auth, builder, client_identity.minor_version).await?;
+    }
     resp.check_status()?;
     let op = resp.op_ok(0)?;
     let mut data = op.data.clone();

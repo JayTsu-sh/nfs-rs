@@ -18,6 +18,7 @@ struct Step {
     replies: Vec<Reply>,
     reconnect: bool,
     drop_reply: bool,
+    fence: Option<bool>,
 }
 
 fn step(minor: u32, tag: &'static str, replies: Vec<Reply>) -> Step {
@@ -27,6 +28,7 @@ fn step(minor: u32, tag: &'static str, replies: Vec<Reply>) -> Step {
         replies,
         reconnect: false,
         drop_reply: false,
+        fence: None,
     }
 }
 
@@ -124,18 +126,19 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
     let opcode = args.get_u32();
     if opcode == 42 {
         let mut exchange_args = args.clone();
-        exchange_args.advance(8); // verifier
+        let verifier = exchange_args.split_to(8);
         let owner = take_opaque(&mut exchange_args, "owner").unwrap();
+        let identity = Bytes::from([verifier.as_ref(), owner.as_ref()].concat());
         let flags = exchange_args.get_u32();
-        assert_eq!(flags & 4 != 0, step.minor == 2);
+        assert_eq!(flags & 4 != 0, step.fence.unwrap_or(step.minor == 2));
         if let Some((minor, previous)) = previous_owner.take() {
             if minor == step.minor {
-                assert_eq!(owner, previous);
+                assert_eq!(identity, previous);
             } else {
-                assert_ne!(owner, previous);
+                assert_ne!(identity, previous);
             }
         }
-        *previous_owner = Some((step.minor, owner));
+        *previous_owner = Some((step.minor, identity));
     }
     let mut replies = step.replies;
     if opcode == 53 {
@@ -215,6 +218,52 @@ async fn v42_public_mount_recovery_and_teardown_preserve_minor_version() {
 }
 
 #[tokio::test]
+async fn v42_retries_only_optional_fencing_rejection_without_changing_identity_or_version() {
+    for final_status in [0, 22] {
+        let rejection = || {
+            step(
+                2,
+                "exchange_id",
+                vec![Reply {
+                    opcode: 42,
+                    status: 22,
+                    data: vec![],
+                }],
+            )
+        };
+        let mut steps = vec![rejection()];
+        if final_status == 0 {
+            let mut next = bootstrap(2);
+            next[0].fence = Some(false);
+            steps.extend(next);
+            steps.push(step(2, "destroy_session", vec![ok(44, vec![])]));
+            steps.push(step(2, "destroy_clientid", vec![ok(57, vec![])]));
+        } else {
+            let mut next = rejection();
+            next.fence = Some(false);
+            steps.push(next);
+        }
+        let (addr, task) = server(steps).await;
+        let result =
+            crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.2&noresvport=true"))
+                .await;
+        if final_status == 0 {
+            let mount = result.unwrap();
+            assert_eq!(mount.version(), crate::NFSVersion::NFSv4p2);
+            mount.umount().await.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::NfsError::Nfs4(
+                    crate::nfs4::fastxdr::nfsstat4::NFS4ERR_INVAL
+                ))
+            ));
+        }
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn exact_v42_rejection_is_preserved() {
     let (addr, task) = server(vec![step(2, "exchange_id", vec![])]).await;
     let error =
@@ -226,6 +275,32 @@ async fn exact_v42_rejection_is_preserved() {
         crate::NfsError::Nfs4(crate::nfs4::fastxdr::nfsstat4::NFS4ERR_MINOR_VERS_MISMATCH)
     ));
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn fencing_retry_does_not_hide_v41_inval_or_v42_access_denied() {
+    for (minor, status, expected) in [
+        (1, 22, crate::nfs4::Nfs4ErrorCode::NFS4ERR_INVAL),
+        (2, 13, crate::nfs4::Nfs4ErrorCode::NFS4ERR_ACCESS),
+    ] {
+        let (addr, task) = server(vec![step(
+            minor,
+            "exchange_id",
+            vec![Reply {
+                opcode: 42,
+                status,
+                data: vec![],
+            }],
+        )])
+        .await;
+        let error = crate::parse_url_and_mount(&format!(
+            "nfs://{addr}/export?version=4.{minor}&noresvport=true"
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(error, crate::NfsError::Nfs4(code) if code == expected));
+        task.await.unwrap();
+    }
 }
 
 #[tokio::test]
