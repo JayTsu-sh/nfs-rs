@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -142,3 +144,43 @@ def test_matrix_requires_successful_evidence(
         (detail,) = evidence["failure_details"]
         assert detail["stage"] == expected_stage
         assert detail["type"] == expected_type
+
+
+def test_ots_proxy_command_launches_under_openssh(tmp_path):
+    openssh = shutil.which("ssh")
+    assert openssh is not None
+    key = tmp_path / "key"
+    key.write_text("test key", encoding="utf-8")
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.touch()
+    proxy_log = tmp_path / "proxy-arguments"
+    proxy = tmp_path / "ssh"
+    proxy.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$PROXY_ARGUMENTS"\n', encoding="utf-8")
+    proxy.chmod(0o700)
+
+    subprocess.run(
+        [
+            "bash", "-c",
+            """
+            set -euo pipefail
+            source "$1/tests/lab/common.sh"
+            source "$1/tests/lab/ots-executor.sh"
+            ots_configure_ssh
+            "$2" -F /dev/null "${ots_ssh_options[@]}" -o "ProxyCommand=$ots_proxy_command" "$ots_node_host" true
+            """,
+            "test", str(ROOT), openssh,
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "LAB_OTS_JUMP": "127.0.0.1",
+            "LAB_OTS_NODE": "127.0.0.2",
+            "LAB_OTS_SSH_USER": "root",
+            "LAB_OTS_SSH_KEY": str(key),
+            "LAB_OTS_KNOWN_HOSTS": str(known_hosts),
+            "PROXY_ARGUMENTS": str(proxy_log),
+        },
+        check=False, capture_output=True, timeout=10,
+    )
+    proxy_arguments = proxy_log.read_text(encoding="utf-8").splitlines()
+    assert proxy_arguments[-4:] == ["StrictHostKeyChecking=yes", "-W", "127.0.0.2:22", "root@127.0.0.1"]

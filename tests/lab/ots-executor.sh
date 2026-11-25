@@ -19,11 +19,9 @@ ots_configure_ssh() {
     -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2
     -o "UserKnownHostsFile=$known")
 
-  # OpenSSH expands % tokens before passing ProxyCommand to the shell.
-  local proxy
-  # Quote each option as a shell word while leaving the forwarding tokens intact.
-  printf -v proxy '%q ' ssh "${ots_ssh_options[@]//%/%%}" -o StrictHostKeyChecking=yes
-  ots_proxy_command="exec ${proxy}-W %h:%p $ots_jump_host"
+  # OpenSSH supplies exec and expands % tokens itself.
+  printf -v ots_proxy_command '%q ' ssh "${ots_ssh_options[@]//%/%%}" \
+    -o StrictHostKeyChecking=yes -W '%h:%p' "$ots_jump_host"
 }
 
 ots_ssh() {
