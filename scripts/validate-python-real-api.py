@@ -301,7 +301,7 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         while not page.eof:
             page = client.scandir_page(root, page.next)
             paged += page.entries
-        check(sorted(entry.name for entry in paged) == sorted(entries), "Client.scandir_page", checks)
+        check(sorted(bytes(entry.name) for entry in paged) == sorted(bytes(name) for name in entries), "Client.scandir_page", checks)
         check(client.access(data, os.R_OK), "Client.access", checks)
         fs_info = client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "Client.fs_info", checks)
@@ -512,7 +512,7 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         while not page.eof:
             page = await client.scandir_page(root, page.next)
             paged += page.entries
-        check(sorted(entry.name for entry in paged) == sorted(entries), "AsyncClient.scandir_page", checks)
+        check(sorted(bytes(entry.name) for entry in paged) == sorted(bytes(name) for name in entries), "AsyncClient.scandir_page", checks)
         check(await client.access(data, os.R_OK), "AsyncClient.access", checks)
         fs_info = await client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "AsyncClient.fs_info", checks)
