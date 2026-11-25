@@ -58,10 +58,16 @@ pub enum RetryExhaustion {
 /// The filehandle is valid in both cases; only the open state differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateidFailure {
-    /// BAD/STALE/OLD stateid: nfs-rs refreshes the lane and retries in place.
-    RecoverableState,
-    /// The bounded recovery attempt did not restore usable open state.
-    StateRecoveryExhausted,
+    /// BAD/OLD stateid: nfs-rs refreshes the lane and retries in place.
+    ///
+    /// STALE_STATEID is also classified here because the close path treats it
+    /// as an already-released open, but READ/WRITE report it as
+    /// [`NfsError::LostOpenState`] instead of refreshing in place: the state
+    /// belongs to an earlier server instance, so the caller must reopen.
+    Recoverable,
+    /// The bounded recovery attempt did not restore usable open state, which
+    /// callers observe as [`NfsError::StateRecoveryExhausted`].
+    Exhausted,
 }
 
 /// An NFSv4.0 open stateid could not be restored within the bounded budget.
@@ -351,27 +357,26 @@ impl NfsError {
             _ => false,
         }
     }
-    /// True when the failure is an NFSv4.0 stateid that nfs-rs can refresh in place.
+    /// True when the failure is an NFSv4.0 stateid that nfs-rs handles in
+    /// place: BAD/OLD refresh the lane, STALE is treated as released by CLOSE
+    /// but reported as [`NfsError::LostOpenState`] by READ/WRITE.
     #[must_use]
     pub fn is_recoverable_state(&self) -> bool {
-        matches!(
-            self,
-            Self::Nfs4(
-                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-            )
-        )
+        matches!(self.stateid_failure(), Some(StateidFailure::Recoverable))
     }
 
     /// Classification of a stateid failure without requiring callers to parse status codes.
+    ///
+    /// Single source for the stateid status set; other classifiers delegate here.
     #[must_use]
     pub fn stateid_failure(&self) -> Option<StateidFailure> {
-        if self.is_recoverable_state() {
-            return Some(StateidFailure::RecoverableState);
-        }
         match self {
-            Self::StateRecoveryExhausted(_) => Some(StateidFailure::StateRecoveryExhausted),
+            Self::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+            ) => Some(StateidFailure::Recoverable),
+            Self::StateRecoveryExhausted(_) => Some(StateidFailure::Exhausted),
             _ => None,
         }
     }

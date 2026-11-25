@@ -1178,7 +1178,14 @@ impl Client {
                     if is_conn_error {
                         let recovery =
                             disconnect.get_or_insert_with(|| DisconnectRecovery::new(e, deadline));
-                        attempt += 1;
+                        // A request that never crossed the send boundary cannot
+                        // have executed, so it does not consume a replay attempt:
+                        // ONE_ATTEMPT (WRITE) must still resend after a reconnect.
+                        // Only sends after a real transmission are bounded by the
+                        // policy's attempt count.
+                        if logical_transmission == crate::RequestTransmission::Sent {
+                            attempt += 1;
+                        }
                         if attempt >= max_attempts {
                             break;
                         }

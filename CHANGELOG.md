@@ -22,10 +22,35 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   The client owns the socket and the RPC records stay in native code. Only a
   plain `socket.socket` is taken, and at most 16 dial calls run at once.
 
+### Changed
+
+- Rust `StateidFailure` variants were renamed from `RecoverableState` and
+  `StateRecoveryExhausted` to `Recoverable` and `Exhausted`. This is a source
+  breaking change for callers that match the enum exhaustively; the
+  `NfsError::StateRecoveryExhausted` error and the Python exception classes are
+  unchanged.
+
 ### Fixed
 
+- A lock that NFSv4.0 state recovery cannot reclaim no longer leaves the
+  surviving open usable: `read` and `write` on that file handle fail with
+  `NfsError::StateRecoveryExhausted` (operation `read`/`write`, source
+  `LockDenied`) until the caller reacquires a lock that restores the lost
+  protection (at least as strong, covering the lost range) or closes the handle,
+  while unrelated file handles keep working. A disjoint or weaker lock on the
+  same handle does not lift the gate, and I/O that was already waiting when the
+  loss was recorded is rechecked before it is sent. Previously the mount resumed
+  and I/O continued outside the application's critical section.
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.
+- NFSv4.0 `read` no longer falls back to an anonymous-stateid READ while the
+  mount is not `Ready`: after state loss its locks are gone and the handle has
+  no open lane to gate at dispatch, so that read could run outside a byte-range
+  lock another client may hold (servers enforce only share reservations and
+  mandatory locks) while `write` already failed. A zero-length read still
+  returns an empty buffer without reaching the server. A size-changing SETATTR
+  is refused the same way, with or without an open lane, while metadata-only
+  SETATTR keeps using the anonymous stateid.
 
 ## [0.12.0] - 2026-11-09
 
