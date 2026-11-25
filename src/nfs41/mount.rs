@@ -1064,7 +1064,7 @@ async fn mount_on_addr(
     auth: &Auth,
     minor_version: MinorVersion,
 ) -> Result<Box<dyn crate::Mount>> {
-    info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
+    info!(addr = %addr, dirpath = ?args.dirpath, "connecting for NFSv4.1 mount");
 
     // 1. TCP connect
     let dialer = args.dialer();
@@ -1477,7 +1477,7 @@ async fn navigate_to_export(
     rpc: &rpc::Client,
     session: &Session,
     auth: &Auth,
-    dirpath: &str,
+    dirpath: &[u8],
 ) -> Result<Bytes> {
     let mut slot = session.acquire_slot().await?;
     let sequence_id = slot.sequence_id;
@@ -1491,7 +1491,10 @@ async fn navigate_to_export(
         .putrootfh();
 
     // Split path into components and add LOOKUP for each
-    let components: Vec<&str> = dirpath.split('/').filter(|c| !c.is_empty()).collect();
+    let components: Vec<&[u8]> = dirpath
+        .split(|byte| *byte == b'/')
+        .filter(|c| !c.is_empty())
+        .collect();
     for component in &components {
         builder = builder.lookup(component);
     }
@@ -2875,6 +2878,46 @@ pub(super) async fn test_wait_closing(wrapper: &Mount41Wrapper) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn non_utf8_export_navigation_preserves_each_component() {
+        use crate::nfs4::compound::take_opaque;
+        use crate::nfs41::test_support::{ok, opaque, serve, serve_v42};
+        for minor in [MinorVersion::V1, MinorVersion::V2] {
+            let handler = |tag: &str, mut args: Bytes| {
+                assert_eq!(tag, "navigate");
+                assert_eq!(args.get_u32(), 24); // PUTROOTFH
+                for name in [b"data".as_slice(), b"\xff"] {
+                    assert_eq!(args.get_u32(), 15); // LOOKUP
+                    assert_eq!(
+                        take_opaque(&mut args, "export component").unwrap().as_ref(),
+                        name
+                    );
+                }
+                assert_eq!(args.get_u32(), 10); // GETFH
+                assert!(args.is_empty());
+                vec![
+                    ok(24, vec![]),
+                    ok(15, vec![]),
+                    ok(15, vec![]),
+                    ok(10, opaque(b"export-fh")),
+                ]
+            };
+            let (mount, server) = if minor == MinorVersion::V1 {
+                serve(handler).await
+            } else {
+                serve_v42(handler).await
+            };
+            let args = crate::parse_url("nfs://server/data/%FF?version=4.1").unwrap();
+            let session = mount.session_holder.get().await;
+            let fh = navigate_to_export(&mount.rpc, &session, &mount.auth, &args.dirpath)
+                .await
+                .unwrap();
+            assert_eq!(fh, Bytes::from_static(b"export-fh"));
+            mount.rpc.shutdown().await;
+            server.await.unwrap();
+        }
+    }
 
     fn bind_response(session_id: [u8; 16], direction: u32) -> Bytes {
         let mut response = Vec::new();

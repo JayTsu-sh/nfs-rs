@@ -9,6 +9,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Export URL paths are percent-decoded into raw bytes through NFSv3 MNT/UMNT
+  and NFSv4 export LOOKUP traversal, allowing EXPORT results with non-UTF-8
+  paths to be mounted without a text conversion. Encoded separators and NUL
+  remain invalid. Ordinary path normalization is lexical; explicit resolution
+  inspects components and symlinks in filesystem order.
 - Python public paths now reject a leading `/` as documented. NFSv3 MOUNT
   export paths and access groups are returned as lossless bytes in Rust and
   Python; callers decode them only for display. NFSv4 server name rejection

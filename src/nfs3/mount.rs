@@ -347,9 +347,9 @@ async fn mount_on_addr(
     auth: &crate::Auth,
     mountport: u16,
 ) -> Result<Box<dyn crate::Mount>> {
-    info!(addr = %addr, dirpath = %args.dirpath, "connecting to NFS server for mount");
+    info!(addr = %addr, dirpath = ?args.dirpath, "connecting to NFS server for mount");
     let nfs_mux = rpc::StreamMux::dial(Arc::clone(dialer), addr.clone()).await?;
-    let dir: String = args.dirpath.to_owned();
+    let dir = args.dirpath.clone();
     let mount_mux = if mountport != addr.port() {
         Some(rpc::StreamMux::dial(Arc::clone(dialer), addr.with_port(mountport)).await?)
     } else {
@@ -367,7 +367,7 @@ async fn mount_on_addr(
         auth,
     )
     .encode(&mut buf);
-    encode_dirpath(&mut buf, dir.trim_end_matches('/'));
+    encode_dirpath(&mut buf, &dir);
     // Mount phase: use small retry count for fast failure detection.
     let mut bytes = client.call(buf, MOUNT_REPLAY, METADATA_TIMEOUT).await?;
     let status =
@@ -378,7 +378,7 @@ async fn mount_on_addr(
     }
     let ok = mountres3_ok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
     let fh = ok.fhandle.0;
-    info!(addr = %addr, dirpath = %args.dirpath, fh_len = fh.len(), "MOUNT MNT succeeded, got root file handle");
+    info!(addr = %addr, dirpath = ?args.dirpath, fh_len = fh.len(), "MOUNT MNT succeeded, got root file handle");
 
     let mut m = Mount {
         rpc: client,
@@ -722,6 +722,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_utf8_export_round_trips_through_mount_and_umount() {
+        use crate::nfs4::compound::{take_opaque, xdr_opaque};
+        use bytes::Buf;
+
+        // RFC 1813 Appendix I: EXPORT ex_dir, MNT and UMNT dirpath all use
+        // counted XDR bytes. Exercise the public URL entry point as well.
+        for path in [b"/data/\xff".as_slice(), b"/data/\xff/", b"/"] {
+            let mut export = Vec::new();
+            export.extend_from_slice(&1u32.to_be_bytes());
+            xdr_opaque(&mut export, path);
+            export.extend_from_slice(&[0; 8]); // no groups, no more exports
+            let entries = decode_exports(&mut Bytes::from(export)).unwrap();
+            let encoded = percent_encoding::percent_encode(
+                &entries[0].path,
+                percent_encoding::NON_ALPHANUMERIC,
+            )
+            .to_string()
+            .replace("%2F", "/");
+            let options = crate::MountOptions::from_url(&format!(
+                "nfs://server{encoded}?version=3&nfsport=2049&mountport=2049"
+            ))
+            .unwrap();
+            let dialer = Arc::new(ScriptedDialer::default());
+            let mut stream = dialer.accept();
+            let expected = path.to_vec();
+            let server = tokio::spawn(async move {
+                let mnt = read_record(&mut stream).await.unwrap();
+                assert_eq!(u32::from_be_bytes(mnt[20..24].try_into().unwrap()), 1);
+                let mut args = Bytes::copy_from_slice(&mnt[24..]);
+                for _ in 0..2 {
+                    args.advance(4);
+                    take_opaque(&mut args, "auth").unwrap();
+                }
+                assert_eq!(
+                    take_opaque(&mut args, "MNT dirpath").unwrap().as_ref(),
+                    expected
+                );
+                assert!(args.is_empty());
+                reply(&mut stream, &mnt, &mnt_ok()).await.unwrap();
+                let fsinfo = read_record(&mut stream).await.unwrap();
+                reply(&mut stream, &fsinfo, &fsinfo_ok(65536))
+                    .await
+                    .unwrap();
+                let probe = read_record(&mut stream).await.unwrap();
+                assert_eq!(
+                    u32::from_be_bytes(probe[12..16].try_into().unwrap()),
+                    rpc::NFSACL_PROG
+                );
+                let mut unsupported = probe[..4].to_vec();
+                for word in [1u32, 0, 0, 0, 1] {
+                    unsupported.extend_from_slice(&word.to_be_bytes());
+                }
+                stream
+                    .write_u32(0x8000_0000 | unsupported.len() as u32)
+                    .await
+                    .unwrap();
+                stream.write_all(&unsupported).await.unwrap();
+                let umnt = read_record(&mut stream).await.unwrap();
+                assert_eq!(u32::from_be_bytes(umnt[20..24].try_into().unwrap()), 3);
+                let mut args = Bytes::copy_from_slice(&umnt[24..]);
+                for _ in 0..2 {
+                    args.advance(4);
+                    take_opaque(&mut args, "auth").unwrap();
+                }
+                assert_eq!(
+                    take_opaque(&mut args, "UMNT dirpath").unwrap().as_ref(),
+                    expected
+                );
+                assert!(args.is_empty());
+                reply(&mut stream, &umnt, &[]).await.unwrap();
+            });
+            let mount = crate::mount_with(options, dialer).await.unwrap();
+            mount.umount().await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_names_survive_pagination_rename_and_remove_v3() {
+        use crate::nfs4::compound::{take_opaque, xdr_opaque};
+        use bytes::Buf;
+        let dialer = Arc::new(ScriptedDialer::default());
+        let mut stream = dialer.accept();
+        let server = tokio::spawn(async move {
+            for page in 0u64..2 {
+                let request = read_record(&mut stream).await.unwrap();
+                assert_eq!(u32::from_be_bytes(request[20..24].try_into().unwrap()), 16);
+                let mut args = Bytes::copy_from_slice(&request[40..]); // AUTH_NULL
+                take_opaque(&mut args, "directory").unwrap();
+                assert_eq!(args.get_u64(), page);
+                assert_eq!(
+                    args.split_to(8).as_ref(),
+                    &[if page == 0 { 0 } else { 7 }; 8]
+                );
+                let mut payload = vec![0; 8]; // status OK, no post-op attributes
+                payload.extend_from_slice(&[7; 8]);
+                payload.extend_from_slice(&1u32.to_be_bytes());
+                payload.extend_from_slice(&(page + 1).to_be_bytes());
+                xdr_opaque(
+                    &mut payload,
+                    if page == 0 {
+                        b"\xff"
+                    } else {
+                        b"~nfs-rs-raw:FF"
+                    },
+                );
+                payload.extend_from_slice(&(page + 1).to_be_bytes());
+                payload.extend_from_slice(&0u32.to_be_bytes());
+                payload.extend_from_slice(&u32::from(page == 1).to_be_bytes());
+                reply(&mut stream, &request, &payload).await.unwrap();
+            }
+            let rename = read_record(&mut stream).await.unwrap();
+            assert_eq!(u32::from_be_bytes(rename[20..24].try_into().unwrap()), 14);
+            let mut args = Bytes::copy_from_slice(&rename[40..]);
+            take_opaque(&mut args, "from directory").unwrap();
+            assert_eq!(
+                take_opaque(&mut args, "old name").unwrap().as_ref(),
+                b"\xff"
+            );
+            take_opaque(&mut args, "to directory").unwrap();
+            assert_eq!(
+                take_opaque(&mut args, "new name").unwrap().as_ref(),
+                b"\xfe"
+            );
+            assert!(args.is_empty());
+            reply(&mut stream, &rename, &[0; 20]).await.unwrap();
+            let remove = read_record(&mut stream).await.unwrap();
+            assert_eq!(u32::from_be_bytes(remove[20..24].try_into().unwrap()), 12);
+            let mut args = Bytes::copy_from_slice(&remove[40..]);
+            take_opaque(&mut args, "directory").unwrap();
+            assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xfe");
+            assert!(args.is_empty());
+            reply(&mut stream, &remove, &[0; 12]).await.unwrap();
+        });
+        let mux = rpc::StreamMux::dial(dialer, Endpoint::new("server", 2049))
+            .await
+            .unwrap();
+        let mount = Mount {
+            rpc: rpc::Client::new(mux, None),
+            auth: crate::Auth::new_null(),
+            fh: Bytes::from_static(b"root"),
+            dir: Bytes::from_static(b"/"),
+            dircount: 8192,
+            maxcount: 8192,
+            rsize: 4096,
+            wsize: 4096,
+        };
+        let entries: Vec<_> = mount
+            .readdir(mount.fh.clone())
+            .await
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file_name.as_ref(), b"\xff");
+        assert_eq!(entries[1].file_name.as_ref(), b"~nfs-rs-raw:FF");
+        mount
+            .rename(
+                mount.fh.clone(),
+                &entries[0].file_name,
+                mount.fh.clone(),
+                b"\xfe",
+            )
+            .await
+            .unwrap();
+        mount.remove(mount.fh.clone(), b"\xfe").await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn list_exports_with_asks_the_portmapper_through_the_dialer() {
         let dialer = Arc::new(ScriptedDialer::default());
         let error = crate::list_exports_with("nfs.example.internal", dialer.clone())
@@ -766,7 +936,7 @@ mod tests {
             let args = crate::MountArgs {
                 versions: vec![NFSVersion::NFSv3],
                 host: "127.0.0.1".to_string(),
-                dirpath: "/export".to_string(),
+                dirpath: Bytes::from_static(b"/export"),
                 mountport: addr.port(),
                 nfsport: addr.port(),
                 uid: 0,

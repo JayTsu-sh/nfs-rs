@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes};
+
 use tracing::{debug, warn};
 
 use super::compound::OpResponse;
@@ -278,5 +279,91 @@ impl Mount41 {
             fh,
             attr: Some(attr),
         })
+    }
+}
+
+#[cfg(test)]
+mod byte_name_tests {
+    use super::*;
+    use crate::nfs4::compound::{take_opaque, xdr_opaque, xdr_u32};
+    use crate::nfs41::test_support::{ok, putfh, serve, serve_v42};
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn raw_names_survive_pagination_rename_and_remove_v41_v42() {
+        for v42 in [false, true] {
+            let mut page = 0;
+            let handler = move |tag: &str, mut args: Bytes| {
+                putfh(&mut args);
+                match tag {
+                    "readdir" => {
+                        assert_eq!(args.get_u32(), 26);
+                        assert_eq!(args.get_u64(), page);
+                        assert_eq!(
+                            args.split_to(8).as_ref(),
+                            &[if page == 0 { 0 } else { 7 }; 8]
+                        );
+                        let mut data = vec![7; 8];
+                        xdr_u32(&mut data, 1);
+                        page += 1;
+                        data.extend(page.to_be_bytes());
+                        xdr_opaque(
+                            &mut data,
+                            if page == 1 {
+                                b"\xff"
+                            } else {
+                                b"~nfs-rs-raw:FF"
+                            },
+                        );
+                        xdr_u32(&mut data, 1);
+                        xdr_u32(&mut data, 1 << 20);
+                        xdr_opaque(&mut data, &page.to_be_bytes());
+                        xdr_u32(&mut data, 0);
+                        xdr_u32(&mut data, u32::from(page == 2));
+                        vec![ok(22, vec![]), ok(26, data)]
+                    }
+                    "rename" => {
+                        assert_eq!(args.get_u32(), 32); // SAVEFH
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 29);
+                        assert_eq!(take_opaque(&mut args, "old").unwrap().as_ref(), b"\xff");
+                        assert_eq!(take_opaque(&mut args, "new").unwrap().as_ref(), b"\xfe");
+                        vec![
+                            ok(22, vec![]),
+                            ok(32, vec![]),
+                            ok(22, vec![]),
+                            ok(29, vec![0; 40]),
+                        ]
+                    }
+                    "remove" => {
+                        assert_eq!(args.get_u32(), 28);
+                        assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"\xfe");
+                        vec![ok(22, vec![]), ok(28, vec![0; 20])]
+                    }
+                    _ => panic!("unexpected operation {tag}"),
+                }
+            };
+            let (mount, server) = if v42 {
+                serve_v42(handler).await
+            } else {
+                serve(handler).await
+            };
+            let entries: Vec<_> = mount
+                .readdir(Bytes::new())
+                .await
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].file_name.as_ref(), b"\xff");
+            assert_eq!(entries[1].file_name.as_ref(), b"~nfs-rs-raw:FF");
+            mount
+                .rename(Bytes::new(), &entries[0].file_name, Bytes::new(), b"\xfe")
+                .await
+                .unwrap();
+            mount.remove(Bytes::new(), b"\xfe").await.unwrap();
+            mount.rpc.shutdown().await;
+            server.await.unwrap();
+        }
     }
 }

@@ -289,9 +289,9 @@ async fn mount_on_addr(addr: &Endpoint, args: &MountArgs, auth: Auth) -> Result<
         .map_err(|error| NfsError::Rpc(format!("NFSv4.0 identity task failed: {error}")))??;
     let client_id = Arc::new(AtomicU64::new(client_id));
 
-    let components: Vec<&str> = args
+    let components: Vec<&[u8]> = args
         .dirpath
-        .split('/')
+        .split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
         .collect();
     let mut navigation = CompoundBuilder::new("navigate").putrootfh();

@@ -282,11 +282,6 @@ fn xdr_var_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     xdr_fixed_bytes(buf, data);
 }
 
-/// Write an XDR variable-length string (same encoding as opaque).
-fn xdr_string(buf: &mut Vec<u8>, s: &str) {
-    xdr_var_bytes(buf, s.as_bytes());
-}
-
 // Mount phase uses a small retry count for fast failure detection.
 const MOUNT_RETRIES: usize = 2;
 // Post-mount NFS operations use a higher retry count for resilience.
@@ -359,7 +354,7 @@ pub struct Mount {
     pub(crate) rpc: rpc::Client,
     pub(crate) auth: Auth,
     pub(crate) fh: Bytes,
-    pub(crate) dir: String,
+    pub(crate) dir: Bytes,
     pub(crate) dircount: u32,
     pub(crate) maxcount: u32,
     pub(crate) rsize: u32,
@@ -1088,9 +1083,9 @@ impl XdrEncode for LOOKUP3args {
 
 // ─── MOUNT protocol argument encoding ────────────────────────────────────────
 
-/// Encode a MOUNT dirpath argument (variable-length string).
-pub(crate) fn encode_dirpath(buf: &mut Vec<u8>, path: &str) {
-    xdr_string(buf, path);
+/// RFC 1813 Appendix I: MNT and UMNT carry the same counted path bytes.
+pub(crate) fn encode_dirpath(buf: &mut Vec<u8>, path: &[u8]) {
+    xdr_var_bytes(buf, path);
 }
 
 // ─── From/Into conversions ────────────────────────────────────────────────────
@@ -1344,9 +1339,9 @@ mod tests {
     }
 
     #[test]
-    fn xdr_string_encodes_as_var_bytes() {
+    fn mount_dirpath_encodes_as_var_bytes() {
         let mut buf1 = Vec::new();
-        xdr_string(&mut buf1, "test");
+        encode_dirpath(&mut buf1, b"test");
         let mut buf2 = Vec::new();
         xdr_var_bytes(&mut buf2, b"test");
         assert_eq!(buf1, buf2);

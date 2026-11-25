@@ -105,7 +105,20 @@ uses NFSv3. This is a default, not automatic negotiation across all versions.
 Export URL path segments are percent-decoded once before mounting. Raw Unicode
 names and percent-encoded UTF-8 spellings address the same export; `%25` names a
 literal `%`. A literal `%20` in a server name is written `%2520` in the URL.
-Encoded separators, NUL, and invalid UTF-8 are rejected.
+Each segment decodes to raw bytes, so `nfs://server/data/%FF?version=3`
+mounts the exported path `b"/data/\xff"` when the server accepts it.
+Encoded separators and NUL are rejected. Build a URL from an EXPORT result
+without decoding the name to text:
+
+```python
+from urllib.parse import quote_from_bytes
+from nfs_rs import Client, list_exports
+
+export = list_exports("nfs://server/")[0]
+url = "nfs://server" + quote_from_bytes(export.path, safe="/") + "?version=3"
+with Client.connect(url) as client:
+    names = client.listdir(b".")
+```
 
 Options can also be passed as keyword arguments. Explicit arguments override
 defaults while the URL selects the export and may carry the same connection
@@ -212,6 +225,20 @@ with Client.connect("nfs://server/export?version=4.1") as client:
 All paths are relative to the mounted export. `bytes` and `os.PathLike[bytes]`
 are accepted. Text paths, absolute paths, attempts to escape with `..`, and
 embedded NUL bytes are rejected before reaching the server.
+
+Ordinary operations normalize `.` and `..` lexically before contacting the
+server. For example, `client.stat(b"missing/../file")` looks up `b"file"`
+without checking `b"missing"`. This behavior predates the byte API. It differs
+from Linux path traversal when the removed component is a symlink, a regular
+file, or missing. Rust path helpers use the same lexical byte normalization.
+The byte API also makes Rust NFSv4 `lookup_path` lexical: older Rust NFSv4
+implementations forwarded parent components to the server instead. This is an
+explicit part of the breaking API change, not a claim of Linux path semantics.
+Use `resolve()` when component order and symbolic-link traversal matter:
+`resolve(b"missing/../file")` reports `MISSING`, and
+`resolve(b"file/../peer")` reports `NOT_DIRECTORY` when `file` is regular.
+Resolution returns an advisory observation; it does not make a subsequent
+open, rename or remove atomic with that observation.
 
 ```python
 from nfs_rs import Client, FileType

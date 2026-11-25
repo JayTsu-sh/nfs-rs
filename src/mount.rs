@@ -544,6 +544,13 @@ impl LockToken {
 
 /// Trait which defines the procedures that can be performed on an NFS mount.
 ///
+/// Ordinary path helpers normalize `.` and `..` lexically before LOOKUP:
+/// `missing/../file` can access `file` without inspecting `missing`. This is
+/// not Linux filesystem traversal when a removed component is a symlink,
+/// regular file or missing entry. Use [`Mount::resolve_path`] to inspect each
+/// component in order and follow symlinks within the mounted namespace. The
+/// result is advisory; it does not make a later mutation atomic with resolution.
+///
 /// NFS version agnostic.  However, since NFSv4 introduces procedures that are not present in NFSv3, invoking those
 /// procedures will return an error when relevant [`Mount`] is NFSv3.
 ///

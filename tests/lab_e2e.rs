@@ -285,12 +285,12 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "stateid recovery fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
 
     let result: TestResult = async {
         let file = mount
             .open_path_with_options(
-                &path,
+                path.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -330,7 +330,7 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
     mount.umount().await?;
     expect_recovery_outcome(result)
 }
@@ -354,12 +354,12 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "stateid close fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
 
     let result: TestResult = async {
         let file = mount
             .open_path_with_options(
-                &path,
+                path.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -383,7 +383,7 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
     mount.umount().await?;
     expect_close_outcome(result)
 }
@@ -413,13 +413,13 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "multi-lane fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&first).await;
-    let _ = mount.remove_path(&second).await;
+    let _ = mount.remove_path(first.as_bytes()).await;
+    let _ = mount.remove_path(second.as_bytes()).await;
 
     let result: TestResult = async {
         let file_a = mount
             .open_path_with_options(
-                &first,
+                first.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -430,7 +430,7 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
             .object;
         let file_b = mount
             .open_path_with_options(
-                &second,
+                second.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -487,8 +487,8 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&first).await;
-    let _ = mount.remove_path(&second).await;
+    let _ = mount.remove_path(first.as_bytes()).await;
+    let _ = mount.remove_path(second.as_bytes()).await;
     mount.umount().await?;
     expect_recovery_outcome(result)
 }

@@ -15,6 +15,15 @@ use tokio::sync::{Notify, oneshot};
 /// Answers a v4.0 mount on `stream`: SETCLIENTID, SETCLIENTID_CONFIRM, the root navigation
 /// and the mount-parameter GETATTR, whose attribute mask and values are `bitmap` / `values`.
 async fn serve_mount(stream: &mut TcpStream, bitmap: u32, values: &[u8]) -> std::io::Result<()> {
+    serve_mount_for_export(stream, bitmap, values, &[b"export"]).await
+}
+
+async fn serve_mount_for_export(
+    stream: &mut TcpStream,
+    bitmap: u32,
+    values: &[u8],
+    components: &[&[u8]],
+) -> std::io::Result<()> {
     let identity = read_record(stream).await?;
     assert!(
         identity
@@ -41,16 +50,32 @@ async fn serve_mount(stream: &mut TcpStream, bitmap: u32, values: &[u8]) -> std:
     reply(stream, &confirm, &compound_result("confirm", &[(36, &[])])).await?;
 
     let navigation = read_record(stream).await?;
-    let minor_and_ops = [0u32.to_be_bytes(), 3u32.to_be_bytes()].concat();
-    assert!(navigation.windows(8).any(|value| value == minor_and_ops));
+    let mut args = Bytes::copy_from_slice(&navigation[24..]);
+    for _ in 0..2 {
+        args.advance(4);
+        crate::nfs4::compound::take_opaque(&mut args, "auth").unwrap();
+    }
+    crate::nfs4::compound::take_opaque(&mut args, "tag").unwrap();
+    assert_eq!(args.get_u32(), 0); // minor version
+    assert_eq!(args.get_u32(), components.len() as u32 + 2);
+    assert_eq!(args.get_u32(), 24); // PUTROOTFH
+    for component in components {
+        assert_eq!(args.get_u32(), 15); // LOOKUP
+        assert_eq!(
+            crate::nfs4::compound::take_opaque(&mut args, "export component")
+                .unwrap()
+                .as_ref(),
+            *component
+        );
+    }
+    assert_eq!(args.get_u32(), 10); // GETFH
+    assert!(args.is_empty());
     let mut fh = Vec::new();
     xdr_opaque(&mut fh, b"scripted-fh");
-    reply(
-        stream,
-        &navigation,
-        &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
-    )
-    .await?;
+    let mut ops = vec![(24, &[][..])];
+    ops.extend(components.iter().map(|_| (15, &[][..])));
+    ops.push((10, &fh));
+    reply(stream, &navigation, &compound_result("navigate", &ops)).await?;
     let lease_time = read_record(stream).await?;
     let mut attrs = Vec::new();
     attrs.extend_from_slice(&1u32.to_be_bytes());
@@ -2407,9 +2432,15 @@ async fn recovery_serializes_locks_that_share_an_open_owner() {
 
 #[tokio::test]
 async fn reclaim_rejected_by_fsal_falls_back_to_fresh_open_per_lane() {
+    verify_reclaim_fallback_name(b"file").await;
+    verify_reclaim_fallback_name(b"\xff").await;
+}
+
+async fn verify_reclaim_fallback_name(name: &'static [u8]) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount = connected_direct_mount(&listener).await;
     register_scripted_open(&mount, 73, b"fh").await;
+    mount.state.by_owner(73).await.unwrap().lock().await.name = Bytes::from_static(name);
     register_scripted_lock(&mount, 73, [0x74; 16]).await;
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
@@ -2440,6 +2471,13 @@ async fn reclaim_rejected_by_fsal_falls_back_to_fresh_open_per_lane() {
         )
         .await?;
         let fresh = read_record(&mut stream).await?;
+        let mut expected = Vec::new();
+        xdr_opaque(&mut expected, name);
+        expected.extend_from_slice(&10u32.to_be_bytes()); // GETFH after CLAIM_NULL name
+        assert!(
+            fresh.ends_with(&expected),
+            "recovery must reopen the original raw name"
+        );
         reply(&mut stream, &fresh, &open_result(0, [0x7a; 16], b"fh")).await?;
         let reclaim_lock = read_record(&mut stream).await?;
         reply(
@@ -2470,6 +2508,7 @@ async fn reclaim_rejected_by_fsal_falls_back_to_fresh_open_per_lane() {
     assert_eq!(mount.health().generation, 1);
     let lane = mount.state.by_owner(73).await.unwrap();
     assert_eq!(lane.lock().await.stateid, [0x7a; 16]);
+    assert_eq!(lane.lock().await.name.as_ref(), name);
     let lock = mount.locks.by_stateid(&[0x7b; 16]).await.unwrap();
     assert_eq!(lock.lock().await.stateid, [0x7b; 16]);
     // The pre-recovery stateid remains a valid alias for the same lane.
@@ -4095,7 +4134,7 @@ async fn scripted_mount_reconnect_preserves_confirmed_identity() {
     let args = crate::MountArgs {
         versions: vec![NFSVersion::NFSv4p0],
         host: "127.0.0.1".to_string(),
-        dirpath: "/export".to_string(),
+        dirpath: Bytes::from_static(b"/export"),
         mountport: 0,
         nfsport: addr.port(),
         uid: 0,
@@ -4117,6 +4156,41 @@ async fn scripted_mount_reconnect_preserves_confirmed_identity() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     mount.null().await.unwrap();
     server.await.unwrap().unwrap();
+    mount.umount().await.unwrap();
+}
+
+#[tokio::test]
+async fn non_utf8_export_navigation_preserves_each_component() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let values = [
+            60u32.to_be_bytes().as_slice(),
+            65536u64.to_be_bytes().as_slice(),
+            32768u64.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        serve_mount_for_export(
+            &mut stream,
+            (1 << 10) | (1 << 30) | (1 << 31),
+            &values,
+            &[b"data", b"\xff"],
+        )
+        .await
+        .unwrap();
+        stream
+    });
+    let args = crate::parse_url(&format!(
+        "nfs://127.0.0.1/data/%FF?version=4.0&nfsport={}&noresvport=true",
+        addr.port()
+    ))
+    .unwrap();
+    let mount = mount_on_addr(&addr.into(), &args, Auth::new_null())
+        .await
+        .unwrap();
+    assert_eq!(mount.root_fh, Bytes::from_static(b"scripted-fh"));
+    let _stream = server.await.unwrap();
     mount.umount().await.unwrap();
 }
 
@@ -4146,7 +4220,7 @@ async fn scripted_mount_without_maxread_keeps_the_default_directory_reply_size()
         let args = crate::MountArgs {
             versions: vec![NFSVersion::NFSv4p0],
             host: "127.0.0.1".to_string(),
-            dirpath: "/export".to_string(),
+            dirpath: Bytes::from_static(b"/export"),
             mountport: 0,
             nfsport: addr.port(),
             uid: 0,
@@ -4206,7 +4280,7 @@ async fn retained_delegations_publish_callback_before_setclientid() {
     let args = crate::MountArgs {
         versions: vec![NFSVersion::NFSv4p0],
         host: "127.0.0.1".to_string(),
-        dirpath: "/export".to_string(),
+        dirpath: Bytes::from_static(b"/export"),
         mountport: 0,
         nfsport: addr.port(),
         uid: 0,
@@ -4610,7 +4684,7 @@ async fn cancelling_after_setclientid_detaches_while_confirm_settles() {
     let args = crate::MountArgs {
         versions: vec![NFSVersion::NFSv4p0],
         host: "127.0.0.1".to_string(),
-        dirpath: "/export".to_string(),
+        dirpath: Bytes::from_static(b"/export"),
         mountport: 0,
         nfsport: addr.port(),
         uid: 0,
@@ -4661,6 +4735,84 @@ fn readdir_result(verifier: [u8; 8], cookie: u64, name: &[u8], eof: bool) -> Vec
     page.extend_from_slice(&0u32.to_be_bytes());
     page.extend_from_slice(&u32::from(eof).to_be_bytes());
     compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
+}
+
+#[tokio::test]
+async fn raw_names_survive_pagination_rename_and_remove_v40() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount = connected_direct_mount(&listener).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        for (cookie, name, eof) in [
+            (1u64, b"\xff".as_slice(), false),
+            (2, b"~nfs-rs-raw:FF", true),
+        ] {
+            let request = read_record(&mut stream).await.unwrap();
+            let continuation = [
+                (cookie - 1).to_be_bytes().as_slice(),
+                &[if cookie == 1 { 0 } else { 7 }; 8],
+            ]
+            .concat();
+            assert!(
+                request
+                    .windows(continuation.len())
+                    .any(|wire| wire == continuation)
+            );
+            reply(
+                &mut stream,
+                &request,
+                &readdir_result([7; 8], cookie, name, eof),
+            )
+            .await
+            .unwrap();
+        }
+        let rename = read_record(&mut stream).await.unwrap();
+        let mut names = Vec::new();
+        xdr_opaque(&mut names, b"\xff");
+        xdr_opaque(&mut names, b"\xfe");
+        assert!(rename.ends_with(&names));
+        reply(
+            &mut stream,
+            &rename,
+            &compound_result("rename", &[(22, &[]), (32, &[]), (22, &[]), (29, &[0; 40])]),
+        )
+        .await
+        .unwrap();
+        let remove = read_record(&mut stream).await.unwrap();
+        let mut name = Vec::new();
+        xdr_opaque(&mut name, b"\xfe");
+        assert!(remove.ends_with(&name));
+        reply(
+            &mut stream,
+            &remove,
+            &compound_result("remove", &[(22, &[]), (28, &[0; 20])]),
+        )
+        .await
+        .unwrap();
+    });
+    let entries: Vec<_> = mount
+        .readdir(Bytes::from_static(b"root"))
+        .await
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].file_name.as_ref(), b"\xff");
+    assert_eq!(entries[1].file_name.as_ref(), b"~nfs-rs-raw:FF");
+    mount
+        .rename(
+            Bytes::from_static(b"root"),
+            &entries[0].file_name,
+            Bytes::from_static(b"root"),
+            b"\xfe",
+        )
+        .await
+        .unwrap();
+    mount
+        .remove(Bytes::from_static(b"root"), b"\xfe")
+        .await
+        .unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test]

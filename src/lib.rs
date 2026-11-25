@@ -49,6 +49,7 @@
 //! `noresvport=true` when the server export accepts non-privileged source
 //! ports.
 
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::{TcpSocket, TcpStream};
@@ -342,7 +343,7 @@ use url::Url;
 struct MountArgs {
     versions: Vec<NFSVersion>,
     host: String,
-    dirpath: String,
+    dirpath: Bytes,
     mountport: u16,
     nfsport: u16,
     uid: u32,
@@ -383,6 +384,9 @@ impl MountArgs {
 /// The URL takes the same form and query parameters as
 /// [`parse_url_and_mount`]. `noresvport` only affects the default
 /// [`TcpDialer`]; a custom dialer decides its own source ports.
+/// Export path segments are percent-decoded once into bytes, including non-UTF-8
+/// values such as `%FF`. Encoded `/` and NUL are rejected. The hostname and
+/// connection URL remain text; the server decides whether to accept the path.
 #[derive(Debug)]
 pub struct MountOptions(MountArgs);
 
@@ -614,18 +618,17 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         .path()
         .split('/')
         .map(|encoded| {
-            let decoded = percent_decode_str(encoded)
-                .decode_utf8()
-                .map_err(|_| NfsError::InvalidInput("NFS export path is not valid UTF-8".into()))?;
-            if decoded.contains('/') || decoded.contains('\0') {
+            let decoded = percent_decode_str(encoded).collect::<Vec<u8>>();
+            if decoded.contains(&b'/') || decoded.contains(&0) {
                 return Err(NfsError::InvalidInput(
                     "NFS export path contains an encoded separator or NUL".into(),
                 ));
             }
-            Ok(decoded.into_owned())
+            Ok(decoded)
         })
         .collect::<Result<Vec<_>>>()?
-        .join("/");
+        .join(&b'/');
+    let dirpath = Bytes::from(dirpath);
     Ok(MountArgs {
         versions,
         host,
@@ -675,7 +678,7 @@ fn parse_readdir_buffer_query_param(param: &str) -> Result<(u32, u32)> {
 async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
     let mut errs: Vec<NfsError> = Vec::new();
     for version in &args.versions {
-        info!(version = ?version, host = %args.host, dirpath = %args.dirpath, "attempting NFS mount");
+        info!(version = ?version, host = %args.host, dirpath = ?args.dirpath, "attempting NFS mount");
         let res: Result<Box<dyn Mount>> = match version {
             NFSVersion::NFSv3 => nfs3::mount(&args).await,
             NFSVersion::NFSv4p1 => nfs41::mount::mount(&args, nfs41::MinorVersion::V1).await,
@@ -835,12 +838,36 @@ mod tests {
             ("100%2520done", "/100%20done"),
         ] {
             let args = parse_url(&format!("nfs://127.0.0.1/{path}")).expect("valid export URL");
-            assert_eq!(args.dirpath, expected, "{path}");
+            assert_eq!(args.dirpath.as_ref(), expected.as_bytes(), "{path}");
         }
-        for path in ["%FF", "a%2Fb", "a%00b"] {
+        for path in ["a%2Fb", "a%2fb", "a%00b"] {
             assert!(
                 parse_url(&format!("nfs://127.0.0.1/{path}")).is_err(),
                 "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_urls_preserve_non_utf8_components_for_every_version() {
+        for version in ["3", "4.0", "4.1", "4.2"] {
+            let args =
+                parse_url(&format!("nfs://server/data/%FF/%252F?version={version}")).unwrap();
+            assert_eq!(args.host, "server");
+            assert_eq!(args.dirpath.as_ref(), b"/data/\xff/%2F");
+        }
+    }
+
+    #[test]
+    fn ordinary_paths_collapse_parents_lexically_before_any_lookup() {
+        // These names could be links, regular files or absent. Ordinary path
+        // normalization cannot inspect them; resolve_path has that contract.
+        for prefix in [b"deep-alias".as_slice(), b"file", b"missing", b"\xff"] {
+            let path = [prefix, b"/../peer"].concat();
+            assert_eq!(path_components(&path).unwrap(), [b"peer".as_slice()]);
+            assert_eq!(
+                split_path(&path).unwrap(),
+                (b"/".to_vec(), b"peer".to_vec())
             );
         }
     }
@@ -988,7 +1015,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1005,7 +1032,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), (616, 666));
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1019,7 +1046,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20490);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1033,7 +1060,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20490);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1047,7 +1074,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1061,7 +1088,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1075,7 +1102,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1089,7 +1116,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1119,7 +1146,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, Some((4096, 4096)));
     }
@@ -1133,7 +1160,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath, Bytes::from_static(b"/some/export/path"));
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, Some((2048, 4096)));
     }

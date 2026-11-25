@@ -28,6 +28,8 @@ pytestmark = pytest.mark.skipif(
     ("dangling", "missing", False, None),
     ("file/child", "not_directory", False, None),
     ("file/..", "not_directory", False, None),
+    ("missing/../file", "missing", False, None),
+    ("file/../file", "not_directory", False, None),
     ("link/", "not_directory", False, None),
     ("server-notdir", "not_directory", False, None),
     ("absolute", "outside_mount", None, None),
@@ -96,6 +98,30 @@ def test_native_resolution_validates_paths_and_bounds_expansion():
         for path in ["text", b"bad\0name", b"/file", b"x" * 65537, b"./" * 4096, b"nul", b"long", b"many"]:
             with pytest.raises((TypeError, ValueError)):
                 client.resolve(path)
+
+
+def test_ordinary_normalization_and_explicit_resolution_have_distinct_contracts():
+    from nfs_rs import AsyncClient, Client
+
+    cases = [(b"deep-alias/../peer", "resolved", b"nested/peer"),
+             (b"file/../peer", "not_directory", None),
+             (b"missing/../peer", "missing", None)]
+    with Client.connect("nfs-test://fixture/export") as client:
+        for path, status, target in cases:
+            # Ordinary operations normalize before native filesystem lookup.
+            assert client.stat(path).path == b"peer"
+            result = client.resolve(path)
+            assert result.status.value == status
+            assert result.path == target
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            for path, status, target in cases:
+                assert (await client.stat(path)).path == b"peer"
+                result = await client.resolve(path)
+                assert result.status.value == status
+                assert result.path == target
+    asyncio.run(scenario())
 
 
 def test_native_resolution_deadline_cancellation_and_closed_client():
