@@ -89,7 +89,7 @@ async fn new_file_open_reuses_parent_and_creates_guarded_without_setattr() {
     let mount = super::mount::test_wrapper(mount);
     let file = mount
         .open_path_with_options(
-            "parent/new",
+            b"parent/new",
             OpenOptions {
                 access: OPEN_WRITE,
                 create_mode: Some(0o666),
@@ -148,7 +148,7 @@ async fn guarded_create_returns_unsolicited_delegations_even_when_getattr_fails(
             let result = mount
                 .create_guarded(
                     Bytes::from_static(b"parent"),
-                    "new",
+                    b"new",
                     Some(0o666),
                     OPEN_WRITE,
                 )
@@ -300,7 +300,7 @@ async fn exercise(case: Case, truncate: bool) -> (crate::Result<()>, Vec<String>
     let mount = super::mount::test_wrapper(mount);
     let result = match mount
         .open_path_with_options(
-            "parent/new",
+            b"parent/new",
             OpenOptions {
                 access: OPEN_WRITE,
                 create_mode: Some(0o666),
@@ -377,7 +377,7 @@ async fn invalid_open_options_send_no_rpc() {
     for access in [crate::OPEN_READ, 0, 4] {
         let error = mount
             .open_path_with_options(
-                "parent/new",
+                b"parent/new",
                 OpenOptions {
                     access,
                     create_mode: Some(0o666),

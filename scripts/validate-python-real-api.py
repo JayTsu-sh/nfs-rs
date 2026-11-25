@@ -402,9 +402,9 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         with client.open(hard_link, "rb") as file:
             check(file.read() == b"payl", "Client.link", checks)
         client.symlink("renamed.bin", symbolic_link)
-        check(client.readlink(symbolic_link) == "renamed.bin", "Client.symlink/readlink", checks)
+        check(client.readlink(symbolic_link) == b"renamed.bin", "Client.symlink/readlink", checks)
         resolved = client.resolve(symbolic_link)
-        check(resolved.exists is True and resolved.path == renamed
+        check(resolved.exists is True and resolved.path == renamed.encode()
               and resolved.info.type is nfs_rs.FileType.FILE, "Client.resolve", checks)
         for name, target, suffix, expected in (
             ("resolution-broken", "missing", "", nfs_rs.PathResolutionStatus.MISSING),
@@ -613,9 +613,9 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
         async with await client.open(hard_link, "rb") as file:
             check(await file.read() == b"payl", "AsyncClient.link", checks)
         await client.symlink("async-renamed.bin", symbolic_link)
-        check(await client.readlink(symbolic_link) == "async-renamed.bin", "AsyncClient.symlink/readlink", checks)
+        check(await client.readlink(symbolic_link) == b"async-renamed.bin", "AsyncClient.symlink/readlink", checks)
         resolved = await client.resolve(symbolic_link)
-        check(resolved.exists is True and resolved.path == renamed
+        check(resolved.exists is True and resolved.path == renamed.encode()
               and resolved.info.type is nfs_rs.FileType.FILE, "AsyncClient.resolve", checks)
         for name, target, suffix, expected in (
             ("async-resolution-broken", "missing", "", nfs_rs.PathResolutionStatus.MISSING),

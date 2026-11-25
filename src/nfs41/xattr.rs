@@ -56,7 +56,7 @@ impl Mount41 {
         // Step 1: open attr dir + lookup the named attribute → get its fh
         let resp = self
             .compound("getxattr-lookup", |b| {
-                b.putfh(&fh).openattr(false).lookup(name).getfh()
+                b.putfh(&fh).openattr(false).lookup(name.as_bytes()).getfh()
             })
             .await?;
         resp.op_ok(1)?; // PUTFH
@@ -114,7 +114,7 @@ impl Mount41 {
             create: true,
             create_attrs_mask: vec![1 << 4],
             create_attrs_vals: 0u64.to_be_bytes().to_vec(),
-            claim_file: name.to_string(),
+            claim_file: name.as_bytes(),
             want_no_delegation: true,
         };
         let resp = self
@@ -167,13 +167,12 @@ impl Mount41 {
         }
         .await;
         // Preserve cleanup failures as well as the primary write failure.
-        let close_result = self
-            .compound("setxattr-close", |b| {
-                b.require_generation(generation)
-                    .putfh(&attr_fh)
-                    .close(0, &stateid)
-            })
-            .await;
+        let close_result = crate::retry::cleanup(self.compound("setxattr-close", |b| {
+            b.require_generation(generation)
+                .putfh(&attr_fh)
+                .close(0, &stateid)
+        }))
+        .await;
         let mut failures = Vec::new();
         if let Err(error) = write_result {
             failures.push(FileCloseFailure {
@@ -209,8 +208,10 @@ impl Mount41 {
         let mut entries = self.readdir(attr_dir_fh).await;
         let mut names = Vec::new();
         while let Some(entry) = entries.try_next().await? {
-            if entry.file_name != "." && entry.file_name != ".." {
-                names.push(entry.file_name);
+            if entry.file_name.as_ref() != b"." && entry.file_name.as_ref() != b".." {
+                let name = std::str::from_utf8(&entry.file_name)
+                    .map_err(|_| NfsError::Xdr("named attribute is not UTF-8".into()))?;
+                names.push(name.to_owned());
             }
         }
         Ok(names)
@@ -218,7 +219,9 @@ impl Mount41 {
 
     pub(crate) async fn removexattr(&self, fh: Bytes, name: &str) -> Result<()> {
         let resp = self
-            .compound("removexattr", |b| b.putfh(&fh).openattr(false).remove(name))
+            .compound("removexattr", |b| {
+                b.putfh(&fh).openattr(false).remove(name.as_bytes())
+            })
             .await?;
         resp.op_ok(1)?; // PUTFH
         resp.op_ok(2)?; // OPENATTR
@@ -229,10 +232,14 @@ impl Mount41 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::mount::{test_wait_closing, test_wrapper};
     use super::*;
+    use crate::Mount;
     use crate::nfs4::compound::{take_opaque, xdr_u32};
-    use crate::nfs41::test_support::{Reply, ok, opaque, putfh, serve};
+    use crate::nfs41::test_support::{Reply, ok, opaque, putfh, serve, serve_with_reply_hook};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
 
     async fn attribute_server(
         initial: Vec<u8>,
@@ -245,8 +252,8 @@ mod tests {
             putfh(&mut args);
             match tag {
                 "setxattr-open" => {
-                    assert_eq!(args.get_u32(), 20);
-                    args.advance(4); // createdir
+                    assert_eq!(args.get_u32(), 19); // OPENATTR (RFC 5662)
+                    assert_eq!(args.get_u32(), 1); // createdir
                     assert_eq!(args.get_u32(), 18);
                     args.advance(20); // seqid, share access/deny, clientid
                     take_opaque(&mut args, "owner").unwrap();
@@ -266,17 +273,21 @@ mod tests {
                     open[..16].fill(7);
                     vec![
                         ok(22, vec![]),
-                        ok(20, vec![]),
+                        ok(19, vec![]),
                         ok(18, open),
                         ok(10, opaque(b"attr")),
                     ]
                 }
-                "getxattr-lookup" => vec![
-                    ok(22, vec![]),
-                    ok(20, vec![]),
-                    ok(15, vec![]),
-                    ok(10, opaque(b"attr")),
-                ],
+                "getxattr-lookup" => {
+                    assert_eq!(args.get_u32(), 19);
+                    assert_eq!(args.get_u32(), 0); // createdir
+                    vec![
+                        ok(22, vec![]),
+                        ok(19, vec![]),
+                        ok(15, vec![]),
+                        ok(10, opaque(b"attr")),
+                    ]
+                }
                 "setxattr-write" => {
                     assert_eq!(args.get_u32(), 38);
                     args.advance(16);
@@ -378,8 +389,8 @@ mod tests {
                 assert_eq!(calls, 1, "must not replay a successful truncating OPEN");
                 assert_eq!(tag, "setxattr-open");
                 putfh(&mut args);
-                assert_eq!(args.get_u32(), 20);
-                args.advance(4);
+                assert_eq!(args.get_u32(), 19);
+                assert_eq!(args.get_u32(), 1); // createdir
                 assert_eq!(args.get_u32(), 18);
                 args.advance(20);
                 take_opaque(&mut args, "owner").unwrap();
@@ -388,7 +399,7 @@ mod tests {
                 assert_eq!(args.get_u32(), 1); // bitmap length
                 assert_eq!(args.get_u32(), 1 << 4); // SIZE
                 assert_eq!(take_opaque(&mut args, "attrs").unwrap().get_u64(), 0);
-                let mut replies = vec![ok(22, vec![]), ok(20, vec![])];
+                let mut replies = vec![ok(22, vec![]), ok(19, vec![])];
                 if failed_opcode == 10 {
                     contents.lock().unwrap().clear();
                     replies.push(ok(18, vec![0; 48]));
@@ -426,6 +437,103 @@ mod tests {
             mount.rpc.shutdown().await;
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_xattr_set_finishes_write_and_close_before_umount() {
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut opened_tx = Some(opened_tx);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let server_calls = calls.clone();
+        let stateid = [7; 16];
+        let (mount, server) = serve_with_reply_hook(
+            move |tag, mut args| {
+                server_calls.lock().unwrap().push(tag.to_owned());
+                match tag {
+                    "setxattr-open" => {
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 19);
+                        assert_eq!(args.get_u32(), 1);
+                        let mut open = vec![0; 48];
+                        open[..16].copy_from_slice(&stateid);
+                        opened_tx.take().unwrap().send(()).unwrap();
+                        vec![
+                            ok(22, vec![]),
+                            ok(19, vec![]),
+                            ok(18, open),
+                            ok(10, opaque(b"attr")),
+                        ]
+                    }
+                    "setxattr-write" => {
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 38);
+                        assert_eq!(args.split_to(16).as_ref(), stateid);
+                        assert_eq!(args.get_u64(), 0);
+                        assert_eq!(args.get_u32(), 2);
+                        let value = take_opaque(&mut args, "value").unwrap();
+                        assert_eq!(value.as_ref(), b"new");
+                        let mut reply = Vec::new();
+                        xdr_u32(&mut reply, value.len() as u32);
+                        xdr_u32(&mut reply, 2);
+                        reply.extend([0; 8]);
+                        vec![ok(22, vec![]), ok(38, reply)]
+                    }
+                    "setxattr-close" => {
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 4);
+                        assert_eq!(args.get_u32(), 0);
+                        assert_eq!(args.as_ref(), stateid);
+                        vec![ok(22, vec![]), ok(4, stateid.to_vec())]
+                    }
+                    "destroy_session" => vec![ok(44, vec![])],
+                    "destroy_clientid" => vec![ok(57, vec![])],
+                    _ => panic!("unexpected compound {tag}"),
+                }
+            },
+            Some(release_rx),
+            |_| {},
+        )
+        .await;
+        let mount = Arc::new(test_wrapper(mount));
+        let setter = mount.clone();
+        let write = tokio::spawn(async move {
+            setter
+                .setxattr(
+                    Bytes::from_static(b"file"),
+                    "key",
+                    Bytes::from_static(b"new"),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(5), opened_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        write.abort();
+        assert!(write.await.unwrap_err().is_cancelled());
+        let closer = mount.clone();
+        let umount = tokio::spawn(async move { closer.umount().await });
+        timeout(Duration::from_secs(5), test_wait_closing(&mount))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(5), umount)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "setxattr-open",
+                "setxattr-write",
+                "setxattr-close",
+                "destroy_session",
+                "destroy_clientid"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -470,7 +578,7 @@ mod tests {
             vec![
                 ok(22, vec![]),
                 Reply {
-                    opcode: 20,
+                    opcode: 19,
                     status: 2,
                     data: vec![],
                 },
@@ -484,7 +592,12 @@ mod tests {
         let mut pages = 0;
         let (mount, server) = serve(move |tag, mut args| {
             if tag == "openattr" {
-                return vec![ok(22, vec![]), ok(20, vec![]), ok(10, opaque(b"attrs"))];
+                putfh(&mut args);
+                assert_eq!(args.get_u32(), 19);
+                assert_eq!(args.get_u32(), 0); // createdir
+                assert_eq!(args.get_u32(), 10); // GETFH
+                assert!(!args.has_remaining());
+                return vec![ok(22, vec![]), ok(19, vec![]), ok(10, opaque(b"attrs"))];
             }
             assert_eq!(tag, "readdir");
             putfh(&mut args);

@@ -15,39 +15,41 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Mount, RENAME3args, Result, diropargs3, filename3, nfs_fh3};
-use crate::split_path;
+use crate::path_resolution::split_byte_path;
 use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn rename_path(&self, from: &str, to: &str) -> Result<()> {
-        let (from_dir, from_filename) = split_path(from)?;
-        let (to_dir, to_filename) = split_path(to)?;
-        let from_dir_fh = self.lookup_path(&from_dir).await?.fh;
+    pub async fn rename_path(&self, from: &[u8], to: &[u8]) -> Result<()> {
+        let (from_dir, from_filename) = split_byte_path(from)?;
+        let (to_dir, to_filename) = split_byte_path(to)?;
+        let from_dir_fh = self.lookup_path(from_dir).await?.fh;
         let to_dir_fh = if from_dir == to_dir {
             from_dir_fh.clone()
         } else {
-            self.lookup_path(&to_dir).await?.fh
+            self.lookup_path(to_dir).await?.fh
         };
-        self.rename(from_dir_fh, &from_filename, to_dir_fh, &to_filename)
+        self.rename(from_dir_fh, from_filename, to_dir_fh, to_filename)
             .await
     }
 
     pub async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
+        crate::path_resolution::validate_leaf(from_filename)?;
+        crate::path_resolution::validate_leaf(to_filename)?;
         let args = RENAME3args {
             from: diropargs3 {
                 dir: nfs_fh3 { data: from_dir_fh },
-                name: filename3(from_filename.to_string()),
+                name: filename3(from_filename),
             },
             to: diropargs3 {
                 dir: nfs_fh3 { data: to_dir_fh },
-                name: filename3(to_filename.to_string()),
+                name: filename3(to_filename),
             },
         };
         self._rename(args).await?;

@@ -48,32 +48,6 @@ use crate::error::{NfsError, RequestContext, Result, classify_sent_nfs3_error};
 use crate::{Auth, ObjRes, Time, rpc};
 use bytes::Bytes;
 
-/// Convert NFS byte-string to Rust String. Tries UTF-8 first;
-/// falls back to lossy conversion with a warning for non-UTF-8 filenames.
-pub(crate) fn bytes_to_string(raw: Bytes) -> String {
-    match std::str::from_utf8(&raw) {
-        Ok(s) => s.to_owned(),
-        Err(_) => {
-            tracing::warn!(raw_hex = %hex_preview(&raw), "NFS name contains invalid UTF-8, using lossy conversion");
-            String::from_utf8_lossy(&raw).into_owned()
-        }
-    }
-}
-
-fn hex_preview(bytes: &[u8]) -> String {
-    let limit = bytes.len().min(32);
-    let hex: String = bytes[..limit]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if bytes.len() > 32 {
-        format!("{}...", hex)
-    } else {
-        hex
-    }
-}
-
 pub(crate) mod fastxdr;
 
 // Re-export fastxdr response types used by procedure files.
@@ -308,11 +282,6 @@ fn xdr_var_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     xdr_fixed_bytes(buf, data);
 }
 
-/// Write an XDR variable-length string (same encoding as opaque).
-fn xdr_string(buf: &mut Vec<u8>, s: &str) {
-    xdr_var_bytes(buf, s.as_bytes());
-}
-
 // Mount phase uses a small retry count for fast failure detection.
 const MOUNT_RETRIES: usize = 2;
 // Post-mount NFS operations use a higher retry count for resilience.
@@ -366,6 +335,10 @@ macro_rules! nfs3_call {
             match status {
                 nfsstat3::NFS3_OK => {
                     tracing::trace!(proc = stringify!($proc), "NFS3 call succeeded");
+                    if matches!(procedure, NFSProc3::Readdir | NFSProc3::Readdirplus) {
+                        let reply_size = bytes.len();
+                        bytes = crate::directory_buffer::retain(bytes, reply_size)?;
+                    }
                     <$resok>::try_from(&mut bytes)
                         .map_err(|error| classify_sent_nfs3_error(operation_class, context, NfsError::Xdr(error.to_string())))
                 }
@@ -385,7 +358,7 @@ pub struct Mount {
     pub(crate) rpc: rpc::Client,
     pub(crate) auth: Auth,
     pub(crate) fh: Bytes,
-    pub(crate) dir: String,
+    pub(crate) dir: Bytes,
     pub(crate) dircount: u32,
     pub(crate) maxcount: u32,
     pub(crate) rsize: u32,
@@ -461,13 +434,13 @@ impl Mount {
 
     nfs3_call!(_access, Access, ACCESS3args, ACCESS3resok);
     nfs3_call!(_commit, Commit, COMMIT3args, COMMIT3resok);
-    nfs3_call!(_create, Create, CREATE3args, CREATE3resok);
+    nfs3_call!(_create, Create, CREATE3args<'_>, CREATE3resok);
     nfs3_call!(_fsinfo, FSInfo, FSINFO3args, FSINFO3resok);
     nfs3_call!(_fsstat, FSStat, FSSTAT3args, FSSTAT3resok);
     nfs3_call!(_getattr, GetAttr, GETATTR3args, GETATTR3resok);
-    nfs3_call!(_link, Link, LINK3args, LINK3resok);
-    nfs3_call!(_lookup, Lookup, LOOKUP3args, LOOKUP3resok);
-    nfs3_call!(_mkdir, Mkdir, MKDIR3args, MKDIR3resok, info);
+    nfs3_call!(_link, Link, LINK3args<'_>, LINK3resok);
+    nfs3_call!(_lookup, Lookup, LOOKUP3args<'_>, LOOKUP3resok);
+    nfs3_call!(_mkdir, Mkdir, MKDIR3args<'_>, MKDIR3resok, info);
     nfs3_call!(_pathconf, Pathconf, PATHCONF3args, PATHCONF3resok);
     // _read is special-cased: timeout scales with requested read size.
     async fn _read(&self, args: READ3args) -> Result<READ3resok> {
@@ -525,11 +498,11 @@ impl Mount {
         |args: &READDIRPLUS3args| data_timeout(args.maxcount as usize)
     );
     nfs3_call!(_readlink, Readlink, READLINK3args, READLINK3resok);
-    nfs3_call!(_remove, Remove, REMOVE3args, REMOVE3resok);
-    nfs3_call!(_rename, Rename, RENAME3args, RENAME3resok);
-    nfs3_call!(_rmdir, Rmdir, RMDIR3args, RMDIR3resok);
+    nfs3_call!(_remove, Remove, REMOVE3args<'_>, REMOVE3resok);
+    nfs3_call!(_rename, Rename, RENAME3args<'_>, RENAME3resok);
+    nfs3_call!(_rmdir, Rmdir, RMDIR3args<'_>, RMDIR3resok);
     nfs3_call!(_setattr, SetAttr, SETATTR3args, SETATTR3resok);
-    nfs3_call!(_symlink, Symlink, SYMLINK3args, SYMLINK3resok);
+    nfs3_call!(_symlink, Symlink, SYMLINK3args<'_>, SYMLINK3resok);
     // _write is special-cased to avoid copying the write payload into the request buffer.
     // WRITE3args::encode writes only the XDR length prefix; the raw data is passed to
     // call_with_data which appends it directly to the TCP stream.
@@ -594,32 +567,32 @@ impl XdrEncode for nfs_fh3 {
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct filename3(pub(crate) String);
+pub(crate) struct filename3<'a>(pub(crate) &'a [u8]);
 
-impl XdrEncode for filename3 {
+impl XdrEncode for filename3<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
-        xdr_string(buf, &self.0);
+        xdr_var_bytes(buf, self.0);
     }
 }
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct nfspath3(pub(crate) String);
+pub(crate) struct nfspath3<'a>(pub(crate) &'a [u8]);
 
-impl XdrEncode for nfspath3 {
+impl XdrEncode for nfspath3<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
-        xdr_string(buf, &self.0);
+        xdr_var_bytes(buf, self.0);
     }
 }
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct diropargs3 {
+pub(crate) struct diropargs3<'a> {
     pub(crate) dir: nfs_fh3,
-    pub(crate) name: filename3,
+    pub(crate) name: filename3<'a>,
 }
 
-impl XdrEncode for diropargs3 {
+impl XdrEncode for diropargs3<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.dir.encode(buf);
         self.name.encode(buf);
@@ -778,12 +751,12 @@ impl XdrEncode for sattrguard3 {
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
-pub(crate) struct symlinkdata3 {
+pub(crate) struct symlinkdata3<'a> {
     pub(crate) symlink_attributes: sattr3,
-    pub(crate) symlink_data: nfspath3,
+    pub(crate) symlink_data: nfspath3<'a>,
 }
 
-impl XdrEncode for symlinkdata3 {
+impl XdrEncode for symlinkdata3<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.symlink_attributes.encode(buf);
         self.symlink_data.encode(buf);
@@ -916,12 +889,12 @@ impl WriteStable {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct CREATE3args {
-    pub(crate) where_: diropargs3,
+pub(crate) struct CREATE3args<'a> {
+    pub(crate) where_: diropargs3<'a>,
     pub(crate) how: createhow3,
 }
 
-impl XdrEncode for CREATE3args {
+impl XdrEncode for CREATE3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.where_.encode(buf);
         self.how.encode(buf);
@@ -929,12 +902,12 @@ impl XdrEncode for CREATE3args {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct MKDIR3args {
-    pub(crate) where_: diropargs3,
+pub(crate) struct MKDIR3args<'a> {
+    pub(crate) where_: diropargs3<'a>,
     pub(crate) attrs: sattr3,
 }
 
-impl XdrEncode for MKDIR3args {
+impl XdrEncode for MKDIR3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.where_.encode(buf);
         self.attrs.encode(buf);
@@ -942,12 +915,12 @@ impl XdrEncode for MKDIR3args {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct SYMLINK3args {
-    pub(crate) where_: diropargs3,
-    pub(crate) symlink: symlinkdata3,
+pub(crate) struct SYMLINK3args<'a> {
+    pub(crate) where_: diropargs3<'a>,
+    pub(crate) symlink: symlinkdata3<'a>,
 }
 
-impl XdrEncode for SYMLINK3args {
+impl XdrEncode for SYMLINK3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.where_.encode(buf);
         self.symlink.encode(buf);
@@ -955,34 +928,34 @@ impl XdrEncode for SYMLINK3args {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct REMOVE3args {
-    pub(crate) object: diropargs3,
+pub(crate) struct REMOVE3args<'a> {
+    pub(crate) object: diropargs3<'a>,
 }
 
-impl XdrEncode for REMOVE3args {
+impl XdrEncode for REMOVE3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.object.encode(buf);
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct RMDIR3args {
-    pub(crate) object: diropargs3,
+pub(crate) struct RMDIR3args<'a> {
+    pub(crate) object: diropargs3<'a>,
 }
 
-impl XdrEncode for RMDIR3args {
+impl XdrEncode for RMDIR3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.object.encode(buf);
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct RENAME3args {
-    pub(crate) from: diropargs3,
-    pub(crate) to: diropargs3,
+pub(crate) struct RENAME3args<'a> {
+    pub(crate) from: diropargs3<'a>,
+    pub(crate) to: diropargs3<'a>,
 }
 
-impl XdrEncode for RENAME3args {
+impl XdrEncode for RENAME3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.from.encode(buf);
         self.to.encode(buf);
@@ -990,12 +963,12 @@ impl XdrEncode for RENAME3args {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct LINK3args {
+pub(crate) struct LINK3args<'a> {
     pub(crate) file: nfs_fh3,
-    pub(crate) link: diropargs3,
+    pub(crate) link: diropargs3<'a>,
 }
 
-impl XdrEncode for LINK3args {
+impl XdrEncode for LINK3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         self.file.encode(buf);
         self.link.encode(buf);
@@ -1102,21 +1075,23 @@ impl XdrEncode for SETATTR3args {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct LOOKUP3args {
-    pub(crate) what: diropargs3,
+pub(crate) struct LOOKUP3args<'a> {
+    pub(crate) dir: nfs_fh3,
+    pub(crate) name: &'a [u8],
 }
 
-impl XdrEncode for LOOKUP3args {
+impl XdrEncode for LOOKUP3args<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
-        self.what.encode(buf);
+        self.dir.encode(buf);
+        xdr_var_bytes(buf, self.name);
     }
 }
 
 // ─── MOUNT protocol argument encoding ────────────────────────────────────────
 
-/// Encode a MOUNT dirpath argument (variable-length string).
-pub(crate) fn encode_dirpath(buf: &mut Vec<u8>, path: &str) {
-    xdr_string(buf, path);
+/// RFC 1813 §5.1.4–5.1.5: MNT and UMNT use a counted byte path.
+pub(crate) fn encode_dirpath(buf: &mut Vec<u8>, path: &[u8]) {
+    xdr_var_bytes(buf, path);
 }
 
 // ─── From/Into conversions ────────────────────────────────────────────────────
@@ -1370,60 +1345,11 @@ mod tests {
     }
 
     #[test]
-    fn xdr_string_encodes_as_var_bytes() {
+    fn mount_path_encodes_as_var_bytes() {
         let mut buf1 = Vec::new();
-        xdr_string(&mut buf1, "test");
+        encode_dirpath(&mut buf1, b"test");
         let mut buf2 = Vec::new();
         xdr_var_bytes(&mut buf2, b"test");
         assert_eq!(buf1, buf2);
-    }
-
-    // ─── bytes_to_string tests ───────────────────────────────────────
-
-    #[test]
-    fn bytes_to_string_valid_utf8() {
-        let b = Bytes::from("hello world");
-        assert_eq!(bytes_to_string(b), "hello world");
-    }
-
-    #[test]
-    fn bytes_to_string_valid_utf8_unicode() {
-        let b = Bytes::from("日本語テスト");
-        assert_eq!(bytes_to_string(b), "日本語テスト");
-    }
-
-    #[test]
-    fn bytes_to_string_empty() {
-        let b = Bytes::new();
-        assert_eq!(bytes_to_string(b), "");
-    }
-
-    #[test]
-    fn bytes_to_string_invalid_utf8_lossy() {
-        let b = Bytes::from_static(&[0xFF, 0xFE, 0x68, 0x69]); // invalid + "hi"
-        let result = bytes_to_string(b);
-        assert!(result.contains("hi"));
-        assert!(result.contains('\u{FFFD}')); // replacement character
-    }
-
-    // ─── hex_preview tests ───────────────────────────────────────────
-
-    #[test]
-    fn hex_preview_short() {
-        assert_eq!(hex_preview(&[0xAB, 0xCD, 0xEF]), "ab cd ef");
-    }
-
-    #[test]
-    fn hex_preview_truncates_at_32() {
-        let data: Vec<u8> = (0..64).collect();
-        let result = hex_preview(&data);
-        assert!(result.ends_with("..."));
-        // 32 bytes * 3 chars ("xx ") - 1 trailing space + 3 "..." = ~98 chars
-        assert!(!result.contains("20")); // byte 0x20 = 32, should be truncated
-    }
-
-    #[test]
-    fn hex_preview_empty() {
-        assert_eq!(hex_preview(&[]), "");
     }
 }

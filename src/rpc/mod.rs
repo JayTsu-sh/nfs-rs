@@ -22,6 +22,7 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -356,6 +357,23 @@ impl AsyncWrite for ConnectionWriter {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.half.as_mut() {
+            Some(half) => Pin::new(half).poll_write_vectored(cx, buffers),
+            None => std::task::Poll::Ready(Err(Self::poisoned())),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.half
+            .as_ref()
+            .is_some_and(AsyncWrite::is_write_vectored)
+    }
+
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -382,6 +400,34 @@ impl AsyncWrite for ConnectionWriter {
 struct FrameWriteGuard<'a> {
     writer: TokioMutexGuard<'a, ConnectionWriter>,
     complete: bool,
+}
+
+struct OutgoingRecord<'a> {
+    prefix: &'a [u8],
+    body: &'a [u8],
+    data: &'a [u8],
+    padding: usize,
+}
+
+impl OutgoingRecord<'_> {
+    async fn write(self, stream: &mut ConnectionWriter) -> std::io::Result<()> {
+        let mut slices = [
+            IoSlice::new(self.prefix),
+            IoSlice::new(self.body),
+            IoSlice::new(self.data),
+            IoSlice::new(&[0; 3][..self.padding]),
+        ];
+        let mut remaining = slices.as_mut_slice();
+        IoSlice::advance_slices(&mut remaining, 0);
+        while !remaining.is_empty() {
+            let count = stream.write_vectored(remaining).await?;
+            if count == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut remaining, count);
+        }
+        stream.flush().await
+    }
 }
 
 impl Drop for FrameWriteGuard<'_> {
@@ -538,14 +584,10 @@ impl StreamMux {
         }
     }
 
-    /// `header` is the pre-assembled RPC frame header + msg_body (prefix already prepended).
-    /// `data` is the optional large payload (e.g. WRITE data), sent zero-copy after the header.
     async fn send_and_receive_inner(
         &self,
         xid: u32,
-        header: &[u8],
-        data: &[u8],
-        data_pad: usize,
+        record: OutgoingRecord<'_>,
         timeout: std::time::Duration,
         bypass_readiness: bool,
     ) -> Result<Bytes> {
@@ -586,7 +628,6 @@ impl StreamMux {
             };
 
             // Write request under the writer lock — released before awaiting the response.
-            // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
             // Shutdown interrupts a send waiting for the writer or stalled in
             // it; the frame guard then releases the stream.
             let stopping = self.stopping.notified();
@@ -605,20 +646,9 @@ impl StreamMux {
                     complete: false,
                 };
                 transmission = crate::RequestTransmission::Sent;
-                async {
-                    frame.writer.write_all(header).await?;
-                    if !data.is_empty() {
-                        frame.writer.write_all(data).await?;
-                        if data_pad > 0 {
-                            frame.writer.write_all(&[0u8; 4][..data_pad]).await?;
-                        }
-                    }
-                    // A buffered stream holds the record until flushed.
-                    frame.writer.flush().await?;
-                    frame.complete = true;
-                    Ok::<(), NfsError>(())
-                }
-                .await
+                record.write(&mut frame.writer).await?;
+                frame.complete = true;
+                Ok::<(), NfsError>(())
             };
             let write_result = tokio::select! {
                 biased;
@@ -1085,7 +1115,7 @@ impl Client {
 
     async fn call_with_data_inner(
         &self,
-        mut msg_body: Vec<u8>,
+        msg_body: Vec<u8>,
         data: Bytes,
         replay_policy: ReplayPolicy,
         timeout: std::time::Duration,
@@ -1117,12 +1147,11 @@ impl Client {
         let data_pad = (4 - data_len % 4) % 4;
         let payload_len = (8 + msg_body.len() + data_len + data_pad) as u32;
 
-        // Prepend 12-byte RPC frame prefix space to msg_body (one-time allocation).
-        // XID at offset 4..8 is overwritten per retry; the rest is constant.
-        msg_body.splice(0..0, [0u8; PREFIX_LEN]);
-        BigEndian::write_u32(&mut msg_body[0..4], payload_len | SIZE_HDR_BIT);
-        // msg_body[4..8] = xid, written per retry below
-        BigEndian::write_u32(&mut msg_body[8..12], MessageType::Request as u32);
+        // The record marker (RFC 5531 §11), XID and message type precede
+        // the body without moving its encoded bytes.
+        let mut prefix = [0; PREFIX_LEN];
+        BigEndian::write_u32(&mut prefix[0..4], payload_len | SIZE_HDR_BIT);
+        BigEndian::write_u32(&mut prefix[8..12], MessageType::Request as u32);
 
         while attempt < max_attempts {
             let attempt_deadline = disconnect
@@ -1134,7 +1163,7 @@ impl Client {
 
             // Each retry uses a fresh XID (the old one may have stale responses in flight).
             let xid = get_xid();
-            BigEndian::write_u32(&mut msg_body[4..8], xid);
+            BigEndian::write_u32(&mut prefix[4..8], xid);
 
             debug!(
                 xid,
@@ -1148,9 +1177,12 @@ impl Client {
             let res = mux
                 .send_and_receive_inner(
                     xid,
-                    &msg_body,
-                    &data,
-                    data_pad,
+                    OutgoingRecord {
+                        prefix: &prefix,
+                        body: &msg_body,
+                        data: &data,
+                        padding: data_pad,
+                    },
                     timeout.min(
                         attempt_deadline.saturating_duration_since(tokio::time::Instant::now()),
                     ),
@@ -1291,6 +1323,8 @@ impl Client {
 /// Format: [xid(4)] [msgtype(4)] [msg_status(4)] [verf_flavor(4)] [verf_len(4)]
 ///         [verf_data…] [accept_stat(4)] [payload…]
 fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
+    const MAX_AUTH_BODY: usize = 400; // RFC 5531 §8.2, opaque_auth.
+
     let read_u32 = |data: &[u8], p: usize| -> Result<u32> {
         if p + 4 > data.len() {
             return Err(NfsError::Rpc("response truncated".to_string()));
@@ -1352,10 +1386,15 @@ fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
     pos += 4;
     if accept_status != AcceptStatus::Success as i32 {
         error!(xid, accept_status, "RPC request rejected by server");
-        // Preserve authoritative unsupported-program evidence for optional RPC
-        // extensions. Authentication, garbage arguments and system failures
-        // must remain errors rather than silently disabling a feature.
-        // RFC 5531 section 9: PROG_UNAVAIL, PROG_MISMATCH, PROC_UNAVAIL.
+        // RFC 5531 §9 defines a void body for GARBAGE_ARGS.
+        if accept_status == AcceptStatus::GarbageArgs as i32
+            && verf_len <= MAX_AUTH_BODY
+            && pos == res.len()
+        {
+            return Err(NfsError::RpcGarbageArgs);
+        }
+        // Optional RPC extensions use the service-unavailable statuses to
+        // detect support (PROG_UNAVAIL, PROG_MISMATCH, PROC_UNAVAIL).
         if matches!(accept_status, 1..=3) {
             return Err(NfsError::Unsupported(format!(
                 "RPC service unavailable (accept status {accept_status})"
@@ -1388,7 +1427,6 @@ enum AcceptStatus {
     ProgMismatch = 2,
     #[allow(unused)]
     ProcUnavail = 3,
-    #[allow(unused)]
     GarbageArgs = 4,
 }
 
@@ -1437,11 +1475,15 @@ mod tests {
                 Err(NfsError::Unsupported(_))
             ));
         }
+        let mut oversized_verifier = vec![42u32, 1, 0, 0, 404];
+        oversized_verifier.extend([0; 101]);
+        oversized_verifier.push(4);
         for reply in [
-            vec![42u32, 1, 0, 0, 0, 4], // GARBAGE_ARGS
-            vec![42, 1, 0, 0, 0, 5],    // SYSTEM_ERR
-            vec![42, 1, 1, 1, 5],       // MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK
-            vec![42, 1, 0, 0, 0],       // Missing accept status
+            vec![42u32, 1, 0, 0, 0, 4, 0], // GARBAGE_ARGS with unexpected body
+            oversized_verifier,            // GARBAGE_ARGS with malformed verifier
+            vec![42, 1, 0, 0, 0, 5],       // SYSTEM_ERR
+            vec![42, 1, 1, 1, 5],          // MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK
+            vec![42, 1, 0, 0, 0],          // Missing accept status
         ] {
             let reply = reply
                 .into_iter()
@@ -1611,9 +1653,12 @@ mod tests {
         let error = mux
             .send_and_receive_inner(
                 7,
-                &[0; 12],
-                &[],
-                0,
+                OutgoingRecord {
+                    prefix: &[0; 12],
+                    body: &[],
+                    data: &[],
+                    padding: 0,
+                },
                 std::time::Duration::from_millis(10),
                 false,
             )

@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 
+use super::fastxdr::MNTPATHLEN;
 use super::{
     Mount, MountProc3, ObjRes, Time, encode_dirpath, export::decode_exports, mount_mountstat3,
     mountres3_ok, rpc_header,
@@ -81,22 +82,22 @@ impl crate::Mount for Mount3 {
         self.m.commit(fh, offset, count).await
     }
 
-    async fn create(&self, dir_fh: Bytes, filename: &str, mode: Option<u32>) -> Result<ObjRes> {
+    async fn create(&self, dir_fh: Bytes, filename: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         self.m.create(dir_fh, filename, mode).await
     }
 
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<ObjRes> {
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<ObjRes> {
         self.m.create_path(path, mode).await
     }
 
     async fn open_path_with_options(
         &self,
-        path: &str,
+        path: &[u8],
         options: crate::OpenOptions,
     ) -> Result<crate::OpenFile> {
         crate::mount::open_path_guarded(self, path, options, |parent, name| async move {
             self.m
-                .create_guarded(parent, &name, options.create_mode)
+                .create_guarded(parent, name, options.create_mode)
                 .await
                 .map(crate::OpenFile::from_object)
         })
@@ -133,7 +134,7 @@ impl crate::Mount for Mount3 {
 
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -155,37 +156,37 @@ impl crate::Mount for Mount3 {
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<crate::mount::Attr> {
         self.m.link(src_fh, dst_dir_fh, dst_filename).await
     }
 
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<crate::mount::Attr> {
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<crate::mount::Attr> {
         self.m.link_path(src_path, dst_path).await
     }
 
     async fn symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<ObjRes> {
         self.m.symlink(src_path, dst_dir_fh, dst_filename).await
     }
 
-    async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes> {
+    async fn symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<ObjRes> {
         self.m.symlink_path(src_path, dst_path).await
     }
 
-    async fn readlink(&self, fh: Bytes) -> Result<String> {
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         self.m.readlink(fh).await
     }
 
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes> {
         self.m.lookup(dir_fh, filename).await
     }
 
-    async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
+    async fn lookup_path(&self, path: &[u8]) -> Result<ObjRes> {
         self.m.lookup_path(path).await
     }
 
@@ -228,43 +229,43 @@ impl crate::Mount for Mount3 {
         self.m.readdirplus_page(dir_fh, position).await
     }
 
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes> {
         self.m.mkdir(dir_fh, dirname, mode).await
     }
 
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes> {
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes> {
         self.m.mkdir_path(path, mode).await
     }
 
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
         self.m.remove(dir_fh, filename).await
     }
 
-    async fn remove_path(&self, path: &str) -> Result<()> {
+    async fn remove_path(&self, path: &[u8]) -> Result<()> {
         self.m.remove_path(path).await
     }
 
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         self.m.rmdir(dir_fh, dirname).await
     }
 
-    async fn rmdir_path(&self, path: &str) -> Result<()> {
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         self.m.rmdir_path(path).await
     }
 
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
         self.m
             .rename(from_dir_fh, from_filename, to_dir_fh, to_filename)
             .await
     }
 
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         self.m.rename_path(from_path, to_path).await
     }
 
@@ -297,6 +298,11 @@ async fn ensure_port(
 }
 
 pub(crate) async fn mount(args: &crate::MountArgs) -> Result<Box<dyn crate::Mount>> {
+    if args.dirpath.len() > MNTPATHLEN as usize {
+        return Err(NfsError::InvalidInput(format!(
+            "NFSv3 MOUNT path exceeds {MNTPATHLEN} bytes"
+        )));
+    }
     // start by resolving host address and assigning portmapper port to each resolved address
     let dialer = args.dialer();
     let addrs = dialer.resolve(&args.host, rpc::PORTMAP_PORT).await?;
@@ -347,9 +353,9 @@ async fn mount_on_addr(
     auth: &crate::Auth,
     mountport: u16,
 ) -> Result<Box<dyn crate::Mount>> {
-    info!(addr = %addr, dirpath = %args.dirpath, "connecting to NFS server for mount");
+    info!(addr = %addr, dirpath = ?args.dirpath, "connecting to NFS server for mount");
     let nfs_mux = rpc::StreamMux::dial(Arc::clone(dialer), addr.clone()).await?;
-    let dir: String = args.dirpath.to_owned();
+    let dir = args.dirpath.clone();
     let mount_mux = if mountport != addr.port() {
         Some(rpc::StreamMux::dial(Arc::clone(dialer), addr.with_port(mountport)).await?)
     } else {
@@ -367,7 +373,7 @@ async fn mount_on_addr(
         auth,
     )
     .encode(&mut buf);
-    encode_dirpath(&mut buf, dir.trim_end_matches('/'));
+    encode_dirpath(&mut buf, &dir);
     // Mount phase: use small retry count for fast failure detection.
     let mut bytes = client.call(buf, MOUNT_REPLAY, METADATA_TIMEOUT).await?;
     let status =
@@ -378,7 +384,7 @@ async fn mount_on_addr(
     }
     let ok = mountres3_ok::try_from(&mut bytes).map_err(|e| NfsError::Xdr(e.to_string()))?;
     let fh = ok.fhandle.0;
-    info!(addr = %addr, dirpath = %args.dirpath, fh_len = fh.len(), "MOUNT MNT succeeded, got root file handle");
+    info!(addr = %addr, dirpath = ?args.dirpath, fh_len = fh.len(), "MOUNT MNT succeeded, got root file handle");
 
     let mut m = Mount {
         rpc: client,
@@ -578,7 +584,7 @@ mod tests {
             });
             let file = mount
                 .open_path_with_options(
-                    "parent/new",
+                    b"parent/new",
                     crate::OpenOptions {
                         access: crate::OPEN_WRITE,
                         create_mode: Some(0o666),
@@ -748,6 +754,21 @@ mod tests {
         assert!(dialer.dialed().is_empty());
     }
 
+    #[tokio::test]
+    async fn mount_with_rejects_overlong_v3_export_before_dialing() {
+        let dialer = Arc::new(ScriptedDialer::default());
+        let overlong = "a".repeat(MNTPATHLEN as usize);
+        let options = crate::MountOptions::from_url(&format!(
+            "nfs://nfs.example.internal/{overlong}?version=3"
+        ))
+        .unwrap();
+        let error = crate::mount_with(options, dialer.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NfsError::InvalidInput(_)), "{error:?}");
+        assert!(dialer.dialed().is_empty());
+    }
+
     /// Without `readdir-buffer`, an NFSv3 mount sizes READDIRPLUS `dircount` and `maxcount` from
     /// the FSINFO `rtmax` it negotiated for READ (bounded by the client ceiling); an explicit
     /// `readdir-buffer` is sent as given. Checked on the READDIRPLUS request itself.
@@ -766,7 +787,7 @@ mod tests {
             let args = crate::MountArgs {
                 versions: vec![NFSVersion::NFSv3],
                 host: "127.0.0.1".to_string(),
-                dirpath: "/export".to_string(),
+                dirpath: Bytes::from_static(b"/export"),
                 mountport: addr.port(),
                 nfsport: addr.port(),
                 uid: 0,

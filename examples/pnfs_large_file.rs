@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mount.get_max_write_size(),
         mount.capabilities().pnfs
     );
-    let created = mount.create_path(&path, Some(0o600)).await?;
+    let created = mount.create_path(path.as_bytes(), Some(0o600)).await?;
     let result = async {
         let writer = BufferedFile::new(mount.clone(), created.fh);
         let payload = if patterned {
@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "write_done seconds={write_seconds:.3} mib_s={:.1}",
             total as f64 / 1024.0 / 1024.0 / write_seconds
         );
-        let opened = mount.open_path(&path, OPEN_READ).await?;
+        let opened = mount.open_path(path.as_bytes(), OPEN_READ).await?;
         let reader = BufferedFile::new(mount.clone(), opened.fh);
         let read_started = Instant::now();
         offset = 0;
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok::<(), Box<dyn Error>>(())
     }
     .await;
-    let remove = mount.remove_path(&path).await;
+    let remove = mount.remove_path(path.as_bytes()).await;
     let unmount = mount.umount().await;
     result?;
     remove?;

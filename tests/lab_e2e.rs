@@ -105,11 +105,11 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
     mount.null().await?;
     ensure(!mount.getfh().await.is_empty(), "empty export filehandle")?;
     for residual in [&original, &renamed, &hardlink, &symlink] {
-        let _ = mount.remove_path(residual).await;
+        let _ = mount.remove_path(residual.as_bytes()).await;
     }
 
     let result: TestResult = async {
-        let created = mount.create_path(&original, Some(0o600)).await?;
+        let created = mount.create_path(original.as_bytes(), Some(0o600)).await?;
         let mut written = 0usize;
         while written < payload.len() {
             let end = (written + mount.get_max_write_size() as usize).min(payload.len());
@@ -128,7 +128,7 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
             .await?;
         mount.close(created.fh).await?;
 
-        let reopened = mount.open_path(&original, OPEN_READ).await?;
+        let reopened = mount.open_path(original.as_bytes(), OPEN_READ).await?;
         ensure(
             mount.getattr(reopened.fh.clone()).await?.filesize == payload.len() as u64,
             "single-export GETATTR size mismatch",
@@ -139,14 +139,21 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
         )?;
         mount.close(reopened.fh).await?;
 
-        mount.rename_path(&original, &renamed).await?;
-        let renamed_object = mount.lookup_path(&renamed).await?;
-        let linked = mount.link_path(&renamed, &hardlink).await?;
+        mount
+            .rename_path(original.as_bytes(), renamed.as_bytes())
+            .await?;
+        let renamed_object = mount.lookup_path(renamed.as_bytes()).await?;
+        let linked = mount
+            .link_path(renamed.as_bytes(), hardlink.as_bytes())
+            .await?;
         ensure(
-            linked.nlink >= 2 && mount.lookup_path(&hardlink).await?.fh == renamed_object.fh,
+            linked.nlink >= 2
+                && mount.lookup_path(hardlink.as_bytes()).await?.fh == renamed_object.fh,
             "single-export hard-link identity mismatch",
         )?;
-        let symbolic = mount.symlink_path(&renamed, &symlink).await?;
+        let symbolic = mount
+            .symlink_path(renamed.as_bytes(), symlink.as_bytes())
+            .await?;
         ensure(
             mount.readlink(symbolic.fh).await? == renamed,
             "single-export symbolic-link target mismatch",
@@ -159,7 +166,9 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
             .await?;
         for expected in [&renamed, &hardlink, &symlink] {
             ensure(
-                names.contains(expected),
+                names
+                    .iter()
+                    .any(|name| name.as_ref() == expected.as_bytes()),
                 format!("single-export READDIR omitted {expected}"),
             )?;
         }
@@ -169,7 +178,7 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
 
     let mut cleanup_error = None;
     for path in [&symlink, &hardlink, &renamed, &original] {
-        if let Err(error) = mount.remove_path(path).await
+        if let Err(error) = mount.remove_path(path.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
@@ -274,12 +283,12 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "stateid recovery fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
 
     let result: TestResult = async {
         let file = mount
             .open_path_with_options(
-                &path,
+                path.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -319,7 +328,7 @@ async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
     mount.umount().await?;
     expect_recovery_outcome(result)
 }
@@ -343,12 +352,12 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "stateid close fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
 
     let result: TestResult = async {
         let file = mount
             .open_path_with_options(
-                &path,
+                path.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -372,7 +381,7 @@ async fn nfs_v40_close_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&path).await;
+    let _ = mount.remove_path(path.as_bytes()).await;
     mount.umount().await?;
     expect_close_outcome(result)
 }
@@ -402,13 +411,13 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
         mount.version() == NFSVersion::NFSv4p0,
         "multi-lane fixture negotiated the wrong protocol",
     )?;
-    let _ = mount.remove_path(&first).await;
-    let _ = mount.remove_path(&second).await;
+    let _ = mount.remove_path(first.as_bytes()).await;
+    let _ = mount.remove_path(second.as_bytes()).await;
 
     let result: TestResult = async {
         let file_a = mount
             .open_path_with_options(
-                &first,
+                first.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -419,7 +428,7 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
             .object;
         let file_b = mount
             .open_path_with_options(
-                &second,
+                second.as_bytes(),
                 OpenOptions {
                     access: OPEN_BOTH,
                     create_mode: Some(0o666),
@@ -476,8 +485,8 @@ async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
     }
     .await;
 
-    let _ = mount.remove_path(&first).await;
-    let _ = mount.remove_path(&second).await;
+    let _ = mount.remove_path(first.as_bytes()).await;
+    let _ = mount.remove_path(second.as_bytes()).await;
     mount.umount().await?;
     expect_recovery_outcome(result)
 }
@@ -571,13 +580,13 @@ async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResul
         let child_directory = format!("{root}/child");
         let child_file = format!("{child_directory}/child-file.txt");
 
-        let _ = mount.remove_path(&child_file).await;
-        let _ = mount.rmdir_path(&child_directory).await;
-        let _ = mount.remove_path(&root_file).await;
-        let _ = mount.rmdir_path(&root).await;
+        let _ = mount.remove_path(child_file.as_bytes()).await;
+        let _ = mount.rmdir_path(child_directory.as_bytes()).await;
+        let _ = mount.remove_path(root_file.as_bytes()).await;
+        let _ = mount.rmdir_path(root.as_bytes()).await;
 
         let result: TestResult = async {
-            let root_object = mount.mkdir_path(&root, 0o700).await?;
+            let root_object = mount.mkdir_path(root.as_bytes(), 0o700).await?;
             let root_acl = Acl {
                 aces: vec![
                     NfsAce {
@@ -608,7 +617,7 @@ async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResul
                 format!("NFSv4.0 directory ACL did not stabilize through {url}"),
             )?;
 
-            let root_file_object = mount.create_path(&root_file, Some(0o600)).await?;
+            let root_file_object = mount.create_path(root_file.as_bytes(), Some(0o600)).await?;
             mount.close(root_file_object.fh.clone()).await?;
             let root_file_acl = Acl {
                 aces: vec![
@@ -642,7 +651,8 @@ async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResul
                 format!("NFSv4.0 file ACL did not stabilize through {url}"),
             )?;
 
-            let child_directory_object = mount.mkdir_path(&child_directory, 0o700).await?;
+            let child_directory_object =
+                mount.mkdir_path(child_directory.as_bytes(), 0o700).await?;
             let inherited_child_acl = mount.getacl(child_directory_object.fh.clone()).await?;
             ensure(
                 inherited_child_acl
@@ -680,7 +690,9 @@ async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResul
                 format!("NFSv4.0 child-directory ACL did not stabilize through {url}"),
             )?;
 
-            let child_file_object = mount.create_path(&child_file, Some(0o600)).await?;
+            let child_file_object = mount
+                .create_path(child_file.as_bytes(), Some(0o600))
+                .await?;
             mount.close(child_file_object.fh.clone()).await?;
             let inherited_file_acl = mount.getacl(child_file_object.fh.clone()).await?;
             ensure(
@@ -715,22 +727,22 @@ async fn nfs_v40_file_and_directory_acl_primitives_cover_children() -> TestResul
         .await;
 
         let mut cleanup_error = None;
-        if let Err(error) = mount.remove_path(&child_file).await
+        if let Err(error) = mount.remove_path(child_file.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
-        if let Err(error) = mount.rmdir_path(&child_directory).await
+        if let Err(error) = mount.rmdir_path(child_directory.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
-        if let Err(error) = mount.remove_path(&root_file).await
+        if let Err(error) = mount.remove_path(root_file.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
-        if let Err(error) = mount.rmdir_path(&root).await
+        if let Err(error) = mount.rmdir_path(root.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
@@ -769,13 +781,13 @@ async fn nfs_v40_linux_acls_migrate_to_fas2750() -> TestResult {
     let child_directory = format!("{case}/child");
     let child_file = format!("{child_directory}/payload.bin");
     for mount in [&source, &target] {
-        let _ = mount.remove_path(&child_file).await;
-        let _ = mount.rmdir_path(&child_directory).await;
-        let _ = mount.rmdir_path(&case).await;
+        let _ = mount.remove_path(child_file.as_bytes()).await;
+        let _ = mount.rmdir_path(child_directory.as_bytes()).await;
+        let _ = mount.rmdir_path(case.as_bytes()).await;
     }
 
     let result: TestResult = async {
-        let source_root = source.mkdir_path(&case, 0o700).await?;
+        let source_root = source.mkdir_path(case.as_bytes(), 0o700).await?;
         let source_root_acl = Acl {
             aces: vec![
                 NfsAce {
@@ -816,8 +828,10 @@ async fn nfs_v40_linux_acls_migrate_to_fas2750() -> TestResult {
         source
             .setacl(source_root.fh.clone(), &source_root_acl)
             .await?;
-        let source_directory = source.mkdir_path(&child_directory, 0o750).await?;
-        let source_file = source.create_path(&child_file, Some(0o640)).await?;
+        let source_directory = source.mkdir_path(child_directory.as_bytes(), 0o750).await?;
+        let source_file = source
+            .create_path(child_file.as_bytes(), Some(0o640))
+            .await?;
         source.close(source_file.fh.clone()).await?;
 
         // The Linux server's readback, including its normalization, is the
@@ -829,9 +843,11 @@ async fn nfs_v40_linux_acls_migrate_to_fas2750() -> TestResult {
             "Linux source returned an empty ACL",
         )?;
 
-        target.mkdir_path(&case, 0o700).await?;
-        let target_directory = target.mkdir_path(&child_directory, 0o700).await?;
-        let target_file = target.create_path(&child_file, Some(0o600)).await?;
+        target.mkdir_path(case.as_bytes(), 0o700).await?;
+        let target_directory = target.mkdir_path(child_directory.as_bytes(), 0o700).await?;
+        let target_file = target
+            .create_path(child_file.as_bytes(), Some(0o600))
+            .await?;
         target.close(target_file.fh.clone()).await?;
 
         // Existing objects migrate file ACLs first and directory ACLs last so
@@ -860,17 +876,17 @@ async fn nfs_v40_linux_acls_migrate_to_fas2750() -> TestResult {
 
     let mut cleanup_error = None;
     for mount in [&target, &source] {
-        if let Err(error) = mount.remove_path(&child_file).await
+        if let Err(error) = mount.remove_path(child_file.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
-        if let Err(error) = mount.rmdir_path(&child_directory).await
+        if let Err(error) = mount.rmdir_path(child_directory.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
         }
-        if let Err(error) = mount.rmdir_path(&case).await
+        if let Err(error) = mount.rmdir_path(case.as_bytes()).await
             && !error.is_not_found()
         {
             cleanup_error.get_or_insert_with(|| Box::new(error) as _);
@@ -970,15 +986,15 @@ async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
                     &target_root,
                 ),
             ] {
-                let _ = mount.remove_path(inherited_file).await;
-                let _ = mount.rmdir_path(inherited_directory).await;
-                let _ = mount.remove_path(file).await;
-                let _ = mount.rmdir_path(directory).await;
-                let _ = mount.rmdir_path(root).await;
+                let _ = mount.remove_path(inherited_file.as_bytes()).await;
+                let _ = mount.rmdir_path(inherited_directory.as_bytes()).await;
+                let _ = mount.remove_path(file.as_bytes()).await;
+                let _ = mount.rmdir_path(directory.as_bytes()).await;
+                let _ = mount.rmdir_path(root.as_bytes()).await;
             }
 
             let result: TestResult = async {
-                let source_root_object = source.mkdir_path(&source_root, 0o700).await?;
+                let source_root_object = source.mkdir_path(source_root.as_bytes(), 0o700).await?;
                 let inheritable_acl = Acl {
                     aces: vec![
                         NfsAce {
@@ -1019,8 +1035,8 @@ async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
                 source
                     .setacl(source_root_object.fh.clone(), &inheritable_acl)
                     .await?;
-                let source_directory_object = source.mkdir_path(&source_directory, 0o750).await?;
-                let source_file_object = source.create_path(&source_file, Some(0o640)).await?;
+                let source_directory_object = source.mkdir_path(source_directory.as_bytes(), 0o750).await?;
+                let source_file_object = source.create_path(source_file.as_bytes(), Some(0o640)).await?;
                 source.close(source_file_object.fh.clone()).await?;
                 let directory_snapshot = source.getacl(source_directory_object.fh.clone()).await?;
                 let file_snapshot = source.getacl(source_file_object.fh.clone()).await?;
@@ -1029,9 +1045,9 @@ async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
                     format!("ACL matrix source returned an empty ACL for {label}"),
                 )?;
 
-                target.mkdir_path(&target_root, 0o700).await?;
-                let target_directory_object = target.mkdir_path(&target_directory, 0o700).await?;
-                let target_file_object = target.create_path(&target_file, Some(0o600)).await?;
+                target.mkdir_path(target_root.as_bytes(), 0o700).await?;
+                let target_directory_object = target.mkdir_path(target_directory.as_bytes(), 0o700).await?;
+                let target_file_object = target.create_path(target_file.as_bytes(), Some(0o600)).await?;
                 target.close(target_file_object.fh.clone()).await?;
 
                 target
@@ -1087,19 +1103,19 @@ async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
                 }
 
                 let source_inherited_directory_object = source
-                    .mkdir_path(&source_inherited_directory, 0o700)
+                    .mkdir_path(source_inherited_directory.as_bytes(), 0o700)
                     .await?;
                 let source_inherited_file_object = source
-                    .create_path(&source_inherited_file, Some(0o600))
+                    .create_path(source_inherited_file.as_bytes(), Some(0o600))
                     .await?;
                 source
                     .close(source_inherited_file_object.fh.clone())
                     .await?;
                 let target_inherited_directory_object = target
-                    .mkdir_path(&target_inherited_directory, 0o700)
+                    .mkdir_path(target_inherited_directory.as_bytes(), 0o700)
                     .await?;
                 let target_inherited_file_object = target
-                    .create_path(&target_inherited_file, Some(0o600))
+                    .create_path(target_inherited_file.as_bytes(), Some(0o600))
                     .await?;
                 target
                     .close(target_inherited_file_object.fh.clone())
@@ -1156,27 +1172,27 @@ async fn nfsv4_acl_migration_covers_protocol_storage_matrix() -> TestResult {
                     &source_root,
                 ),
             ] {
-                if let Err(error) = mount.remove_path(inherited_file).await
+                if let Err(error) = mount.remove_path(inherited_file.as_bytes()).await
                     && !error.is_not_found()
                 {
                     cleanup_error.get_or_insert_with(|| Box::new(error) as _);
                 }
-                if let Err(error) = mount.rmdir_path(inherited_directory).await
+                if let Err(error) = mount.rmdir_path(inherited_directory.as_bytes()).await
                     && !error.is_not_found()
                 {
                     cleanup_error.get_or_insert_with(|| Box::new(error) as _);
                 }
-                if let Err(error) = mount.remove_path(file).await
+                if let Err(error) = mount.remove_path(file.as_bytes()).await
                     && !error.is_not_found()
                 {
                     cleanup_error.get_or_insert_with(|| Box::new(error) as _);
                 }
-                if let Err(error) = mount.rmdir_path(directory).await
+                if let Err(error) = mount.rmdir_path(directory.as_bytes()).await
                     && !error.is_not_found()
                 {
                     cleanup_error.get_or_insert_with(|| Box::new(error) as _);
                 }
-                if let Err(error) = mount.rmdir_path(root).await
+                if let Err(error) = mount.rmdir_path(root.as_bytes()).await
                     && !error.is_not_found()
                 {
                     cleanup_error.get_or_insert_with(|| Box::new(error) as _);
@@ -1209,9 +1225,9 @@ async fn nfs_v41_dacl_and_sacl_round_trip_on_linux_and_fas2750() -> TestResult {
         let mount = parse_url_and_mount(url).await?;
         let directory = format!("nfs-rs-v41-acl41-{index}");
         let filename = format!("{directory}/file");
-        let _ = mount.rmdir_path(&directory).await;
-        let directory_object = mount.mkdir_path(&directory, 0o700).await?;
-        let file_object = mount.create_path(&filename, Some(0o600)).await?;
+        let _ = mount.rmdir_path(directory.as_bytes()).await;
+        let directory_object = mount.mkdir_path(directory.as_bytes(), 0o700).await?;
+        let file_object = mount.create_path(filename.as_bytes(), Some(0o600)).await?;
         let result = async {
             for (kind, fh) in [
                 ("directory", directory_object.fh.clone()),
@@ -1296,8 +1312,8 @@ async fn nfs_v41_dacl_and_sacl_round_trip_on_linux_and_fas2750() -> TestResult {
         }
         .await;
         let close = mount.close(file_object.fh).await;
-        let remove = mount.remove_path(&filename).await;
-        let cleanup = mount.rmdir_path(&directory).await;
+        let remove = mount.remove_path(filename.as_bytes()).await;
+        let cleanup = mount.rmdir_path(directory.as_bytes()).await;
         let unmount = mount.umount().await;
         result?;
         close?;
@@ -1337,12 +1353,12 @@ async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
             mount.health().callback_healthy == Some(true),
             format!("callback listener is not healthy: {:?}", mount.health()),
         )?;
-        let _ = contender.remove_path(&filename).await;
-        let created = mount.create_path(&filename, Some(0o600)).await?;
+        let _ = contender.remove_path(filename.as_bytes()).await;
+        let created = mount.create_path(filename.as_bytes(), Some(0o600)).await?;
         mount.close(created.fh).await?;
-        let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+        let delegated = mount.open_path(filename.as_bytes(), OPEN_BOTH).await?;
         let granted_here = mount.callback_stats().await.grants_received > 0;
-        let conflicting = contender.open_path(&filename, OPEN_BOTH).await?;
+        let conflicting = contender.open_path(filename.as_bytes(), OPEN_BOTH).await?;
 
         let outcome = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1387,11 +1403,11 @@ async fn nfs_v40_delegation_recall_across_both_lifs() -> TestResult {
         write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
         mount.close(delegated.fh).await?;
         contender.close(conflicting.fh).await?;
-        let reopened = contender.open_path(&filename, OPEN_READ).await?;
+        let reopened = contender.open_path(filename.as_bytes(), OPEN_READ).await?;
         let actual = read_all(contender.as_ref(), reopened.fh.clone(), expected.len()).await?;
         contender.close(reopened.fh).await?;
         ensure(actual == expected, "post-delegation checksum mismatch")?;
-        contender.remove_path(&filename).await?;
+        contender.remove_path(filename.as_bytes()).await?;
         mount.umount().await?;
         contender.umount().await?;
     }
@@ -1417,10 +1433,10 @@ async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
     let mount = parse_url_and_mount(&format!("{}&retain-delegations=true", urls[primary])).await?;
     let contender = parse_url_and_mount(&urls[1 - primary]).await?;
     let filename = format!("nfs-rs-v40-callback-fault-{primary}.bin");
-    let _ = contender.remove_path(&filename).await;
-    let created = mount.create_path(&filename, Some(0o600)).await?;
+    let _ = contender.remove_path(filename.as_bytes()).await;
+    let created = mount.create_path(filename.as_bytes(), Some(0o600)).await?;
     mount.close(created.fh).await?;
-    let delegated = mount.open_path(&filename, OPEN_BOTH).await?;
+    let delegated = mount.open_path(filename.as_bytes(), OPEN_BOTH).await?;
     if let (Ok(armed), Ok(applied)) = (
         env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_ARMED"),
         env::var("NFS_RS_LAB_V40_CALLBACK_FAULT_APPLIED"),
@@ -1452,7 +1468,7 @@ async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
             std::fs::write(trigger, b"trigger recall")?;
             let conflicting = tokio::time::timeout(
                 Duration::from_secs(90),
-                contender.open_path(&filename, OPEN_BOTH),
+                contender.open_path(filename.as_bytes(), OPEN_BOTH),
             )
             .await
             .map_err(|_| {
@@ -1481,11 +1497,11 @@ async fn nfs_v40_unreachable_callback_preserves_base_io() -> TestResult {
         .await
         .map_err(|_| io::Error::other("callback fault was not restored"))?;
     }
-    let reopened = contender.open_path(&filename, OPEN_READ).await?;
+    let reopened = contender.open_path(filename.as_bytes(), OPEN_READ).await?;
     let actual = read_all(contender.as_ref(), reopened.fh.clone(), expected.len()).await?;
     contender.close(reopened.fh).await?;
     ensure(actual == expected, "callback loss corrupted ordinary I/O")?;
-    contender.remove_path(&filename).await?;
+    contender.remove_path(filename.as_bytes()).await?;
     contender.umount().await?;
     mount.umount().await?;
     Ok(())
@@ -1530,8 +1546,8 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             Err(error) => return Err(error.into()),
         }
         let namespace_dir = "nfs-rs-v40-namespace-dir";
-        let _ = mount.rmdir_path(namespace_dir).await;
-        let created_dir = mount.mkdir_path(namespace_dir, 0o700).await?;
+        let _ = mount.rmdir_path(namespace_dir.as_bytes()).await;
+        let created_dir = mount.mkdir_path(namespace_dir.as_bytes(), 0o700).await?;
         ensure(
             created_dir
                 .attr
@@ -1540,17 +1556,19 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             format!("NFSv4.0 MKDIR mode mismatch through {url}"),
         )?;
         ensure(
-            mount.lookup_path(namespace_dir).await?.fh == created_dir.fh,
+            mount.lookup_path(namespace_dir.as_bytes()).await?.fh == created_dir.fh,
             format!("NFSv4.0 MKDIR lookup mismatch through {url}"),
         )?;
-        mount.rmdir_path(namespace_dir).await?;
+        mount.rmdir_path(namespace_dir.as_bytes()).await?;
         ensure(
-            mount.lookup_path(namespace_dir).await.is_err(),
+            mount.lookup_path(namespace_dir.as_bytes()).await.is_err(),
             format!("NFSv4.0 RMDIR left a residual directory through {url}"),
         )?;
         let namespace_file = "nfs-rs-v40-created.bin";
-        let _ = mount.remove_path(namespace_file).await;
-        let created_file = mount.create_path(namespace_file, Some(0o600)).await?;
+        let _ = mount.remove_path(namespace_file.as_bytes()).await;
+        let created_file = mount
+            .create_path(namespace_file.as_bytes(), Some(0o600))
+            .await?;
         ensure(
             created_file
                 .attr
@@ -1653,7 +1671,9 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
             format!("NFSv4.0 CREATE write count mismatch through {url}"),
         )?;
         mount.close(created_file.fh).await?;
-        let reopened = mount.open_path(namespace_file, OPEN_READ).await?;
+        let reopened = mount
+            .open_path(namespace_file.as_bytes(), OPEN_READ)
+            .await?;
         ensure(
             mount
                 .read(reopened.fh.clone(), 0, created_payload.len() as u32)
@@ -1666,33 +1686,44 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
         let hardlink_file = "nfs-rs-v40-hardlink.bin";
         let symlink_file = "nfs-rs-v40-symlink";
         for residual in [renamed_file, hardlink_file, symlink_file] {
-            let _ = mount.remove_path(residual).await;
+            let _ = mount.remove_path(residual.as_bytes()).await;
         }
-        mount.rename_path(namespace_file, renamed_file).await?;
+        mount
+            .rename_path(namespace_file.as_bytes(), renamed_file.as_bytes())
+            .await?;
         ensure(
-            mount.lookup_path(namespace_file).await.is_err(),
+            mount.lookup_path(namespace_file.as_bytes()).await.is_err(),
             format!("NFSv4.0 RENAME left the source through {url}"),
         )?;
-        let renamed = mount.lookup_path(renamed_file).await?;
-        let linked_attr = mount.link_path(renamed_file, hardlink_file).await?;
+        let renamed = mount.lookup_path(renamed_file.as_bytes()).await?;
+        let linked_attr = mount
+            .link_path(renamed_file.as_bytes(), hardlink_file.as_bytes())
+            .await?;
         ensure(
-            linked_attr.nlink >= 2 && mount.lookup_path(hardlink_file).await?.fh == renamed.fh,
+            linked_attr.nlink >= 2
+                && mount.lookup_path(hardlink_file.as_bytes()).await?.fh == renamed.fh,
             format!("NFSv4.0 LINK identity mismatch through {url}"),
         )?;
-        let symbolic = mount.symlink_path(renamed_file, symlink_file).await?;
+        let symbolic = mount
+            .symlink_path(renamed_file.as_bytes(), symlink_file.as_bytes())
+            .await?;
         ensure(
             mount.readlink(symbolic.fh).await? == renamed_file,
             format!("NFSv4.0 READLINK target mismatch through {url}"),
         )?;
-        mount.remove_path(symlink_file).await?;
-        mount.remove_path(hardlink_file).await?;
-        mount.remove_path(renamed_file).await?;
+        mount.remove_path(symlink_file.as_bytes()).await?;
+        mount.remove_path(hardlink_file.as_bytes()).await?;
+        mount.remove_path(renamed_file.as_bytes()).await?;
         ensure(
-            mount.lookup_path(renamed_file).await.is_err(),
+            mount.lookup_path(renamed_file.as_bytes()).await.is_err(),
             format!("NFSv4.0 REMOVE left a residual file through {url}"),
         )?;
-        let small_open = mount.open_path_stateful(&small_file, OPEN_BOTH).await?;
-        let large_open = mount.open_path_stateful(&large_file, OPEN_BOTH).await?;
+        let small_open = mount
+            .open_path_stateful(small_file.as_bytes(), OPEN_BOTH)
+            .await?;
+        let large_open = mount
+            .open_path_stateful(large_file.as_bytes(), OPEN_BOTH)
+            .await?;
         let (small_lock, large_lock) = tokio::try_join!(
             mount.lock_open_stateful(&small_open, 2, 0, 1),
             mount.lock_open_stateful(&large_open, 2, 0, 1),
@@ -1702,7 +1733,7 @@ async fn nfs_v40_open_io_commit_close_on_both_lifs() -> TestResult {
         mount.close_stateful(small_open).await?;
         mount.close_stateful(large_open).await?;
         for (file, expected) in [(&small_file, &small), (&large_file, &large)] {
-            let opened = mount.open_path_stateful(file, OPEN_BOTH).await?;
+            let opened = mount.open_path_stateful(file.as_bytes(), OPEN_BOTH).await?;
             let fh = opened.object.fh.clone();
             let lock = mount
                 .lock_stateful(fh.clone(), 2, 0, expected.len() as u64)
@@ -1866,8 +1897,8 @@ async fn run_v40_performance_task(
     for file in 0..workload.file_count {
         let workload_started = Instant::now();
         let name = format!("nfsrs-perf-{run_id}-{}-{task}-{file}.bin", workload.name);
-        let _ = mount.remove_path(&name).await;
-        let created = mount.create_path(&name, Some(0o600)).await?;
+        let _ = mount.remove_path(name.as_bytes()).await;
+        let created = mount.create_path(name.as_bytes(), Some(0o600)).await?;
         let started = Instant::now();
         if workload.payload_size <= write_chunk_size {
             write_all_with_chunk_size(
@@ -1894,11 +1925,11 @@ async fn run_v40_performance_task(
             .commit(created.fh.clone(), 0, payload.len() as u32)
             .await?;
         mount.close(created.fh).await?;
-        let opened = mount.open_path(&name, OPEN_READ).await?;
+        let opened = mount.open_path(name.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), payload.len()).await?;
         mount.close(opened.fh).await?;
         ensure(actual == payload, "performance payload checksum mismatch")?;
-        mount.remove_path(&name).await?;
+        mount.remove_path(name.as_bytes()).await?;
         workload_latencies.push(workload_started.elapsed().as_secs_f64() * 1_000.0);
         transferred += payload.len() as u64;
     }
@@ -2105,8 +2136,8 @@ async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
                 .collect::<Vec<_>>(),
         );
         let name = format!("nfsrs-concurrent-io-{run_id}-{server}.bin");
-        let _ = mount.remove_path(&name).await;
-        let created = mount.create_path(&name, Some(0o600)).await?;
+        let _ = mount.remove_path(name.as_bytes()).await;
+        let created = mount.create_path(name.as_bytes(), Some(0o600)).await?;
 
         let mut writes = tokio::task::JoinSet::new();
         for chunk in 0..chunk_count {
@@ -2130,7 +2161,7 @@ async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
             .await?;
         mount.close(created.fh).await?;
 
-        let opened = mount.open_path(&name, OPEN_READ).await?;
+        let opened = mount.open_path(name.as_bytes(), OPEN_READ).await?;
         let mut reads = tokio::task::JoinSet::new();
         for chunk in 0..chunk_count {
             let mount = Arc::clone(&mount);
@@ -2167,7 +2198,7 @@ async fn nfs_v40_same_open_state_supports_concurrent_io() -> TestResult {
             }),
             format!("concurrent I/O payload mismatch on server {server}"),
         )?;
-        mount.remove_path(&name).await?;
+        mount.remove_path(name.as_bytes()).await?;
         mount.umount().await?;
     }
     Ok(())
@@ -2192,10 +2223,10 @@ async fn measure_data_mover_same_file_sample(
             .collect::<Vec<_>>(),
     );
     let name = format!("nfsrs-data-mover-perf-{run_id}-{read_depth}-{write_depth}-{sample}.bin");
-    let _ = mount.remove_path(&name).await;
+    let _ = mount.remove_path(name.as_bytes()).await;
 
     let write_started = Instant::now();
-    let created = mount.create_path(&name, Some(0o600)).await?;
+    let created = mount.create_path(name.as_bytes(), Some(0o600)).await?;
     let mut writes = FuturesUnordered::new();
     for chunk in 0..chunk_count {
         let mount = Arc::clone(&mount);
@@ -2219,7 +2250,7 @@ async fn measure_data_mover_same_file_sample(
     let write_seconds = write_started.elapsed().as_secs_f64();
 
     let read_started = Instant::now();
-    let opened = mount.open_path(&name, OPEN_READ).await?;
+    let opened = mount.open_path(name.as_bytes(), OPEN_READ).await?;
     let mut reads = FuturesOrdered::new();
     let mut next_chunk = 0usize;
     let mut verified_bytes = 0usize;
@@ -2280,7 +2311,7 @@ async fn measure_data_mover_same_file_sample(
             payload.len()
         ),
     )?;
-    mount.remove_path(&name).await?;
+    mount.remove_path(name.as_bytes()).await?;
     mount.umount().await?;
 
     let mib = payload.len() as f64 / 1_048_576.0;
@@ -2405,7 +2436,7 @@ async fn nfs_v40_destination_partition_respects_lease_generation() -> TestResult
         .ok_or_else(|| io::Error::other("NFSv4.0 lease time is not observable"))?;
     ensure(lease_seconds > 0, "NFSv4.0 lease time is zero")?;
     let opened = mount
-        .open_path_stateful("nfs-rs-small.bin", OPEN_READ)
+        .open_path_stateful(b"nfs-rs-small.bin", OPEN_READ)
         .await?;
     std::fs::write(&ready, lease_seconds.to_string())?;
     wait_for_lab_file(&applied, Duration::from_secs(30)).await?;
@@ -2485,11 +2516,14 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
         let parent_fh = if parent.is_empty() {
             mount.getfh().await
         } else {
-            mount.lookup_path(&parent).await?.fh
+            mount.lookup_path(parent.as_bytes()).await?.fh
         };
         let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let case = format!("nfs-rs-readdir-page-{}-{millis}", std::process::id());
-        let dir = mount.mkdir(parent_fh.clone(), &case, 0o755).await?.fh;
+        let dir = mount
+            .mkdir(parent_fh.clone(), case.as_bytes(), 0o755)
+            .await?
+            .fh;
         let names = (0..files)
             .map(|index| format!("entry-{index:06}"))
             .collect::<BTreeSet<_>>();
@@ -2498,7 +2532,7 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
             // Wait for every create, even after a failure, so no request is still
             // in flight when cleanup removes its name.
             futures::stream::iter(&names)
-                .map(|name| mount.create(dir.clone(), name, Some(0o644)))
+                .map(|name| mount.create(dir.clone(), name.as_bytes(), Some(0o644)))
                 .buffer_unordered(64)
                 .collect::<Vec<_>>()
                 .await
@@ -2512,7 +2546,7 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
             .map(|name| {
                 let (mount, dir) = (&mount, dir.clone());
                 async move {
-                    match mount.remove(dir, name).await {
+                    match mount.remove(dir, name.as_bytes()).await {
                         Err(error) if error.is_not_found() => Ok(()),
                         other => other,
                     }
@@ -2523,7 +2557,7 @@ async fn readdirplus_page_resumes_large_directory_from_mid_cookie() -> TestResul
             .await
             .into_iter()
             .collect::<Result<(), _>>();
-        let removed_dir = mount.rmdir(parent_fh, &case).await;
+        let removed_dir = mount.rmdir(parent_fh, case.as_bytes()).await;
         mount.umount().await?;
         checked?;
         removed?;
@@ -2557,7 +2591,10 @@ async fn check_paged_listing(
         .await
         .map_ok(|entry| entry.file_name)
         .try_collect::<Vec<_>>()
-        .await?;
+        .await?
+        .into_iter()
+        .map(|name| String::from_utf8(name.to_vec()))
+        .collect::<Result<Vec<_>, _>>()?;
     ensure(
         streamed == listed,
         format!("{url}: stream order differs from pages"),
@@ -2625,8 +2662,8 @@ async fn read_pages(
         let names = page
             .entries
             .into_iter()
-            .map(|entry| entry.file_name)
-            .collect();
+            .map(|entry| String::from_utf8(entry.file_name.to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
         pages.push((position, names));
         if page.eof {
             return Ok(pages);
@@ -2948,8 +2985,8 @@ fn pnfs_pattern(offset: usize, length: usize) -> Bytes {
 }
 
 async fn cleanup_pnfs_case(mount: &dyn Mount, case_dir: &str, file: &str) {
-    let _ = mount.remove_path(file).await;
-    let _ = mount.rmdir_path(case_dir).await;
+    let _ = mount.remove_path(file.as_bytes()).await;
+    let _ = mount.rmdir_path(case_dir.as_bytes()).await;
 }
 
 async fn wait_for_lab_file(path: &str, timeout: Duration) -> TestResult {
@@ -2972,12 +3009,12 @@ async fn recover_pnfs_file_from_checkpoint(
     let mount = parse_url_and_mount(url).await?;
     cleanup_pnfs_case(mount.as_ref(), case_dir, file).await;
     let result = async {
-        mount.mkdir_path(case_dir, 0o700).await?;
-        let created = mount.create_path(file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         write_all(mount.as_ref(), created.fh.clone(), expected).await?;
         mount.close(created.fh).await?;
 
-        let opened = mount.open_path(file, OPEN_READ).await?;
+        let opened = mount.open_path(file.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
         ensure(
@@ -3059,10 +3096,10 @@ fn lab_io_chunk_rejects_a_zero_server_limit() {
 async fn recover_file_from_checkpoint(url: &str, expected: &Bytes) -> TestResult {
     let mount = parse_url_and_mount(url).await?;
     let result = async {
-        let opened = mount.open_path(RECOVERY_FILE, OPEN_BOTH).await?;
+        let opened = mount.open_path(RECOVERY_FILE.as_bytes(), OPEN_BOTH).await?;
         write_all(mount.as_ref(), opened.fh.clone(), expected).await?;
         mount.close(opened.fh).await?;
-        let opened = mount.open_path(RECOVERY_FILE, OPEN_READ).await?;
+        let opened = mount.open_path(RECOVERY_FILE.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
         ensure(
@@ -3083,9 +3120,9 @@ async fn cleanup_case(mount: &dyn Mount) {
         ORIGINAL_FILE,
         SESSION_WSIZE_FILE,
     ] {
-        let _ = mount.remove_path(path).await;
+        let _ = mount.remove_path(path.as_bytes()).await;
     }
-    let _ = mount.rmdir_path(CASE_DIR).await;
+    let _ = mount.rmdir_path(CASE_DIR.as_bytes()).await;
 }
 
 async fn exercise_endpoint(url: &str) -> TestResult {
@@ -3144,8 +3181,10 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         mount.fsstat().await?;
         mount.pathconf(mount.getfh().await).await?;
 
-        mount.mkdir_path(CASE_DIR, 0o755).await?;
-        let created = mount.create_path(ORIGINAL_FILE, Some(0o640)).await?;
+        mount.mkdir_path(CASE_DIR.as_bytes(), 0o755).await?;
+        let created = mount
+            .create_path(ORIGINAL_FILE.as_bytes(), Some(0o640))
+            .await?;
         let expected = payload();
         if matches!(expected_version, NFSVersion::NFSv4p1 | NFSVersion::NFSv4p2) {
             ensure(
@@ -3175,7 +3214,7 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
         mount.close(created.fh).await?;
 
-        let attr = mount.getattr_path(ORIGINAL_FILE).await?;
+        let attr = mount.getattr_path(ORIGINAL_FILE.as_bytes()).await?;
         ensure(
             attr.filesize == expected.len() as u64,
             format!(
@@ -3187,7 +3226,7 @@ async fn exercise_endpoint(url: &str) -> TestResult {
 
         mount
             .setattr_path(
-                ORIGINAL_FILE,
+                ORIGINAL_FILE.as_bytes(),
                 false,
                 Some(0o600),
                 None,
@@ -3197,13 +3236,15 @@ async fn exercise_endpoint(url: &str) -> TestResult {
                 None,
             )
             .await?;
-        let attr = mount.getattr_path(ORIGINAL_FILE).await?;
+        let attr = mount.getattr_path(ORIGINAL_FILE.as_bytes()).await?;
         ensure(
             attr.file_mode & 0o777 == 0o600,
             format!("{url}: mode mismatch after setattr: {:o}", attr.file_mode),
         )?;
 
-        let opened = mount.open_path_stateful(ORIGINAL_FILE, OPEN_READ).await?;
+        let opened = mount
+            .open_path_stateful(ORIGINAL_FILE.as_bytes(), OPEN_READ)
+            .await?;
         let actual = read_all(mount.as_ref(), opened.object.fh.clone(), expected.len()).await?;
         mount.close_stateful(opened).await?;
         ensure(
@@ -3226,7 +3267,9 @@ async fn exercise_endpoint(url: &str) -> TestResult {
                     .map(|index| ((index * 31 + 17) % 251) as u8)
                     .collect::<Vec<_>>(),
             );
-            let created = mount.create_path(SESSION_WSIZE_FILE, Some(0o640)).await?;
+            let created = mount
+                .create_path(SESSION_WSIZE_FILE.as_bytes(), Some(0o640))
+                .await?;
             write_all_with_chunk_size(
                 mount.as_ref(),
                 created.fh.clone(),
@@ -3236,7 +3279,9 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             .await?;
             mount.close(created.fh).await?;
 
-            let opened = mount.open_path(SESSION_WSIZE_FILE, OPEN_READ).await?;
+            let opened = mount
+                .open_path(SESSION_WSIZE_FILE.as_bytes(), OPEN_READ)
+                .await?;
             let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
             mount.close(opened.fh).await?;
             ensure(
@@ -3246,7 +3291,7 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         }
 
         let names = mount
-            .readdir_path(CASE_DIR)
+            .readdir_path(CASE_DIR.as_bytes())
             .await?
             .map_ok(|entry| entry.file_name)
             .try_collect::<Vec<_>>()
@@ -3257,7 +3302,7 @@ async fn exercise_endpoint(url: &str) -> TestResult {
         )?;
 
         let detailed = mount
-            .readdirplus_path(CASE_DIR)
+            .readdirplus_path(CASE_DIR.as_bytes())
             .await?
             .try_collect::<Vec<_>>()
             .await?;
@@ -3275,11 +3320,15 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             format!("{url}: READDIRPLUS returned payload.bin without attributes"),
         )?;
 
-        mount.rename_path(ORIGINAL_FILE, RENAMED_FILE).await?;
-        mount.link_path(RENAMED_FILE, HARD_LINK).await?;
+        mount
+            .rename_path(ORIGINAL_FILE.as_bytes(), RENAMED_FILE.as_bytes())
+            .await?;
+        mount
+            .link_path(RENAMED_FILE.as_bytes(), HARD_LINK.as_bytes())
+            .await?;
         // A single READ may be short, particularly with appliance MAXREAD
         // limits. Verify the entire hard link using the same bounded read loop.
-        let linked_fh = mount.open_path(HARD_LINK, OPEN_READ).await?.fh;
+        let linked_fh = mount.open_path(HARD_LINK.as_bytes(), OPEN_READ).await?.fh;
         let linked = read_all(mount.as_ref(), linked_fh.clone(), expected.len()).await?;
         mount.close(linked_fh).await?;
         ensure(
@@ -3287,8 +3336,10 @@ async fn exercise_endpoint(url: &str) -> TestResult {
             format!("{url}: hard-link read differs from written payload"),
         )?;
 
-        mount.symlink_path("renamed.bin", SYMLINK).await?;
-        let target = mount.readlink_path(SYMLINK).await?;
+        mount
+            .symlink_path(b"renamed.bin", SYMLINK.as_bytes())
+            .await?;
+        let target = mount.readlink_path(SYMLINK.as_bytes()).await?;
         ensure(
             target == "renamed.bin",
             format!("{url}: symlink target mismatch: {target:?}"),
@@ -3373,8 +3424,8 @@ async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
-        let created = mount.create_path(&file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         let expected = Bytes::from(
             (0..pnfs_payload_size()?)
                 .map(|index| ((index * 29 + 43) % 251) as u8)
@@ -3390,7 +3441,7 @@ async fn nfs_v41_pnfs_write_uses_independent_ds() -> TestResult {
         .await
         .map_err(|_| io::Error::other("independent pNFS DS connection was not observed"))?;
         mount.close(created.fh).await?;
-        let opened = mount.open_path(&file, OPEN_READ).await?;
+        let opened = mount.open_path(file.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
         ensure(actual == expected, "pNFS full-payload checksum mismatch")
@@ -3415,13 +3466,13 @@ async fn nfs_v41_pnfs_multifile_sparse_io() -> TestResult {
     let run_id = validated_pnfs_run_id()?;
     let case_dir = format!("nfs-rs-pnfs-{run_id}");
     let mount = parse_url_and_mount(&url).await?;
-    let _ = mount.rmdir_path(&case_dir).await;
+    let _ = mount.rmdir_path(case_dir.as_bytes()).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
         for index in 0..16usize {
             let file = format!("{case_dir}/refresh-{index:02}.bin");
-            let created = mount.create_path(&file, Some(0o600)).await?;
+            let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
             let head = pnfs_pattern(index * 64 * 1024, 64 * 1024);
             let tail = pnfs_pattern((index + 32) * 64 * 1024, 64 * 1024);
             nfs_rs::write_all(&*mount, created.fh.clone(), 0, head.clone()).await?;
@@ -3434,7 +3485,7 @@ async fn nfs_v41_pnfs_multifile_sparse_io() -> TestResult {
             .await?;
             mount.close(created.fh).await?;
 
-            let opened = mount.open_path(&file, OPEN_READ).await?;
+            let opened = mount.open_path(file.as_bytes(), OPEN_READ).await?;
             ensure(
                 mount.read(opened.fh.clone(), 0, head.len() as u32).await? == head,
                 format!("active refresh head mismatch for file {index}"),
@@ -3447,14 +3498,14 @@ async fn nfs_v41_pnfs_multifile_sparse_io() -> TestResult {
                 format!("active refresh tail mismatch for file {index}"),
             )?;
             mount.close(opened.fh).await?;
-            mount.remove_path(&file).await?;
+            mount.remove_path(file.as_bytes()).await?;
         }
         eprintln!("pnfs-sparse-io files=16 high-offset=1GiB checksum=ok");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;
 
-    let _ = mount.rmdir_path(&case_dir).await;
+    let _ = mount.rmdir_path(case_dir.as_bytes()).await;
     let unmount_result = mount.umount().await;
     result?;
     unmount_result?;
@@ -3543,8 +3594,8 @@ async fn nfs_v41_pnfs_ds_reset_returns_uncertain() -> TestResult {
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
-        let created = mount.create_path(&file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         let seed = Bytes::from(vec![0x3c; 512 * 1024]);
         write_all(mount.as_ref(), created.fh.clone(), &seed).await?;
         std::fs::write(&ready, b"pnfs-ds-session-ready")?;
@@ -3609,8 +3660,8 @@ async fn nfs_v41_pnfs_ds_unreachable_before_write_falls_back_to_mds() -> TestRes
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
-        let created = mount.create_path(&file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         std::fs::write(&ready, b"file-open-no-write-sent")?;
         wait_for_lab_file(&applied, Duration::from_secs(120)).await?;
 
@@ -3621,7 +3672,7 @@ async fn nfs_v41_pnfs_ds_unreachable_before_write_falls_back_to_mds() -> TestRes
         );
         write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
         mount.close(created.fh).await?;
-        let opened = mount.open_path(&file, OPEN_READ).await?;
+        let opened = mount.open_path(file.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
         ensure(
@@ -3659,8 +3710,8 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
-        let created = mount.create_path(&file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         let expected = Bytes::from(
             (0..(1024 * 1024 + 37))
                 .map(|index| ((index * 29 + 43) % 251) as u8)
@@ -3722,7 +3773,7 @@ async fn nfs_v41_pnfs_layoutcommit_failure_retains_dirty_range() -> TestResult {
         // VerifyThenResume by reopening on a fresh mount and verifying the
         // authoritative file rather than retrying on a fenced slot table.
         let verify_mount = parse_url_and_mount(&url).await?;
-        let opened = verify_mount.open_path(&file, OPEN_READ).await?;
+        let opened = verify_mount.open_path(file.as_bytes(), OPEN_READ).await?;
         let actual = read_all(verify_mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         verify_mount.close(opened.fh).await?;
         ensure(
@@ -3765,8 +3816,8 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
     cleanup_pnfs_case(mount.as_ref(), &case_dir, &file).await;
 
     let result = async {
-        mount.mkdir_path(&case_dir, 0o700).await?;
-        let created = mount.create_path(&file, Some(0o600)).await?;
+        mount.mkdir_path(case_dir.as_bytes(), 0o700).await?;
+        let created = mount.create_path(file.as_bytes(), Some(0o600)).await?;
         let expected = Bytes::from(
             (0..(64 * 1024 * 1024 + 37))
                 .map(|index| ((index * 31 + 89) % 251) as u8)
@@ -3802,7 +3853,7 @@ async fn nfs_v41_pnfs_layout_recall_during_write_and_close() -> TestResult {
         .map_err(|_| io::Error::other("ONTAP did not complete CB_LAYOUTRECALL"))?;
         mount.close(created.fh).await?;
 
-        let opened = mount.open_path(&file, OPEN_READ).await?;
+        let opened = mount.open_path(file.as_bytes(), OPEN_READ).await?;
         let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
         mount.close(opened.fh).await?;
         ensure(
@@ -3837,10 +3888,12 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
     let completed = env::var("NFS_RS_LAB_FAULT_DONE_FILE")?;
     let mount = parse_url_and_mount(&url).await?;
     ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
-    let _ = mount.remove_path(RECOVERY_FILE).await;
-    let _ = mount.rmdir_path(RECOVERY_DIR).await;
-    mount.mkdir_path(RECOVERY_DIR, 0o755).await?;
-    let created = mount.create_path(RECOVERY_FILE, Some(0o600)).await?;
+    let _ = mount.remove_path(RECOVERY_FILE.as_bytes()).await;
+    let _ = mount.rmdir_path(RECOVERY_DIR.as_bytes()).await;
+    mount.mkdir_path(RECOVERY_DIR.as_bytes(), 0o755).await?;
+    let created = mount
+        .create_path(RECOVERY_FILE.as_bytes(), Some(0o600))
+        .await?;
     let chunk = Bytes::from(vec![0x5a; 64 * 1024]);
 
     std::fs::write(&ready, b"ready")?;
@@ -3880,8 +3933,8 @@ async fn nfs_v41_session_fault_reopen_resume_checksum() -> TestResult {
         }
     }
     let mount = parse_url_and_mount(&url).await?;
-    mount.remove_path(RECOVERY_FILE).await?;
-    mount.rmdir_path(RECOVERY_DIR).await?;
+    mount.remove_path(RECOVERY_FILE.as_bytes()).await?;
+    mount.rmdir_path(RECOVERY_DIR.as_bytes()).await?;
     mount.umount().await?;
     Ok(())
 }
@@ -3900,10 +3953,12 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     let acknowledged = env::var("NFS_RS_LAB_FAULT_ACK_FILE")?;
     let mount = parse_url_and_mount(&url).await?;
     ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
-    let _ = mount.remove_path(RECOVERY_FILE).await;
-    let _ = mount.rmdir_path(RECOVERY_DIR).await;
-    mount.mkdir_path(RECOVERY_DIR, 0o755).await?;
-    let created = mount.create_path(RECOVERY_FILE, Some(0o600)).await?;
+    let _ = mount.remove_path(RECOVERY_FILE.as_bytes()).await;
+    let _ = mount.rmdir_path(RECOVERY_DIR.as_bytes()).await;
+    mount.mkdir_path(RECOVERY_DIR.as_bytes(), 0o755).await?;
+    let created = mount
+        .create_path(RECOVERY_FILE.as_bytes(), Some(0o600))
+        .await?;
     let chunk = Bytes::from(vec![0xa5; 64 * 1024]);
 
     std::fs::write(&ready, b"ready")?;
@@ -3940,12 +3995,12 @@ async fn nfs_v41_tcp_reset_rebind_checksum() -> TestResult {
     );
     write_all(mount.as_ref(), created.fh.clone(), &expected).await?;
     mount.close(created.fh).await?;
-    let opened = mount.open_path(RECOVERY_FILE, OPEN_READ).await?;
+    let opened = mount.open_path(RECOVERY_FILE.as_bytes(), OPEN_READ).await?;
     let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
     mount.close(opened.fh).await?;
     ensure(actual == expected, "post-rebind checksum payload mismatch")?;
-    mount.remove_path(RECOVERY_FILE).await?;
-    mount.rmdir_path(RECOVERY_DIR).await?;
+    mount.remove_path(RECOVERY_FILE.as_bytes()).await?;
+    mount.rmdir_path(RECOVERY_DIR.as_bytes()).await?;
     mount.umount().await?;
     Ok(())
 }
@@ -3962,10 +4017,12 @@ async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
     let completed = env::var("NFS_RS_LAB_FAULT_DONE_FILE")?;
     let mount = parse_url_and_mount(&url).await?;
     ensure(mount.version() == NFSVersion::NFSv4p1, "NFSv4.1 required")?;
-    let _ = mount.remove_path(CALLBACK_FILE).await;
-    let created = mount.create_path(CALLBACK_FILE, Some(0o600)).await?;
+    let _ = mount.remove_path(CALLBACK_FILE.as_bytes()).await;
+    let created = mount
+        .create_path(CALLBACK_FILE.as_bytes(), Some(0o600))
+        .await?;
     mount.close(created.fh).await?;
-    let delegated = mount.open_path(CALLBACK_FILE, OPEN_BOTH).await?;
+    let delegated = mount.open_path(CALLBACK_FILE.as_bytes(), OPEN_BOTH).await?;
     std::fs::write(&ready, b"delegation-open")?;
     tokio::time::timeout(Duration::from_secs(120), async {
         while !std::path::Path::new(&completed).exists() {
@@ -3978,11 +4035,11 @@ async fn nfs_v41_real_callback_reply_loss_checksum() -> TestResult {
     let expected = payload();
     write_all(mount.as_ref(), delegated.fh.clone(), &expected).await?;
     mount.close(delegated.fh).await?;
-    let opened = mount.open_path(CALLBACK_FILE, OPEN_READ).await?;
+    let opened = mount.open_path(CALLBACK_FILE.as_bytes(), OPEN_READ).await?;
     let actual = read_all(mount.as_ref(), opened.fh.clone(), expected.len()).await?;
     mount.close(opened.fh).await?;
     ensure(actual == expected, "post-callback checksum mismatch")?;
-    mount.remove_path(CALLBACK_FILE).await?;
+    mount.remove_path(CALLBACK_FILE.as_bytes()).await?;
     mount.umount().await?;
     Ok(())
 }
@@ -4019,7 +4076,7 @@ async fn v42_optional_endpoint(url: &str) -> TestResult<serde_json::Value> {
         "exact NFSv4.2 required",
     )?;
     let dir = "nfs42-operations";
-    mount.mkdir_path(dir, 0o700).await?;
+    mount.mkdir_path(dir.as_bytes(), 0o700).await?;
     let mut outcomes = serde_json::Map::new();
     let mut files = Vec::new();
     let mut opened = Vec::new();
@@ -4027,7 +4084,7 @@ async fn v42_optional_endpoint(url: &str) -> TestResult<serde_json::Value> {
         let data = Bytes::from((0..65536).map(|n| ((n * 17 + 9) % 251) as u8).collect::<Vec<_>>());
         for name in ["source", "copy", "clone", "space"] {
             let path = format!("{dir}/{name}");
-            let object = mount.create_path(&path, Some(0o600)).await?;
+            let object = mount.create_path(path.as_bytes(), Some(0o600)).await?;
             files.push(path); opened.push(object.fh);
         }
         let source = opened[0].clone();
@@ -4122,7 +4179,7 @@ async fn v42_optional_endpoint(url: &str) -> TestResult<serde_json::Value> {
             let missing=mount.setxattr_with_mode(source.clone(),key,Bytes::new(),nfs_rs::XattrSetMode::Replace).await.unwrap_err();
             ensure(matches!(missing,NfsError::Nfs4(code) if code as u32==10095),"REPLACE missing did not return NOXATTR")?;
             outcomes.insert("removexattr".into(),serde_json::json!({"status":"passed","missing":"NOXATTR","replace_missing":"NOXATTR"}));
-            let directory = mount.lookup_path(dir).await?.fh;
+            let directory = mount.lookup_path(dir.as_bytes()).await?.fh;
             mount.setxattr_with_mode(directory.clone(),key,Bytes::from_static(b"directory"),nfs_rs::XattrSetMode::Create).await?;
             ensure(mount.getxattr(directory.clone(),key).await?==b"directory"[..],"directory GETXATTR mismatch")?;
             ensure(mount.listxattr(directory.clone()).await?.iter().any(|name|name==key),"directory LISTXATTRS omitted key")?;
@@ -4138,9 +4195,9 @@ async fn v42_optional_endpoint(url: &str) -> TestResult<serde_json::Value> {
         let _ = mount.close(fh).await;
     }
     for path in files {
-        let _ = mount.remove_path(&path).await;
+        let _ = mount.remove_path(path.as_bytes()).await;
     }
-    let _ = mount.rmdir_path(dir).await;
+    let _ = mount.rmdir_path(dir.as_bytes()).await;
     let unmount = mount.umount().await;
     if let Err(error) = result {
         outcomes.insert(

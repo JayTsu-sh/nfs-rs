@@ -1,8 +1,8 @@
 use bytes::{Buf, Bytes};
 
 use crate::nfs4::compound::{
-    CompoundBuilder as CommonCompoundBuilder, OP_GETFH, OP_PUTFH, check_status, response_ops,
-    status_error, take_opaque, take_u32, xdr_opaque, xdr_u32,
+    CompoundBuilder as CommonCompoundBuilder, OP_GETFH, OP_PUTFH, WireArgs, check_status,
+    response_ops, status_error, take_opaque, take_u32, xdr_opaque, xdr_u32,
 };
 use crate::rpc::auth::Auth;
 use crate::{NfsError, Result};
@@ -61,7 +61,7 @@ pub(crate) struct OpenArgs<'a> {
     pub share_access: u32,
     pub client_id: u64,
     pub owner: &'a [u8],
-    pub filename: &'a str,
+    pub filename: &'a [u8],
     pub create: bool,
 }
 
@@ -84,8 +84,8 @@ pub(crate) struct OpenReclaimArgs<'a> {
     pub owner: &'a [u8],
 }
 
-pub(crate) struct CompoundBuilder {
-    inner: CommonCompoundBuilder,
+pub(crate) struct CompoundBuilder<'a> {
+    inner: CommonCompoundBuilder<'a>,
 }
 
 pub(crate) struct SetClientIdArgs<'a> {
@@ -121,7 +121,7 @@ impl<'a> CallbackAddress<'a> {
     }
 }
 
-impl CompoundBuilder {
+impl<'a> CompoundBuilder<'a> {
     pub(crate) fn new(tag: &str) -> Self {
         Self {
             inner: CommonCompoundBuilder::new(tag, 0),
@@ -163,17 +163,17 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn open(self, open: OpenArgs<'_>) -> Self {
+    pub(crate) fn open(self, open: OpenArgs<'a>) -> Self {
         self.open_with_create_attributes(open, false, None)
     }
 
-    pub(crate) fn open_guarded(self, open: OpenArgs<'_>, mode: Option<u32>) -> Self {
+    pub(crate) fn open_guarded(self, open: OpenArgs<'a>, mode: Option<u32>) -> Self {
         self.open_with_create_attributes(open, true, mode)
     }
 
     fn open_with_create_attributes(
         mut self,
-        open: OpenArgs<'_>,
+        open: OpenArgs<'a>,
         guarded: bool,
         mode: Option<u32>,
     ) -> Self {
@@ -198,8 +198,11 @@ impl CompoundBuilder {
             xdr_u32(&mut args, 0); // OPEN4_NOCREATE
         }
         xdr_u32(&mut args, 0); // CLAIM_NULL
-        xdr_opaque(&mut args, open.filename.as_bytes());
-        self.inner = self.inner.operation(OP_OPEN, args);
+        let offset = args.len();
+        self.inner = self.inner.operation(
+            OP_OPEN,
+            WireArgs::with_names(args, offset, open.filename, None),
+        );
         self
     }
 
@@ -333,7 +336,7 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn lookup(mut self, name: &str) -> Self {
+    pub(crate) fn lookup(mut self, name: &'a [u8]) -> Self {
         self.inner = self.inner.lookup(name);
         self
     }
@@ -372,24 +375,28 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn create_directory(mut self, name: &str) -> Self {
+    pub(crate) fn create_directory(mut self, name: &'a [u8]) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 2); // NF4DIR
-        xdr_opaque(&mut args, name.as_bytes());
+        let offset = args.len();
         xdr_u32(&mut args, 0); // empty createattrs bitmap
         xdr_opaque(&mut args, &[]);
-        self.inner = self.inner.operation(OP_CREATE, args);
+        self.inner = self
+            .inner
+            .operation(OP_CREATE, WireArgs::with_names(args, offset, name, None));
         self
     }
 
-    pub(crate) fn create_symlink(mut self, name: &str, target: &str) -> Self {
+    pub(crate) fn create_symlink(mut self, name: &'a [u8], target: &'a [u8]) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK
-        xdr_opaque(&mut args, target.as_bytes());
-        xdr_opaque(&mut args, name.as_bytes());
+        let offset = args.len();
         xdr_u32(&mut args, 0);
         xdr_opaque(&mut args, &[]);
-        self.inner = self.inner.operation(OP_CREATE, args);
+        self.inner = self.inner.operation(
+            OP_CREATE,
+            WireArgs::with_names(args, offset, target, Some(name)),
+        );
         self
     }
 
@@ -398,18 +405,22 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn rename(mut self, from: &str, to: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_opaque(&mut args, from.as_bytes());
-        xdr_opaque(&mut args, to.as_bytes());
-        self.inner = self.inner.operation(OP_RENAME, args);
+    pub(crate) fn rename(mut self, from: &'a [u8], to: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
+        self.inner = self.inner.operation(
+            OP_RENAME,
+            WireArgs::with_names(args, offset, from, Some(to)),
+        );
         self
     }
 
-    pub(crate) fn link(mut self, name: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
-        self.inner = self.inner.operation(OP_LINK, args);
+    pub(crate) fn link(mut self, name: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
+        self.inner = self
+            .inner
+            .operation(OP_LINK, WireArgs::with_names(args, offset, name, None));
         self
     }
 
@@ -439,10 +450,12 @@ impl CompoundBuilder {
         self
     }
 
-    pub(crate) fn remove(mut self, name: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
-        self.inner = self.inner.operation(OP_REMOVE, args);
+    pub(crate) fn remove(mut self, name: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
+        self.inner = self
+            .inner
+            .operation(OP_REMOVE, WireArgs::with_names(args, offset, name, None));
         self
     }
 
@@ -746,7 +759,7 @@ pub(crate) fn decode_remove_response(buf: Bytes) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<String> {
+pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<Bytes> {
     let (count, mut ops) = response_ops(buf)?;
     if count != 2 {
         return Err(NfsError::Xdr(format!(
@@ -755,9 +768,7 @@ pub(crate) fn decode_readlink_response(buf: Bytes) -> Result<String> {
     }
     expect_op(&mut ops, OP_PUTFH, "PUTFH")?;
     expect_op(&mut ops, OP_READLINK, "READLINK")?;
-    let link = take_opaque(&mut ops, "READLINK target")?;
-    String::from_utf8(link.to_vec())
-        .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
+    crate::path_resolution::checked_readlink_target(take_opaque(&mut ops, "READLINK target")?)
 }
 
 pub(crate) fn decode_readdir_response(buf: Bytes) -> Result<Bytes> {
@@ -1692,7 +1703,7 @@ mod tests {
             .putfh(b"source")
             .savefh()
             .putfh(b"target")
-            .link("hardlink")
+            .link(b"hardlink")
             .encode_body();
         let mut expected = Vec::new();
         xdr_opaque(&mut expected, b"namespace");
@@ -1756,14 +1767,15 @@ mod tests {
         .unwrap();
 
         let mut target = Vec::new();
-        xdr_opaque(&mut target, b"target");
+        xdr_opaque(&mut target, b"target-\xff");
         assert_eq!(
             decode_readlink_response(compound_response(
                 "readlink",
                 &[(OP_PUTFH, &[]), (OP_READLINK, &target)]
             ))
-            .unwrap(),
-            "target"
+            .unwrap()
+            .as_ref(),
+            b"target-\xff"
         );
 
         let directory = [0x5au8; 16];
@@ -1826,7 +1838,7 @@ mod tests {
                 .concat(),
             ),
             (
-                CompoundBuilder::new("remove").remove("file").encode_body(),
+                CompoundBuilder::new("remove").remove(b"file").encode_body(),
                 OP_REMOVE,
                 [4u32.to_be_bytes().as_slice(), b"file"].concat(),
             ),
@@ -1865,27 +1877,27 @@ mod tests {
         let cases = [
             (
                 CompoundBuilder::new("mkdir")
-                    .create_directory("dir")
+                    .create_directory(b"dir")
                     .encode_body(),
                 OP_CREATE,
                 2,
             ),
             (
                 CompoundBuilder::new("symlink")
-                    .create_symlink("name", "target")
+                    .create_symlink(b"name", b"target")
                     .encode_body(),
                 OP_CREATE,
                 5,
             ),
             (
                 CompoundBuilder::new("rename")
-                    .rename("old", "new")
+                    .rename(b"old", b"new")
                     .encode_body(),
                 OP_RENAME,
                 3,
             ),
             (
-                CompoundBuilder::new("link").link("name").encode_body(),
+                CompoundBuilder::new("link").link(b"name").encode_body(),
                 OP_LINK,
                 4,
             ),
@@ -1912,7 +1924,7 @@ mod tests {
                 share_access: 3,
                 client_id: 9,
                 owner: b"owner",
-                filename: "file",
+                filename: b"file",
                 create: true,
             })
             .encode_body();

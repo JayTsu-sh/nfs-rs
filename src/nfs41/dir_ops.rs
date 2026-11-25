@@ -21,7 +21,8 @@ fn parse_change_info(op: &OpResponse) -> Option<(bool, u64, u64)> {
 }
 
 impl Mount41 {
-    pub(crate) async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    pub(crate) async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
+        crate::path_resolution::validate_leaf(filename)?;
         let resp = self
             .compound("remove", |b| b.putfh(&dir_fh).remove(filename))
             .await?;
@@ -30,33 +31,35 @@ impl Mount41 {
         if let Some(remove_op) = resp.results.get(2)
             && let Some((atomic, before, after)) = parse_change_info(remove_op)
         {
-            debug!(atomic, before, after, name = filename, "REMOVE change_info");
+            debug!(atomic, before, after, name = ?filename, "REMOVE change_info");
         }
         Ok(())
     }
 
-    pub(crate) async fn remove_path(&self, path: &str) -> Result<()> {
-        let (dir, name) = crate::split_path(path)?;
-        let dir_obj = self.lookup_path(&dir).await?;
-        self.remove(dir_obj.fh, &name).await
+    pub(crate) async fn remove_path(&self, path: &[u8]) -> Result<()> {
+        let (dir, name) = crate::path_resolution::split_byte_path(path)?;
+        let dir_obj = self.lookup_path(dir).await?;
+        self.remove(dir_obj.fh, name).await
     }
 
-    pub(crate) async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    pub(crate) async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         // NFSv4 REMOVE works for both files and directories
         self.remove(dir_fh, dirname).await
     }
 
-    pub(crate) async fn rmdir_path(&self, path: &str) -> Result<()> {
+    pub(crate) async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         self.remove_path(path).await
     }
 
     pub(crate) async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_filename: &str,
+        from_filename: &[u8],
         to_dir_fh: Bytes,
-        to_filename: &str,
+        to_filename: &[u8],
     ) -> Result<()> {
+        crate::path_resolution::validate_leaf(from_filename)?;
+        crate::path_resolution::validate_leaf(to_filename)?;
         // NFSv4 RENAME: PUTFH(src_dir) + SAVEFH + PUTFH(dst_dir) + RENAME(old, new)
         let resp = self
             .compound("rename", |b| {
@@ -86,8 +89,8 @@ impl Mount41 {
                     dst_atomic,
                     dst_before,
                     dst_after,
-                    from = from_filename,
-                    to = to_filename,
+                    from = ?from_filename,
+                    to = ?to_filename,
                     "RENAME change_info"
                 );
             }
@@ -95,12 +98,12 @@ impl Mount41 {
         Ok(())
     }
 
-    pub(crate) async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
-        let (from_dir, from_name) = crate::split_path(from_path)?;
-        let (to_dir, to_name) = crate::split_path(to_path)?;
-        let from_obj = self.lookup_path(&from_dir).await?;
-        let to_obj = self.lookup_path(&to_dir).await?;
-        self.rename(from_obj.fh, &from_name, to_obj.fh, &to_name)
+    pub(crate) async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
+        let (from_dir, from_name) = crate::path_resolution::split_byte_path(from_path)?;
+        let (to_dir, to_name) = crate::path_resolution::split_byte_path(to_path)?;
+        let from_obj = self.lookup_path(from_dir).await?;
+        let to_obj = self.lookup_path(to_dir).await?;
+        self.rename(from_obj.fh, from_name, to_obj.fh, to_name)
             .await
     }
 
@@ -108,8 +111,9 @@ impl Mount41 {
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<mount::Attr> {
+        crate::path_resolution::validate_leaf(dst_filename)?;
         // NFSv4 LINK: PUTFH(src) + SAVEFH + PUTFH(dst_dir) + LINK(newname)
         let bitmap = standard_getattr_bitmap();
         let resp = self
@@ -133,7 +137,7 @@ impl Mount41 {
                 atomic,
                 before,
                 after,
-                name = dst_filename,
+                name = ?dst_filename,
                 "LINK change_info"
             );
         }
@@ -143,19 +147,21 @@ impl Mount41 {
         decode_getattr_response(&mut data)
     }
 
-    pub(crate) async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+    pub(crate) async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<mount::Attr> {
         let src_obj = self.lookup_path(src_path).await?;
-        let (dst_dir, dst_name) = crate::split_path(dst_path)?;
-        let dst_dir_obj = self.lookup_path(&dst_dir).await?;
-        self.link(src_obj.fh, dst_dir_obj.fh, &dst_name).await
+        let (dst_dir, dst_name) = crate::path_resolution::split_byte_path(dst_path)?;
+        let dst_dir_obj = self.lookup_path(dst_dir).await?;
+        self.link(src_obj.fh, dst_dir_obj.fh, dst_name).await
     }
 
     pub(crate) async fn symlink(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<mount::ObjRes> {
+        crate::path_resolution::validate_leaf(dst_filename)?;
+        crate::path_resolution::validate_link_target(target)?;
         // NFSv4 symlink: CREATE with NF4LNK type
         let bitmap = standard_getattr_bitmap();
         let resp = self
@@ -180,10 +186,14 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
-        let (dst_dir, dst_name) = crate::split_path(dst_path)?;
-        let dst_dir_obj = self.lookup_path(&dst_dir).await?;
-        self.symlink(target, dst_dir_obj.fh, &dst_name).await
+    pub(crate) async fn symlink_path(
+        &self,
+        target: &[u8],
+        dst_path: &[u8],
+    ) -> Result<mount::ObjRes> {
+        let (dst_dir, dst_name) = crate::path_resolution::split_byte_path(dst_path)?;
+        let dst_dir_obj = self.lookup_path(dst_dir).await?;
+        self.symlink(target, dst_dir_obj.fh, dst_name).await
     }
 
     /// CREATE(NF4LNK) 与 SETATTR 合并到单个 COMPOUND 的实现。
@@ -198,9 +208,9 @@ impl Mount41 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn symlink_with_attrs(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
         uid: Option<u32>,
         gid: Option<u32>,
         atime: Option<crate::Time>,
@@ -212,6 +222,8 @@ impl Mount41 {
             return self.symlink(target, dst_dir_fh, dst_filename).await;
         }
 
+        crate::path_resolution::validate_leaf(dst_filename)?;
+        crate::path_resolution::validate_link_target(target)?;
         let bitmap = standard_getattr_bitmap();
         let stateid = [0u8; 16]; // anonymous stateid（RFC 5661 §8.2.3）
         let resp = self

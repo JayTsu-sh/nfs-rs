@@ -30,12 +30,12 @@
 //! )
 //! .await?;
 //!
-//! let created = mount.create_path("hello.txt", Some(0o644)).await?;
+//! let created = mount.create_path(b"hello.txt", Some(0o644)).await?;
 //! nfs_rs::write_all(&*mount, created.fh.clone(), 0, Bytes::from_static(b"hello NFS"))
 //!     .await?;
 //! mount.close(created.fh).await?;
 //!
-//! let opened = mount.open_path("hello.txt", OPEN_READ).await?;
+//! let opened = mount.open_path(b"hello.txt", OPEN_READ).await?;
 //! let contents = mount.read(opened.fh.clone(), 0, 9).await?;
 //! mount.close(opened.fh).await?;
 //! assert_eq!(&contents[..], b"hello NFS");
@@ -49,6 +49,7 @@
 //! `noresvport=true` when the server export accepts non-privileged source
 //! ports.
 
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::{TcpSocket, TcpStream};
@@ -254,6 +255,7 @@ mod client_core;
 #[cfg(test)]
 mod client_core_contract;
 mod dialer;
+mod directory_buffer;
 pub mod error;
 mod fileio;
 mod mount;
@@ -342,7 +344,7 @@ use url::Url;
 struct MountArgs {
     versions: Vec<NFSVersion>,
     host: String,
-    dirpath: String,
+    dirpath: Bytes,
     mountport: u16,
     nfsport: u16,
     uid: u32,
@@ -458,14 +460,16 @@ fn export_listing_url(host: &str) -> String {
     }
 }
 
-/// Parses the specified URL and attempts to mount the relevant NFS export
+/// Parses the specified URL and attempts to mount the relevant NFS export.
+/// Each export path component is percent-decoded once into bytes. Encoded `/`
+/// and NUL are rejected. For example, `%FF` represents the single byte `0xff`.
 ///
 /// # Example
 ///
 /// ```no_run
 /// async fn example() {
 ///     let mount = nfs_rs::parse_url_and_mount("nfs://127.0.0.1/some/export?version=4.1,4.0,3").await.unwrap();
-///     if let Some(res) = mount.create_path("nfs-rs.txt", Some(0o664)).await.ok() {
+///     if let Some(res) = mount.create_path(b"nfs-rs.txt", Some(0o664)).await.ok() {
 ///         let contents = "hello rust".as_bytes().to_vec();
 ///         let contents_len = contents.len();
 ///         let num_bytes_written = nfs_rs::write_all(&*mount, res.fh.clone(), 0, contents.clone().into()).await.unwrap_or_default();
@@ -493,7 +497,7 @@ pub async fn parse_url_and_mount(url: &str) -> Result<Box<dyn Mount>> {
 /// async fn example() {
 ///     let exports = nfs_rs::list_exports("192.168.1.1").await.unwrap();
 ///     for e in exports {
-///         println!("{} {:?}", e.path, e.groups);
+///         println!("{:?} {:?}", e.path, e.groups);
 ///     }
 /// }
 /// ```
@@ -610,28 +614,30 @@ fn parse_url(url: &str) -> Result<MountArgs> {
         ));
     }
     let host = parsed_url.host_str().unwrap_or_default().to_string();
-    let dirpath = parsed_url
-        .path()
-        .split('/')
-        .map(|encoded| {
-            let decoded = percent_decode_str(encoded)
-                .decode_utf8()
-                .map_err(|_| NfsError::InvalidInput("NFS export path is not valid UTF-8".into()))?;
-            if decoded.contains('/') || decoded.contains('\0') {
+    let path = parsed_url.path();
+    let mut dirpath = Vec::with_capacity(path.len().max(1));
+    for (index, component) in path.split('/').enumerate() {
+        if index != 0 {
+            dirpath.push(b'/');
+        }
+        for byte in percent_decode_str(component) {
+            if matches!(byte, b'/' | 0) {
                 return Err(NfsError::InvalidInput(
                     "NFS export path contains an encoded separator or NUL".into(),
                 ));
             }
-            Ok(decoded.into_owned())
-        })
-        .collect::<Result<Vec<_>>>()?
-        .join("/");
+            dirpath.push(byte);
+        }
+    }
+    if dirpath.is_empty() {
+        dirpath.push(b'/');
+    }
     Ok(MountArgs {
         versions,
         host,
         mountport,
         nfsport,
-        dirpath,
+        dirpath: dirpath.into(),
         uid,
         gid,
         readdir_buffer,
@@ -675,7 +681,7 @@ fn parse_readdir_buffer_query_param(param: &str) -> Result<(u32, u32)> {
 async fn mount(args: MountArgs) -> Result<Box<dyn Mount>> {
     let mut errs: Vec<NfsError> = Vec::new();
     for version in &args.versions {
-        info!(version = ?version, host = %args.host, dirpath = %args.dirpath, "attempting NFS mount");
+        info!(version = ?version, host = %args.host, dirpath = ?args.dirpath, "attempting NFS mount");
         let res: Result<Box<dyn Mount>> = match version {
             NFSVersion::NFSv3 => nfs3::mount(&args).await,
             NFSVersion::NFSv4p1 => nfs41::mount::mount(&args, nfs41::MinorVersion::V1).await,
@@ -707,6 +713,7 @@ fn nfs_error_msg(err: &NfsError) -> String {
         NfsError::Nfs4(c) => c.to_string(),
         NfsError::LockDenied { .. } => err.to_string(),
         NfsError::Mount(c) => c.to_string(),
+        NfsError::RpcGarbageArgs => err.to_string(),
         NfsError::Rpc(s)
         | NfsError::Xdr(s)
         | NfsError::Unsupported(s)
@@ -760,40 +767,6 @@ fn squash_mount_errors(errs: Vec<NfsError>) -> NfsError {
     NfsError::Rpc(msg)
 }
 
-fn split_path(path: &str) -> Result<(String, String)> {
-    let cleaned = path_clean::clean(format!("/=/{}", path));
-    if !cleaned.starts_with("/=/") {
-        return Err(NfsError::InvalidInput("invalid path specified".to_string()));
-    }
-    if cleaned.eq(std::path::Path::new("/=/")) {
-        return Ok(("/".to_string(), "".to_string()));
-    }
-    let dir = cleaned
-        .parent()
-        .map(|x| {
-            let path_str = x.to_string_lossy();
-            let trimmed = &path_str[2..];
-            #[cfg(windows)]
-            {
-                // Windows platform: replace backslashes with forward slashes
-                trimmed.replace('\\', "/")
-            }
-            #[cfg(not(windows))]
-            {
-                // Non-Windows platform: keep original separators
-                trimmed.to_string()
-            }
-        })
-        .ok_or_else(|| NfsError::InvalidInput("invalid path specified".to_string()))?;
-
-    let name = cleaned
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    Ok((dir, name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,13 +797,23 @@ mod tests {
             ("100%2520done", "/100%20done"),
         ] {
             let args = parse_url(&format!("nfs://127.0.0.1/{path}")).expect("valid export URL");
-            assert_eq!(args.dirpath, expected, "{path}");
+            assert_eq!(args.dirpath.as_ref(), expected.as_bytes(), "{path}");
         }
-        for path in ["%FF", "a%2Fb", "a%00b"] {
+        for path in ["a%2Fb", "a%2fb", "a%00b"] {
             assert!(
                 parse_url(&format!("nfs://127.0.0.1/{path}")).is_err(),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn export_url_accepts_non_utf8_for_each_protocol() {
+        for version in ["3", "4.0", "4.1", "4.2"] {
+            let options =
+                MountOptions::from_url(&format!("nfs://server/data/%FF/%252F/?version={version}"))
+                    .unwrap();
+            assert_eq!(options.0.dirpath.as_ref(), b"/data/\xff/%2F/");
         }
     }
 
@@ -977,7 +960,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -994,7 +977,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), (616, 666));
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1008,7 +991,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20490);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1022,7 +1005,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20490);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1036,7 +1019,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1050,7 +1033,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1064,7 +1047,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1078,7 +1061,7 @@ mod tests {
         assert_eq!(args.host, "localhost".to_string());
         assert_eq!(args.nfsport, 20389);
         assert_eq!(args.mountport, 20490);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, None);
     }
@@ -1108,7 +1091,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, Some((4096, 4096)));
     }
@@ -1122,7 +1105,7 @@ mod tests {
         assert_eq!(args.host, "127.0.0.1".to_string());
         assert_eq!(args.nfsport, 0);
         assert_eq!(args.mountport, 0);
-        assert_eq!(args.dirpath, "/some/export/path".to_string());
+        assert_eq!(args.dirpath.as_ref(), b"/some/export/path");
         assert_eq!((args.uid, args.gid), get_uid_gid());
         assert_eq!(args.readdir_buffer, Some((2048, 4096)));
     }
@@ -1282,64 +1265,6 @@ mod tests {
         assert!(
             matches!(&err, NfsError::Rpc(msg) if msg == "some error - some other error - NFSv4 is not supported - NFSv4.2 is not supported")
         );
-    }
-
-    #[test]
-    fn split_path_empty_path() {
-        let path = "";
-        let res = split_path(path);
-        assert!(res.is_ok());
-        let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/".to_string());
-        assert_eq!(name, "".to_string());
-    }
-
-    #[test]
-    fn split_path_root_path() {
-        let path = "/";
-        let res = split_path(path);
-        assert!(res.is_ok());
-        let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/".to_string());
-        assert_eq!(name, "".to_string());
-    }
-
-    #[test]
-    fn split_path_sneaky_one() {
-        let path = "..";
-        let res = split_path(path);
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
-    }
-
-    #[test]
-    fn split_path_sneaky_two() {
-        let path = "/first/../..";
-        let res = split_path(path);
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(matches!(&err, NfsError::InvalidInput(msg) if msg == "invalid path specified"));
-    }
-
-    #[test]
-    fn split_path_path_depth_one() {
-        let path = "/first/place/";
-        let res = split_path(path);
-        assert!(res.is_ok());
-        let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/first".to_string());
-        assert_eq!(name, "place".to_string());
-    }
-
-    #[test]
-    fn split_path_path_depth_two() {
-        let path = "/first/place/1999.txt";
-        let res = split_path(path);
-        assert!(res.is_ok());
-        let (dir, name) = res.unwrap();
-        assert_eq!(dir, "/first/place".to_string());
-        assert_eq!(name, "1999.txt".to_string());
     }
 
     #[test]

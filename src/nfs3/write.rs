@@ -75,7 +75,7 @@ mod tests {
         let mount = Mount {
             rpc: crate::rpc::Client::new_dummy().await,
             auth: crate::rpc::auth::Auth::new_null(),
-            dir: "/".to_string(),
+            dir: Bytes::from_static(b"/"),
             fh: Bytes::new(),
             dircount: 512,
             maxcount: 4096,

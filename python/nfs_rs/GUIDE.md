@@ -133,11 +133,17 @@ v4.1 engine; data servers can independently negotiate v4.1.
 client (similar to `showmount -e`):
 
 ```python
+from urllib.parse import quote_from_bytes
 from nfs_rs import list_exports
 
 for export in list_exports("nfs://server/"):
-    print(export.path, export.groups)
+    url = "nfs://server" + quote_from_bytes(export.path, safe="/") + "?version=3"
+    print(url, export.groups)
 ```
+
+Export paths and groups are `bytes`. Mount URLs remain text. Each path
+component is percent-decoded once, so `%FF` sends the single byte `0xff`.
+Encoded `/` and NUL are rejected. NFSv3 uses the same path bytes for MNT and UMNT.
 
 Use `await list_exports_async(...)` in async code. It is not NFSv4 namespace
 discovery; availability depends on the server exposing the MOUNT service.
@@ -193,9 +199,11 @@ with Client.connect("nfs://server/export?version=4.1") as client:
 
 ### Paths and directories
 
-All paths are relative to the mounted export. `str` and `os.PathLike[str]` are
-accepted. Absolute paths, attempts to escape with `..`, embedded NUL bytes, and
-byte-string paths are rejected before reaching the server.
+Filesystem paths are interpreted relative to the mounted export. Traversal,
+lookup, opening, metadata and namespace operations accept `str`, `bytes`,
+`os.PathLike` values, and contiguous read-only views of immutable bytes.
+Pass `bytes` or a view when the original filename may contain non-UTF-8
+bytes. Paths with embedded NUL or a `..` escape are rejected.
 
 ```python
 from pathlib import Path
@@ -228,8 +236,9 @@ creation time. The same fields appear on `DirEntry.info` from `scandir`.
 `utime(ns=(atime, mtime))` continues to take nanosecond values.
 
 `scandir` accepts `DirectoryRef(path, fh=None)` or a previously returned
-`DirEntry`, in addition to a string/path-like value. With `fh`, the adapter calls
-`Mount::readdirplus(fh)` directly; without it, it first calls `lookup_path`.
+`DirEntry`, in addition to byte, text and path-like values. With `fh`, the
+adapter calls `Mount::readdirplus(fh)` directly. When an entry has no child
+handle, it looks up the original name relative to the entry's parent handle.
 `DirEntry.fh` contains the server's opaque handle when supplied, otherwise `None`.
 Use handles from the same mount. The path labels results and errors; it is not
 looked up or checked against a supplied handle. Invalid/stale handles produce an
@@ -245,7 +254,14 @@ for entry in client.scandir(DirectoryRef("jobs", fh=None)):
             print(child.path)  # reuses entry.fh when present
 ```
 
-The same target structures work with `AsyncClient.scandir`.
+The same target structures work with `AsyncClient.scandir`. Pass a returned
+`DirEntry` to `scandir`, `scandir_page`, `stat`, or `open` on the client that
+returned it. This uses its handle or the parent handle and raw name as
+appropriate, and avoids constructing the full path. `open(entry)` requires
+the existing entry. When it carries a file handle, the client verifies
+the handle returned by OPEN before exposing the file or truncating it.
+Writing through an entry requires its file handle. A missing name raises
+`FileNotFoundError` and a replaced entry raises `NfsInvalidInputError`.
 
 Both clients transfer directory results from Rust in batches of at most 128
 entries, while the public iterator yields one `DirEntry` at a time. Ready
@@ -258,6 +274,24 @@ error are yielded before that error is raised.
 Use `scandir()` for metadata and file handles. `scandir()` streams entries and
 avoids constructing a complete list. Consume or
 close the client before discarding a partially consumed iterator.
+
+Both methods default to the mounted export's root (`b"."`). `scandir()` and
+`scandir_page()` expose read-only `memoryview` objects over the original reply.
+`listdir()` copies names once into compact blocks so that earlier RPC replies
+can be released during enumeration. The collected name bytes and Rust name
+handles have a 64 MiB per-call limit, reported as `NfsOSError` with
+`errno=EOVERFLOW` when exceeded.
+
+`DirEntry.path` builds an export-relative `bytes` path when accessed. Path
+operations, including DACL, SACL, xattr and NFSv4.2 operations, accept bytes
+and contiguous read-only views of immutable bytes or returned names. The
+client encodes text paths as UTF-8. Decode names explicitly for display.
+
+Views from `scandir()` and `scandir_page()` keep their entire reply alive.
+A separate 64 MiB process-wide budget conservatively accounts for retained
+RPC replies. Exhausting it raises `NfsOSError` with `errno=EAGAIN`.
+Release entries or explicitly copy individual names that must be stored
+beyond the scan.
 
 ### Resumable directory pages
 
@@ -301,15 +335,27 @@ Namespace operations include `mkdir`, `touch`, `remove`/`unlink`, `rmdir`,
 `rename`, hard `link`, `symlink`, and `readlink`. `remove` and `unlink` are
 equivalent file-removal operations.
 
+Both operands of `rename` and `link` accept byte paths. For example:
+
+```python
+with client.open(b"old-\xd6\xd0\xce\xc4", "wb") as file:
+    file.write(b"payload")
+client.rename(b"old-\xd6\xd0\xce\xc4", b"new-\xd6\xd0\xce\xc4")
+client.symlink(b"new-\xd6\xd0\xce\xc4", b"latest")
+assert client.readlink(b"latest") == b"new-\xd6\xd0\xce\xc4"
+client.unlink(b"latest")
+client.unlink(b"new-\xd6\xd0\xce\xc4")
+```
+
 ### Checking symbolic-link targets
 
 Available in 0.12.0. `resolve` accepts ordinary file and directory paths as well
 as symbolic links, so no preliminary type check is needed.
 
-`readlink(path)` returns the stored target text. `stat(path)` and `exists(path)`
-inspect the link itself; a dangling link can therefore pass `exists`.
-The String-based interface raises `NfsEncodingError` for a non-UTF-8 target;
-it never replaces undecodable bytes with a different filename.
+`symlink(target, link_path)` stores the target bytes as supplied, including
+relative components and leading or trailing slashes. `readlink(path)`
+returns those bytes as a read-only `memoryview`. `stat(path)` and
+`exists(path)` inspect the link itself, including when its target is missing.
 Use `resolve(path)` to follow intermediate and final links and inspect the target:
 
 ```python
@@ -328,13 +374,13 @@ else:
 
 `PathResolution.status` is `RESOLVED`, `MISSING`, `NOT_DIRECTORY`, `OUTSIDE_MOUNT`
 or `TOO_MANY_SYMLINKS`. `path` and `info` are present only for `RESOLVED`;
-`path` is export-relative (`.` for root). `exists` is `True` for `RESOLVED`,
+`path` is a read-only byte view (`b"."` for root). `exists` is `True` for `RESOLVED`,
 `False` for `MISSING`/`NOT_DIRECTORY`, and `None` for the other two states.
 Check with `is True` / `is False` to preserve that distinction.
 
 For example, if `links/latest` stores `../data/report.csv`, a successful
-`client.resolve("links/latest").path` is `data/report.csv`. The original stored
-text remains available through `client.readlink("links/latest")`. Multilevel
+`client.resolve("links/latest").path` compares equal to `b"data/report.csv"`. The stored
+target remains available through `client.readlink("links/latest")`. Multilevel
 links resolve to the final target. A non-link path returns its own information.
 
 Relative targets start at the link's directory. `..` is evaluated after following
@@ -345,8 +391,8 @@ absolute link targets also return `OUTSIDE_MOUNT`, because the library cannot ma
 the client's root namespace to this export. This does not mean the target is broken.
 
 The resolver follows at most 40 links and accepts at most 4096 cumulative path
-components / 64 KiB of cumulative UTF-8 path text, including link expansions.
-Oversized or NUL-containing text raises `ValueError`. Permission, connection,
+components / 64 KiB of cumulative path bytes, including link expansions.
+Oversized or NUL-containing paths raises `ValueError`. Permission, connection,
 timeout, stale-handle and other errors propagate instead of becoming a missing
 target. `operation_timeout` covers the complete Python resolution. This is an
 observation of the namespace; it neither checks read/write permissions nor
@@ -555,6 +601,15 @@ session binding and replay share this limit, subject to the request's own
 replay permission and deadline. Brief flaps can recover transparently; exhaustion
 preserves the first connection error and sent/uncertain outcome evidence.
 No URL setting is needed. Ordinary response timeouts remain separate.
+
+For NFSv3, an RPC `GARBAGE_ARGS` reply raises `NfsRpcError` with `code=4`,
+`code_name="GARBAGE_ARGS"`, and `recovery_action="do_not_retry"`. If the
+server reports `NFS3ERR_NAMETOOLONG`, Python raises `NfsOSError` with
+`errno=ENAMETOOLONG`.
+
+`NfsError.filename` and `RecoveryEvent.path` carry path bytes when available.
+Use `repr()` when displaying a path so invalid UTF-8 bytes and literal backslashes
+remain distinguishable.
 
 Errors map to familiar Python families where possible:
 

@@ -12,7 +12,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("path,status,exists,target", [
-    ("file", "resolved", True, "file"),
+    ("file", "resolved", True, b"file"),
+    (memoryview(b"raw-link"), "resolved", True, b"raw-\xff"),
     ("nested", "resolved", True, "nested"),
     ("link", "resolved", True, "file"),
     ("nested/up", "resolved", True, "file"),
@@ -43,11 +44,13 @@ def test_native_sync_and_async_resolution(path, status, exists, target):
         assert isinstance(result, PathResolution)
         assert result.status is PathResolutionStatus(status)
         assert result.exists is exists
-        assert result.path == target
+        expected = target.encode() if isinstance(target, str) else target
+        assert result.path == expected
         if target is None:
             assert result.info is None
         else:
-            assert result.info.path == target
+            assert result.path.readonly
+            assert result.info.path == expected
             assert result.info.fileid == 9
 
     with Client.connect("nfs-test://fixture/export") as client:
@@ -71,7 +74,7 @@ def test_native_resolution_preserves_errors_and_context():
             with pytest.raises(error) as caught:
                 client.resolve(path)
             assert caught.value.operation == "resolve"
-            assert caught.value.filename == path
+            assert caught.value.filename == path.encode()
             assert caught.value.protocol == str(client.version)
 
     async def scenario():
@@ -80,7 +83,7 @@ def test_native_resolution_preserves_errors_and_context():
                 with pytest.raises(error) as caught:
                     await client.resolve(path)
                 assert caught.value.operation == "resolve"
-                assert caught.value.filename == path
+                assert caught.value.filename == path.encode()
 
     asyncio.run(scenario())
 
@@ -89,8 +92,8 @@ def test_native_resolution_validates_paths_and_bounds_expansion():
     from nfs_rs import Client
 
     with Client.connect("nfs-test://fixture/export") as client:
-        assert client.resolve(Path("nested/up")).path == "file"
-        for path in [b"bytes", "bad\0name", "/file", "x" * 65537, "./" * 4096, "nul", "long", "many"]:
+        assert client.resolve(Path("nested/up")).path == b"file"
+        for path in [b"bad\0name", "bad\0name", "/file", "x" * 65537, "./" * 4096, "nul", "long", "many"]:
             with pytest.raises((TypeError, ValueError)):
                 client.resolve(path)
 

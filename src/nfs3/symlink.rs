@@ -18,30 +18,32 @@ use super::{
     Mount, ObjRes, Result, SYMLINK3args, SYMLINK3resok, diropargs3, filename3, from_post_op_fh3,
     nfs_fh3, nfspath3, sattr3, symlinkdata3,
 };
-use crate::split_path;
+use crate::path_resolution::split_byte_path;
 use bytes::Bytes;
 
 impl Mount {
-    pub async fn symlink_path(&self, src_path: &str, dst_path: &str) -> Result<ObjRes> {
-        let (dst_dir, dst_filename) = split_path(dst_path)?;
-        let dst_dir_fh = self.lookup_path(&dst_dir).await?.fh;
-        self.symlink(src_path, dst_dir_fh, &dst_filename).await
+    pub async fn symlink_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<ObjRes> {
+        let (dst_dir, dst_filename) = split_byte_path(dst_path)?;
+        let dst_dir_fh = self.lookup_path(dst_dir).await?.fh;
+        self.symlink(src_path, dst_dir_fh, dst_filename).await
     }
 
     pub async fn symlink(
         &self,
-        src_path: &str,
+        src_path: &[u8],
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<ObjRes> {
+        crate::path_resolution::validate_leaf(dst_filename)?;
+        crate::path_resolution::validate_link_target(src_path)?;
         let args = SYMLINK3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dst_dir_fh },
-                name: filename3(dst_filename.to_string()),
+                name: filename3(dst_filename),
             },
             symlink: symlinkdata3 {
                 symlink_attributes: sattr3::default(),
-                symlink_data: nfspath3(src_path.to_string()),
+                symlink_data: nfspath3(src_path),
             },
         };
         self._symlink(args).await?.into()
