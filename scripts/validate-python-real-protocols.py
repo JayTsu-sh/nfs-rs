@@ -221,7 +221,7 @@ def sync_scenario(url: str, version: str, require_pnfs: bool, payload: bytes) ->
         heartbeats_during_read = heartbeat_after_read - heartbeat_before_read
         assert data == payload and heartbeats_during_read >= 2
         verified_rename(client, payload_path, renamed_path)
-        assert "renamed.bin" in {name for name in client.listdir(leaf) if name not in {".", ".."}}
+        assert b"renamed.bin" in {name for name in client.listdir(leaf) if name not in {b".", b".."}}
         verified_remove(client, renamed_path)
         return {
             "write_mib_s": len(payload) / write_seconds / 2**20,

@@ -219,7 +219,7 @@ def remove_tree(client: nfs_rs.Client, path: str) -> None:
     if info.type == nfs_rs.FileType.DIRECTORY:
         entries = list(client.scandir(path))
         for entry in entries:
-            if entry.name not in {".", ".."}:
+            if entry.name not in {b".", b".."}:
                 remove_tree(client, entry.path)
         client.rmdir(path)
     else:
@@ -293,9 +293,9 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         info = client.stat(data)
         check(info.size == 7 and info.type == nfs_rs.FileType.FILE, "Client.stat", checks)
         names = client.listdir(root)
-        check("data.bin" in names, "Client.listdir", checks)
+        check(b"data.bin" in names, "Client.listdir", checks)
         entries = {entry.name: entry for entry in client.scandir(root)}
-        check(entries["data.bin"].info.size == 7, "Client.scandir", checks)
+        check(entries[b"data.bin"].info.size == 7, "Client.scandir", checks)
         page = client.scandir_page(root)
         paged = list(page.entries)
         while not page.eof:
@@ -504,9 +504,9 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             check(await file.read() == b"payload", "AsyncFile.read", checks)
         info = await client.stat(data)
         check(info.size == 7, "AsyncClient.stat", checks)
-        check("async-data.bin" in await client.listdir(root), "AsyncClient.listdir", checks)
+        check(b"async-data.bin" in await client.listdir(root), "AsyncClient.listdir", checks)
         entries = {entry.name: entry async for entry in client.scandir(root)}
-        check(entries["async-data.bin"].info.size == 7, "AsyncClient.scandir", checks)
+        check(entries[b"async-data.bin"].info.size == 7, "AsyncClient.scandir", checks)
         page = await client.scandir_page(root)
         paged = list(page.entries)
         while not page.eof:
