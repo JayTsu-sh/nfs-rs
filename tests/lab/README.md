@@ -77,12 +77,12 @@ real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
 With accepted baselines committed, the scheduled `Performance baseline
 capture` workflow runs at 02:00, 10:00, and 18:00 UTC, records five independent
-captures for every runner-direct environment, and uploads the raw JSON and
-generated report. Environments marked `executor` in the manifest (OTS pNFS)
-are acquired from a data-network executor host the runner cannot reach
-directly; the runner skips them in capture and gate mode, and the gate and
-baseline report show them as `executor_pending` (a warning, not a release
-failure) until executor acquisition is wired and their baseline is accepted.
+captures per environment, and uploads the raw JSON and generated report.
+Environments marked `executor: ots-dxn-node` in the manifest are acquired via
+the DXN executor for capture, release validation, and supplemental measurements.
+An OTS baseline that is still collecting samples reports `executor_pending`.
+Once accepted, it requires at least four valid measurements from the current
+release gate, including when executor credentials are unavailable.
 The reduced cadence monitors drift without retaining the temporary
 20-minute bootstrap schedule.
 

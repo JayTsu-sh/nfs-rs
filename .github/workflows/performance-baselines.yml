@@ -40,24 +40,10 @@ jobs:
           [[ -n "$toolchain_bin" ]] || { echo "Rust 1.95.0 not found" >&2; exit 1; }
           echo "$toolchain_bin" >> "$GITHUB_PATH"
       - run: rustc --version | grep -q '^rustc 1\.95\.0 '
-      - name: Discover pre-provisioned Zig 0.13.0
-        run: |
-          zig_bin=""
-          for candidate in \
-            "/opt/zig/0.13.0" \
-            "/home/github-runner/.local/zig/0.13.0"; do
-            if [[ -x "$candidate/zig" ]]; then
-              zig_bin="$candidate"
-              break
-            fi
-          done
-          if [[ -z "$zig_bin" ]]; then
-            echo "pre-provisioned Zig 0.13.0 not found" >&2
-            exit 1
-          fi
-          echo "$zig_bin" >> "$GITHUB_PATH"
       - name: Use pre-provisioned Zig 0.13.0
-        run: test "$(zig version)" = "0.13.0"
+        run: |
+          zig="$(tests/lab/find-runner-zig.sh)"
+          dirname "$zig" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -66,23 +52,7 @@ jobs:
       - name: Prepare OTS pNFS executor SSH credentials
         env:
           OTS_SSH_KEY: ${{ secrets.NFS_RS_OTS_SSH_KEY }}
-        run: |
-          key_dir="$RUNNER_TEMP/ots-executor-ssh"
-          mkdir -p "$key_dir"
-          printf '%s\n' "$OTS_SSH_KEY" > "$key_dir/key"
-          chmod 600 "$key_dir/key"
-          touch "$key_dir/known_hosts"
-          probe_options=(-i "$key_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes
-            -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$key_dir/known_hosts"
-            -o ConnectTimeout=15)
-          # Trust-on-first-use probe for both hops; the executor scripts then
-          # enforce StrictHostKeyChecking=yes against this known_hosts file.
-          ssh "${probe_options[@]}" root@10.128.134.90 true
-          ssh "${probe_options[@]}" \
-            -o "ProxyCommand=ssh -i $key_dir/key -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$key_dir/known_hosts -W %h:%p root@10.128.134.90" \
-            root@10.128.135.141 true
-          echo "LAB_OTS_SSH_KEY=$key_dir/key" >> "$GITHUB_ENV"
-          echo "LAB_OTS_KNOWN_HOSTS=$key_dir/known_hosts" >> "$GITHUB_ENV"
+        run: tests/lab/prepare-ots-executor.sh
       - name: Capture every storage environment and protocol
         run: tests/benchmarks/run-storage-benchmark-suite.sh capture "$RUN_ID" "$RUNNER_TEMP/storage-performance-captures"
       - name: Upload baseline captures and report

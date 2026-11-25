@@ -63,11 +63,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Use pre-provisioned Zig 0.13.0
+        run: |
+          zig="$(tests/lab/find-runner-zig.sh)"
+          dirname "$zig" >> "$GITHUB_PATH"
       - name: Build and install the Python conformance wheel
         run: |
           python -m pip install "maturin>=1,<2"
           mkdir -p "$RUNNER_TEMP/python-conformance-wheel"
-          maturin build --locked --out "$RUNNER_TEMP/python-conformance-wheel"
+          maturin build --release --locked --compatibility manylinux2014 --zig --out "$RUNNER_TEMP/python-conformance-wheel"
           python -m pip install --force-reinstall --no-deps "$RUNNER_TEMP"/python-conformance-wheel/*.whl
           shopt -s nullglob
           wheels=("$RUNNER_TEMP"/python-conformance-wheel/*.whl)
@@ -130,23 +134,7 @@ jobs:
       - name: Prepare OTS pNFS executor SSH credentials
         env:
           OTS_SSH_KEY: ${{ secrets.NFS_RS_OTS_SSH_KEY }}
-        run: |
-          key_dir="$RUNNER_TEMP/ots-executor-ssh"
-          mkdir -p "$key_dir"
-          printf '%s\n' "$OTS_SSH_KEY" > "$key_dir/key"
-          chmod 600 "$key_dir/key"
-          touch "$key_dir/known_hosts"
-          probe_options=(-i "$key_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes
-            -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$key_dir/known_hosts"
-            -o ConnectTimeout=15)
-          # Trust-on-first-use probe for both hops; the executor scripts then
-          # enforce StrictHostKeyChecking=yes against this known_hosts file.
-          ssh "${probe_options[@]}" root@10.128.134.90 true
-          ssh "${probe_options[@]}" \
-            -o "ProxyCommand=ssh -i $key_dir/key -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=$key_dir/known_hosts -W %h:%p root@10.128.134.90" \
-            root@10.128.135.141 true
-          echo "LAB_OTS_SSH_KEY=$key_dir/key" >> "$GITHUB_ENV"
-          echo "LAB_OTS_KNOWN_HOSTS=$key_dir/known_hosts" >> "$GITHUB_ENV"
+        run: tests/lab/prepare-ots-executor.sh
       - name: NFSv4.1 session recovery E2E
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-session-recovery-e2e.sh "$RUN_ID"
       - name: NFSv4.1 TCP rebind E2E

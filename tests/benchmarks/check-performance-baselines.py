@@ -126,31 +126,18 @@ for environment in manifest["environments"]:
         and baseline.get("capture_runs", 0) >= manifest["minimum_capture_runs"]
         and baseline.get("capture_windows", 0) >= manifest["minimum_capture_windows"]
     )
-    if environment.get("executor"):
-        # Executor-marked environments are acquired from a data-network
-        # executor host the runner cannot reach directly (the OTS data
-        # network is only reachable through the DXN jump path). They wait
-        # for executor acquisition and an accepted baseline, and report
-        # executor_pending (a warning) instead of gating the release;
-        # once both exist, their fetched results gate like any other
-        # environment.
-        executor_results = sorted(results_root.glob(f'{environment["id"]}-run-*.json'))
-        if accepted and executor_results:
-            row = evaluate_runs(baseline, executor_results)
-        else:
-            row = {
-                "status": "executor_pending",
-                "valid_runs": 0,
-                "violations": [],
-                "warnings": [],
-            }
-    elif accepted:
+    if accepted:
         row = evaluate_runs(
             baseline,
             sorted(results_root.glob(f'{environment["id"]}-run-*.json')),
         )
     else:
-        row = {"status": "baseline_missing", "valid_runs": 0, "violations": [], "warnings": []}
+        row = {
+            "status": "executor_pending" if environment.get("executor") else "baseline_missing",
+            "valid_runs": 0,
+            "violations": [],
+            "warnings": [],
+        }
     retryable = (
         row["status"] == "fail"
         and row["violations"]

@@ -740,11 +740,16 @@ def main() -> None:
         "results": [],
     }
     failures: list[str] = []
+    failure_details: list[dict[str, str]] = []
     for case in arguments.case:
         try:
             result["results"].append(validate_case(case, arguments.run_id))  # type: ignore[union-attr]
         except Exception as error:
             failures.append(f"{case.name}: {type(error).__name__}: {error}")
+            failure_details.append(
+                {"case": case.name, "stage": "validate", "type": type(error).__name__, "message": str(error)}
+            )
+    result["failure_details"] = failure_details
     result["failures"] = failures
     result["status"] = "failed" if failures else "passed"
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
