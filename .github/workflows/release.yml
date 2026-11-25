@@ -10,6 +10,7 @@ permissions:
 jobs:
   validate:
     uses: ./.github/workflows/release-validation.yml
+    secrets: inherit
     with:
       ref: ${{ github.ref }}
 
