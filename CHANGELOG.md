@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-25
+
 ### Changed
 
 - NFSv3, v4.0 and v4.1 directory listing preserves raw name bytes. Rust

@@ -77,12 +77,12 @@ real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
 With accepted baselines committed, the scheduled `Performance baseline
 capture` workflow runs at 02:00, 10:00, and 18:00 UTC, records five independent
-captures for every runner-direct environment, and uploads the raw JSON and
-generated report. Environments marked `executor` in the manifest (OTS pNFS)
-are acquired from a data-network executor host the runner cannot reach
-directly; the runner skips them in capture and gate mode, and the gate and
-baseline report show them as `executor_pending` (a warning, not a release
-failure) until executor acquisition is wired and their baseline is accepted.
+captures per environment, and uploads the raw JSON and generated report.
+Environments marked `executor: ots-dxn-node` in the manifest are acquired via
+the DXN executor for capture, release validation, and supplemental measurements.
+An OTS baseline that is still collecting samples reports `executor_pending`.
+Once accepted, it requires at least four valid measurements from the current
+release gate, including when executor credentials are unavailable.
 The reduced cadence monitors drift without retaining the temporary
 20-minute bootstrap schedule.
 
@@ -170,7 +170,15 @@ acceptance baselines. Commit only reusable tests and deliberately redacted,
 reviewed documentation; retain raw investigation data locally for reproduction.
 
 
-## AFX NFSv4.2
+## AFX NFSv4.2 (environment retired)
+
+> **Status 2026-11-24:** the AFX environment (jump `10.128.56.17`, svm2 data
+> network `192.168.9.x`) is decommissioned, so `run-afx-v42-e2e.sh` cannot run
+> until an AFX replacement is provisioned. The script is retained for manual
+> re-activation on a compatible v4.2 fixture. The current pNFS storage is OTS
+> (see the OTS executor notes in `common.sh`); OTS is exercised through the
+> DXN executor node `10.128.135.141` (data `10.30.3.x`) via jump
+> `10.128.134.90`.
 
 Run `run-afx-v42-e2e.sh` on the AFX data-network executor, with a unique
 `nightly-*` or `release-*` ID. This profile uses `svm2`'s existing `/pnfs_test2`
@@ -220,50 +228,17 @@ APIs on sync and async clients and records their optional rejections. No SVM
 feature switch is changed by this runner; inspect current configuration and
 wire outcomes before claiming positive physical support.
 
-## AFX T15 same-WRITE partial failure
+## AFX T15 same-WRITE partial failure (retired)
 
-`run-afx-t15-e2e.sh` is a separate AFX executor path in the nightly workflow.
-It requires a pre-provisioned Rust 1.95.0 musl target on the controller, a static
-`pnfs_partial_failure` example built from the checked-out commit, and SSH access
-to the AFX data-network executor. It does not inherit a legacy-cluster pNFS skip.
-A missing independent-DS stripe plan reports `blocked-capability` and fails.
-
-The controller uses `LAB_AFX_SSH_HOST` (default `10.128.56.17`),
-`LAB_AFX_SSH_USER` (`root`), `LAB_AFX_SSH_KEY`
-(`/home/github-runner/.ssh/nfsrs_afx_t15`), and `LAB_AFX_KNOWN_HOSTS`
-(`/home/github-runner/.ssh/known_hosts_afx_t15`). Keys remain on the runner,
-known-host verification is mandatory, and no password is stored in the repo.
-The dedicated executor key is restricted to the controller's source address.
-The executor needs Python 3.9+, nftables, tcpdump with immediate mode, tshark,
-coreutils, and kernel NFS mount tools. Provision dependencies ahead of a run.
-
-```sh
-cargo build --release --locked --target x86_64-unknown-linux-musl \
-  --example pnfs_partial_failure
-NFS_RS_AFX_T15_BINARY=/path/to/pnfs_partial_failure \
-NFS_RS_AFX_T15_COMMIT="$(git rev-parse HEAD)" \
-NFS_RS_AFX_T15_EVIDENCE_DIR=/path/outside/checkout/new-private-evidence \
-  tests/lab/run-afx-t15-e2e.sh run nightly-<unique-id>
-```
-
-The executor holds `/tmp/nfsrs-svm2-issue40.lock`, prepares its unique directory
-on `192.168.9.101:/pnfs_test2`, writes 20 GiB of patterned data, and observes
-successful 32 KiB stripes of ONE 64 KiB API call on two distinct DS endpoints.
-It then drops only the failing DS's response packets to this probe's specific
-TCP socket, backed by an independent 180-second restore watchdog. Acceptance
-requires successful sibling acknowledgement, Uncertain/VerifyThenResume, zero
-MDS replay, an actually partially mutated range after reconnect, complete
-resume/commit, and a new-mount 20 GiB byte comparison plus SHA-256. Packet counts
-must agree with zero kernel drops. DS targets come from actual traffic and must
-remain within the four AFX fixture LIFs; no server configuration is changed.
-
-Cancellation restores the owned fault before stopping children and cleaning the
-owned directory. Preparation collisions never authorize fixture deletion. The
-workflow has a second `cleanup` invocation in an `always()` step. The controller
-saves raw packet/diagnostic evidence in a private local archive and uploads only
-`public/result.json`, containing the exact commit, probe and capture hashes,
-redacted acceptance results and cleanup status. A cleanup failure makes the run
-fail even when content checks passed. This is a correctness gate, not a new
-performance acceptance baseline. Nightly keeps the private evidence under
-`$HOME/.local/state/nfs-rs-lab/afx-t15-<run>-<attempt>` with restrictive permissions,
-outside both the checkout and the automatically cleared `$RUNNER_TEMP` directory.
+The AFX environment (jump `10.128.56.17`, svm2 data network `192.168.9.x`) was
+decommissioned on 2026-11-24. `run-afx-t15-e2e.sh` was removed from the
+repository and its nightly workflow steps were deleted. The T15 nightly
+mapping is now recorded as
+`blocked-capability:ots-independent-ds-partial-failure-executor-pending` in
+`tests/nfs41-reliability-coverage.json`; the in-tree controller contracts
+(`afx_t15.py`, `afx_t15_wire.py`, `test_afx_t15.py`) are retained as CI unit
+coverage. The current pNFS storage is OTS, which is exercised through the
+DXN executor node (`10.128.135.141` via jump `10.128.134.90`, both hops with
+the workflow-provisioned `LAB_OTS_SSH_KEY`); an OTS fault-injection helper
+for the independent-DS partial-failure scenario is the follow-up that
+re-enables physical T15 coverage.

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+lab_dir="$(cd "$(dirname "$0")" && pwd -P)"
+source "$lab_dir/common.sh"
+source "$lab_dir/ots-executor.sh"
+source "$lab_dir/python-ots.sh"
 
 run_id="${1:?run id required}"
 artifact="${2:?wheel or sdist-wheel required}"
@@ -16,13 +19,19 @@ validate_run_id "$run_id"
   echo "mode must be gate or smoke" >&2
   exit 2
 }
-validate_ipv4 "$LAB_SOURCE_DATA"
-validate_ipv4 "$LAB_DXN_V40_DATA"
-validate_ipv4 "$LAB_PNFS_MDS_DATA"
-validate_export_path "$LAB_NFS3_EXPORT"
-validate_export_path "$LAB_NFS41_EXPORT"
-validate_export_path "$LAB_DXN_V40_EXPORT"
-validate_export_path "$LAB_PNFS_SECONDARY_EXPORT"
+# The wheel under test: the built release wheel, or the wheel rebuilt from
+# the final source artifact by the calling workflow step.
+if [[ "$artifact" == wheel ]]; then
+  wheel_candidates=(target/python-release-artifacts/*_x86_64.whl)
+else
+  wheel_candidates=("$RUNNER_TEMP"/python-sdist-wheel/*.whl)
+fi
+[[ ${#wheel_candidates[@]} -eq 1 ]] || {
+  echo "expected exactly one matrix wheel, found ${#wheel_candidates[@]}" >&2
+  exit 2
+}
+wheel="${wheel_candidates[0]}"
+[[ -f "$wheel" ]] || { echo "matrix wheel missing: $wheel" >&2; exit 2; }
 
 baseline="tests/python/performance-baselines.json"
 policy=$(python3 -c \
@@ -34,15 +43,8 @@ if [[ "$mode" == smoke ]]; then
   run_options=(--runs 1 --minimum-valid-runs 1 --payload-mib 1)
 fi
 
-"$python" scripts/validate-python-real-protocols.py \
-  "${run_options[@]}" \
-  --run-id "$run_id" \
-  --artifact "$artifact" \
-  --output "$output" \
-  --case "linux-source-v3|3|nfs://$LAB_SOURCE_DATA$LAB_NFS3_EXPORT/ci/$run_id?version=3&noresvport=true|false" \
-  --case "dxn-v40|4.0|nfs://$LAB_DXN_V40_DATA$LAB_DXN_V40_EXPORT?version=4.0&noresvport=true&uid=0&gid=0|false" \
-  --case "linux-source-v41|4.1|nfs://$LAB_SOURCE_DATA$LAB_NFS41_EXPORT/ci/$run_id?version=4.1&noresvport=true|false" \
-  --case "netapp-pnfs-mds|4.1|nfs://$LAB_PNFS_MDS_DATA$LAB_PNFS_SECONDARY_EXPORT?version=4.1&noresvport=true|true"
+run_python_lab_matrix "$python" "$run_id" "$output" "$wheel" \
+  "$lab_dir/../../scripts/validate-python-real-protocols.py" --artifact "$artifact" "${run_options[@]}"
 
 if [[ "$mode" == gate ]]; then
   python3 scripts/check-python-performance.py \

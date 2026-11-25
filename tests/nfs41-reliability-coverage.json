@@ -181,7 +181,7 @@
     {
       "id": "T15",
       "ci": "pnfs_io::ds_batch_waits_for_success_when_failure_completes_first+ds_batch_waits_for_failure_when_success_completes_first+cancelling_ds_batch_drops_every_pending_write+afx_t15_controller_contracts",
-      "nightly": "tests/lab/run-afx-t15-e2e.sh (AFX independent-DS same-WRITE partial failure; fail-closed capability gate)",
+      "nightly": "blocked-capability:ots-independent-ds-partial-failure-executor-pending;previous:tests/lab/run-afx-t15-e2e.sh (AFX independent-DS same-WRITE partial failure; AFX environment retired 2026-11-24, jump 10.128.56.17 decommissioned; OTS fault-injection helper pending)",
       "required": true,
       "ci_tests": [
         "nfs41::pnfs_io::tests::ds_batch_waits_for_success_when_failure_completes_first",

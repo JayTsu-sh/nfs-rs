@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+lab_dir="$(dirname "$0")/../lab"
+source "$lab_dir/common.sh"
+source "$lab_dir/ots-executor.sh"
 
 mode="${1:?capture or gate mode required}"
 run_id="${2:?run id required}"
@@ -34,38 +37,86 @@ flock --wait 1800 8
 exec 9>/tmp/terrasync-lab-performance.lock
 flock --wait 1800 9
 
+remote_dir=""
+local_workspace=""
+cleanup_ots_benchmark() {
+  local status=$? cleanup_status=0
+  if [[ -n "$remote_dir" ]]; then
+    ots_remove_workspace "$remote_dir" || cleanup_status=$?
+  fi
+  if [[ -n "$local_workspace" ]]; then
+    rm -r -- "$local_workspace" || cleanup_status=$?
+  fi
+  if ((status == 0)); then
+    status=$cleanup_status
+  fi
+  exit "$status"
+}
+trap cleanup_ots_benchmark EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+build_ots_benchmark_binary() {
+  local output="$1"
+  local zig_bin target_dir wrapper="$local_workspace/zig-cc"
+  zig_bin="$("$lab_dir/find-runner-zig.sh")"
+  target_dir="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+  printf '#!/usr/bin/env bash\nexec "%s" cc --target=x86_64-linux-gnu.2.17 "$@"\n' \
+    "$zig_bin" > "$wrapper"
+  chmod +x "$wrapper"
+  # The runner's native glibc build is too new for the DXN executor.
+  RUSTFLAGS="-C linker=$wrapper" cargo build --release --locked \
+    --target x86_64-unknown-linux-gnu --bin nfs-storage-benchmark
+  cp -- "$target_dir/x86_64-unknown-linux-gnu/release/nfs-storage-benchmark" "$output"
+}
+
+prepare_ots_benchmark() {
+  if [[ -n "$remote_dir" ]]; then
+    return
+  fi
+  ots_configure_ssh
+  local_workspace="$(mktemp -d "${TMPDIR:-/tmp}/nfsrs-ots-bench.XXXXXX")"
+  local binary="$local_workspace/nfs-storage-benchmark"
+  build_ots_benchmark_binary "$binary"
+  remote_dir="$(ots_create_workspace "nfsrs-bench-$run_id")"
+  ots_ssh "cat > '$remote_dir/nfs-storage-benchmark'" < "$binary"
+  ots_exec "chmod 700 '$remote_dir/nfs-storage-benchmark'"
+}
+
 run_environment() {
-  local environment="$1"
-  local template="$2"
-  local runs="$3"
-  local target="$4"
-  url="${template//\$\{RUN_ID\}/$run_id}"
+  local environment="$1" template="$2" runs="$3" target="$4" executor="$5"
+  local url="${template//\$\{RUN_ID\}/$run_id}"
+  local run suffix remote_command
+  if [[ -n "$executor" ]]; then
+    if [[ "$executor" != "ots-dxn-node" || -z "${LAB_OTS_SSH_KEY:-}" ]]; then
+      echo "skipping benchmark environment $environment (executor unavailable)"
+      return
+    fi
+    prepare_ots_benchmark
+  fi
+
   for run in $(seq 1 "$runs"); do
     suffix="-capture-$run"
     [[ "$mode" == gate ]] && suffix="-run-$run"
-    cargo run --release --locked --bin nfs-storage-benchmark -- \
-      --environment "$environment" \
-      --run-id "$run_id-$run" \
-      --window-id "$run_id" \
-      --commit "$commit" \
-      --url "$url" \
-      --samples "$samples" \
-      --payload-mib "$payload_mib" \
-      >"$target/$environment$suffix.json"
+    local -a arguments=(
+      --environment "$environment" --run-id "$run_id-$run" --window-id "$run_id"
+      --commit "$commit" --url "$url" --samples "$samples" --payload-mib "$payload_mib"
+    )
+    if [[ -n "$executor" ]]; then
+      printf -v remote_command '%q ' "$remote_dir/nfs-storage-benchmark" "${arguments[@]}"
+      ots_exec "$remote_command" > "$target/$environment$suffix.json"
+    else
+      cargo run --release --locked --bin nfs-storage-benchmark -- "${arguments[@]}" \
+        > "$target/$environment$suffix.json"
+    fi
   done
 }
 
-# Executor-marked environments are acquired from a data-network executor host
-# the runner cannot reach directly; skip them in both capture and gate mode.
-while IFS= read -r skipped; do
-  echo "skipping benchmark environment ${skipped} (executor acquisition not wired on this runner)"
-done < <(jq -r '.environments[] | select(.executor != null) | .id' "$manifest")
-
-while IFS=$'\t' read -r environment template; do
-  runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
-  [[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
-  run_environment "$environment" "$template" "$runs" "$output"
-done < <(jq -r '.environments[] | select(.executor == null) | [.id, .url_template] | @tsv' "$manifest")
+runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
+[[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
+while IFS=$'\t' read -r environment template executor; do
+  run_environment "$environment" "$template" "$runs" "$output" "$executor"
+done < <(jq -r '.environments | sort_by(.executor == null)[] | [.id, .url_template, .executor // ""] | @tsv' "$manifest")
 
 if [[ "$mode" == gate ]]; then
   python3 tests/benchmarks/check-performance-baselines.py \
@@ -80,9 +131,9 @@ if [[ "$mode" == gate ]]; then
       mkdir -p "$supplemental"
       supplemental_args+=(--supplemental-results-dir "$supplemental")
       for environment in "${supplemental_environments[@]}"; do
-        template="$(jq -r --arg environment "$environment" \
-          '.environments[] | select(.id == $environment) | .url_template' "$manifest")"
-        run_environment "$environment" "$template" "${NFS_RS_BENCHMARK_GATE_RUNS:-5}" "$supplemental"
+        IFS=$'\t' read -r template executor < <(jq -r --arg environment "$environment" \
+          '.environments[] | select(.id == $environment) | [.url_template, .executor // ""] | @tsv' "$manifest")
+        run_environment "$environment" "$template" "$runs" "$supplemental" "$executor"
       done
     done
     python3 tests/benchmarks/check-performance-baselines.py \

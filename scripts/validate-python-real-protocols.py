@@ -221,7 +221,7 @@ def sync_scenario(url: str, version: str, require_pnfs: bool, payload: bytes) ->
         heartbeats_during_read = heartbeat_after_read - heartbeat_before_read
         assert data == payload and heartbeats_during_read >= 2
         verified_rename(client, payload_path, renamed_path)
-        assert "renamed.bin" in {name for name in client.listdir(leaf) if name not in {".", ".."}}
+        assert b"renamed.bin" in {name for name in client.listdir(leaf) if name not in {b".", b".."}}
         verified_remove(client, renamed_path)
         return {
             "write_mib_s": len(payload) / write_seconds / 2**20,
@@ -382,20 +382,32 @@ def main() -> None:
         "schema_version": 1,
         "run_id": arguments.run_id,
         "nfs_rs_version": nfs_rs.__version__,
-        "results": [
-            validate_case(
-                case,
-                arguments.run_id,
-                arguments.artifact,
-                payload,
-                arguments.runs,
-                arguments.minimum_valid_runs,
-            )
-            for case in arguments.case
-        ],
+        "results": [],
+        "failures": [],
+        "failure_details": [],
     }
+    for case in arguments.case:
+        try:
+            result["results"].append(
+                validate_case(
+                    case,
+                    arguments.run_id,
+                    arguments.artifact,
+                    payload,
+                    arguments.runs,
+                    arguments.minimum_valid_runs,
+                )
+            )
+        except Exception as error:
+            result["failures"].append(f"{case.name}: {type(error).__name__}: {error}")
+            result["failure_details"].append(
+                {"case": case.name, "stage": "validate", "type": type(error).__name__, "message": str(error)}
+            )
+    result["status"] = "failed" if result["failures"] else "passed"
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if result["failures"]:
+        raise RuntimeError("; ".join(result["failures"]))
 
 
 if __name__ == "__main__":

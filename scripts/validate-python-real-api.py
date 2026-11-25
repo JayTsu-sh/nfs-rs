@@ -219,7 +219,7 @@ def remove_tree(client: nfs_rs.Client, path: str) -> None:
     if info.type == nfs_rs.FileType.DIRECTORY:
         entries = list(client.scandir(path))
         for entry in entries:
-            if entry.name not in {".", ".."}:
+            if entry.name not in {b".", b".."}:
                 remove_tree(client, entry.path)
         client.rmdir(path)
     else:
@@ -293,15 +293,15 @@ def sync_client_scenario(url: str, case: Case, root: str) -> list[str]:
         info = client.stat(data)
         check(info.size == 7 and info.type == nfs_rs.FileType.FILE, "Client.stat", checks)
         names = client.listdir(root)
-        check("data.bin" in names, "Client.listdir", checks)
+        check(b"data.bin" in names, "Client.listdir", checks)
         entries = {entry.name: entry for entry in client.scandir(root)}
-        check(entries["data.bin"].info.size == 7, "Client.scandir", checks)
+        check(entries[b"data.bin"].info.size == 7, "Client.scandir", checks)
         page = client.scandir_page(root)
         paged = list(page.entries)
         while not page.eof:
             page = client.scandir_page(root, page.next)
             paged += page.entries
-        check(sorted(entry.name for entry in paged) == sorted(entries), "Client.scandir_page", checks)
+        check(sorted(bytes(entry.name) for entry in paged) == sorted(bytes(name) for name in entries), "Client.scandir_page", checks)
         check(client.access(data, os.R_OK), "Client.access", checks)
         fs_info = client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "Client.fs_info", checks)
@@ -504,15 +504,15 @@ async def async_client_scenario(url: str, case: Case, root: str) -> list[str]:
             check(await file.read() == b"payload", "AsyncFile.read", checks)
         info = await client.stat(data)
         check(info.size == 7, "AsyncClient.stat", checks)
-        check("async-data.bin" in await client.listdir(root), "AsyncClient.listdir", checks)
+        check(b"async-data.bin" in await client.listdir(root), "AsyncClient.listdir", checks)
         entries = {entry.name: entry async for entry in client.scandir(root)}
-        check(entries["async-data.bin"].info.size == 7, "AsyncClient.scandir", checks)
+        check(entries[b"async-data.bin"].info.size == 7, "AsyncClient.scandir", checks)
         page = await client.scandir_page(root)
         paged = list(page.entries)
         while not page.eof:
             page = await client.scandir_page(root, page.next)
             paged += page.entries
-        check(sorted(entry.name for entry in paged) == sorted(entries), "AsyncClient.scandir_page", checks)
+        check(sorted(bytes(entry.name) for entry in paged) == sorted(bytes(name) for name in entries), "AsyncClient.scandir_page", checks)
         check(await client.access(data, os.R_OK), "AsyncClient.access", checks)
         fs_info = await client.fs_info()
         check(fs_info.max_read > 0 and fs_info.max_write > 0, "AsyncClient.fs_info", checks)
@@ -740,11 +740,16 @@ def main() -> None:
         "results": [],
     }
     failures: list[str] = []
+    failure_details: list[dict[str, str]] = []
     for case in arguments.case:
         try:
             result["results"].append(validate_case(case, arguments.run_id))  # type: ignore[union-attr]
         except Exception as error:
             failures.append(f"{case.name}: {type(error).__name__}: {error}")
+            failure_details.append(
+                {"case": case.name, "stage": "validate", "type": type(error).__name__, "message": str(error)}
+            )
+    result["failure_details"] = failure_details
     result["failures"] = failures
     result["status"] = "failed" if failures else "passed"
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

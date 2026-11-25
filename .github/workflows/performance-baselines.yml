@@ -40,11 +40,19 @@ jobs:
           [[ -n "$toolchain_bin" ]] || { echo "Rust 1.95.0 not found" >&2; exit 1; }
           echo "$toolchain_bin" >> "$GITHUB_PATH"
       - run: rustc --version | grep -q '^rustc 1\.95\.0 '
+      - name: Use pre-provisioned Zig 0.13.0
+        run: |
+          zig="$(tests/lab/find-runner-zig.sh)"
+          dirname "$zig" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - name: Prepare OTS pNFS executor SSH credentials
+        env:
+          OTS_SSH_KEY: ${{ secrets.NFS_RS_OTS_SSH_KEY }}
+        run: tests/lab/prepare-ots-executor.sh
       - name: Capture every storage environment and protocol
         run: tests/benchmarks/run-storage-benchmark-suite.sh capture "$RUN_ID" "$RUNNER_TEMP/storage-performance-captures"
       - name: Upload baseline captures and report

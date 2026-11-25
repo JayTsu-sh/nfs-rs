@@ -605,7 +605,8 @@ fn gate_report_treats_pending_executors_as_warnings() {
         .expect("gate run must be written");
     }
     let gate_path = fixture_dir.join("gate.json");
-    let gate_status = Command::new("python3")
+    let mut gate_command = Command::new("python3");
+    gate_command
         .arg(workspace_path(
             "tests/benchmarks/check-performance-baselines.py",
         ))
@@ -615,7 +616,8 @@ fn gate_report_treats_pending_executors_as_warnings() {
         .arg(&fixture_dir)
         .arg("--output")
         .arg(&gate_path)
-        .current_dir(workspace_path("."))
+        .current_dir(workspace_path("."));
+    let gate_status = gate_command
         .status()
         .expect("performance gate should start");
     assert_eq!(gate_status.code(), Some(0));
@@ -665,6 +667,20 @@ fn gate_report_treats_pending_executors_as_warnings() {
             .any(|line| line.contains("| `baseline_missing` |")),
         "no environment row may remain baseline_missing while an executor is pending"
     );
+
+    fs::copy(&direct_baseline, &pending_baseline).expect("executor baseline should be promoted");
+    let gate_status = gate_command
+        .status()
+        .expect("promoted executor performance gate should start");
+    assert_eq!(gate_status.code(), Some(2));
+    let gate: Value =
+        serde_json::from_slice(&fs::read(&gate_path).expect("gate report must be generated"))
+            .expect("gate report must be JSON");
+    assert_eq!(gate["status"], "fail");
+    let executor = &gate["environments"][1];
+    assert_eq!(executor["environment"], "pendexec");
+    assert_eq!(executor["status"], "insufficient_valid_runs");
+    assert_eq!(executor["valid_runs"], 0);
 }
 
 #[test]

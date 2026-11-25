@@ -21,8 +21,8 @@ written `%2520` in the URL.
 
 ## Complete API documentation
 
-- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/API.md)
-- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.12.0/python/nfs_rs/GUIDE.md)
+- [API reference: all public Python interfaces](https://github.com/JayTsu-sh/nfs-rs/blob/v0.13.0/python/nfs_rs/API.md)
+- [User guide](https://github.com/JayTsu-sh/nfs-rs/blob/v0.13.0/python/nfs_rs/GUIDE.md)
 
 Both complete documents are included in the PyPI wheel and source distribution,
 including signatures, defaults, return values, timestamp units, error types,
@@ -164,24 +164,26 @@ Use `await client.resolve(path)` with `AsyncClient`. `PathResolution` exposes
 | `TOO_MANY_SYMLINKS` | `None` | `None` |
 
 For `links/latest -> ../data/report.csv`, a successful `result.path` is
-`data/report.csv`. `readlink("links/latest")` returns the original
-`../data/report.csv` text. `stat` and `exists` continue to inspect the link itself,
+`b"data/report.csv"`. `readlink("links/latest")` returns a read-only
+`memoryview` containing `b"../data/report.csv"`. `stat` and `exists` continue to inspect the link itself,
 so a dangling link can pass `exists`; use `resolve` to check its target.
 
 An absolute target or traversal outside the mounted root is `OUTSIDE_MOUNT`,
 which does not prove that the target is broken. More than 40 links is
 `TOO_MANY_SYMLINKS`, possibly a cycle. Relative targets start at their containing
 directory; `..` and trailing slashes are evaluated during traversal. Limits are
-4096 cumulative components and 64 KiB of cumulative UTF-8 text. Permission,
-connection, timeout, stale-handle and encoding failures raise typed exceptions.
-Non-UTF-8 targets raise `NfsEncodingError` instead of selecting a replacement name.
+4096 cumulative components and 64 KiB of cumulative path bytes. Permission,
+connection, timeout and stale-handle failures raise typed exceptions.
+Non-UTF-8 targets are preserved as bytes.
 The result reports existence at observation time; it does not check read/write
 access or guarantee a subsequent open.
 
 ## Scan directories using file handles
 
 `scandir()` yields entries from one directory. Each `DirEntry` contains `name`,
-`path`, `info`, and an optional `fh`. Use `DirectoryRef(path, fh)` to reuse a
+`path`, `info`, and an optional `fh`. Names are read-only `memoryview`
+objects and paths are `bytes`. Use `bytes(entry.name)` for a durable copy
+or decode explicitly for display. Use `DirectoryRef(path, fh)` to reuse a
 returned handle when scanning a child directory:
 
 ```python
@@ -196,7 +198,7 @@ with Client.connect(url) as client:
     while pending:
         directory = pending.popleft()
         for entry in client.scandir(directory):
-            if entry.name in (".", ".."):
+            if entry.name in (b".", b".."):
                 continue
             print(entry.path, entry.info.size, entry.info.mtime)
             if entry.info.type is FileType.DIRECTORY:
@@ -319,12 +321,12 @@ async def main() -> None:
             assert buffer == payload
 
         async for entry in client.scandir(DirectoryRef("outgoing")):
-            if entry.name in (".", ".."):
+            if entry.name in (b".", b".."):
                 continue
             print(entry.path)
             if entry.info.type is FileType.DIRECTORY:
                 async for child in client.scandir(DirectoryRef(entry.path, entry.fh)):
-                    if child.name not in (".", ".."):
+                    if child.name not in (b".", b".."):
                         print(child.path)
 
 

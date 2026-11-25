@@ -74,14 +74,13 @@ for environment in manifest["environments"]:
         and baseline.get("capture_runs", 0) >= manifest["minimum_capture_runs"]
         and baseline.get("capture_windows", 0) >= manifest["minimum_capture_windows"]
     )
-    if environment.get("executor"):
-        # Executor-marked environments wait for data-network executor
-        # acquisition; they do not gate the runner-direct report.
+    if accepted:
+        row_status = "accepted"
+    elif environment.get("executor"):
         row_status = "executor_pending"
     else:
-        if not accepted:
-            complete = False
-        row_status = "accepted" if accepted else "baseline_missing"
+        complete = False
+        row_status = "baseline_missing"
     gate_row = gate_by_environment.get(environment["id"])
     current_runs = []
     if results_root:

@@ -15,10 +15,23 @@ LAB_PNFS_MDS_DATA="${LAB_PNFS_MDS_DATA:-10.128.56.160}"
 LAB_PNFS_DS_DATA="${LAB_PNFS_DS_DATA:-10.128.56.161}"
 LAB_PNFS_PRIMARY_EXPORT="${LAB_PNFS_PRIMARY_EXPORT:-/nfsrs_pnfs_a}"
 LAB_PNFS_SECONDARY_EXPORT="${LAB_PNFS_SECONDARY_EXPORT:-/nfsrs_pnfs_b}"
-# AFX svm2 pNFS data network. Unreachable from the runner; reached through
-# the AFX executor (see run-afx-t15-e2e.sh) or manual run-afx-v42-e2e.sh.
-LAB_AFX_PNFS_DATA="${LAB_AFX_PNFS_DATA:-192.168.9.101}"
-LAB_AFX_PNFS_EXPORT="${LAB_AFX_PNFS_EXPORT:-/pnfs_test2}"
+# OTS pNFS (current pNFS storage). The AFX svm2 and legacy NetApp pNFS
+# targets are retired: the AFX jump host 10.128.56.17 was decommissioned and
+# the legacy cluster no longer negotiates pNFS. The 10.30.3.0/24 data network
+# is unreachable from the runner, so pNFS cases run on the DXN executor node
+# 10.128.135.141 (data IP 10.30.3.141) through the management jump
+# 10.128.134.90; both hops authenticate with LAB_OTS_SSH_KEY.
+LAB_OTS_PNFS_DATA="${LAB_OTS_PNFS_DATA:-10.30.3.154}"
+LAB_OTS_PNFS_EXPORT="${LAB_OTS_PNFS_EXPORT:-/nfsrs_pnfs_a}"
+LAB_OTS_JUMP="${LAB_OTS_JUMP:-10.128.134.90}"
+LAB_OTS_NODE="${LAB_OTS_NODE:-10.128.135.141}"
+LAB_OTS_SSH_USER="${LAB_OTS_SSH_USER:-root}"
+# LAB_OTS_SSH_KEY / LAB_OTS_KNOWN_HOSTS are provisioned per run by the
+# "Prepare OTS pNFS executor SSH credentials" workflow step (secret
+# NFS_RS_OTS_SSH_KEY). The executor interpreter is a standalone CPython 3.11
+# preinstalled at /opt/nfsrs-executor/python3.11 on the node (the node has no
+# package network access, so the interpreter is not installable at run time).
+LAB_OTS_EXECUTOR_PYTHON="${LAB_OTS_EXECUTOR_PYTHON:-/opt/nfsrs-executor/python3.11/bin/python3.11}"
 LAB_DXN_V40_DATA="${LAB_DXN_V40_DATA:-10.131.7.201}"
 LAB_DXN_V40_EXPORT="${LAB_DXN_V40_EXPORT:-/jay_nfs}"
 

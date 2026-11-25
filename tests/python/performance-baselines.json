@@ -3,12 +3,23 @@
   "status": "accepted",
   "captured_at": "2026-08-28",
   "provenance": {
-    "run_id": "nightly-codex-ticket14-20260828",
-    "artifacts": [
-      "production manylinux2014 x86_64 wheel",
-      "wheel rebuilt from the production sdist"
-    ],
-    "selection": "minimum observed median throughput and maximum observed p95 latency"
+    "direct_cases": {
+      "run_id": "nightly-codex-ticket14-20260828",
+      "captured_at": "2026-08-28",
+      "artifacts": [
+        "production manylinux2014 x86_64 wheel",
+        "wheel rebuilt from the production sdist"
+      ],
+      "selection": "minimum observed median throughput and maximum observed p95 latency"
+    },
+    "ots-pnfs-mds": {
+      "run_id": "local-ots-pnfs-baseline-20261124",
+      "captured_at": "2026-11-24",
+      "artifacts": [
+        "production manylinux2014 x86_64 wheel (nfs_rs 0.12.0)"
+      ],
+      "selection": "5-of-5 valid runs against OTS 10.30.3.154:/nfsrs_pnfs_a on the DXN executor node 10.128.135.141 (4 MiB payload); replaces the retired netapp-pnfs-mds legacy-cluster baseline"
+    }
   },
   "policy": {
     "comparable_runs": 5,
@@ -34,11 +45,11 @@
       "write_latency_ms_p95": 400.4327254369855,
       "read_latency_ms_p95": 16.01852010935545
     },
-    "netapp-pnfs-mds": {
-      "write_mib_s_median": 46.72933351201229,
-      "read_mib_s_median": 69.725315167318,
-      "write_latency_ms_p95": 107.53947123885155,
-      "read_latency_ms_p95": 67.36926827579737
+    "ots-pnfs-mds": {
+      "write_mib_s_median": 26.6535,
+      "read_mib_s_median": 89.8957,
+      "write_latency_ms_p95": 200.4771,
+      "read_latency_ms_p95": 74.3358
     }
   }
 }
