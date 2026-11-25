@@ -485,6 +485,10 @@ pub(crate) struct StreamMux {
     stopping: Notify,
     /// Highest closed reader generation plus one; old readers cannot poison a new connection.
     failed_generation: Arc<AtomicU64>,
+    /// Highest generation retired because a sent request timed out. Kept separate
+    /// from `failed_generation`: a retired reader is still running, only later
+    /// callers must avoid queueing behind it.
+    retired_generation: AtomicU64,
 }
 
 impl StreamMux {
@@ -539,11 +543,35 @@ impl StreamMux {
             shutdown_flag: AtomicBool::new(false),
             stopping: Notify::new(),
             failed_generation,
+            retired_generation: AtomicU64::new(0),
         })
     }
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Marks `generation` as retired so that the next request reconnects instead of
+    /// queueing behind a connection that may be half-open.
+    ///
+    /// RFC 5531 section 5: a request that timed out after being sent may or may not
+    /// have executed, so the caller must still report it as uncertain. Retiring only
+    /// affects *later* requests — it never replays the timed-out one.
+    fn retire(&self, generation: u64) {
+        let next = generation.saturating_add(1);
+        let previous = self.retired_generation.fetch_max(next, Ordering::AcqRel);
+        if previous < next {
+            warn!(
+                addr = %self.endpoint,
+                generation,
+                "retiring RPC connection after a sent request timed out"
+            );
+        }
+    }
+
+    /// Whether `generation` has been retired.
+    fn is_retired(&self, generation: u64) -> bool {
+        self.retired_generation.load(Ordering::Acquire) > generation
     }
 
     /// Install the backchannel handler so the reader loop dispatches inbound
@@ -1161,6 +1189,41 @@ impl Client {
                 break;
             }
 
+            // A previous sent request may have retired this connection because its
+            // reply never arrived. Replace it before queueing more work behind a
+            // possibly half-open socket; `reconnect` is single-flight and
+            // generation-checked, so concurrent callers converge on one new link.
+            // The redial is bounded by this attempt's deadline: a connect stall
+            // must not push the call past the timeout the caller asked for.
+            if !bypass_readiness {
+                let current_generation = mux.generation();
+                if mux.is_retired(current_generation) {
+                    match tokio::time::timeout_at(
+                        attempt_deadline,
+                        mux.reconnect(current_generation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            return Err(NfsError::transport(
+                                crate::RequestTransmission::NotSent,
+                                error,
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(NfsError::transport(
+                                crate::RequestTransmission::NotSent,
+                                NfsError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "RPC reconnect timeout",
+                                )),
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Each retry uses a fresh XID (the old one may have stale responses in flight).
             let xid = get_xid();
             BigEndian::write_u32(&mut prefix[4..8], xid);
@@ -1248,6 +1311,22 @@ impl Client {
                     } else if is_timeout {
                         attempt += 1;
                         if attempt >= max_attempts {
+                            // Final timeout for a request that was already written.
+                            // Retire the connection so later requests reconnect
+                            // instead of each burning a full timeout on the same
+                            // stalled socket. The request keeps its Sent/uncertain
+                            // outcome; it is never replayed here.
+                            //
+                            // Only operations that cannot be replayed at the
+                            // transport layer (`ONE_ATTEMPT`, i.e. ReplaySensitive)
+                            // retire: a replayed read consumes its own retries, so a
+                            // slow-but-alive server does not lose the connection and
+                            // tear down every other request in flight on it.
+                            if logical_transmission == crate::RequestTransmission::Sent
+                                && replay_policy.max_attempts() == 1
+                            {
+                                mux.retire(r#gen);
+                            }
                             last_error = Some(e);
                             continue;
                         }
@@ -2081,6 +2160,184 @@ mod tests {
         server.await.unwrap();
         assert_eq!(reply, Bytes::from_static(b"ok"));
         assert_eq!(dialer.dialed(), vec![endpoint.clone(), endpoint]);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sent_timeout_retires_connection_and_next_call_uses_a_fresh_one() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let mut second = dialer.accept();
+        let server = tokio::spawn(async move {
+            // First connection: consume the request but never answer, so the
+            // client observes a Sent request that timed out.
+            read_test_record(&mut first).await.unwrap();
+            // Second connection: answer normally.
+            let record = read_test_record(&mut second).await.unwrap();
+            write_test_rpc_reply(&mut second, BigEndian::read_u32(&record[..4]), b"ok")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(Arc::clone(&mux), None);
+
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        assert!(
+            mux.is_retired(mux.generation()),
+            "a Sent request that timed out must retire the connection"
+        );
+
+        // The following call must reconnect instead of queueing behind the
+        // stalled socket; otherwise every later call burns its own timeout.
+        let reply = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, Bytes::from_static(b"ok"));
+        assert_eq!(mux.generation(), 1);
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retired_connection_fails_before_send_when_redial_is_refused() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let server = tokio::spawn(async move {
+            read_test_record(&mut first).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(Arc::clone(&mux), None);
+
+        let _ = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(mux.is_retired(mux.generation()));
+
+        // No queued connection: the retry must fail before writing and must not
+        // put the request on the retired socket.
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        assert_eq!(mux.generation(), 0);
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_before_sending_does_not_retire_connection() {
+        let client = Client::new_dummy().await;
+        client
+            .nfs_mux
+            .readiness
+            .store(CONNECTION_REBINDING, Ordering::Release);
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        assert!(
+            !client.nfs_mux.is_retired(client.nfs_mux.generation()),
+            "a request that never reached the socket must not retire the connection"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replayed_timeout_does_not_retire_the_connection() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let server = tokio::spawn(async move {
+            read_test_record(&mut first).await.unwrap();
+            // Swallow the replay as well: the client must not reconnect between
+            // attempts, and a replayable call must leave the link for the next
+            // caller instead of retiring it.
+            read_test_record(&mut first).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(mux, None);
+
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            dialer.dialed().len(),
+            1,
+            "a replayable call must not reconnect between attempts"
+        );
+        assert!(
+            !client.nfs_mux.is_retired(client.nfs_mux.generation()),
+            "only ReplaySensitive (ONE_ATTEMPT) timeouts retire the connection"
+        );
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retiring_a_generation_does_not_retire_its_successor() {
+        let client = Client::new_dummy().await;
+        let mux = &client.nfs_mux;
+        let current = mux.generation();
+
+        mux.retire(current);
+
+        assert!(mux.is_retired(current));
+        assert!(
+            !mux.is_retired(current + 1),
+            "the connection built by reconnect (generation + 1) must stay usable"
+        );
         client.shutdown().await;
     }
 
