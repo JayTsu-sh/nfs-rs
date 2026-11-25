@@ -55,6 +55,30 @@ OPEN/CREATE/LINK/SYMLINK codec tests and installed byte-name I/O tests also ran.
 Python and Rust contract tests distinguish lexical `missing/../file` from
 ordered resolution and cover regular-file and symlink parent components.
 
+### Final-commit verification environment
+
+The tested source is commit `ddf14e7` (following export-path repair `32b5d0f`).
+All 321 tracked files on 194 were compared against that commit with no content
+differences after line-ending normalization. Two subsequent shared-host reruns
+hit `ConnectionRefused` while connecting to unrelated local TCP fixtures.
+The same failure reproduced independently in a standard-library-only Python
+loopback probe: 2 of 3,000 connections failed on ports 35673 and 39091. Existing
+Kubernetes nftables rules explicitly reject those local destination ports,
+overlapping Linux's ephemeral port range. The fixture logic and production
+transport were not changed to mask this host interference.
+
+In a temporary network namespace with only loopback enabled, the same 3,000
+probe connections all passed. Final deterministic suites therefore use
+`unshare --net` with `ip link set lo up`; the real 6.79 tests continue to run in
+the host namespace. No host firewall, sysctl, Kubernetes service or running
+application was changed. A separate bounded-concurrency attempt also passed
+libtest arguments to Criterion incorrectly; that command's harness rejection
+is preserved in its log and is not counted as a successful suite.
+
+Final isolated-suite logs: `/tmp/nfs679-final-isolated-rust.log` and
+`/tmp/nfs679-final-commit-python.log`. Earlier failing runs are retained in
+`/tmp/nfs679-final-commit-rust.log` and `/tmp/nfs679-final-bounded-rust.log`.
+
 ## Real server checks and limits
 
 A separate **production wheel without `python-test-support`** was installed
