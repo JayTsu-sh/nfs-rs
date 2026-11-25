@@ -28,9 +28,16 @@ fn push_opaque(reply: &mut Vec<u8>, value: &[u8]) {
     reply.resize(reply.len().next_multiple_of(4), 0);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FirstReply {
+    Success,
+    Missing,
+    GarbageArgs,
+}
+
 // Use the real Mount/RPC encoder, as in readlink and retry tests. No mount or
 // portmapper exchange is needed for this isolated LOOKUP name/FH regression.
-async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCall>) {
+async fn resolve(path: &[u8], first_reply: FirstReply) -> (Result<ObjRes>, Vec<LookupCall>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, mut stopped) = oneshot::channel();
@@ -59,17 +66,33 @@ async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCal
             assert!(args.is_empty());
             calls.push(LookupCall { parent, name });
 
-            let failed = fail_first && calls.len() == 1;
+            let first = if calls.len() == 1 {
+                first_reply
+            } else {
+                FirstReply::Success
+            };
             let mut reply = request[..4].to_vec();
-            // RPC accepted SUCCESS followed by the NFS status.
-            for word in [1u32, 0, 0, 0, 0, if failed { 2 } else { 0 }] {
+            let accept_status = if first == FirstReply::GarbageArgs {
+                4u32
+            } else {
+                0
+            };
+            for word in [1, 0, 0, 0, accept_status] {
                 reply.extend(word.to_be_bytes());
             }
-            if !failed {
-                push_opaque(&mut reply, &[calls.len() as u8]);
-                reply.extend(0u32.to_be_bytes()); // absent object attributes
+            if first != FirstReply::GarbageArgs {
+                let status = if first == FirstReply::Missing {
+                    2u32
+                } else {
+                    0
+                };
+                reply.extend(status.to_be_bytes());
+                if status == 0 {
+                    push_opaque(&mut reply, &[calls.len() as u8]);
+                    reply.extend(0u32.to_be_bytes()); // absent object attributes
+                }
+                reply.extend(0u32.to_be_bytes()); // absent directory attributes
             }
-            reply.extend(0u32.to_be_bytes()); // absent directory attributes
             stream
                 .write_u32(0x80000000 | reply.len() as u32)
                 .await
@@ -98,7 +121,7 @@ async fn resolve(path: &str, fail_first: bool) -> (Result<ObjRes>, Vec<LookupCal
 }
 
 async fn assert_resolved(path: &str, names: &[&str]) {
-    let (result, calls) = resolve(path, false).await;
+    let (result, calls) = resolve(path.as_bytes(), FirstReply::Success).await;
     assert_eq!(
         calls,
         names
@@ -114,7 +137,6 @@ async fn assert_resolved(path: &str, names: &[&str]) {
     assert_eq!(result.unwrap().fh, vec![names.len() as u8]);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn lookup_path_preserves_literal_backslash_v3() {
     // RFC 1813 §§3.2/3.3.3: LOOKUP selects the named entry. On Unix a
@@ -122,7 +144,6 @@ async fn lookup_path_preserves_literal_backslash_v3() {
     assert_resolved("\\", &["\\"]).await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn lookup_path_preserves_nested_backslash_v3() {
     for (path, names) in [
@@ -133,12 +154,6 @@ async fn lookup_path_preserves_nested_backslash_v3() {
     }
 }
 
-#[cfg(windows)]
-#[tokio::test]
-async fn lookup_path_skips_windows_root_v3() {
-    assert_resolved("\\", &[]).await;
-}
-
 #[tokio::test]
 async fn lookup_path_keeps_existing_normalization_v3() {
     for path in ["", "/", ".", "./", "/./", "folder/.."] {
@@ -147,16 +162,30 @@ async fn lookup_path_keeps_existing_normalization_v3() {
     for (path, names) in [
         ("folder/leaf", vec!["folder", "leaf"]),
         ("/folder//./unused/../leaf/", vec!["folder", "leaf"]),
-        ("../leaf", vec!["..", "leaf"]),
-        ("folder/../../leaf", vec!["..", "leaf"]),
     ] {
         assert_resolved(path, &names).await;
     }
 }
 
 #[tokio::test]
+async fn lookup_path_rejects_escape_before_rpc() {
+    for path in [b"../leaf".as_slice(), b"folder/../../leaf"] {
+        let (result, calls) = resolve(path, FirstReply::Success).await;
+        assert!(matches!(result, Err(NfsError::InvalidInput(_))));
+        assert!(calls.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn lookup_path_sends_non_utf8_bytes_unchanged() {
+    let (result, calls) = resolve(b"dir/\xd6\xd0\xce\xc4", FirstReply::Success).await;
+    assert_eq!(result.unwrap().fh.as_ref(), &[2]);
+    assert_eq!(calls[1].name, b"\xd6\xd0\xce\xc4");
+}
+
+#[tokio::test]
 async fn lookup_path_preserves_first_error_v3() {
-    let (result, calls) = resolve("missing/leaf", true).await;
+    let (result, calls) = resolve(b"missing/leaf", FirstReply::Missing).await;
     assert!(matches!(
         result,
         Err(NfsError::Nfs3(super::super::nfsstat3::NFS3ERR_NOENT))
@@ -168,4 +197,22 @@ async fn lookup_path_preserves_first_error_v3() {
             name: b"missing".to_vec(),
         }]
     );
+}
+
+#[tokio::test]
+async fn lookup_garbage_args_is_a_definite_rpc_rejection() {
+    let filename = [b'z'; 256];
+    let (result, calls) = resolve(&filename, FirstReply::GarbageArgs).await;
+    let error = result.unwrap_err();
+    assert!(matches!(error, NfsError::RpcGarbageArgs), "{error:?}");
+    assert_eq!(
+        error.request_transmission(),
+        Some(crate::RequestTransmission::Sent)
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, filename);
+
+    let (result, calls) = resolve(&filename, FirstReply::Success).await;
+    assert_eq!(result.unwrap().fh.as_ref(), &[1]);
+    assert_eq!(calls[0].name, filename);
 }

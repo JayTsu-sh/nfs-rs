@@ -42,7 +42,7 @@ class NfsError(RuntimeError):
     operation_class: OperationClass | None
     completed_bytes: int | None
     errno: int | None
-    filename: str | None
+    filename: bytes | None
     errors: tuple[NfsError, ...]
     retry_count: int | None
     retry_elapsed_ms: int | None
@@ -61,7 +61,7 @@ class NfsError(RuntimeError):
         operation_class: OperationClass | str | None = None,
         completed_bytes: int | None = None,
         errno: int | None = None,
-        filename: str | None = None,
+        filename: bytes | None = None,
         errors: tuple[NfsError, ...] = (),
         retry_count: int | None = None,
         retry_elapsed_ms: int | None = None,
@@ -116,7 +116,7 @@ class NfsError(RuntimeError):
         *,
         operation: str | None = None,
         protocol: str | None = None,
-        filename: str | None = None,
+        filename: bytes | None = None,
     ) -> NfsError:
         state = self.__reduce__()[1][1]
         if self.operation is None:

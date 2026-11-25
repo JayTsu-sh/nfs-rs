@@ -57,7 +57,7 @@ impl LeaseHealth {
                 | nfsstat4::NFS4ERR_SEQ_MISORDERED
                 | nfsstat4::NFS4ERR_BADSLOT,
             ) => Self::SessionFailure,
-            NfsError::Io(_) | NfsError::Rpc(_) => Self::TransportFailure,
+            NfsError::Io(_) | NfsError::Rpc(_) | NfsError::RpcGarbageArgs => Self::TransportFailure,
             NfsError::Xdr(message) if message.contains("mismatch") => Self::IdentityMismatch,
             _ => Self::ProtocolFailure,
         }
@@ -279,6 +279,7 @@ mod tests {
                 data: Bytes::from(data),
             }],
             session_generation: 1,
+            wire_len: 0,
         }
     }
 
@@ -365,6 +366,10 @@ mod tests {
                 std::io::ErrorKind::TimedOut,
                 "timeout"
             ))),
+            LeaseHealth::TransportFailure
+        );
+        assert_eq!(
+            LeaseHealth::from_error(&NfsError::RpcGarbageArgs),
             LeaseHealth::TransportFailure
         );
         assert_eq!(

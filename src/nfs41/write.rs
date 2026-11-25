@@ -116,9 +116,10 @@ impl Mount41 {
     pub(crate) async fn open(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         access: u32,
     ) -> Result<mount::ObjRes> {
+        crate::path_resolution::validate_name(filename)?;
         let access_mode = match access {
             crate::OPEN_READ => AccessMode::Read,
             crate::OPEN_WRITE => AccessMode::Write,
@@ -135,7 +136,7 @@ impl Mount41 {
             create: false,
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
-            claim_file: filename.to_string(),
+            claim_file: filename,
             want_no_delegation: !self.retain_delegations,
         };
         let resp = self
@@ -193,10 +194,10 @@ impl Mount41 {
         }
     }
 
-    pub(crate) async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
-        let (dir, name) = crate::split_path(path)?;
-        let dir_obj = self.lookup_path(&dir).await?;
-        self.open(dir_obj.fh, &name, access).await
+    pub(crate) async fn open_path(&self, path: &[u8], access: u32) -> Result<mount::ObjRes> {
+        let (dir, name) = crate::path_resolution::split_byte_path(path)?;
+        let dir_obj = self.lookup_path(dir).await?;
+        self.open(dir_obj.fh, name, access).await
     }
 
     pub(crate) async fn close_file(&self, fh: Bytes) -> Result<()> {
@@ -231,7 +232,7 @@ impl Mount41 {
     pub(crate) async fn create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
         self.create_with_access(dir_fh, filename, mode, crate::OPEN_BOTH)
@@ -241,10 +242,11 @@ impl Mount41 {
     pub(crate) async fn create_with_access(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::ObjRes> {
+        crate::path_resolution::validate_leaf(filename)?;
         let access_mode = match access {
             crate::OPEN_READ => AccessMode::Read,
             crate::OPEN_WRITE => AccessMode::Write,
@@ -266,7 +268,7 @@ impl Mount41 {
             create: true,
             create_attrs_mask: vec![],
             create_attrs_vals: vec![],
-            claim_file: filename.to_string(),
+            claim_file: filename,
             want_no_delegation: !self.retain_delegations,
         };
         let resp = self
@@ -324,7 +326,11 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    pub(crate) async fn create_path(
+        &self,
+        path: &[u8],
+        mode: Option<u32>,
+    ) -> Result<mount::ObjRes> {
         self.create_path_with_access(path, mode, crate::OPEN_BOTH)
             .await
     }
@@ -332,10 +338,11 @@ impl Mount41 {
     pub(crate) async fn create_guarded(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
+        crate::path_resolution::validate_leaf(filename)?;
         let access_mode = match access {
             crate::OPEN_READ => AccessMode::Read,
             crate::OPEN_WRITE => AccessMode::Write,
@@ -366,7 +373,7 @@ impl Mount41 {
                 create: true,
                 create_attrs_mask: mask,
                 create_attrs_vals: values,
-                claim_file: filename.to_string(),
+                claim_file: filename,
                 want_no_delegation: !self.retain_delegations,
             };
             // Preserve OPEN progress: a failure in GETFH/GETATTR cannot authorize
@@ -450,22 +457,23 @@ impl Mount41 {
 
     pub(crate) async fn create_path_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::ObjRes> {
-        let (dir, name) = crate::split_path(path)?;
-        let dir_obj = self.lookup_path(&dir).await?;
-        self.create_with_access(dir_obj.fh, &name, mode, access)
+        let (dir, name) = crate::path_resolution::split_byte_path(path)?;
+        let dir_obj = self.lookup_path(dir).await?;
+        self.create_with_access(dir_obj.fh, name, mode, access)
             .await
     }
 
     pub(crate) async fn mkdir(
         &self,
         dir_fh: Bytes,
-        dirname: &str,
+        dirname: &[u8],
         mode: u32,
     ) -> Result<mount::ObjRes> {
+        crate::path_resolution::validate_leaf(dirname)?;
         // 不在 CREATE createattrs 传 mode，避免 NFS4ERR_ATTRNOTSUPP；创建后 SETATTR 设置。
         let bitmap = standard_getattr_bitmap();
         let resp = self
@@ -485,7 +493,7 @@ impl Mount41 {
                 let atomic = cdata.get_u32() != 0;
                 let before = cdata.get_u64();
                 let after = cdata.get_u64();
-                debug!(atomic, before, after, name = dirname, "CREATE change_info");
+                debug!(atomic, before, after, name = ?dirname, "CREATE change_info");
             }
         }
         let getfh = resp.op_ok(3)?;
@@ -510,9 +518,9 @@ impl Mount41 {
         })
     }
 
-    pub(crate) async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
-        let (dir, name) = crate::split_path(path)?;
-        let dir_obj = self.lookup_path(&dir).await?;
-        self.mkdir(dir_obj.fh, &name, mode).await
+    pub(crate) async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<mount::ObjRes> {
+        let (dir, name) = crate::path_resolution::split_byte_path(path)?;
+        let dir_obj = self.lookup_path(dir).await?;
+        self.mkdir(dir_obj.fh, name, mode).await
     }
 }

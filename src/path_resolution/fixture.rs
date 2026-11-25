@@ -31,8 +31,14 @@ impl Namespace for FixtureNamespace {
         Ok(self.node("", 2))
     }
 
-    async fn child(&self, directory: Bytes, name: &str) -> Result<Node> {
+    async fn child(&self, directory: Bytes, name: &[u8]) -> Result<Node> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        if directory.is_empty() && name == b"raw-\xff" {
+            let mut node = self.node("", 1);
+            node.fh = Bytes::from_static(b"raw-\xff");
+            return Ok(node);
+        }
+        let name = std::str::from_utf8(name).map_err(|error| NfsError::Xdr(error.to_string()))?;
         let directory =
             std::str::from_utf8(&directory).map_err(|error| NfsError::Xdr(error.to_string()))?;
         let path = if directory.is_empty() {
@@ -64,7 +70,9 @@ impl Namespace for FixtureNamespace {
             "file" | "nested/file" | "nested/peer" => Ok(self.node(&path, 1)),
             "link" | "dangling" | "absolute" | "outside" | "cycle" | "cycle-a" | "cycle-b"
             | "alias" | "deep-alias" | "nested/up" | "nested/back" | "empty" | "nul" | "long"
-            | "many" | "slow" | "readlink-error" | "encoding-error" => Ok(self.node(&path, 5)),
+            | "many" | "slow" | "readlink-error" | "encoding-error" | "raw-link" => {
+                Ok(self.node(&path, 5))
+            }
             _ if path.starts_with("chain-") => Ok(self.node(&path, 5)),
             _ => Err(if self.v4 {
                 NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_NOENT)
@@ -74,11 +82,12 @@ impl Namespace for FixtureNamespace {
         }
     }
 
-    async fn link_text(&self, fh: Bytes) -> Result<String> {
+    async fn link_target(&self, fh: Bytes) -> Result<Bytes> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let path = std::str::from_utf8(&fh).map_err(|error| NfsError::Xdr(error.to_string()))?;
         Ok(match path {
             "link" => "file".into(),
+            "raw-link" => Bytes::from_static(b"raw-\xff"),
             "dangling" => "missing".into(),
             "absolute" => "/file".into(),
             "outside" => "../file".into(),
@@ -89,13 +98,13 @@ impl Namespace for FixtureNamespace {
             "deep-alias" => "nested/deep".into(),
             "nested/up" => "../file".into(),
             "nested/back" => "..".into(),
-            "empty" => String::new(),
+            "empty" => Bytes::new(),
             "nul" => "bad\0name".into(),
-            "long" => "x".repeat(MAX_PATH_BYTES + 1),
-            "many" => "./".repeat(MAX_COMPONENTS),
+            "long" => "x".repeat(MAX_PATH_BYTES + 1).into(),
+            "many" => "./".repeat(MAX_COMPONENTS).into(),
             "slow" => std::future::pending().await,
             "readlink-error" => return Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_IO)),
-            "encoding-error" => return Err(NfsError::Xdr("READLINK target is not UTF-8".into())),
+            "encoding-error" => return Err(NfsError::Xdr("malformed READLINK reply".into())),
             _ => {
                 let number = path
                     .strip_prefix("chain-")
@@ -104,7 +113,7 @@ impl Namespace for FixtureNamespace {
                 if number == 0 {
                     "file".into()
                 } else {
-                    format!("chain-{}", number - 1)
+                    format!("chain-{}", number - 1).into()
                 }
             }
         })
@@ -115,6 +124,15 @@ impl Namespace for FixtureNamespace {
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn raw_link_resolves_to_the_exact_target() {
+        let result = resolve(&FixtureNamespace::default(), b"raw-link")
+            .await
+            .unwrap();
+        assert_eq!(result.path.as_deref(), Some(b"raw-\xff".as_slice()));
+        assert_eq!(result.object.unwrap().fh, b"raw-\xff"[..]);
+    }
 
     #[tokio::test]
     async fn follows_final_and_intermediate_links_and_preserves_dotdot_order() {
@@ -134,9 +152,9 @@ mod tests {
             ("alias/../alias/file", "nested/file"),
             ("alias/", "nested"),
         ] {
-            let result = resolve(&namespace, input).await.unwrap();
+            let result = resolve(&namespace, input.as_bytes()).await.unwrap();
             assert_eq!(result.status, PathResolutionStatus::Resolved, "{input}");
-            assert_eq!(result.path.as_deref(), Some(expected), "{input}");
+            assert_eq!(result.path.as_deref(), Some(expected.as_bytes()), "{input}");
             assert_eq!(result.exists(), Some(true));
             assert!(result.object.unwrap().attr.is_some());
         }
@@ -176,7 +194,7 @@ mod tests {
                 ("cycle", PathResolutionStatus::TooManySymlinks, None),
                 ("cycle-a", PathResolutionStatus::TooManySymlinks, None),
             ] {
-                let result = resolve(&namespace, input).await.unwrap();
+                let result = resolve(&namespace, input.as_bytes()).await.unwrap();
                 assert_eq!(
                     (result.status, result.exists()),
                     (status, exists),
@@ -191,15 +209,15 @@ mod tests {
     async fn permits_exactly_forty_links_and_stops_cycles() {
         let namespace = FixtureNamespace::default();
         assert_eq!(
-            resolve(&namespace, "chain-39").await.unwrap().exists(),
+            resolve(&namespace, b"chain-39").await.unwrap().exists(),
             Some(true)
         );
         assert_eq!(
-            resolve(&namespace, "chain-40").await.unwrap().status,
+            resolve(&namespace, b"chain-40").await.unwrap().status,
             PathResolutionStatus::TooManySymlinks
         );
         let before = namespace.calls.load(Ordering::Relaxed);
-        resolve(&namespace, "cycle").await.unwrap();
+        resolve(&namespace, b"cycle").await.unwrap();
         assert_eq!(namespace.calls.load(Ordering::Relaxed) - before, 82);
     }
 
@@ -211,19 +229,19 @@ mod tests {
                 ..Default::default()
             };
             assert!(matches!(
-                resolve(&namespace, "denied").await,
+                resolve(&namespace, b"denied").await,
                 Err(NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_ACCES)
                     | NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_ACCESS))
             ));
-            assert!(matches!(resolve(&namespace, "disconnected").await,
+            assert!(matches!(resolve(&namespace, b"disconnected").await,
                 Err(NfsError::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionReset));
             assert!(matches!(
-                resolve(&namespace, "stale").await,
+                resolve(&namespace, b"stale").await,
                 Err(NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_STALE)
                     | NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_STALE))
             ));
             assert!(matches!(
-                resolve(&namespace, "readlink-error").await,
+                resolve(&namespace, b"readlink-error").await,
                 Err(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_IO))
             ));
         }
@@ -239,28 +257,28 @@ mod tests {
             "./".repeat(MAX_COMPONENTS),
         ] {
             assert!(matches!(
-                resolve(&namespace, &path).await,
+                resolve(&namespace, path.as_bytes()).await,
                 Err(NfsError::InvalidInput(_))
             ));
         }
         assert_eq!(namespace.calls.load(Ordering::Relaxed), 0);
         let at_limit = vec!["."; MAX_COMPONENTS].join("/");
         assert_eq!(
-            resolve(&namespace, &at_limit)
+            resolve(&namespace, at_limit.as_bytes())
                 .await
                 .unwrap()
                 .path
                 .as_deref(),
-            Some(".")
+            Some(b".".as_slice())
         );
         for path in ["nul", "long", "many"] {
             assert!(matches!(
-                resolve(&namespace, path).await,
+                resolve(&namespace, path.as_bytes()).await,
                 Err(NfsError::InvalidInput(_))
             ));
         }
         assert_eq!(
-            resolve(&namespace, &".".repeat(MAX_PATH_BYTES))
+            resolve(&namespace, (".".repeat(MAX_PATH_BYTES)).as_bytes())
                 .await
                 .unwrap()
                 .status,
@@ -272,7 +290,7 @@ mod tests {
     async fn resolution_can_be_cancelled_while_readlink_is_pending() {
         let namespace = FixtureNamespace::default();
         assert!(
-            timeout(Duration::from_millis(10), resolve(&namespace, "slow"))
+            timeout(Duration::from_millis(10), resolve(&namespace, b"slow"))
                 .await
                 .is_err()
         );
@@ -280,7 +298,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(namespace.calls.load(Ordering::Relaxed), calls);
         assert_eq!(
-            resolve(&namespace, "link").await.unwrap().exists(),
+            resolve(&namespace, b"link").await.unwrap().exists(),
             Some(true)
         );
     }

@@ -15,39 +15,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Mount, READLINK3args, Result, nfs_fh3};
-use crate::NfsError;
 use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn readlink_path(&self, path: &str) -> Result<String> {
+    pub async fn readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         self.readlink(self.lookup_path(path).await?.fh).await
     }
 
-    pub async fn readlink(&self, fh: Bytes) -> Result<String> {
+    pub async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         let args = READLINK3args {
             symlink: nfs_fh3 { data: fh },
         };
-        let ok = self._readlink(args).await?;
-        // RFC 1813 §3.3.5 leaves interpretation to the client. This String
-        // interface must not replace bytes and silently select another target.
-        std::str::from_utf8(&ok.data.0)
-            .map(str::to_owned)
-            .map_err(|error| NfsError::Xdr(format!("READLINK target is not UTF-8: {error}")))
+        crate::path_resolution::checked_readlink_target(self._readlink(args).await?.data.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Auth, NfsError, rpc};
+    use crate::{Auth, rpc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn readlink_preserves_utf8_identity_v3() {
-        // RFC 1813 §3.3.5 returns uninterpreted target bytes. A String API
-        // must reject unrepresentable bytes rather than resolve another name.
+    async fn readlink_preserves_target_bytes_v3() {
+        // RFC 1813 §3.3.5 leaves interpretation of the target bytes to the client.
         for target in [
             b"../target".as_slice(),
             "目录/target".as_bytes(),
@@ -91,10 +84,7 @@ mod tests {
                 wsize: 4096,
             };
             let result = mount.readlink(mount.getfh()).await;
-            match std::str::from_utf8(target) {
-                Ok(expected) => assert_eq!(result.unwrap(), expected),
-                Err(_) => assert!(matches!(result, Err(NfsError::Xdr(_))), "{result:?}"),
-            }
+            assert_eq!(result.unwrap().as_ref(), target);
             server.await.unwrap();
         }
     }

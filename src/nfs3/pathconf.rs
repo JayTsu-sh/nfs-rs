@@ -19,7 +19,7 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn pathconf_path(&self, path: &str) -> Result<crate::mount::Pathconf> {
+    pub async fn pathconf_path(&self, path: &[u8]) -> Result<crate::mount::Pathconf> {
         self.pathconf(self.lookup_path(path).await?.fh).await
     }
 

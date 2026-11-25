@@ -71,7 +71,7 @@ pub(super) fn stateid_hex(stateid: &[u8; 16]) -> String {
 /// Inputs shared by the fresh-OPEN helpers.
 pub(super) struct FreshOpenSpec<'a> {
     pub(super) dir_fh: &'a Bytes,
-    pub(super) name: &'a str,
+    pub(super) name: &'a [u8],
     pub(super) owner_wire: &'a [u8],
     pub(super) access: u32,
     pub(super) client_id: u64,

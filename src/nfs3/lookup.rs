@@ -14,36 +14,27 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result, diropargs3, filename3, nfs_fh3};
+use super::{LOOKUP3args, LOOKUP3resok, Mount, ObjRes, Result, nfs_fh3};
+use crate::path_resolution::{path_components, validate_name};
 use bytes::Bytes;
-use std::path::Component;
 
 impl Mount {
-    pub async fn lookup_path(&self, path: &str) -> Result<ObjRes> {
-        tracing::debug!(path, "resolving path");
-        let mut res = Ok(ObjRes {
+    pub async fn lookup_path(&self, path: &[u8]) -> Result<ObjRes> {
+        let mut object = ObjRes {
             fh: self.fh.clone(),
             attr: None,
-        });
-        for component in path_clean::clean(path).components() {
-            // Skip path syntax, not filename text: on Unix, `\` is a normal name.
-            if let Ok(ref r) = res
-                && !matches!(component, Component::RootDir | Component::CurDir)
-            {
-                let n = component.as_os_str();
-                tracing::trace!(component = %n.to_string_lossy(), "resolving path component");
-                res = self.lookup(r.fh.clone(), &n.to_string_lossy()).await;
-            }
+        };
+        for component in path_components(path)? {
+            object = self.lookup(object.fh, component).await?;
         }
-        res
+        Ok(object)
     }
 
-    pub async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<ObjRes> {
+    pub async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<ObjRes> {
+        validate_name(filename)?;
         let args = LOOKUP3args {
-            what: diropargs3 {
-                dir: nfs_fh3 { data: dir_fh },
-                name: filename3(filename.to_string()),
-            },
+            dir: nfs_fh3 { data: dir_fh },
+            name: filename,
         };
         self._lookup(args).await?.into()
     }

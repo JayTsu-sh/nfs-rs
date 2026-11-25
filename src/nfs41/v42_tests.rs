@@ -593,11 +593,12 @@ async fn cancelled_queued_mutation_keeps_uncertainty_before_releasing_barrier() 
     let core = crate::client_core::ClientCore::new(mount.clone());
     let destination = Bytes::from_static(b"destination");
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let mut operation = Box::pin(super::v42_ops::run_owned::<(), _, _>(
+    let mut operation = Box::pin(super::write_owner::run_owned::<(), _, _>(
         mount.clone(),
         core,
         None,
         destination.clone(),
+        "test mutation",
         move |mount| async move {
             let _ = entered_tx.send(());
             Err(mount.mutation_error("copy", crate::NfsError::Rpc("reply lost".into())))
@@ -625,11 +626,12 @@ async fn panicked_mutation_publishes_uncertainty_before_releasing_barrier() {
     let mount = Arc::new(mount);
     let core = crate::client_core::ClientCore::new(mount.clone());
     let destination = Bytes::from_static(b"destination");
-    let error = super::v42_ops::run_owned::<(), _, _>(
+    let error = super::write_owner::run_owned::<(), _, _>(
         mount.clone(),
         core,
         None,
         destination.clone(),
+        "test mutation",
         |_| async move {
             panic!("injected mutation task failure");
         },
@@ -765,7 +767,7 @@ async fn default_dot_path_resolves_mount_root_without_invalid_lookup() {
     let (mount, server) = serve_v42(|tag, _| panic!("root path must not send LOOKUP: {tag}")).await;
     for path in ["", ".", "/", "./", "/./"] {
         assert_eq!(
-            mount.lookup_path(path).await.unwrap().fh,
+            mount.lookup_path(path.as_bytes()).await.unwrap().fh,
             Bytes::from_static(b"root")
         );
     }

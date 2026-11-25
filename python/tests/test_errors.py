@@ -31,7 +31,7 @@ from nfs_rs import (
     ],
 )
 def test_filesystem_errors_keep_builtin_and_nfs_inheritance(error_type, builtin):
-    error = error_type(message="failure", operation="stat", filename="safe/path")
+    error = error_type(message="failure", operation="stat", filename=b"safe/path")
     assert isinstance(error, builtin)
     assert isinstance(error, NfsError)
     assert str(error) == "failure"
@@ -48,7 +48,7 @@ def test_structured_fields_are_immutable_and_pickle_stable():
         outcome=OperationOutcome.UNCERTAIN,
         operation_class=OperationClass.REPLAY_SENSITIVE,
         completed_bytes=8,
-        filename="safe/file",
+        filename=b"safe/file",
     )
     restored = pickle.loads(pickle.dumps(error))
     assert type(restored) is type(error)
@@ -60,10 +60,10 @@ def test_structured_fields_are_immutable_and_pickle_stable():
 
 def test_context_enrichment_never_overwrites_authoritative_fields():
     original = NfsNotFoundError(message="missing", operation="lookup", protocol="3")
-    enriched = original.with_context(operation="stat", protocol="4.1", filename="safe")
+    enriched = original.with_context(operation="stat", protocol="4.1", filename=b"safe")
     assert enriched.operation == "lookup"
     assert enriched.protocol == "3"
-    assert enriched.filename == "safe"
+    assert enriched.filename == b"safe"
 
 
 @pytest.mark.parametrize(
@@ -90,8 +90,8 @@ def test_server_busy_metadata_survives_pickle_and_context():
         retry_reason="retry_limit",
     )
     assert isinstance(error, nfs_rs.NfsRetryableError)
-    restored = pickle.loads(pickle.dumps(error)).with_context(filename="file")
+    restored = pickle.loads(pickle.dumps(error)).with_context(filename=b"file")
     assert (restored.retry_count, restored.retry_elapsed_ms, restored.retry_reason) == (16, 45000, "retry_limit")
-    assert restored.code == 10008 and restored.filename == "file"
+    assert restored.code == 10008 and restored.filename == b"file"
     with pytest.raises(AttributeError):
         restored.retry_count = 0

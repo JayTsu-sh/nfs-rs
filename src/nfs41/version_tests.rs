@@ -18,6 +18,8 @@ struct Step {
     replies: Vec<Reply>,
     reconnect: bool,
     drop_reply: bool,
+    export_component: &'static [u8],
+    exchange_flags: Option<u32>,
 }
 
 fn step(minor: u32, tag: &'static str, replies: Vec<Reply>) -> Step {
@@ -27,6 +29,8 @@ fn step(minor: u32, tag: &'static str, replies: Vec<Reply>) -> Step {
         replies,
         reconnect: false,
         drop_reply: false,
+        export_component: b"export",
+        exchange_flags: None,
     }
 }
 
@@ -117,28 +121,45 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
     let tag = take_opaque(&mut args, "tag").unwrap();
     assert_eq!(tag.as_ref(), step.tag.as_bytes());
     assert_eq!(args.get_u32(), step.minor, "minor version for {}", step.tag);
+    let _count = args.get_u32();
+    let opcode = args.get_u32();
+    if step.tag == "navigate" {
+        assert_eq!(opcode, 53);
+        let mut navigation = args.slice(32..);
+        assert_eq!(navigation.get_u32(), 24);
+        assert_eq!(navigation.get_u32(), 15);
+        assert_eq!(
+            take_opaque(&mut navigation, "export name").unwrap(),
+            step.export_component
+        );
+        assert_eq!(navigation.get_u32(), 10);
+        assert!(navigation.is_empty());
+    }
+    if opcode == 42 {
+        let mut exchange_args = args.clone();
+        let verifier = exchange_args.split_to(8);
+        let owner = take_opaque(&mut exchange_args, "owner").unwrap();
+        let identity = Bytes::from([verifier.as_ref(), owner.as_ref()].concat());
+        let flags = exchange_args.get_u32();
+        if let Some(expected) = step.exchange_flags {
+            assert_eq!(flags, expected);
+        } else {
+            assert_eq!(flags & 4 != 0, step.minor == 2);
+        }
+        if let Some((minor, previous)) = previous_owner.take() {
+            if minor == step.minor {
+                assert_eq!(identity, previous);
+            } else {
+                assert_ne!(identity, previous);
+            }
+        }
+        *previous_owner = Some((step.minor, identity));
+    }
     if step.drop_reply {
         return;
     }
-    let _count = args.get_u32();
-    let opcode = args.get_u32();
-    if opcode == 42 {
-        let mut exchange_args = args.clone();
-        exchange_args.advance(8); // verifier
-        let owner = take_opaque(&mut exchange_args, "owner").unwrap();
-        let flags = exchange_args.get_u32();
-        assert_eq!(flags & 4 != 0, step.minor == 2);
-        if let Some((minor, previous)) = previous_owner.take() {
-            if minor == step.minor {
-                assert_eq!(owner, previous);
-            } else {
-                assert_ne!(owner, previous);
-            }
-        }
-        *previous_owner = Some((step.minor, owner));
-    }
     let mut replies = step.replies;
-    if opcode == 53 {
+    if opcode == 53 && replies.first().is_none_or(|reply| reply.opcode != 53) {
         let mut sequence = args.split_to(28).to_vec();
         xdr_u32(&mut sequence, 0); // target highest slot
         xdr_u32(&mut sequence, 0); // flags
@@ -164,6 +185,32 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .unwrap();
     stream.write_all(&response).await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_export_url_sends_exact_lookup_bytes_in_v41_and_v42() {
+    for (minor, version) in [
+        (1, crate::NFSVersion::NFSv4p1),
+        (2, crate::NFSVersion::NFSv4p2),
+    ] {
+        let mut steps = bootstrap(minor);
+        steps
+            .iter_mut()
+            .find(|step| step.tag == "navigate")
+            .unwrap()
+            .export_component = b"\xff%2F";
+        steps.push(step(minor, "destroy_session", vec![ok(44, vec![])]));
+        steps.push(step(minor, "destroy_clientid", vec![ok(57, vec![])]));
+        let (addr, task) = server(steps).await;
+        let mount = crate::parse_url_and_mount(&format!(
+            "nfs://{addr}/%FF%252F/?version=4.{minor}&noresvport=true"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(mount.version(), version);
+        mount.umount().await.unwrap();
+        task.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -205,7 +252,7 @@ async fn v42_public_mount_recovery_and_teardown_preserve_minor_version() {
             .unwrap();
     assert_eq!(mount.version(), crate::NFSVersion::NFSv4p2);
     assert!(matches!(
-        mount.lookup(mount.getfh().await, "missing").await,
+        mount.lookup(mount.getfh().await, b"missing").await,
         Err(crate::NfsError::Nfs4(
             crate::nfs4::fastxdr::nfsstat4::NFS4ERR_NOENT
         ))
@@ -228,9 +275,95 @@ async fn exact_v42_rejection_is_preserved() {
     task.await.unwrap();
 }
 
+fn rejected_exchange(minor: u32, opcode: u32, status: u32) -> Step {
+    step(
+        minor,
+        "exchange_id",
+        vec![Reply {
+            opcode,
+            status,
+            data: vec![],
+        }],
+    )
+}
+
+#[tokio::test]
+async fn v42_fence_negotiation_retries_once_with_only_the_optional_bit_cleared() {
+    use super::session::EXCHGID4_FLAG_USE_PNFS_MDS as MDS;
+    for accepts in [true, false] {
+        let mut rejected = rejected_exchange(2, 42, 22);
+        rejected.exchange_flags = Some(MDS | 4);
+        let mut rest = if accepts {
+            bootstrap(2)
+        } else {
+            vec![rejected_exchange(2, 42, 22)]
+        };
+        rest[0].exchange_flags = Some(MDS);
+        let mut steps = vec![rejected];
+        steps.extend(rest);
+        if accepts {
+            steps.push(step(2, "destroy_session", vec![ok(44, vec![])]));
+            steps.push(step(2, "destroy_clientid", vec![ok(57, vec![])]));
+        }
+        let (addr, task) = server(steps).await;
+        let result =
+            crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.2&noresvport=true"))
+                .await;
+        if accepts {
+            let mount = result.unwrap();
+            assert_eq!(mount.version(), crate::NFSVersion::NFSv4p2);
+            mount.umount().await.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_INVAL))
+            ));
+        }
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn v42_fence_negotiation_does_not_mask_other_failures() {
+    for (minor, opcode, status, code) in [
+        (1, 42, 22, crate::Nfs4ErrorCode::NFS4ERR_INVAL),
+        (2, 3, 22, crate::Nfs4ErrorCode::NFS4ERR_INVAL),
+        (2, 42, 13, crate::Nfs4ErrorCode::NFS4ERR_ACCESS),
+    ] {
+        let (addr, task) = server(vec![rejected_exchange(minor, opcode, status)]).await;
+        let result = crate::parse_url_and_mount(&format!(
+            "nfs://{addr}/export?version=4.{minor}&noresvport=true"
+        ))
+        .await;
+        assert!(matches!(result, Err(crate::NfsError::Nfs4(actual)) if actual == code));
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn v42_fence_negotiation_preserves_connection_failure_without_a_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut expected = exchange(2);
+        expected.drop_reply = true;
+        answer(&mut stream, expected, &mut None).await;
+    });
+    let result =
+        crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.2&noresvport=true"))
+            .await;
+    assert!(
+        result.is_err_and(|error| error.is_connection_lost()),
+        "must preserve the EXCHANGE_ID connection failure"
+    );
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn v42_ds_downgrades_only_after_minor_mismatch_and_uses_v41_for_io_and_cleanup() {
-    for ds_minor in [2, 1] {
+    use super::session::EXCHGID4_FLAG_USE_PNFS_DS as DS;
+    for (ds_minor, rejects_fence) in [(2, false), (1, false), (2, true)] {
         let mut read = Vec::new();
         xdr_u32(&mut read, 1);
         xdr_opaque(&mut read, b"data");
@@ -240,11 +373,23 @@ async fn v42_ds_downgrades_only_after_minor_mismatch_and_uses_v41_for_io_and_cle
         write.extend([3; 8]);
         let mut steps = if ds_minor == 1 {
             vec![step(2, "exchange_id", vec![])]
+        } else if rejects_fence {
+            let mut rejected = rejected_exchange(2, 42, 22);
+            rejected.exchange_flags = Some(DS | 4);
+            vec![rejected]
         } else {
             vec![]
         };
+        let mut exchange = exchange(ds_minor);
+        exchange.exchange_flags = Some(
+            DS | if ds_minor == 2 && !rejects_fence {
+                4
+            } else {
+                0
+            },
+        );
         steps.extend(vec![
-            exchange(ds_minor),
+            exchange,
             create_session(ds_minor),
             step(ds_minor, "ds-read", vec![ok(22, vec![]), ok(25, read)]),
             step(ds_minor, "ds-write", vec![ok(22, vec![]), ok(38, write)]),
@@ -404,7 +549,7 @@ async fn v42_reconnect_rebind_preserves_minor_version() {
         crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.2&noresvport=true"))
             .await
             .unwrap();
-    let result = mount.lookup(mount.getfh().await, "missing").await;
+    let result = mount.lookup(mount.getfh().await, b"missing").await;
     assert!(
         matches!(
             &result,
@@ -414,6 +559,55 @@ async fn v42_reconnect_rebind_preserves_minor_version() {
         ),
         "lookup result: {result:?}"
     );
+    mount.umount().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn v41_xattr_truncation_is_not_replayed_after_original_session_is_lost() {
+    use crate::nfs4::fastxdr::nfsstat4;
+    use crate::{NfsError, OperationOutcome, RecoveryAction};
+
+    let mut steps = bootstrap(1);
+    let mut dropped_open = step(1, "setxattr-open", vec![]);
+    dropped_open.drop_reply = true;
+    steps.push(dropped_open);
+    let mut bind = vec![7; 16];
+    xdr_u32(&mut bind, 3);
+    xdr_u32(&mut bind, 0);
+    steps.push(step(1, "bind_conn", vec![ok(41, bind)]));
+    // The lost OPEN reply may have acknowledged truncation. The retry now sees
+    // only a failed SEQUENCE, which cannot establish the first OPEN's outcome.
+    steps.push(step(
+        1,
+        "setxattr-open",
+        vec![Reply {
+            opcode: 53,
+            status: nfsstat4::NFS4ERR_BADSESSION as u32,
+            data: vec![],
+        }],
+    ));
+    steps.push(step(1, "destroy_session", vec![ok(44, vec![])]));
+    steps.push(step(1, "destroy_clientid", vec![ok(57, vec![])]));
+    let (addr, task) = server(steps).await;
+    let mount =
+        crate::parse_url_and_mount(&format!("nfs://{addr}/export?version=4.1&noresvport=true"))
+            .await
+            .unwrap();
+    let error = mount
+        .setxattr(mount.getfh().await, "key", Bytes::from_static(b"new"))
+        .await
+        .unwrap_err();
+    let outcome = error
+        .operation_outcome()
+        .expect("lost OPEN result must remain uncertain");
+    assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+    assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+    assert_eq!(outcome.context().operation, "setxattr-open");
+    assert!(matches!(
+        outcome.source.as_ref(),
+        NfsError::Nfs4(nfsstat4::NFS4ERR_BADSESSION)
+    ));
     mount.umount().await.unwrap();
     task.await.unwrap();
 }

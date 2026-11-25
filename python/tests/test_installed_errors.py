@@ -34,7 +34,7 @@ def test_protocol_statuses_have_structured_python_semantics() -> None:
         assert error.protocol == "3"
         assert error.code == code
         assert error.code_name == code_name
-        assert error.filename == path
+        assert error.filename == path.encode()
     from nfs_rs import NfsBadCookieError
     for path, code, code_name in (
         ("__bad_cookie__", 10003, "NFS3ERR_BAD_COOKIE"),
@@ -163,10 +163,40 @@ def test_async_classification_matches_sync() -> None:
         client = await AsyncClient.connect("nfs-test://fixture/export")
         with pytest.raises(NfsNotFoundError) as caught:
             await client.stat("missing")
-        assert (caught.value.operation, caught.value.protocol, caught.value.filename) == ("stat", "3", "missing")
+        assert (caught.value.operation, caught.value.protocol, caught.value.filename) == ("stat", "3", b"missing")
         await client.close()
 
     import asyncio
+
+    asyncio.run(scenario())
+
+
+def test_raw_error_filenames_distinguish_bytes_from_escaped_text():
+    import asyncio
+    import pickle
+
+    from nfs_rs import AsyncClient, Client, NfsLostOpenStateError, RecoveryAction
+
+    paths = (b"dir/\xff", b"dir/\\xff")
+    with Client.connect("nfs-test://fixture/export") as client:
+        for path in paths:
+            with client.open(memoryview(path), "rb") as file:
+                file._inner._target._lose_open_state()
+                with pytest.raises(NfsLostOpenStateError) as caught:
+                    file.read(1)
+                assert caught.value.filename == path
+                assert caught.value.recovery_action is RecoveryAction.REOPEN
+                assert pickle.loads(pickle.dumps(caught.value)).filename == path
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            for path in paths:
+                async with await client.open(memoryview(path), "rb") as file:
+                    file._inner._target._lose_open_state()
+                    with pytest.raises(NfsLostOpenStateError) as caught:
+                        await file.read(1)
+                    assert caught.value.filename == path
+                    assert caught.value.recovery_action is RecoveryAction.REOPEN
 
     asyncio.run(scenario())
 

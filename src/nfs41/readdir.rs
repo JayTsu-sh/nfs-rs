@@ -3,7 +3,8 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use futures::stream::TryStreamExt as _;
 
-use super::mount::{Mount41, decode_string_from_bytes};
+use super::mount::Mount41;
+use crate::directory_buffer::{decode_name, retain};
 use crate::error::{NfsError, Result};
 use crate::mount;
 use crate::nfs4::attrs::{decode_getattr_response, standard_getattr_bitmap};
@@ -157,7 +158,7 @@ impl Mount41 {
                 "READDIR reply exceeds requested maxcount".into(),
             ));
         }
-        let mut data = readdir_op.data.clone();
+        let mut data = retain(readdir_op.data.clone(), resp.wire_len)?;
 
         // READDIR4resok: cookieverf(8) + dirlist4
         if data.remaining() < 8 {
@@ -185,7 +186,7 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie; // track for pagination
-            let name = decode_string_from_bytes(&mut data)?;
+            let name = decode_name(&mut data)?;
             // Decode attrs to extract fileid (NFSv4.1: attr #20)
             let attr = decode_entry_fattr4(&mut data).ok();
             let fileid = attr.as_ref().map(|a| a.fileid).unwrap_or(entry_cookie);
@@ -227,7 +228,7 @@ impl Mount41 {
                 "READDIR reply exceeds requested maxcount".into(),
             ));
         }
-        let mut data = readdir_op.data.clone();
+        let mut data = retain(readdir_op.data.clone(), resp.wire_len)?;
 
         if data.remaining() < 8 {
             return Err(NfsError::Xdr("READDIR cookieverf truncated".to_string()));
@@ -252,12 +253,12 @@ impl Mount41 {
             }
             let entry_cookie = data.get_u64();
             last_cookie = entry_cookie;
-            let name = decode_string_from_bytes(&mut data)?;
+            let name = decode_name(&mut data)?;
             let mut attr = match decode_entry_fattr4(&mut data) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     tracing::warn!(
-                        "readdirplus: failed to decode attrs for entry '{}': {}",
+                        "readdirplus: failed to decode attrs for entry {:?}: {}",
                         name,
                         e
                     );
@@ -300,8 +301,134 @@ fn decode_entry_fattr4(data: &mut Bytes) -> Result<mount::Attr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nfs4::compound::take_opaque;
     use crate::nfs41::test_support::directory_page as page;
-    use crate::nfs41::test_support::{Reply, ok, putfh, serve};
+    use crate::nfs41::test_support::{
+        Reply, named_directory_page, ok, opaque, putfh, serve, serve_v42,
+    };
+
+    #[tokio::test]
+    async fn raw_names_survive_paging_rename_and_remove_v41_and_v42() {
+        const NAMES: [&[u8]; 3] = [b"\xff", b"\xfe", b"~nfs-rs-raw:FF"];
+        for v42 in [false, true] {
+            let handler = |tag: &str, mut args: Bytes| {
+                putfh(&mut args);
+                match tag {
+                    "readdir" => {
+                        assert_eq!(args.get_u32(), 26);
+                        let cookie = args.get_u64();
+                        assert_eq!(
+                            args.split_to(8).as_ref(),
+                            &[if cookie == 0 { 0 } else { 7 }; 8]
+                        );
+                        let name = NAMES[cookie as usize];
+                        let reply =
+                            named_directory_page(Some(cookie + 1), cookie == 2, [7; 8], name);
+                        vec![ok(22, vec![]), ok(26, reply)]
+                    }
+                    "rename" => {
+                        assert_eq!(args.get_u32(), 32);
+                        putfh(&mut args);
+                        assert_eq!(args.get_u32(), 29);
+                        assert_eq!(take_opaque(&mut args, "old name").unwrap(), NAMES[0]);
+                        assert_eq!(
+                            take_opaque(&mut args, "new name").unwrap().as_ref(),
+                            b"moved\xff"
+                        );
+                        assert!(args.is_empty());
+                        vec![
+                            ok(22, vec![]),
+                            ok(32, vec![]),
+                            ok(22, vec![]),
+                            ok(29, vec![0; 40]),
+                        ]
+                    }
+                    "remove" => {
+                        assert_eq!(args.get_u32(), 28);
+                        assert_eq!(
+                            take_opaque(&mut args, "name").unwrap().as_ref(),
+                            b"moved\xff"
+                        );
+                        assert!(args.is_empty());
+                        vec![ok(22, vec![]), ok(28, vec![0; 20])]
+                    }
+                    _ => panic!("unexpected compound {tag}"),
+                }
+            };
+            let (mount, server) = if v42 {
+                serve_v42(handler).await
+            } else {
+                serve(handler).await
+            };
+            let entries = mount
+                .readdir(Bytes::new())
+                .await
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.file_name.as_ref())
+                    .collect::<Vec<_>>(),
+                NAMES
+            );
+            mount
+                .rename(
+                    Bytes::new(),
+                    &entries[0].file_name,
+                    Bytes::new(),
+                    b"moved\xff",
+                )
+                .await
+                .unwrap();
+            mount.remove(Bytes::new(), b"moved\xff").await.unwrap();
+            mount.rpc.shutdown().await;
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_preserves_non_utf8_name() {
+        const NAME: &[u8] = b"\xd6\xd0\xce\xc4x";
+        let (mount, server) = serve(|tag, mut args| {
+            putfh(&mut args);
+            match tag {
+                "readdirplus" => {
+                    let mut reply = page(Some(7), true, [1; 8]);
+                    // The fixture puts the name after verifier, bool, cookie, and length.
+                    reply[24..29].copy_from_slice(NAME);
+                    vec![ok(22, vec![]), ok(26, reply)]
+                }
+                "lookup" => {
+                    assert_eq!(args.get_u32(), 15);
+                    assert_eq!(take_opaque(&mut args, "LOOKUP name").unwrap(), NAME);
+                    let fattr = [1u32.to_be_bytes(), (1u32 << 20).to_be_bytes()].concat();
+                    let attrs = [fattr, opaque(&42u64.to_be_bytes())].concat();
+                    vec![
+                        ok(22, vec![]),
+                        ok(15, vec![]),
+                        ok(10, opaque(b"child")),
+                        ok(9, attrs),
+                    ]
+                }
+                other => panic!("unexpected compound {other}"),
+            }
+        })
+        .await;
+        let entry = mount
+            .readdirplus(Bytes::new())
+            .await
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.file_name.as_ref(), NAME);
+        let object = mount.lookup(Bytes::new(), &entry.file_name).await.unwrap();
+        assert_eq!(object.fh.as_ref(), b"child");
+        mount.rpc.shutdown().await;
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn directory_empty_non_eof_is_an_error() {

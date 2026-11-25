@@ -56,7 +56,7 @@ async fn connect(url: &str) -> Result<Arc<dyn Mount>> {
 }
 
 async fn seed(mount: Arc<dyn Mount>, pattern: &Pattern) -> Result {
-    let created = mount.create_path(LEAF, Some(0o600)).await?;
+    let created = mount.create_path(LEAF.as_bytes(), Some(0o600)).await?;
     let file = BufferedFile::new(mount.clone(), created.fh);
     let mut offset = 0;
     while offset < TOTAL {
@@ -74,7 +74,7 @@ async fn seed(mount: Arc<dyn Mount>, pattern: &Pattern) -> Result {
 
 async fn verify(url: &str, pattern: &Pattern) -> Result {
     let mount = connect(url).await?;
-    let opened = mount.open_path(LEAF, OPEN_READ).await?;
+    let opened = mount.open_path(LEAF.as_bytes(), OPEN_READ).await?;
     if mount.getattr(opened.fh.clone()).await?.filesize != TOTAL {
         return Err("recovered file size differs from the seeded 20 GiB".into());
     }
@@ -115,7 +115,7 @@ async fn verify(url: &str, pattern: &Pattern) -> Result {
 }
 
 async fn interactive(mount: Arc<dyn Mount>, url: &str, pattern: &Pattern) -> Result {
-    let opened = mount.open_path(LEAF, OPEN_BOTH).await?;
+    let opened = mount.open_path(LEAF.as_bytes(), OPEN_BOTH).await?;
     let fh = opened.fh;
     event(json!({"phase":"ready"}))?;
     for line in io::stdin().lock().lines() {

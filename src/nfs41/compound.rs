@@ -14,6 +14,7 @@
 //! ...
 //! ```
 
+use crate::nfs4::compound::{WireArgs, opaque_len};
 use bytes::{Buf, Bytes};
 
 use super::{MinorVersion, NFS4_COMPOUND_PROC, NFS4_PROGRAM, NFS4_VERSION};
@@ -57,7 +58,7 @@ pub(crate) enum OpNum {
     SaveFh = 32,
     SetAttr = 34,
     Write = 38,
-    OpenAttr = 20,
+    OpenAttr = 19, // RFC 5662 nfs_opnum4.
     Lock = 12,
     Lockt = 13,
     Locku = 14,
@@ -194,16 +195,17 @@ fn xdr_bitmap(buf: &mut Vec<u8>, bitmap: &[u32]) {
 ///
 /// Operations are appended via chainable methods. The builder is consumed
 /// by `encode()` to produce the wire-format bytes.
-pub(crate) struct CompoundBuilder {
+pub(crate) struct CompoundBuilder<'a> {
     tag: String,
-    ops: Vec<EncodedOp>,
+    ops: Vec<EncodedOp<'a>>,
     required_generation: Option<u64>,
+    creates_named_attr_dir: bool,
 }
 
 /// A single encoded operation (opcode + pre-serialized args).
-struct EncodedOp {
+struct EncodedOp<'a> {
     opcode: OpNum,
-    args: Vec<u8>,
+    args: WireArgs<'a>,
 }
 
 const SEQUENCE_CACHE_THIS_OFFSET: usize = 28;
@@ -215,7 +217,7 @@ const SEQUENCE_SUCCESS_REPLY_SIZE: usize = 44;
 const MIN_OPERATION_REPLY_SIZE: usize = 8;
 
 #[allow(dead_code)] // Builder offers full NFSv4.1 op set; not all ops used yet
-impl CompoundBuilder {
+impl<'a> CompoundBuilder<'a> {
     /// RFC 8881 §15.1.1.3: a later DELAY cannot replay an earlier mutation.
     pub(crate) fn can_retry_busy(&self, response: &CompoundResponse) -> Result<bool> {
         if response.results.is_empty() || response.results.len() > self.ops.len() {
@@ -258,6 +260,7 @@ impl CompoundBuilder {
             tag: tag.to_string(),
             ops: Vec::new(),
             required_generation: None,
+            creates_named_attr_dir: false,
         }
     }
 
@@ -287,26 +290,27 @@ impl CompoundBuilder {
             .into()
     }
 
-    /// Namespace and v4.2 non-idempotent mutations may only replay within
-    /// their original exactly-once context (RFC 8881 §2.10.13.1.4). Losing
-    /// the session does not prove that the first attempt failed.
+    /// Mutations that cannot be repeated safely may only replay within their
+    /// original session (RFC 8881 §2.10.13.1.4). Session loss does not establish
+    /// that the original attempt failed.
     pub(crate) fn requires_original_session(&self) -> bool {
-        self.ops.iter().any(|op| {
-            matches!(
-                op.opcode,
-                OpNum::Create
-                    | OpNum::Link
-                    | OpNum::Remove
-                    | OpNum::Rename
-                    | OpNum::Allocate
-                    | OpNum::Deallocate
-                    | OpNum::Copy
-                    | OpNum::Clone
-                    | OpNum::OffloadCancel
-                    | OpNum::SetXattr
-                    | OpNum::RemoveXattr
-            )
-        })
+        self.creates_named_attr_dir
+            || self.ops.iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    OpNum::Create
+                        | OpNum::Link
+                        | OpNum::Remove
+                        | OpNum::Rename
+                        | OpNum::Allocate
+                        | OpNum::Deallocate
+                        | OpNum::Copy
+                        | OpNum::Clone
+                        | OpNum::OffloadCancel
+                        | OpNum::SetXattr
+                        | OpNum::RemoveXattr
+                )
+            })
     }
 
     pub(crate) fn require_generation(mut self, generation: u64) -> Self {
@@ -337,7 +341,7 @@ impl CompoundBuilder {
         xdr_bool(&mut args, false);
         self.ops.push(EncodedOp {
             opcode: OpNum::Sequence,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -369,13 +373,13 @@ impl CompoundBuilder {
             .first_mut()
             .ok_or_else(|| NfsError::Rpc("COMPOUND has no SEQUENCE operation".to_string()))?;
         if sequence.opcode as u32 != OpNum::Sequence as u32
-            || sequence.args.len() < SEQUENCE_CACHE_THIS_OFFSET + 4
+            || sequence.args.fixed.len() < SEQUENCE_CACHE_THIS_OFFSET + 4
         {
             return Err(NfsError::Rpc(
                 "COMPOUND first operation is not a valid SEQUENCE".to_string(),
             ));
         }
-        sequence.args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4]
+        sequence.args.fixed[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4]
             .copy_from_slice(&(cachethis as u32).to_be_bytes());
         Ok(self)
     }
@@ -428,7 +432,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, 0);
         self.ops.push(EncodedOp {
             opcode: OpNum::ExchangeId,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -454,7 +458,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, 0); // AUTH_NONE flavor
         self.ops.push(EncodedOp {
             opcode: OpNum::CreateSession,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -464,7 +468,7 @@ impl CompoundBuilder {
         args.extend_from_slice(session_id);
         self.ops.push(EncodedOp {
             opcode: OpNum::DestroySession,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -483,7 +487,7 @@ impl CompoundBuilder {
         xdr_bool(&mut args, use_conn_in_rdma_mode);
         self.ops.push(EncodedOp {
             opcode: OpNum::BindConnToSession,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -493,7 +497,7 @@ impl CompoundBuilder {
         xdr_bool(&mut args, one_fs);
         self.ops.push(EncodedOp {
             opcode: OpNum::ReclaimComplete,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -503,7 +507,7 @@ impl CompoundBuilder {
         xdr_u64(&mut args, client_id);
         self.ops.push(EncodedOp {
             opcode: OpNum::DestroyClientId,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -513,7 +517,7 @@ impl CompoundBuilder {
     pub fn putrootfh(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::PutRootFh,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
@@ -523,7 +527,7 @@ impl CompoundBuilder {
         xdr_var_bytes(&mut args, fh);
         self.ops.push(EncodedOp {
             opcode: OpNum::PutFh,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -531,7 +535,7 @@ impl CompoundBuilder {
     pub fn getfh(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::GetFh,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
@@ -539,7 +543,7 @@ impl CompoundBuilder {
     pub fn savefh(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::SaveFh,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
@@ -547,7 +551,7 @@ impl CompoundBuilder {
     pub fn restorefh(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::RestoreFh,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
@@ -555,23 +559,24 @@ impl CompoundBuilder {
     /// OPENATTR: open the named attribute directory for the current file handle.
     /// create_dir: if true, create the attribute directory if it doesn't exist.
     pub fn openattr(mut self, create_dir: bool) -> Self {
+        self.creates_named_attr_dir |= create_dir;
         let mut args = Vec::new();
         xdr_bool(&mut args, create_dir);
         self.ops.push(EncodedOp {
             opcode: OpNum::OpenAttr,
-            args,
+            args: args.into(),
         });
         self
     }
 
     // ─── File operations ─────────────────────────────────────────────────
 
-    pub fn lookup(mut self, name: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_string(&mut args, name);
+    pub fn lookup(mut self, name: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Lookup,
-            args,
+            args: WireArgs::with_names(args, offset, name, None),
         });
         self
     }
@@ -579,7 +584,7 @@ impl CompoundBuilder {
     pub fn lookupp(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::Lookupp,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
@@ -589,7 +594,7 @@ impl CompoundBuilder {
         xdr_bitmap(&mut args, bitmap);
         self.ops.push(EncodedOp {
             opcode: OpNum::GetAttr,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -603,7 +608,7 @@ impl CompoundBuilder {
         xdr_var_bytes(&mut args, attr_vals);
         self.ops.push(EncodedOp {
             opcode: OpNum::SetAttr,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -613,7 +618,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, access_mask);
         self.ops.push(EncodedOp {
             opcode: OpNum::Access,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -625,7 +630,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, count);
         self.ops.push(EncodedOp {
             opcode: OpNum::Read,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -638,7 +643,7 @@ impl CompoundBuilder {
         xdr_var_bytes(&mut args, data);
         self.ops.push(EncodedOp {
             opcode: OpNum::Write,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -661,7 +666,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, data_len);
         self.ops.push(EncodedOp {
             opcode: OpNum::Write,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -672,7 +677,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, count);
         self.ops.push(EncodedOp {
             opcode: OpNum::Commit,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -693,7 +698,7 @@ impl CompoundBuilder {
         xdr_bitmap(&mut args, attr_request);
         self.ops.push(EncodedOp {
             opcode: OpNum::ReadDir,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -701,28 +706,30 @@ impl CompoundBuilder {
     pub fn readlink(mut self) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::ReadLink,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         self
     }
 
-    pub fn open(mut self, open_args: &OpenArgs) -> Self {
+    pub fn open(mut self, open_args: &OpenArgs<'a>) -> Self {
         let mut args = Vec::new();
-        open_args.encode(&mut args);
+        open_args.encode_prefix(&mut args, false);
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Open,
-            args,
+            args: WireArgs::with_names(args, offset, open_args.claim_file, None),
         });
         self
     }
 
     /// RFC 8881 §18.16.3: a successful GUARDED4 OPEN proves fresh creation.
-    pub fn open_guarded(mut self, open_args: &OpenArgs) -> Self {
+    pub fn open_guarded(mut self, open_args: &OpenArgs<'a>) -> Self {
         let mut args = Vec::new();
-        open_args.encode_create(&mut args, true);
+        open_args.encode_prefix(&mut args, true);
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Open,
-            args,
+            args: WireArgs::with_names(args, offset, open_args.claim_file, None),
         });
         self
     }
@@ -733,24 +740,30 @@ impl CompoundBuilder {
         args.extend_from_slice(stateid);
         self.ops.push(EncodedOp {
             opcode: OpNum::Close,
-            args,
+            args: args.into(),
         });
         self
     }
 
     /// CREATE for directories, sockets, FIFOs, etc.
     /// For NF4LNK use `create_symlink` instead.
-    pub fn create(mut self, objtype: u32, name: &str, attrmask: &[u32], attr_vals: &[u8]) -> Self {
+    pub fn create(
+        mut self,
+        objtype: u32,
+        name: &'a [u8],
+        attrmask: &[u32],
+        attr_vals: &[u8],
+    ) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, objtype); // nfs_ftype4
         // CREATE4args: objtype + objname + createattrs
         // For NF4BLK/NF4CHR, specdata would go here (not implemented yet)
-        xdr_string(&mut args, name);
+        let offset = args.len();
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
         self.ops.push(EncodedOp {
             opcode: OpNum::Create,
-            args,
+            args: WireArgs::with_names(args, offset, name, None),
         });
         self
     }
@@ -758,52 +771,50 @@ impl CompoundBuilder {
     /// CREATE for symlinks (NF4LNK): requires the link target path.
     pub fn create_symlink(
         mut self,
-        name: &str,
-        link_target: &str,
+        name: &'a [u8],
+        link_target: &'a [u8],
         attrmask: &[u32],
         attr_vals: &[u8],
     ) -> Self {
         let mut args = Vec::new();
         xdr_u32(&mut args, 5); // NF4LNK = 5
         // For NF4LNK, linkdata (utf8str) comes before objname
-        xdr_string(&mut args, link_target);
-        xdr_string(&mut args, name);
+        let offset = args.len();
         xdr_bitmap(&mut args, attrmask);
         xdr_var_bytes(&mut args, attr_vals);
         self.ops.push(EncodedOp {
             opcode: OpNum::Create,
-            args,
+            args: WireArgs::with_names(args, offset, link_target, Some(name)),
         });
         self
     }
 
-    pub fn remove(mut self, name: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_string(&mut args, name);
+    pub fn remove(mut self, name: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Remove,
-            args,
+            args: WireArgs::with_names(args, offset, name, None),
         });
         self
     }
 
-    pub fn rename(mut self, oldname: &str, newname: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_string(&mut args, oldname);
-        xdr_string(&mut args, newname);
+    pub fn rename(mut self, oldname: &'a [u8], newname: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Rename,
-            args,
+            args: WireArgs::with_names(args, offset, oldname, Some(newname)),
         });
         self
     }
 
-    pub fn link(mut self, newname: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_string(&mut args, newname);
+    pub fn link(mut self, newname: &'a [u8]) -> Self {
+        let args = Vec::new();
+        let offset = args.len();
         self.ops.push(EncodedOp {
             opcode: OpNum::Link,
-            args,
+            args: WireArgs::with_names(args, offset, newname, None),
         });
         self
     }
@@ -836,7 +847,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, max_count);
         self.ops.push(EncodedOp {
             opcode: OpNum::LayoutGet,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -870,7 +881,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, 0);
         self.ops.push(EncodedOp {
             opcode: OpNum::LayoutCommit,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -903,7 +914,7 @@ impl CompoundBuilder {
         }
         self.ops.push(EncodedOp {
             opcode: OpNum::LayoutReturn,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -920,7 +931,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, (1 << 1) | (1 << 2));
         self.ops.push(EncodedOp {
             opcode: OpNum::GetDeviceInfo,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -965,7 +976,7 @@ impl CompoundBuilder {
         }
         self.ops.push(EncodedOp {
             opcode: OpNum::Lock,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -988,7 +999,7 @@ impl CompoundBuilder {
         xdr_var_bytes(&mut args, lock_owner);
         self.ops.push(EncodedOp {
             opcode: OpNum::Lockt,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1010,7 +1021,7 @@ impl CompoundBuilder {
         xdr_u64(&mut args, length);
         self.ops.push(EncodedOp {
             opcode: OpNum::Locku,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1024,7 +1035,7 @@ impl CompoundBuilder {
         }
         self.ops.push(EncodedOp {
             opcode: OpNum::TestStateId,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1035,7 +1046,7 @@ impl CompoundBuilder {
         args.extend_from_slice(stateid); // stateid4 = 16 bytes
         self.ops.push(EncodedOp {
             opcode: OpNum::DelegReturn,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1046,7 +1057,7 @@ impl CompoundBuilder {
         args.extend_from_slice(stateid);
         self.ops.push(EncodedOp {
             opcode: OpNum::FreeStateId,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1062,7 +1073,7 @@ impl CompoundBuilder {
             } else {
                 OpNum::Deallocate
             },
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1073,7 +1084,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, what as u32);
         self.ops.push(EncodedOp {
             opcode: OpNum::Seek,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1084,7 +1095,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, count);
         self.ops.push(EncodedOp {
             opcode: OpNum::ReadPlus,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1111,7 +1122,7 @@ impl CompoundBuilder {
         }
         self.ops.push(EncodedOp {
             opcode: if clone { OpNum::Clone } else { OpNum::Copy },
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1119,7 +1130,7 @@ impl CompoundBuilder {
     pub fn offload_cancel(mut self, stateid: &[u8; 16]) -> Self {
         self.ops.push(EncodedOp {
             opcode: OpNum::OffloadCancel,
-            args: stateid.to_vec(),
+            args: stateid.to_vec().into(),
         });
         self
     }
@@ -1129,7 +1140,7 @@ impl CompoundBuilder {
         xdr_string(&mut args, name);
         self.ops.push(EncodedOp {
             opcode: OpNum::GetXattr,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1141,7 +1152,7 @@ impl CompoundBuilder {
         xdr_var_bytes(&mut args, value);
         self.ops.push(EncodedOp {
             opcode: OpNum::SetXattr,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1152,7 +1163,7 @@ impl CompoundBuilder {
         xdr_u32(&mut args, maxcount);
         self.ops.push(EncodedOp {
             opcode: OpNum::ListXattrs,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1162,7 +1173,7 @@ impl CompoundBuilder {
         xdr_string(&mut args, name);
         self.ops.push(EncodedOp {
             opcode: OpNum::RemoveXattr,
-            args,
+            args: args.into(),
         });
         self
     }
@@ -1183,6 +1194,15 @@ impl CompoundBuilder {
     }
 
     fn encode_body_for_version(&self, minor_version: MinorVersion, buf: &mut Vec<u8>) {
+        buf.reserve(
+            opaque_len(self.tag.as_bytes())
+                + 8
+                + self
+                    .ops
+                    .iter()
+                    .map(|op| 4 + op.args.wire_len())
+                    .sum::<usize>(),
+        );
         // tag (utf8str_cs)
         xdr_string(buf, &self.tag);
         // minorversion
@@ -1192,7 +1212,7 @@ impl CompoundBuilder {
         // argarray entries
         for op in &self.ops {
             xdr_u32(buf, op.opcode as u32);
-            buf.extend_from_slice(&op.args);
+            op.args.encode(buf);
         }
     }
 }
@@ -1229,7 +1249,7 @@ const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0400;
 const OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG: u32 = 0x0200;
 
 /// OPEN arguments.
-pub(crate) struct OpenArgs {
+pub(crate) struct OpenArgs<'a> {
     pub seqid: u32,
     pub share_access: u32,
     pub share_deny: u32,
@@ -1238,16 +1258,12 @@ pub(crate) struct OpenArgs {
     pub create: bool,
     pub create_attrs_mask: Vec<u32>,
     pub create_attrs_vals: Vec<u8>,
-    pub claim_file: String,
+    pub claim_file: &'a [u8],
     pub want_no_delegation: bool,
 }
 
-impl OpenArgs {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        self.encode_create(buf, false);
-    }
-
-    fn encode_create(&self, buf: &mut Vec<u8>, guarded: bool) {
+impl OpenArgs<'_> {
+    fn encode_prefix(&self, buf: &mut Vec<u8>, guarded: bool) {
         xdr_u32(buf, self.seqid);
         // 统一附加 WANT_NO_DELEG：合规服务器（knfsd/ONTAP）将不再授予 delegation
         let share_access = if self.want_no_delegation {
@@ -1272,7 +1288,6 @@ impl OpenArgs {
         }
         // open_claim4: CLAIM_NULL = 0
         xdr_u32(buf, 0);
-        xdr_string(buf, &self.claim_file);
     }
 }
 
@@ -1286,6 +1301,7 @@ pub(crate) struct CompoundResponse {
     pub results: Vec<OpResponse>,
     /// Local session generation that carried this response (zero before publication).
     pub session_generation: u64,
+    pub wire_len: usize,
 }
 
 /// A single operation result: opcode + status + remaining bytes for the caller to decode.
@@ -1300,6 +1316,7 @@ pub(crate) struct OpResponse {
 impl CompoundResponse {
     /// Decode a COMPOUND4res from the RPC response payload.
     pub fn decode(mut buf: Bytes) -> Result<Self> {
+        let wire_len = buf.len();
         if buf.remaining() < 4 {
             return Err(NfsError::Xdr("COMPOUND response too short".to_string()));
         }
@@ -1347,6 +1364,7 @@ impl CompoundResponse {
             status,
             results,
             session_generation: 0,
+            wire_len,
         })
     }
 
@@ -2086,13 +2104,29 @@ mod tests {
 
     #[test]
     fn compound_builder_lookup_encode() {
-        let builder = CompoundBuilder::new("t").lookup("test.txt");
+        let builder = CompoundBuilder::new("t").lookup(b"test.txt");
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
         // After header (16 bytes): opcode(4) + string_len(4) + "test.txt"(8) = 16
         assert_eq!(&buf[16..20], &15u32.to_be_bytes()); // LOOKUP opcode = 15
         assert_eq!(&buf[20..24], &8u32.to_be_bytes()); // name length
         assert_eq!(&buf[24..32], b"test.txt");
+    }
+
+    #[test]
+    fn compound_builder_openattr_matches_rfc5662() {
+        for createdir in [false, true] {
+            let mut request = Vec::new();
+            CompoundBuilder::new("t")
+                .openattr(createdir)
+                .getfh()
+                .encode_body(&mut request);
+            let expected: Vec<u8> = [19u32, u32::from(createdir), 10]
+                .into_iter()
+                .flat_map(u32::to_be_bytes)
+                .collect();
+            assert_eq!(&request[16..], expected);
+        }
     }
 
     #[test]
@@ -2111,9 +2145,9 @@ mod tests {
     fn compound_builder_chained_ops() {
         let builder = CompoundBuilder::new("c")
             .putrootfh()
-            .lookup("dir1")
-            .lookup("dir2")
-            .lookup("file")
+            .lookup(b"dir1")
+            .lookup(b"dir2")
+            .lookup(b"file")
             .getfh()
             .getattr(&[0, 0]);
         assert_eq!(builder.op_count(), 6);
@@ -2141,12 +2175,14 @@ mod tests {
                 create: false,
                 create_attrs_mask: Vec::new(),
                 create_attrs_vals: Vec::new(),
-                claim_file: "f".to_string(),
+                claim_file: b"f",
                 want_no_delegation,
             };
             let mut encoded = Vec::new();
-            args.encode(&mut encoded);
-            u32::from_be_bytes(encoded[4..8].try_into().unwrap())
+            CompoundBuilder::new("t")
+                .open(&args)
+                .encode_body(&mut encoded);
+            u32::from_be_bytes(encoded[24..28].try_into().unwrap())
         };
         assert_eq!(encode_access(true), 0x0403);
         assert_eq!(encode_access(false), 0x0203);
@@ -2154,27 +2190,40 @@ mod tests {
 
     #[test]
     fn compound_builder_remove_encode() {
-        let builder = CompoundBuilder::new("t").remove("oldfile");
+        let builder = CompoundBuilder::new("t").remove(b"\xff");
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
-        assert_eq!(&buf[16..20], &28u32.to_be_bytes()); // REMOVE opcode = 28
+        assert_eq!(&buf[16..], &[0, 0, 0, 28, 0, 0, 0, 1, 0xff, 0, 0, 0]);
+        // REMOVE opcode = 28
     }
 
     #[test]
     fn compound_builder_rename_encode() {
-        let builder = CompoundBuilder::new("t").rename("old", "new");
-        assert_eq!(builder.op_count(), 1);
+        let builder = CompoundBuilder::new("t").rename(b"\xfe", b"n\xff");
+        let mut buf = Vec::new();
+        builder.encode_body(&mut buf);
+        // RENAME opcode = 29, followed by both opaque components.
+        assert_eq!(
+            &buf[16..],
+            &[
+                0, 0, 0, 29, 0, 0, 0, 1, 0xfe, 0, 0, 0, 0, 0, 0, 2, b'n', 0xff, 0, 0
+            ]
+        );
     }
 
     #[test]
     fn compound_builder_create_symlink_encode() {
-        let builder = CompoundBuilder::new("t").create_symlink("link", "/target/path", &[], &[]);
-        assert_eq!(builder.op_count(), 1);
+        let builder = CompoundBuilder::new("t").create_symlink(b"\xfe", b"../\xff", &[], &[]);
         let mut buf = Vec::new();
         builder.encode_body(&mut buf);
         assert_eq!(&buf[16..20], &6u32.to_be_bytes()); // CREATE opcode = 6
-        // NF4LNK = 5
-        assert_eq!(&buf[20..24], &5u32.to_be_bytes());
+        assert_eq!(&buf[20..24], &5u32.to_be_bytes()); // NF4LNK
+        assert_eq!(
+            &buf[24..40],
+            &[
+                0, 0, 0, 4, b'.', b'.', b'/', 0xff, 0, 0, 0, 1, 0xfe, 0, 0, 0
+            ]
+        );
     }
 
     // ─── CompoundResponse decode tests ───────────────────────────────
@@ -2275,7 +2324,7 @@ mod tests {
     fn compound_builder_basic_encode() {
         let builder = CompoundBuilder::new("test")
             .putrootfh()
-            .lookup("mydir")
+            .lookup(b"mydir")
             .getfh()
             .getattr(&[0x0018_00bb, 0x0030_0b73]);
 
@@ -2402,12 +2451,12 @@ mod tests {
         let builder = CompoundBuilder::new("read")
             .sequence(&session_id, 1, 0, 0)
             .putrootfh()
-            .lookup("file")
+            .lookup(b"file")
             .getattr(&[1])
             .apply_sequence_cache_policy(0)
             .unwrap();
         assert_eq!(
-            &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
+            &builder.ops[0].args.fixed[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
             &0u32.to_be_bytes()
         );
     }
@@ -2424,11 +2473,14 @@ mod tests {
             .apply_sequence_cache_policy(2128)
             .unwrap();
         assert_eq!(
-            &builder.ops[0].args[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
+            &builder.ops[0].args.fixed[SEQUENCE_CACHE_THIS_OFFSET..SEQUENCE_CACHE_THIS_OFFSET + 4],
             &1u32.to_be_bytes()
         );
-        assert_eq!(builder.ops[2].args.len(), 32);
-        assert_eq!(&builder.ops[2].args[28..32], &1_048_576u32.to_be_bytes());
+        assert_eq!(builder.ops[2].args.fixed.len(), 32);
+        assert_eq!(
+            &builder.ops[2].args.fixed[28..32],
+            &1_048_576u32.to_be_bytes()
+        );
     }
 
     #[test]
@@ -2437,7 +2489,7 @@ mod tests {
         let builder_at_limit = CompoundBuilder::new("remove")
             .sequence(&session_id, 1, 0, 0)
             .putfh(b"fh")
-            .remove("file");
+            .remove(b"file");
         let required = builder_at_limit.minimum_cached_response_size();
         assert!(
             builder_at_limit
@@ -2448,7 +2500,7 @@ mod tests {
         let builder_below_limit = CompoundBuilder::new("remove")
             .sequence(&session_id, 1, 0, 0)
             .putfh(b"fh")
-            .remove("file");
+            .remove(b"file");
         let error = match builder_below_limit.apply_sequence_cache_policy(required - 1) {
             Ok(_) => panic!("modifying compound requires cached reply capacity"),
             Err(error) => error,

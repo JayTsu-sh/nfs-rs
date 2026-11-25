@@ -4,6 +4,7 @@ import os
 import socket
 import struct
 import threading
+from urllib.parse import quote_from_bytes
 
 import pytest
 
@@ -18,15 +19,14 @@ MOUNT_PROG, MOUNT_PORT, EXPORT = 100005, 20048, 5
 
 
 def _xdr_string(value):
-    data = value.encode()
-    return struct.pack(">I", len(data)) + data + b"\0" * (-len(data) % 4)
+    return struct.pack(">I", len(value)) + value + b"\0" * (-len(value) % 4)
 
 
 def _exports_reply():
     # RFC 1813 exports: one export, one group, then the end of both lists.
     return (
-        struct.pack(">I", 1) + _xdr_string("/data")
-        + struct.pack(">I", 1) + _xdr_string("team") + struct.pack(">I", 0)
+        struct.pack(">I", 1) + _xdr_string(b"/data")
+        + struct.pack(">I", 1) + _xdr_string(b"team") + struct.pack(">I", 0)
         + struct.pack(">I", 0)
     )
 
@@ -41,7 +41,15 @@ def _read_exact(sock, size):
     return data
 
 
-def _serve(sock):
+def _export_rpc(program, procedure, _request):
+    if program == PORTMAP_PROG and procedure == GETPORT:
+        return struct.pack(">I", MOUNT_PORT)
+    if program == MOUNT_PROG and procedure == EXPORT:
+        return _exports_reply()
+    return b""
+
+
+def _serve(sock, reply_body):
     """Answers portmapper and MOUNT calls (RFC 5531 record marking) until EOF."""
     with sock:
         while True:
@@ -52,12 +60,7 @@ def _serve(sock):
             if record is None:
                 return
             xid, _, _, prog, _, proc = struct.unpack(">6I", record[:24])
-            if prog == PORTMAP_PROG and proc == GETPORT:
-                payload = struct.pack(">I", MOUNT_PORT)
-            elif prog == MOUNT_PROG and proc == EXPORT:
-                payload = _exports_reply()
-            else:
-                payload = b""
+            payload = reply_body(prog, proc, record)
             # Accepted reply, AUTH_NONE verifier, SUCCESS.
             reply = struct.pack(">6I", xid, 1, 0, 0, 0, 0) + payload
             sock.sendall(struct.pack(">I", 0x80000000 | len(reply)) + reply)
@@ -66,14 +69,15 @@ def _serve(sock):
 class ServingDialer:
     """Hands out one end of a socket pair and serves RPC on the other."""
 
-    def __init__(self):
+    def __init__(self, reply_body=_export_rpc):
         self.dialed = []
         self.threads = []
+        self.reply_body = reply_body
 
     def dial(self, host, port):
         self.dialed.append((host, port, threading.current_thread() is threading.main_thread()))
         client, server = socket.socketpair()
-        thread = threading.Thread(target=_serve, args=(server,), daemon=True)
+        thread = threading.Thread(target=_serve, args=(server, self.reply_body), daemon=True)
         thread.start()
         self.threads.append(thread)
         return client
@@ -82,6 +86,94 @@ class ServingDialer:
         for thread in self.threads:
             thread.join(timeout=10)
             assert not thread.is_alive(), "the client must close every dialed connection"
+
+
+def _v3_mount_reply(program, procedure):
+    if program == PORTMAP_PROG:  # no optional NFSACL service
+        return struct.pack(">I", 0)
+    if (program, procedure) in ((100227, 0), (MOUNT_PROG, 3)):
+        return b""
+    if (program, procedure) == (MOUNT_PROG, 1):
+        return struct.pack(">II4sII", 0, 4, b"root", 1, 1)
+    assert (program, procedure) == (100003, 19)
+    return struct.pack(">9IQ3I", 0, 0, 4096, 4096, 512, 4096, 4096, 512, 512, 1 << 42, 0, 1, 0)
+
+
+def test_v3_paged_names_drive_rename_and_remove_without_collisions():
+    from nfs_rs import Client
+
+    names = (b"\xff", b"\xfe", b"~nfs-rs-raw:FF")
+    renamed = b"moved\xff"
+    verifier = b"page-v3!"
+    operations = []
+
+    def rpc_reply(program, procedure, request):
+        if program == 100003:
+            if procedure == 16:
+                cookie, received_verifier, _ = struct.unpack(">Q8sI", request[-20:])
+                assert received_verifier == (verifier if cookie else bytes(8))
+                operations.append(("readdir", cookie))
+                return (
+                    struct.pack(">II8sIQ", 0, 0, verifier, 1, cookie + 1)
+                    + _xdr_string(names[cookie])
+                    + struct.pack(">QII", cookie + 1, 0, cookie + 1 == len(names))
+                )
+            directory = _xdr_string(b"root")
+            if procedure == 14:
+                assert request.endswith(directory + _xdr_string(names[0]) + directory + _xdr_string(renamed))
+                operations.append(("rename", renamed))
+                return bytes(20)
+            if procedure == 12:
+                assert request.endswith(directory + _xdr_string(renamed))
+                operations.append(("remove", renamed))
+                return bytes(12)
+        return _v3_mount_reply(program, procedure)
+
+    dialer = ServingDialer(rpc_reply)
+    url = f"nfs://{HOST}:{MOUNT_PORT}/data?version=3&mountport={MOUNT_PORT}"
+    with Client.connect(url, dialer=dialer) as client:
+        entries = client.listdir(b"")
+        assert tuple(entries) == names
+        client.rename(entries[0], renamed)
+        client.remove(renamed)
+    del client
+    dialer.join()
+    assert operations == [("readdir", 0), ("readdir", 1), ("readdir", 2), ("rename", renamed), ("remove", renamed)]
+
+
+def test_listdir_can_collect_names_from_thousands_of_small_pages():
+    from nfs_rs import AsyncClient, Client
+
+    entries = [f"entry-{i:04}".encode() + b"\xff" for i in range(5_500)]
+    verifier = b"listing!"
+
+    def directory_rpc(program, procedure, request):
+        if (program, procedure) != (100003, 16):
+            return _v3_mount_reply(program, procedure)
+        cookie, received_verifier, _ = struct.unpack(">Q8sI", request[-20:])
+        assert received_verifier == (verifier if cookie else bytes(8))
+        name = entries[cookie]
+        return (
+            struct.pack(">II8sIQI", 0, 0, verifier, 1, cookie + 1, len(name))
+            + name + bytes((-len(name)) % 4)
+            + struct.pack(">QII", cookie + 1, 0, cookie + 1 == len(entries))
+        )
+
+    dialer = ServingDialer(directory_rpc)
+    url = f"nfs://{HOST}:{MOUNT_PORT}/data?version=3&mountport={MOUNT_PORT}&readdir-buffer=512"
+    with Client.connect(url, dialer=dialer) as client:
+        views = client.listdir(b"")
+        assert views == entries and all(view.readonly for view in views)
+    # NFSv3 UMNT is advisory. The final mount reference owns transport shutdown.
+    del client
+    assert views == entries
+
+    async def scenario():
+        async with await AsyncClient.connect(url, dialer=dialer) as client:
+            assert await client.listdir(b"") == entries
+
+    asyncio.run(scenario())
+    dialer.join()
 
 
 class RefusingDialer:
@@ -96,7 +188,54 @@ class RefusingDialer:
 def _expected_exports():
     from nfs_rs import ExportEntry
 
-    return (ExportEntry("/data", ("team",)),)
+    return (ExportEntry(b"/data", (b"team",)),)
+
+
+@pytest.mark.parametrize("path", [b"/", b"/raw/\xff/%2F/", b"/" + b"a" * 1023])
+def test_export_bytes_round_trip_through_v3_mount_and_umount(path):
+    from nfs_rs import AsyncClient, Client, ExportEntry, list_exports, list_exports_async
+
+    group = b"team-\xfe"
+    exports = struct.pack(">I", 1) + _xdr_string(path)
+    exports += struct.pack(">I", 1) + _xdr_string(group) + struct.pack(">2I", 0, 0)
+    mount_calls = []
+
+    def mount_rpc(program, procedure, request):
+        if (program, procedure) == (MOUNT_PROG, EXPORT):
+            return exports
+        if program == MOUNT_PROG and procedure in (1, 3):
+            expected = _xdr_string(path)
+            mount_calls.append((procedure, request[-len(expected):]))
+            return struct.pack(">II4sII", 0, 4, b"root", 1, 1) if procedure == 1 else b""
+        if program == PORTMAP_PROG:
+            return struct.pack(">I", 0)
+        if (program, procedure) == (100227, 0):
+            return b""
+        assert (program, procedure) == (100003, 19)
+        return struct.pack(">9IQ3I", 0, 0, 4096, 4096, 512, 4096, 4096, 512, 512, 1 << 42, 0, 1, 0)
+
+    dialer = ServingDialer(mount_rpc)
+    host = f"nfs://{HOST}:{MOUNT_PORT}"
+    options = {"dialer": dialer, "mount_port": MOUNT_PORT}
+
+    def export_url(export):
+        return f"{host}{quote_from_bytes(export.path, safe='/')}?version=3"
+
+    (export,) = list_exports(host, **options)
+    assert export == ExportEntry(path, (group,))
+    with Client.connect(export_url(export), **options) as client:
+        assert client.version == "3"
+    del client
+
+    async def scenario():
+        (export,) = await list_exports_async(host, **options)
+        assert export == ExportEntry(path, (group,))
+        async with await AsyncClient.connect(export_url(export), **options) as client:
+            assert client.version == "3"
+
+    asyncio.run(scenario())
+    dialer.join()
+    assert mount_calls == [(op, _xdr_string(path)) for op in (1, 3, 1, 3)]
 
 
 def test_list_exports_dials_every_connection_through_the_dialer():

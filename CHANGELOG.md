@@ -7,6 +7,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- NFSv3, v4.0 and v4.1 directory listing preserves raw name bytes. Rust
+  directory entries expose shared `Bytes` and lookup, stat and open paths
+  take byte slices. Python exposes read-only name views, accepts byte
+  paths and can scan, stat and open entries from the same mount directly.
+  A process-wide budget bounds retained directory responses.
+- Namespace mutations, metadata paths, and symlink resolution preserve raw
+  filename bytes across NFSv3, v4.0 and v4.1. Rust `readlink` returns `Bytes`.
+  Python `readlink` and the resolved path expose read-only byte views.
+- Export discovery returns raw path and group bytes (`Bytes` in Rust and
+  `bytes` in Python). Mount URLs preserve percent-encoded export path bytes.
+- Python `NfsError.filename` and `RecoveryEvent.path` expose path bytes.
+
+- Rust `StateidFailure` variants were renamed from `RecoverableState` and
+  `StateRecoveryExhausted` to `Recoverable` and `Exhausted`. This is a source
+  breaking change for callers that match the enum exhaustively; the
+  `NfsError::StateRecoveryExhausted` error and the Python exception classes are
+  unchanged.
+
 ### Added
 
 - Rust `Dialer` trait, `Endpoint`, `TcpDialer`, `MountOptions`, `mount_with`
@@ -22,14 +42,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   The client owns the socket and the RPC records stay in native code. Only a
   plain `socket.socket` is taken, and at most 16 dial calls run at once.
 
-### Changed
-
-- Rust `StateidFailure` variants were renamed from `RecoverableState` and
-  `StateRecoveryExhausted` to `Recoverable` and `Exhausted`. This is a source
-  breaking change for callers that match the enum exhaustively; the
-  `NfsError::StateRecoveryExhausted` error and the Python exception classes are
-  unchanged.
-
 ### Fixed
 
 - A lock that NFSv4.0 state recovery cannot reclaim no longer leaves the
@@ -41,6 +53,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   same handle does not lift the gate, and I/O that was already waiting when the
   loss was recorded is rechecked before it is sent. Previously the mount resumed
   and I/O continued outside the application's critical section.
+- NFSv4.2 retries `EXCHANGE_ID` once without `FENCE_OPS` after a definite
+  `NFS4ERR_INVAL`, preserving the client identity and minor version.
+- NFSv4.1 named-attribute requests use the RFC 5662 `OPENATTR` opcode.
+- Admitted NFSv4.1 named-attribute writes finish cleanup after caller cancellation.
+  Potentially completed truncating requests are fenced to their original session.
+- Python opens through a directory entry verify its handle before truncation.
+  Names reused by a replacement file cannot redirect writes.
+- Rust ACL and xattr path helpers and Python ACL, xattr and NFSv4.2 path
+  operations accept the raw names returned by directory listing.
+- Python `listdir` collects names in compact blocks and releases RPC
+  replies as it reads them, so small pages can be collected across large directories.
+- NFSv4 namespace requests write borrowed filename bytes directly to the
+  final XDR buffer. RPC sends the record prefix alongside that buffer.
+- NFSv3 preserves RPC `GARBAGE_ARGS` as a definite rejection in Rust and
+  Python, including when Linux nfsd rejects an oversized lookup component.
+- NFSv4.0 path lookup resolves `.` locally, avoiding `NFS4ERR_BADNAME` when
+  Rust or Python uses `.` to list or stat the mounted root.
 - NFSv3 path lookup on Unix preserves a literal backslash filename component
   instead of silently returning or resolving from its parent directory.
 - NFSv4.0 `read` no longer falls back to an anonymous-stateid READ while the

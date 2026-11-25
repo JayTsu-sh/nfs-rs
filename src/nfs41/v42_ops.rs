@@ -6,7 +6,6 @@ use crate::{
     SeekResult,
 };
 use bytes::{Buf, Bytes};
-use std::sync::Arc;
 
 pub(super) fn word(buf: &mut Bytes) -> Result<u32> {
     if buf.remaining() < 4 {
@@ -172,99 +171,6 @@ pub(super) fn clip_read_plus(
     })
 }
 
-/// Keep admitted mutations and per-file barriers alive if their waiter is cancelled.
-/// Stable handle ordering prevents reciprocal COPY/CLONE and CLOSE deadlocks.
-pub(super) async fn run_owned<T, F, Fut>(
-    mount: Arc<Mount41>,
-    core: Arc<crate::client_core::ClientCore>,
-    source: Option<Bytes>,
-    destination: Bytes,
-    work: F,
-) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(Arc<Mount41>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
-{
-    let mut handles = vec![destination.clone()];
-    if let Some(source) = source {
-        handles.push(source);
-    }
-    handles.sort();
-    handles.dedup();
-    let mut guards = Vec::new();
-    for fh in handles {
-        guards.push(mount.writes.barrier(&fh).await);
-        if let Some(error) = mount.writes.error(&fh) {
-            return Err(error);
-        }
-    }
-    // A ready notification is not acknowledgement: cancellation can discard a
-    // queued result. Keep the result and barriers until the waiter consumes it
-    // or the task publishes its abandoned uncertainty (RFC 8881 §13.7).
-    let result = Arc::new(std::sync::Mutex::new(None));
-    let slot = result.clone();
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let task_abandoned = abandoned.clone();
-    let task_mount = mount.clone();
-    let task_destination = destination.clone();
-    core.spawn_owned(async move {
-        let _guards = guards;
-        let mut task = super::write_owner::WriteTaskGuard::for_operation(
-            task_mount.writes.clone(),
-            task_destination.clone(),
-            task_abandoned,
-            "NFSv4.2 mutation",
-        );
-        let completed = work(task_mount.clone()).await;
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completed);
-        let _ = sender.send(());
-        if ack_rx.await.is_err() {
-            let unclaimed = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(Err(error)) = unclaimed
-                && error
-                    .operation_outcome()
-                    .is_some_and(|o| o.outcome == crate::OperationOutcome::Uncertain)
-            {
-                task_mount.writes.record(task_destination, error);
-            }
-        }
-        task.settled();
-    })?;
-    let mut waiter = super::write_owner::WriteWaiter::new(
-        mount.writes.clone(),
-        destination.clone(),
-        abandoned,
-        ack_tx,
-    );
-    if receiver.await.is_err() {
-        waiter.acknowledge();
-        return Err(mount.writes.error(&destination).unwrap_or_else(|| {
-            mount.mutation_error(
-                "v42",
-                NfsError::Rpc("NFSv4.2 operation task ended without result".into()),
-            )
-        }));
-    }
-    let value = result
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    waiter.acknowledge();
-    value.unwrap_or_else(|| {
-        Err(NfsError::Rpc(
-            "NFSv4.2 operation result already consumed".into(),
-        ))
-    })
-}
-
 impl Mount41 {
     pub(super) fn require_v42(&self) -> Result<()> {
         if self.client_identity.minor_version != super::MinorVersion::V2 {
@@ -373,17 +279,6 @@ impl Mount41 {
             decode_read_plus(&mut result_data(&resp, 2, 68)?)?,
             offset,
             count,
-        )
-    }
-
-    pub(super) fn mutation_error(&self, operation: &str, error: NfsError) -> NfsError {
-        crate::nfs41::pnfs_io::uncertain_pnfs_write(
-            crate::RequestContext {
-                operation: operation.into(),
-                protocol: self.protocol_version(),
-                request_id: None,
-            },
-            error,
         )
     }
 

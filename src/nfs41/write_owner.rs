@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 use bytes::Bytes;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+use super::mount::Mount41;
+use crate::client_core::ClientCore;
 use crate::error::{
     NfsError, OperationClass, OperationOutcome, OperationOutcomeError, RecoveryAction,
     RequestContext,
@@ -238,4 +240,89 @@ impl Drop for WriteWaiter {
             self.abandoned.store(true, Ordering::Release);
         }
     }
+}
+
+/// Keep admitted mutations and per-file barriers alive if their waiter is cancelled.
+/// Stable handle ordering prevents reciprocal COPY/CLONE and CLOSE deadlocks.
+pub(super) async fn run_owned<T, F, Fut>(
+    mount: Arc<Mount41>,
+    core: Arc<ClientCore>,
+    source: Option<Bytes>,
+    destination: Bytes,
+    operation: &'static str,
+    work: F,
+) -> crate::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<Mount41>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = crate::Result<T>> + Send + 'static,
+{
+    let mut handles = vec![destination.clone()];
+    if let Some(source) = source {
+        handles.push(source);
+    }
+    handles.sort();
+    handles.dedup();
+    let mut guards = Vec::new();
+    for fh in handles {
+        guards.push(mount.writes.barrier(&fh).await);
+        if let Some(error) = mount.writes.error(&fh) {
+            return Err(error);
+        }
+    }
+    // A ready notification is not acknowledgement: cancellation can discard a
+    // queued result. Keep the result and barriers until the waiter consumes it
+    // or the task publishes its abandoned uncertainty (RFC 8881 §13.7).
+    let result = Arc::new(Mutex::new(None));
+    let slot = result.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let task_abandoned = abandoned.clone();
+    let task_mount = mount.clone();
+    let task_destination = destination.clone();
+    core.spawn_owned(async move {
+        let _guards = guards;
+        let mut task = WriteTaskGuard::for_operation(
+            task_mount.writes.clone(),
+            task_destination.clone(),
+            task_abandoned,
+            operation,
+        );
+        let completed = work(task_mount.clone()).await;
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completed);
+        let _ = sender.send(());
+        if ack_rx.await.is_err() {
+            let unclaimed = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(Err(error)) = unclaimed
+                && error
+                    .operation_outcome()
+                    .is_some_and(|o| o.outcome == crate::OperationOutcome::Uncertain)
+            {
+                task_mount.writes.record(task_destination, error);
+            }
+        }
+        task.settled();
+    })?;
+    let mut waiter = WriteWaiter::new(mount.writes.clone(), destination.clone(), abandoned, ack_tx);
+    if receiver.await.is_err() {
+        waiter.acknowledge();
+        return Err(mount.writes.error(&destination).unwrap_or_else(|| {
+            mount.mutation_error(
+                operation,
+                NfsError::Rpc("mutation task ended without result".into()),
+            )
+        }));
+    }
+    let value = result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    waiter.acknowledge();
+    value.unwrap_or_else(|| Err(NfsError::Rpc("mutation result already consumed".into())))
 }

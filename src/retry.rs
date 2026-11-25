@@ -185,7 +185,6 @@ pub(crate) fn with_timeout<F: Future>(
 
 /// Temporary OPENs still need CLOSE after the caller's operation deadline.
 /// Cleanup gets its own bound; it never resubmits the original mutation.
-#[cfg(feature = "python-bindings")]
 pub(crate) async fn cleanup<F: Future>(future: F) -> F::Output {
     let started = Instant::now();
     let deadline = started + MAX_ELAPSED;
@@ -194,16 +193,17 @@ pub(crate) async fn cleanup<F: Future>(future: F) -> F::Output {
         deadline,
         retries: AtomicU32::new(0),
     });
-    let cancel = Arc::new(ReadCancel {
-        cancelled: std::sync::atomic::AtomicBool::new(false),
-        notify: tokio::sync::Notify::new(),
-    });
-    READ_CANCEL
-        .scope(
-            cancel,
-            CALLER_DEADLINE.scope(deadline, BUDGET.scope(budget, future)),
-        )
-        .await
+    let cleanup = CALLER_DEADLINE.scope(deadline, BUDGET.scope(budget, future));
+    #[cfg(feature = "python-bindings")]
+    {
+        let cancel = Arc::new(ReadCancel {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        READ_CANCEL.scope(cancel, cleanup).await
+    }
+    #[cfg(not(feature = "python-bindings"))]
+    cleanup.await
 }
 
 /// Preserve an active budget when admitted work is detached from its caller.

@@ -15,22 +15,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{Mount, REMOVE3args, Result, diropargs3, filename3, nfs_fh3};
-use crate::split_path;
+use crate::path_resolution::split_byte_path;
 use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn remove_path(&self, path: &str) -> Result<()> {
-        let (dir, filename) = split_path(path)?;
-        let dir_fh = self.lookup_path(&dir).await?.fh;
-        self.remove(dir_fh, &filename).await
+    pub async fn remove_path(&self, path: &[u8]) -> Result<()> {
+        let (dir, filename) = split_byte_path(path)?;
+        let dir_fh = self.lookup_path(dir).await?.fh;
+        self.remove(dir_fh, filename).await
     }
 
-    pub async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    pub async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
+        crate::path_resolution::validate_leaf(filename)?;
         let args = REMOVE3args {
             object: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(filename.to_string()),
+                name: filename3(filename),
             },
         };
         self._remove(args).await?;

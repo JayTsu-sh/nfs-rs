@@ -12,7 +12,7 @@ pub(crate) struct OwnerLane {
     /// Directory handle and name used by OPEN, retained so a released state can
     /// be re-established with a fresh OPEN (CLAIM_NULL) without a path walk.
     pub dir_fh: Bytes,
-    pub name: String,
+    pub name: Bytes,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
     /// Shared permits cover in-flight stateid I/O. CLOSE takes the exclusive

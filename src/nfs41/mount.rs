@@ -240,6 +240,17 @@ pub(crate) struct Mount41 {
 }
 
 impl Mount41 {
+    pub(super) fn mutation_error(&self, operation: &str, error: NfsError) -> NfsError {
+        crate::nfs41::pnfs_io::uncertain_pnfs_write(
+            crate::RequestContext {
+                operation: operation.into(),
+                protocol: self.protocol_version(),
+                request_id: None,
+            },
+            error,
+        )
+    }
+
     pub(super) fn protocol_version(&self) -> NFSVersion {
         self.client_identity.minor_version.version()
     }
@@ -358,10 +369,10 @@ impl Mount41 {
 
     /// Send a COMPOUND with SEQUENCE prepended (metadata timeout).
     /// Retries on NFS4ERR_DELAY/GRACE; re-establishes session on BADSESSION/DEADSESSION.
-    pub(crate) async fn compound(
+    pub(crate) async fn compound<'name>(
         &self,
         tag: &str,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         self.compound_inner(tag, METADATA_TIMEOUT, None, None, &build_ops)
             .await
@@ -370,11 +381,11 @@ impl Mount41 {
     /// Preserve a partial response after the specified operation has succeeded.
     /// The index includes SEQUENCE. Callers must check all subsequent results.
     /// This prevents retrying a mutation when a later operation returns DELAY/GRACE.
-    pub(crate) async fn compound_preserving_progress(
+    pub(crate) async fn compound_preserving_progress<'name>(
         &self,
         tag: &str,
         progress_index: usize,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         self.compound_inner(
             tag,
@@ -387,11 +398,11 @@ impl Mount41 {
     }
 
     /// Send a COMPOUND with SEQUENCE (data-transfer timeout scaled by payload size).
-    pub(crate) async fn compound_data(
+    pub(crate) async fn compound_data<'name>(
         &self,
         tag: &str,
         data_size: usize,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         self.compound_inner(tag, data_timeout(data_size), None, None, &build_ops)
             .await
@@ -399,11 +410,11 @@ impl Mount41 {
 
     /// Send a COMPOUND with SEQUENCE for writes, using zero-copy data transfer.
     /// The write data is sent separately via `rpc::Client::call_with_data()`.
-    pub(crate) async fn compound_write(
+    pub(crate) async fn compound_write<'name>(
         &self,
         tag: &str,
         data: bytes::Bytes,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         self.compound_inner(tag, data_timeout(data.len()), Some(data), None, &build_ops)
             .await
@@ -411,13 +422,13 @@ impl Mount41 {
 
     /// Unified COMPOUND execution with retry/recovery logic.
     /// When `write_data` is Some, uses `rpc.call_with_data()` for zero-copy writes.
-    async fn compound_inner(
+    async fn compound_inner<'name>(
         &self,
         tag: &str,
         timeout: std::time::Duration,
         write_data: Option<bytes::Bytes>,
         progress_index: Option<usize>,
-        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+        build_ops: &(dyn Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync),
     ) -> Result<CompoundResponse> {
         crate::retry::scope(self.compound_budgeted(
             tag,
@@ -429,13 +440,13 @@ impl Mount41 {
         .await
     }
 
-    async fn compound_budgeted(
+    async fn compound_budgeted<'name>(
         &self,
         tag: &str,
         timeout: std::time::Duration,
         write_data: Option<bytes::Bytes>,
         progress_index: Option<usize>,
-        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+        build_ops: &(dyn Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync),
     ) -> Result<CompoundResponse> {
         let budget = crate::retry::current();
         let mut attempt = 0;
@@ -667,12 +678,12 @@ impl Mount41 {
 
     /// Send a COMPOUND to a pNFS data server with SEQUENCE on the DS's own
     /// session (RFC 8881 §13.1: DS 上的 READ/WRITE 同样要求 session)。
-    pub(crate) async fn compound_ds(
+    pub(crate) async fn compound_ds<'name>(
         ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data_size: usize,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         crate::retry::scope(Self::compound_ds_budgeted(
             ds, auth, tag, data_size, None, &build_ops,
@@ -682,12 +693,12 @@ impl Mount41 {
 
     /// DS writes retain the same session replay identity and the same bounded
     /// backpressure policy as reads; transport failure is not a busy response.
-    pub(crate) async fn compound_ds_write(
+    pub(crate) async fn compound_ds_write<'name>(
         ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data: Bytes,
-        build_ops: impl Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync,
+        build_ops: impl Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync,
     ) -> Result<CompoundResponse> {
         crate::retry::scope(Self::compound_ds_budgeted(
             ds,
@@ -700,13 +711,13 @@ impl Mount41 {
         .await
     }
 
-    async fn compound_ds_budgeted(
+    async fn compound_ds_budgeted<'name>(
         ds: &DsConnection,
         auth: &Auth,
         tag: &str,
         data_size: usize,
         write_data: Option<Bytes>,
-        build_ops: &(dyn Fn(CompoundBuilder) -> CompoundBuilder + Send + Sync),
+        build_ops: &(dyn Fn(CompoundBuilder<'name>) -> CompoundBuilder<'name> + Send + Sync),
     ) -> Result<CompoundResponse> {
         let budget = crate::retry::current();
         let mut requeried_uncached = false;
@@ -1064,7 +1075,7 @@ async fn mount_on_addr(
     auth: &Auth,
     minor_version: MinorVersion,
 ) -> Result<Box<dyn crate::Mount>> {
-    info!(addr = %addr, dirpath = %args.dirpath, "connecting for NFSv4.1 mount");
+    info!(addr = %addr, dirpath = ?args.dirpath, "connecting for NFSv4.1 mount");
 
     // 1. TCP connect
     let dialer = args.dialer();
@@ -1352,7 +1363,7 @@ async fn send_recall_return(
     rpc: &rpc::Client,
     auth: &Auth,
     session_holder: &Arc<SessionHolder>,
-    build_ops: impl FnOnce(CompoundBuilder) -> CompoundBuilder,
+    build_ops: impl FnOnce(CompoundBuilder<'static>) -> CompoundBuilder<'static>,
 ) -> bool {
     let mut succeeded = false;
     // Always get the latest session from the holder so that post-recovery
@@ -1477,7 +1488,7 @@ async fn navigate_to_export(
     rpc: &rpc::Client,
     session: &Session,
     auth: &Auth,
-    dirpath: &str,
+    dirpath: &[u8],
 ) -> Result<Bytes> {
     let mut slot = session.acquire_slot().await?;
     let sequence_id = slot.sequence_id;
@@ -1490,10 +1501,13 @@ async fn navigate_to_export(
         )
         .putrootfh();
 
-    // Split path into components and add LOOKUP for each
-    let components: Vec<&str> = dirpath.split('/').filter(|c| !c.is_empty()).collect();
-    for component in &components {
+    let mut count = 0;
+    for component in dirpath
+        .split(|&byte| byte == b'/')
+        .filter(|c| !c.is_empty())
+    {
         builder = builder.lookup(component);
+        count += 1;
     }
     builder = builder.getfh();
     builder.enforce_max_operations(session.max_operations())?;
@@ -1525,12 +1539,12 @@ async fn navigate_to_export(
     resp.op_ok(1)?; // PUTROOTFH
 
     // Check each LOOKUP result
-    for i in 0..components.len() {
+    for i in 0..count {
         resp.op_ok(2 + i)?;
     }
 
     // GETFH result: index = 2 + components.len()
-    let getfh_op = resp.op_ok(2 + components.len())?;
+    let getfh_op = resp.op_ok(2 + count)?;
     let mut data = getfh_op.data.clone();
     // Decode nfs_fh4: opaque<NFS4_FHSIZE>
     if data.remaining() < 4 {
@@ -1844,11 +1858,11 @@ impl crate::Mount for Mount41Wrapper {
 
     // ─── Operations — delegate to impl Mount41 in sub-files ───────────
 
-    async fn lookup(&self, dir_fh: Bytes, filename: &str) -> Result<mount::ObjRes> {
+    async fn lookup(&self, dir_fh: Bytes, filename: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.lookup(dir_fh, filename).await
     }
-    async fn lookup_path(&self, path: &str) -> Result<mount::ObjRes> {
+    async fn lookup_path(&self, path: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.lookup_path(path).await
     }
@@ -1856,7 +1870,7 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.getattr(fh).await
     }
-    async fn getattr_path(&self, path: &str) -> Result<mount::Attr> {
+    async fn getattr_path(&self, path: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.getattr_path(path).await
     }
@@ -1864,7 +1878,7 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.access(fh, mode).await
     }
-    async fn access_path(&self, path: &str, mode: u32) -> Result<u32> {
+    async fn access_path(&self, path: &[u8], mode: u32) -> Result<u32> {
         let _operation = self.core.begin_operation()?;
         self.m.access_path(path, mode).await
     }
@@ -1872,22 +1886,22 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         self.m.read(fh, offset, count).await
     }
-    async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    async fn read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.read_path(path, offset, count).await
     }
-    async fn readlink(&self, fh: Bytes) -> Result<String> {
+    async fn readlink(&self, fh: Bytes) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.readlink(fh).await
     }
-    async fn readlink_path(&self, path: &str) -> Result<String> {
+    async fn readlink_path(&self, path: &[u8]) -> Result<Bytes> {
         let _operation = self.core.begin_operation()?;
         self.m.readlink_path(path).await
     }
     async fn readdir(&self, dir_fh: Bytes) -> mount::ReaddirStream<'_> {
         self.ready_stream(self.m.readdir_owned(self.core.clone(), dir_fh))
     }
-    async fn readdir_path(&self, dir_path: &str) -> Result<mount::ReaddirStream<'_>> {
+    async fn readdir_path(&self, dir_path: &[u8]) -> Result<mount::ReaddirStream<'_>> {
         let _operation = self.core.begin_operation()?;
         let directory = self.m.lookup_path(dir_path).await?;
         Ok(self.ready_stream(self.m.readdir_owned(self.core.clone(), directory.fh)))
@@ -1895,7 +1909,7 @@ impl crate::Mount for Mount41Wrapper {
     async fn readdirplus(&self, dir_fh: Bytes) -> mount::ReaddirplusStream<'_> {
         self.ready_stream(self.m.readdirplus_owned(self.core.clone(), dir_fh))
     }
-    async fn readdirplus_path(&self, dir_path: &str) -> Result<mount::ReaddirplusStream<'_>> {
+    async fn readdirplus_path(&self, dir_path: &[u8]) -> Result<mount::ReaddirplusStream<'_>> {
         let _operation = self.core.begin_operation()?;
         let directory = self.m.lookup_path(dir_path).await?;
         Ok(self.ready_stream(self.m.readdirplus_owned(self.core.clone(), directory.fh)))
@@ -1990,30 +2004,30 @@ impl crate::Mount for Mount41Wrapper {
         value.unwrap_or_else(|| Err(NfsError::Rpc("WRITE result was already consumed".into())))
     }
 
-    async fn open(&self, dir_fh: Bytes, filename: &str, access: u32) -> Result<mount::ObjRes> {
+    async fn open(&self, dir_fh: Bytes, filename: &[u8], access: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.open(dir_fh, filename, access).await
     }
-    async fn open_path(&self, path: &str, access: u32) -> Result<mount::ObjRes> {
+    async fn open_path(&self, path: &[u8], access: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.open_path(path, access).await
     }
     async fn create(
         &self,
         dir_fh: Bytes,
-        filename: &str,
+        filename: &[u8],
         mode: Option<u32>,
     ) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.create(dir_fh, filename, mode).await
     }
-    async fn create_path(&self, path: &str, mode: Option<u32>) -> Result<mount::ObjRes> {
+    async fn create_path(&self, path: &[u8], mode: Option<u32>) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.create_path(path, mode).await
     }
     async fn create_path_stateful_with_access(
         &self,
-        path: &str,
+        path: &[u8],
         mode: Option<u32>,
         access: u32,
     ) -> Result<mount::OpenFile> {
@@ -2024,83 +2038,83 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn open_path_with_options(
         &self,
-        path: &str,
+        path: &[u8],
         options: mount::OpenOptions,
     ) -> Result<mount::OpenFile> {
         let _operation = self.core.begin_operation()?;
         mount::open_path_guarded(self, path, options, |parent, name| async move {
             self.m
-                .create_guarded(parent, &name, options.create_mode, options.access)
+                .create_guarded(parent, name, options.create_mode, options.access)
                 .await
         })
         .await
     }
-    async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.mkdir(dir_fh, dirname, mode).await
     }
-    async fn mkdir_path(&self, path: &str, mode: u32) -> Result<mount::ObjRes> {
+    async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.mkdir_path(path, mode).await
     }
-    async fn remove(&self, dir_fh: Bytes, filename: &str) -> Result<()> {
+    async fn remove(&self, dir_fh: Bytes, filename: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.remove(dir_fh, filename).await
     }
-    async fn remove_path(&self, path: &str) -> Result<()> {
+    async fn remove_path(&self, path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.remove_path(path).await
     }
-    async fn rmdir(&self, dir_fh: Bytes, dirname: &str) -> Result<()> {
+    async fn rmdir(&self, dir_fh: Bytes, dirname: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rmdir(dir_fh, dirname).await
     }
-    async fn rmdir_path(&self, path: &str) -> Result<()> {
+    async fn rmdir_path(&self, path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rmdir_path(path).await
     }
     async fn rename(
         &self,
         from_dir_fh: Bytes,
-        from_name: &str,
+        from_name: &[u8],
         to_dir_fh: Bytes,
-        to_name: &str,
+        to_name: &[u8],
     ) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m
             .rename(from_dir_fh, from_name, to_dir_fh, to_name)
             .await
     }
-    async fn rename_path(&self, from_path: &str, to_path: &str) -> Result<()> {
+    async fn rename_path(&self, from_path: &[u8], to_path: &[u8]) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         self.m.rename_path(from_path, to_path).await
     }
-    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &str) -> Result<mount::Attr> {
+    async fn link(&self, src_fh: Bytes, dst_dir_fh: Bytes, dst_name: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.link(src_fh, dst_dir_fh, dst_name).await
     }
-    async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<mount::Attr> {
+    async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<mount::Attr> {
         let _operation = self.core.begin_operation()?;
         self.m.link_path(src_path, dst_path).await
     }
     async fn symlink(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_name: &str,
+        dst_name: &[u8],
     ) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.symlink(target, dst_dir_fh, dst_name).await
     }
-    async fn symlink_path(&self, target: &str, dst_path: &str) -> Result<mount::ObjRes> {
+    async fn symlink_path(&self, target: &[u8], dst_path: &[u8]) -> Result<mount::ObjRes> {
         let _operation = self.core.begin_operation()?;
         self.m.symlink_path(target, dst_path).await
     }
     async fn symlink_with_attrs(
         &self,
-        target: &str,
+        target: &[u8],
         dst_dir_fh: Bytes,
-        dst_name: &str,
+        dst_name: &[u8],
         uid: Option<u32>,
         gid: Option<u32>,
         atime: Option<crate::Time>,
@@ -2129,7 +2143,7 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn setattr_path(
         &self,
-        path: &str,
+        path: &[u8],
         specify_guard: bool,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -2185,7 +2199,7 @@ impl crate::Mount for Mount41Wrapper {
         }
         result
     }
-    async fn commit_path(&self, path: &str, offset: u64, count: u32) -> Result<()> {
+    async fn commit_path(&self, path: &[u8], offset: u64, count: u32) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         let object = self.m.lookup_path(path).await?;
         let _barrier = self.m.writes.barrier(&object.fh).await;
@@ -2271,22 +2285,24 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn allocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
         let _operation = self.core.begin_operation()?;
-        super::v42_ops::run_owned(
+        super::write_owner::run_owned(
             self.m.clone(),
             self.core.clone(),
             None,
             fh.clone(),
+            "allocate",
             move |m| async move { m.v42_space(fh, offset, length, true).await },
         )
         .await
     }
     async fn deallocate(&self, fh: Bytes, offset: u64, length: u64) -> Result<()> {
         let _operation = self.core.begin_operation()?;
-        super::v42_ops::run_owned(
+        super::write_owner::run_owned(
             self.m.clone(),
             self.core.clone(),
             None,
             fh.clone(),
+            "deallocate",
             move |m| async move { m.v42_space(fh, offset, length, false).await },
         )
         .await
@@ -2313,11 +2329,12 @@ impl crate::Mount for Mount41Wrapper {
         count: u64,
     ) -> Result<crate::CopyResult> {
         let _operation = self.core.begin_operation()?;
-        super::v42_ops::run_owned(
+        super::write_owner::run_owned(
             self.m.clone(),
             self.core.clone(),
             Some(source.clone()),
             destination.clone(),
+            "copy",
             move |m| async move {
                 m.v42_copy(
                     source,
@@ -2341,11 +2358,12 @@ impl crate::Mount for Mount41Wrapper {
         count: u64,
     ) -> Result<()> {
         let _operation = self.core.begin_operation()?;
-        super::v42_ops::run_owned(
+        super::write_owner::run_owned(
             self.m.clone(),
             self.core.clone(),
             Some(source.clone()),
             destination.clone(),
+            "clone",
             move |m| async move {
                 m.v42_copy(
                     source,
@@ -2374,11 +2392,12 @@ impl crate::Mount for Mount41Wrapper {
     ) -> Result<()> {
         let _operation = self.core.begin_operation()?;
         let name = name.to_owned();
-        super::v42_ops::run_owned(
+        super::write_owner::run_owned(
             self.m.clone(),
             self.core.clone(),
             None,
             fh.clone(),
+            "setxattr",
             move |m| async move { m.v42_setxattr(fh, &name, value, mode).await },
         )
         .await
@@ -2420,21 +2439,23 @@ impl crate::Mount for Mount41Wrapper {
     }
     async fn setxattr(&self, fh: Bytes, name: &str, value: Bytes) -> Result<()> {
         let _operation = self.core.begin_operation()?;
-        if self.m.protocol_version() == NFSVersion::NFSv4p2 {
-            let name = name.to_owned();
-            return super::v42_ops::run_owned(
-                self.m.clone(),
-                self.core.clone(),
-                None,
-                fh.clone(),
-                move |m| async move {
+        let name = name.to_owned();
+        super::write_owner::run_owned(
+            self.m.clone(),
+            self.core.clone(),
+            None,
+            fh.clone(),
+            "setxattr",
+            move |m| async move {
+                if m.protocol_version() == NFSVersion::NFSv4p2 {
                     m.v42_setxattr(fh, &name, value, crate::XattrSetMode::Either)
                         .await
-                },
-            )
-            .await;
-        }
-        self.m.setxattr(fh, name, value).await
+                } else {
+                    m.setxattr(fh, &name, value).await
+                }
+            },
+        )
+        .await
     }
     async fn listxattr(&self, fh: Bytes) -> Result<Vec<String>> {
         let _operation = self.core.begin_operation()?;
@@ -2447,11 +2468,12 @@ impl crate::Mount for Mount41Wrapper {
         let _operation = self.core.begin_operation()?;
         if self.m.protocol_version() == NFSVersion::NFSv4p2 {
             let name = name.to_owned();
-            return super::v42_ops::run_owned(
+            return super::write_owner::run_owned(
                 self.m.clone(),
                 self.core.clone(),
                 None,
                 fh.clone(),
+                "removexattr",
                 move |m| async move { m.v42_removexattr(fh, &name).await },
             )
             .await;
@@ -2723,7 +2745,7 @@ impl crate::Mount for Mount41Wrapper {
             fsid,
         })
     }
-    async fn pathconf_path(&self, path: &str) -> Result<mount::Pathconf> {
+    async fn pathconf_path(&self, path: &[u8]) -> Result<mount::Pathconf> {
         let _operation = self.core.begin_operation()?;
         let obj = self.m.lookup_path(path).await?;
         self.pathconf(obj.fh).await
@@ -2750,20 +2772,6 @@ pub(super) fn decode_fh(data: &mut Bytes) -> Result<Bytes> {
     let fh = data.slice(..len);
     data.advance(padded);
     Ok(fh)
-}
-
-pub(super) fn decode_string_from_bytes(data: &mut Bytes) -> Result<String> {
-    if data.remaining() < 4 {
-        return Err(NfsError::Xdr("string length truncated".to_string()));
-    }
-    let len = data.get_u32() as usize;
-    let padded = (len + 3) & !3;
-    if data.remaining() < padded {
-        return Err(NfsError::Xdr("string data truncated".to_string()));
-    }
-    let s = String::from_utf8_lossy(&data.slice(..len)).to_string();
-    data.advance(padded);
-    Ok(s)
 }
 
 pub(super) fn extract_stateid(data: &mut Bytes) -> Result<[u8; 16]> {
