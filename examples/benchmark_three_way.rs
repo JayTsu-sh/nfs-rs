@@ -102,7 +102,7 @@ async fn execute(
         "scan" => {
             let limit = request["max_dirs"].as_u64().ok_or("missing max_dirs")? as usize;
             let start = Instant::now();
-            let mut queue = VecDeque::from([(".".to_string(), mount.lookup_path(".").await?.fh)]);
+            let mut queue = VecDeque::from([(Vec::new(), mount.lookup_path(b".").await?.fh)]);
             let mut dirs = 0;
             let mut records = Vec::new();
             while dirs < limit {
@@ -114,11 +114,17 @@ async fn execute(
                 entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
                 for entry in entries {
                     let attr = entry.attr.ok_or("missing directory attributes")?;
-                    let child = if path == "." {
-                        entry.file_name
-                    } else {
-                        format!("{path}/{}", entry.file_name)
-                    };
+                    let mut child = path.clone();
+                    if !child.is_empty() {
+                        child.push(b'/');
+                    }
+                    child.extend_from_slice(&entry.file_name);
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let mut path_hex = String::with_capacity(child.len() * 2);
+                    for byte in &child {
+                        path_hex.push(HEX[(byte >> 4) as usize].into());
+                        path_hex.push(HEX[(byte & 15) as usize].into());
+                    }
                     if attr.type_ == 2 {
                         let fh = if entry.handle.is_empty() {
                             attr.filehandle
@@ -128,9 +134,9 @@ async fn execute(
                         if fh.is_empty() {
                             return Err("missing child directory handle".into());
                         }
-                        queue.push_back((child.clone(), fh));
+                        queue.push_back((child, fh));
                     }
-                    records.push((child, kind(attr.type_), attr.fileid, attr.filesize));
+                    records.push((path_hex, kind(attr.type_), attr.fileid, attr.filesize));
                 }
                 dirs += 1;
             }
@@ -143,7 +149,7 @@ async fn execute(
         "write" => {
             let start = Instant::now();
             let file = mount
-                .create_path(field(request, "path")?, Some(0o644))
+                .create_path((field(request, "path")?).as_bytes(), Some(0o644))
                 .await?;
             let result = if let Some(chunk) = request["chunk_bytes"].as_u64() {
                 write_with_limit(
@@ -167,7 +173,9 @@ async fn execute(
         }
         "read" => {
             let start = Instant::now();
-            let file = mount.open_path(field(request, "path")?, OPEN_READ).await?;
+            let file = mount
+                .open_path(field(request, "path")?.as_bytes(), OPEN_READ)
+                .await?;
             let file = BufferedFile::new(mount.clone(), file.fh);
             let data = file.read_at(0, payload.len().try_into()?).await;
             let closed = file.close().await;

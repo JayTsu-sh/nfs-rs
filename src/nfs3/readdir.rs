@@ -14,9 +14,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    Mount, READDIR3args, READDIR3resok, Result, bytes_to_string, entry3, nfs_fh3, paged_dir_stream,
-};
+use super::{Mount, READDIR3args, READDIR3resok, Result, entry3, nfs_fh3, paged_dir_stream};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use futures::stream::Stream;
@@ -24,7 +22,7 @@ use futures::stream::Stream;
 #[derive(Debug)]
 pub struct ReaddirEntry {
     pub fileid: u64,
-    pub file_name: String,
+    pub file_name: Bytes,
 }
 
 impl From<ReaddirEntry> for crate::mount::ReaddirEntry {
@@ -40,7 +38,7 @@ impl From<ReaddirEntry> for crate::mount::ReaddirEntry {
 impl Mount {
     pub async fn readdir_path(
         &self,
-        dir_path: &str,
+        dir_path: &[u8],
     ) -> Result<impl Stream<Item = Result<ReaddirEntry>> + '_ + use<'_>> {
         let fh = self.lookup_path(dir_path).await?.fh;
         Ok(self.readdir(fh).await)
@@ -53,7 +51,7 @@ impl Mount {
             readdir_at,
             |entry: entry3| ReaddirEntry {
                 fileid: entry.fileid.0,
-                file_name: bytes_to_string(entry.name.0),
+                file_name: entry.name.0,
             },
             "readdir page received"
         )
@@ -184,7 +182,7 @@ mod tests {
             &pages,
             Bytes::new(),
             read,
-            |entry: crate::nfs3::entry3| bytes_to_string(entry.name.0),
+            |entry: crate::nfs3::entry3| entry.name.0,
             "test filtered readdir page"
         );
         let result: Result<Vec<_>> = entries.try_collect().await;
@@ -195,7 +193,7 @@ mod tests {
             &pages,
             Bytes::new(),
             plus,
-            |entry: crate::nfs3::entryplus3| bytes_to_string(entry.name.0),
+            |entry: crate::nfs3::entryplus3| entry.name.0,
             "test filtered readdirplus page"
         );
         let result: Result<Vec<_>> = entries.try_collect().await;

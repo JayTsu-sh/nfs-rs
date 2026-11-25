@@ -22,13 +22,73 @@ pub(crate) fn xdr_opaque(buf: &mut Vec<u8>, value: &[u8]) {
     buf.resize(buf.len() + (4 - value.len() % 4) % 4, 0);
 }
 
-pub(crate) struct CompoundBuilder {
-    tag: String,
-    minor_version: u32,
-    ops: Vec<(u32, Vec<u8>)>,
+/// Serialized fixed fields with borrowed XDR strings inserted during final encoding.
+pub(crate) struct WireArgs<'a> {
+    pub(crate) fixed: Vec<u8>,
+    names: Option<NamedFields<'a>>,
 }
 
-impl CompoundBuilder {
+struct NamedFields<'a> {
+    offset: usize,
+    first: &'a [u8],
+    second: Option<&'a [u8]>,
+}
+
+impl From<Vec<u8>> for WireArgs<'_> {
+    fn from(fixed: Vec<u8>) -> Self {
+        Self { fixed, names: None }
+    }
+}
+
+impl<'a> WireArgs<'a> {
+    pub(crate) fn with_names(
+        fixed: Vec<u8>,
+        offset: usize,
+        first: &'a [u8],
+        second: Option<&'a [u8]>,
+    ) -> Self {
+        Self {
+            fixed,
+            names: Some(NamedFields {
+                offset,
+                first,
+                second,
+            }),
+        }
+    }
+
+    pub(crate) fn wire_len(&self) -> usize {
+        self.fixed.len()
+            + self.names.as_ref().map_or(0, |names| {
+                opaque_len(names.first) + names.second.map_or(0, opaque_len)
+            })
+    }
+
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+        if let Some(names) = &self.names {
+            buf.extend_from_slice(&self.fixed[..names.offset]);
+            xdr_opaque(buf, names.first);
+            if let Some(second) = names.second {
+                xdr_opaque(buf, second);
+            }
+            buf.extend_from_slice(&self.fixed[names.offset..]);
+        } else {
+            buf.extend_from_slice(&self.fixed);
+        }
+    }
+}
+
+pub(crate) fn opaque_len(value: &[u8]) -> usize {
+    4 + value.len().next_multiple_of(4)
+}
+
+pub(crate) struct CompoundBuilder<'a> {
+    tag: String,
+    minor_version: u32,
+    ops: Vec<(u32, WireArgs<'a>)>,
+}
+
+impl<'a> CompoundBuilder<'a> {
     pub(crate) fn new(tag: &str, minor_version: u32) -> Self {
         Self {
             tag: tag.to_string(),
@@ -37,8 +97,8 @@ impl CompoundBuilder {
         }
     }
 
-    pub(crate) fn operation(mut self, opcode: u32, args: Vec<u8>) -> Self {
-        self.ops.push((opcode, args));
+    pub(crate) fn operation(mut self, opcode: u32, args: impl Into<WireArgs<'a>>) -> Self {
+        self.ops.push((opcode, args.into()));
         self
     }
 
@@ -52,32 +112,44 @@ impl CompoundBuilder {
         self.operation(OP_PUTFH, args)
     }
 
-    pub(crate) fn lookup(self, name: &str) -> Self {
-        let mut args = Vec::new();
-        xdr_opaque(&mut args, name.as_bytes());
-        self.operation(OP_LOOKUP, args)
+    pub(crate) fn lookup(self, name: &'a [u8]) -> Self {
+        self.operation(OP_LOOKUP, WireArgs::with_names(Vec::new(), 0, name, None))
     }
 
     pub(crate) fn getfh(self) -> Self {
         self.operation(OP_GETFH, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_body(self) -> Vec<u8> {
         let mut buf = Vec::new();
-        xdr_opaque(&mut buf, self.tag.as_bytes());
-        xdr_u32(&mut buf, self.minor_version);
-        xdr_u32(&mut buf, self.ops.len() as u32);
-        for (opcode, args) in self.ops {
-            xdr_u32(&mut buf, opcode);
-            buf.extend_from_slice(&args);
-        }
+        self.encode_body_into(&mut buf);
         buf
+    }
+
+    fn encode_body_into(self, buf: &mut Vec<u8>) {
+        buf.reserve(
+            opaque_len(self.tag.as_bytes())
+                + 8
+                + self
+                    .ops
+                    .iter()
+                    .map(|(_, args)| 4 + args.wire_len())
+                    .sum::<usize>(),
+        );
+        xdr_opaque(buf, self.tag.as_bytes());
+        xdr_u32(buf, self.minor_version);
+        xdr_u32(buf, self.ops.len() as u32);
+        for (opcode, args) in self.ops {
+            xdr_u32(buf, opcode);
+            args.encode(buf);
+        }
     }
 
     pub(crate) fn encode_with_header(self, auth: &Auth) -> Vec<u8> {
         let mut buf = Vec::new();
         rpc_header(100003, 4, 1, auth).encode(&mut buf);
-        buf.extend_from_slice(&self.encode_body());
+        self.encode_body_into(&mut buf);
         buf
     }
 }
@@ -159,7 +231,7 @@ mod tests {
     fn minor_zero_navigation_has_canonical_common_opcodes() {
         let actual = CompoundBuilder::new("navigate", 0)
             .putrootfh()
-            .lookup("export")
+            .lookup(b"export")
             .getfh()
             .encode_body();
         let mut expected = Vec::new();

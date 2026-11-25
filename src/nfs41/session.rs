@@ -14,8 +14,9 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
 use super::MinorVersion;
-use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse};
+use super::compound::{ChannelAttrsArgs, CompoundBuilder, CompoundResponse, OpNum};
 use crate::error::{NfsError, Result};
+use crate::nfs4::Nfs4ErrorCode;
 use crate::rpc;
 use crate::rpc::auth::Auth;
 
@@ -29,6 +30,7 @@ pub(crate) const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x0002_0000;
 
 /// RFC 8881 §13.1：客户端与 pNFS 数据服务器建立 client-id 时声明 DS 用途。
 pub(crate) const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x0004_0000;
+const EXCHGID4_FLAG_SUPP_FENCE_OPS: u32 = 0x0000_0004;
 
 /// 客户端身份标识，在一个 mount 实例的生命周期内保持不变。
 ///
@@ -636,24 +638,39 @@ async fn exchange_id_step(
 ) -> Result<(u64, u32, u32)> {
     // RFC 7862 §14.1: request fencing support; uncertainty semantics stay
     // conservative because we do not rely on the server's returned fence flag.
-    let flags = flags
-        | if client_identity.minor_version == MinorVersion::V2 {
-            0x4
-        } else {
-            0
-        };
+    let minor = client_identity.minor_version;
+    let requested_flags = if minor == MinorVersion::V2 {
+        flags | EXCHGID4_FLAG_SUPP_FENCE_OPS
+    } else {
+        flags
+    };
     let verifier = &client_identity.verifier;
     let owner_id = client_identity.owner_id.as_bytes();
+    let exchange = |flags| {
+        let builder = CompoundBuilder::new("exchange_id").exchange_id(
+            verifier,
+            owner_id,
+            flags,
+            "nfs-rs",
+            "nfs-rs NFSv4.1/v4.2 client",
+        );
+        send_compound_no_session(rpc, auth, builder, minor)
+    };
 
-    let builder = CompoundBuilder::new("exchange_id").exchange_id(
-        verifier,
-        owner_id,
-        flags,
-        "nfs-rs",
-        "nfs-rs NFSv4.1/v4.2 client",
-    );
-
-    let resp = send_compound_no_session(rpc, auth, builder, client_identity.minor_version).await?;
+    let mut resp = exchange(requested_flags).await?;
+    // Some Linux servers reject the RFC 7862 §14.1 capability. Only a
+    // definite rejection permits changing the request. Keep the identity,
+    // role, and minor version when retrying without the optional bit.
+    if requested_flags != flags
+        && resp.status == Nfs4ErrorCode::NFS4ERR_INVAL
+        && resp.tag == "exchange_id"
+        && matches!(resp.results.as_slice(), [op]
+            if op.opcode == OpNum::ExchangeId as u32
+                && op.status == Nfs4ErrorCode::NFS4ERR_INVAL
+                && op.data.is_empty())
+    {
+        resp = exchange(flags).await?;
+    }
     resp.check_status()?;
     let op = resp.op_ok(0)?;
     let mut data = op.data.clone();
@@ -737,7 +754,7 @@ async fn create_session_step(
 async fn send_compound_no_session(
     rpc: &rpc::Client,
     auth: &Auth,
-    builder: CompoundBuilder,
+    builder: CompoundBuilder<'_>,
     minor_version: MinorVersion,
 ) -> Result<CompoundResponse> {
     send_compound(
@@ -754,7 +771,7 @@ async fn send_compound_no_session(
 async fn send_compound(
     rpc: &rpc::Client,
     auth: &Auth,
-    builder: CompoundBuilder,
+    builder: CompoundBuilder<'_>,
     minor_version: MinorVersion,
     timeout: std::time::Duration,
 ) -> Result<CompoundResponse> {
@@ -767,7 +784,7 @@ async fn send_compound(
 async fn send_compound_on_session(
     rpc: &rpc::Client,
     auth: &Auth,
-    builder: CompoundBuilder,
+    builder: CompoundBuilder<'_>,
     timeout: std::time::Duration,
     session: &Session,
 ) -> Result<CompoundResponse> {

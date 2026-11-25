@@ -20,7 +20,7 @@ def test_sync_namespace_and_whole_file_conveniences() -> None:
     client.rename("old", "new")
     client.link("new", "hard")
     client.symlink("../raw/target", "sym")
-    assert client.readlink("sym") == "../target"
+    assert client.readlink("sym") == b"../target"
     with client.open("whole.bin", "wb") as file:
         assert file.write(b"contents") == 8
     with client.open("whole.bin", "rb") as file:
@@ -58,7 +58,7 @@ def test_async_namespace_twins() -> None:
         await client.rename("from", "to")
         await client.link("to", "hard")
         await client.symlink("../../target", "sym")
-        assert await client.readlink("sym") == "../target"
+        assert await client.readlink("sym") == b"../target"
         async with await client.open("async.bin", "wb") as file:
             assert await file.write(b"value") == 5
         async with await client.open("async.bin", "rb") as file:

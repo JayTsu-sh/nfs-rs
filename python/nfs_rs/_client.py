@@ -5,6 +5,7 @@ import inspect
 import io
 import os
 import platform
+import re
 import sys
 import sysconfig
 import time
@@ -26,17 +27,17 @@ from ._errors import (
 _CONSTRUCTION_TOKEN = object()
 
 
-async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | None, filename: str | None) -> Any:
+async def _await_adapter_result(awaitable: Any, operation: str, protocol: str | None, filename: _PathReference | None) -> Any:
     try:
         return await awaitable
     except NfsError as error:
-        raise error.with_context(operation=operation, protocol=protocol, filename=filename) from error
+        raise error.with_context(operation=operation, protocol=protocol, filename=_error_filename(filename)) from error
 
 
 class _AdapterContext:
     __slots__ = ("_target", "_protocol", "_filename")
 
-    def __init__(self, target: Any, protocol: str | None = None, filename: str | None = None) -> None:
+    def __init__(self, target: Any, protocol: str | None = None, filename: _PathReference | None = None) -> None:
         object.__setattr__(self, "_target", target)
         object.__setattr__(self, "_protocol", protocol)
         object.__setattr__(self, "_filename", filename)
@@ -56,12 +57,12 @@ class _AdapterContext:
         def contextual_call(*args: Any, **kwargs: Any) -> Any:
             public_operation = args[0] if name == "v42" and args else operation
             filename = args[1] if name == "v42" and len(args) > 1 else self._filename
-            if filename is None and args and isinstance(args[0], str):
+            if filename is None and args and isinstance(args[0], (str, bytes, memoryview)):
                 filename = args[1] if name == "symlink" and len(args) > 1 else args[0]
             try:
                 result = attribute(*args, **kwargs)
             except NfsError as error:
-                raise error.with_context(operation=public_operation, protocol=self._protocol, filename=filename) from error
+                raise error.with_context(operation=public_operation, protocol=self._protocol, filename=_error_filename(filename)) from error
             if inspect.isawaitable(result):
                 return _await_adapter_result(result, public_operation, self._protocol, filename)
             return result
@@ -216,7 +217,7 @@ class Health:
 @dataclass(frozen=True, slots=True)
 class RecoveryEvent:
     operation: str
-    path: str | None
+    path: bytes | None
     protocol: str
     outcome: OperationOutcome
     recovery_action: RecoveryAction
@@ -238,7 +239,7 @@ def _recovery_event(values: dict[str, Any]) -> RecoveryEvent:
 
 @dataclass(frozen=True, slots=True)
 class FileInfo:
-    path: str
+    _path: str | bytes | memoryview | _EntryPath
     type: FileType
     mode: int
     nlink: int
@@ -254,11 +255,15 @@ class FileInfo:
     owner: str | None
     group: str | None
 
+    @property
+    def path(self) -> str | bytes:
+        return _materialize_path(self._path)
+
 
 @dataclass(frozen=True, slots=True)
 class PathResolution:
     status: PathResolutionStatus
-    path: str | None
+    path: memoryview | None
     info: FileInfo | None
 
     @property
@@ -271,17 +276,78 @@ class PathResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class _EntryPath:
+    parent: str | bytes | memoryview | _EntryPath
+    name: memoryview
+
+    def to_bytes(self) -> bytes:
+        parts: list[bytes | memoryview] = []
+        current: str | bytes | memoryview | _EntryPath = self
+        while isinstance(current, _EntryPath):
+            parts.append(current.name)
+            current = current.parent
+        root = _normalize_byte_path(current.encode("utf-8") if isinstance(current, str) else current)
+        if root != b".":
+            parts.append(root)
+        return b"/".join(reversed(parts))
+
+
+_Path = str | bytes | memoryview | os.PathLike[str] | os.PathLike[bytes]
+_PathReference = str | bytes | memoryview | _EntryPath
+
+
+def _materialize_path(path: _PathReference) -> str | bytes:
+    if isinstance(path, _EntryPath):
+        return path.to_bytes()
+    if isinstance(path, (bytes, memoryview)):
+        return _normalize_byte_path(path)
+    return path
+
+
+def _normalize_byte_path(path: bytes | memoryview) -> bytes:
+    # Only materialize for explicit path access or error diagnostics. A scan
+    # carries its parent and the original views without joining them.
+    if isinstance(path, memoryview):
+        path = path.tobytes()
+    components: list[bytes] = []
+    for part in path.split(b"/"):
+        if part == b"..":
+            if not components:
+                return path  # retain the original path in error diagnostics
+            components.pop()
+        elif part not in {b"", b"."}:
+            components.append(part)
+    return b"/".join(components) or b"."
+
+
+def _error_filename(path: _PathReference | None) -> bytes | None:
+    if isinstance(path, _EntryPath):
+        return path.to_bytes()
+    if isinstance(path, memoryview):
+        return path.tobytes()
+    if isinstance(path, str):
+        return path.encode("utf-8")
+    return path
+
+
+@dataclass(frozen=True, slots=True)
 class DirectoryRef:
-    path: os.PathLike[str] | str
+    path: _Path
     fh: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DirEntry:
-    name: str
-    path: str
+    name: memoryview
     info: FileInfo
-    fh: bytes | None = None
+    fh: bytes | None
+    _parent_fh: bytes | None
+    _owner: object
+
+    @property
+    def path(self) -> bytes:
+        path = self.info.path
+        return path if isinstance(path, bytes) else path.encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,8 +365,8 @@ class DirectoryPage:
 
 @dataclass(frozen=True, slots=True)
 class ExportEntry:
-    path: str
-    groups: tuple[str, ...]
+    path: bytes
+    groups: tuple[bytes, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,9 +447,9 @@ def _normalize_path(path: os.PathLike[str] | str) -> str:
     return "/".join(parts) or "."
 
 
-def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
+def _file_info(path: _PathReference, values: dict[str, Any]) -> FileInfo:
     return FileInfo(
-        path=path,
+        _path=path,
         type=FileType(values["type"]),
         mode=values["mode"],
         nlink=values["nlink"],
@@ -401,13 +467,21 @@ def _file_info(path: str, values: dict[str, Any]) -> FileInfo:
     )
 
 
-def _resolution_path(path: os.PathLike[str] | str) -> str:
+def _stored_path(path: _Path) -> str | bytes | memoryview:
+    if isinstance(path, memoryview):
+        return path
     raw = os.fspath(path)
-    if isinstance(raw, bytes):
-        raise TypeError("NFS paths must be strings, not bytes")
-    if "\0" in raw or raw.startswith("/"):
+    if ("\0" in raw if isinstance(raw, str) else b"\0" in raw):
+        raise ValueError("NFS paths may not contain NUL")
+    return raw
+
+
+def _resolution_path(path: _Path) -> str | bytes | memoryview:
+    raw = _stored_path(path)
+    if (isinstance(raw, str) and raw.startswith("/")) or (
+        isinstance(raw, bytes) and raw.startswith(b"/")
+    ):
         raise ValueError("resolve requires an export-relative path without NUL")
-    # Preserve .., dots and trailing slashes: their meaning depends on symlinks.
     return raw
 
 
@@ -419,18 +493,91 @@ def _path_resolution(values: dict[str, Any]) -> PathResolution:
     )
 
 
-def _scandir_target(target: DirectoryRef | DirEntry | os.PathLike[str] | str) -> tuple[str, bytes | None]:
-    if isinstance(target, (DirectoryRef, DirEntry)):
-        path, fh = target.path, target.fh
-    else:
-        path, fh = target, None
-    normalized = _normalize_path(path)
+def _byte_path(path: _Path) -> str | bytes | memoryview:
+    raw = _stored_path(path)
+    return _normalize_path(raw) if isinstance(raw, str) else raw
+
+
+def _namespace_path(path: _Path) -> str | bytes | memoryview:
+    raw = _stored_path(path)
+    if isinstance(raw, str):
+        if raw.rstrip("/").rsplit("/", 1)[-1] in {"", ".", ".."}:
+            raise ValueError("NFS mutation requires a leaf name")
+        return _normalize_path(raw)
+    return raw
+
+
+def _mkdir_paths(
+    path: str | bytes | memoryview, parents: bool,
+) -> Iterator[tuple[str | bytes | memoryview, bool]]:
+    if not parents:
+        yield path, True
+        return
+    if isinstance(path, str):
+        for separator in re.finditer("/", path):
+            yield path[:separator.start()], False
+        yield path, True
+        return
+
+    view = memoryview(path)
+    if view.format != "B" or view.ndim != 1 or not view.c_contiguous or not view.readonly:
+        raise TypeError("expected a contiguous read-only byte view")
+    if len(view) > 65536 or 0 in view:
+        raise ValueError("NFS path exceeds 64 KiB or contains NUL")
+    endpoints: list[int] = []
+    leaf_is_name = False
+    for component in re.finditer(rb"[^/]+", view):
+        part = view[component.start():component.end()]
+        leaf_is_name = part != b"." and part != b".."
+        if leaf_is_name:
+            endpoints.append(component.end())
+        elif part == b"..":
+            if not endpoints:
+                raise ValueError("NFS path escapes the export root")
+            endpoints.pop()
+    if not leaf_is_name:
+        raise ValueError("NFS mutation requires a leaf name")
+    for end in endpoints[:-1]:
+        yield view[:end], False
+    yield view, True
+
+
+def _entry_target(
+    target: DirectoryRef | DirEntry | _Path, owner: object,
+) -> tuple[str | bytes | memoryview, _PathReference, bytes | None, bytes | None]:
+    if isinstance(target, DirEntry):
+        if target._owner is not owner:
+            raise ValueError("directory entry belongs to another mount")
+        if target._parent_fh is not None:
+            return target.name, target.info._path, target.fh, target._parent_fh
+        return target.path, target.info._path, target.fh, None
+    path, fh = (target.path, target.fh) if isinstance(target, DirectoryRef) else (target, None)
+    normalized = _byte_path(path)
     if fh is not None:
         if not isinstance(fh, bytes):
             raise TypeError("scandir fh must be bytes or None")
         if not fh:
             raise ValueError("scandir fh must not be empty; use None for path lookup")
-    return normalized, fh
+    return normalized, normalized, fh, None
+
+
+def _entry_options(fh: bytes | None, parent: bytes | None) -> dict[str, bytes]:
+    options = {}
+    if fh is not None:
+        options["fh"] = fh
+    if parent is not None:
+        options["parent"] = parent
+    return options
+
+
+def _open_options(path: DirEntry | _Path, mode: str, fh: bytes | None, parent: bytes | None) -> dict[str, bytes]:
+    options = _entry_options(None, parent)
+    if isinstance(path, DirEntry):
+        if fh is not None:
+            options["expected_fh"] = fh
+        elif mode != "rb":
+            raise ValueError("writing through a directory entry requires its file handle")
+    return options
 
 
 def _directory_position(position: DirectoryCookie | None) -> tuple[int, bytes]:
@@ -446,17 +593,22 @@ def _directory_position(position: DirectoryCookie | None) -> tuple[int, bytes]:
     return cookie, verifier
 
 
-def _directory_page(parent: str, values: dict[str, Any]) -> DirectoryPage:
+def _directory_page(parent: _PathReference, values: dict[str, Any], owner: object) -> DirectoryPage:
     return DirectoryPage(
-        tuple(_directory_entry(parent, entry) for entry in values["entries"]),
+        tuple(_directory_entry(parent, entry, owner) for entry in values["entries"]),
         DirectoryCookie(values["cookie"], bytes(values["verifier"])),
         values["eof"],
     )
 
 
-def _directory_entry(parent: str, values: dict[str, Any]) -> DirEntry:
-    path = values["name"] if parent == "." else f"{parent}/{values['name']}"
-    return DirEntry(values["name"], path, _file_info(path, values["info"]), values.get("fh") or None)
+def _directory_entry(parent: _PathReference, values: dict[str, Any], owner: object) -> DirEntry:
+    name = values["name"]
+    # Native adapters already return a view. This branch also supports simple
+    # adapters that expose immutable bytes directly.
+    if not isinstance(name, memoryview):
+        name = memoryview(name.encode("utf-8") if isinstance(name, str) else name)
+    path = _EntryPath(parent, name)
+    return DirEntry(name, _file_info(path, values["info"]), values.get("fh"), values.get("parent_fh"), owner)
 
 
 def _capabilities(values: dict[str, Any]) -> Capabilities:
@@ -676,7 +828,7 @@ class _ClientOptions:
 
 
 class Client(_ClientOptions):
-    __slots__ = ("_inner",)
+    __slots__ = ("_inner", "_entry_owner")
 
     def __init__(self, inner: Any, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
@@ -684,6 +836,7 @@ class Client(_ClientOptions):
         major, minor = inner.version
         protocol = str(major) if minor is None else f"{major}.{minor}"
         self._inner = _AdapterContext(inner, protocol)
+        self._entry_owner = object()
 
     @classmethod
     def connect(cls, url: str, **options: Any) -> Client:
@@ -728,120 +881,121 @@ class Client(_ClientOptions):
     def close(self) -> None:
         self._inner.close()
 
-    def stat(self, path: os.PathLike[str] | str) -> FileInfo:
-        normalized = _normalize_path(path)
-        return _file_info(normalized, self._inner.stat(normalized))
+    def stat(self, path: DirEntry | _Path) -> FileInfo:
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
+        return _file_info(label, self._inner.stat(target, **_entry_options(fh, parent)))
 
-    def exists(self, path: os.PathLike[str] | str) -> bool:
+    def exists(self, path: DirEntry | _Path) -> bool:
         try:
             self.stat(path)
         except FileNotFoundError:
             return False
         return True
 
-    def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+    def resolve(self, path: _Path) -> PathResolution:
         return _path_resolution(self._inner.resolve(_resolution_path(path)))
 
-    def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> Iterator[DirEntry]:
-        normalized, fh = _scandir_target(path)
-        cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
+    def scandir(self, path: DirectoryRef | DirEntry | _Path = b".") -> Iterator[DirEntry]:
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
+        cursor = self._inner.scandir(target, **_entry_options(fh, parent))
         def entries() -> Iterator[DirEntry]:
             try:
                 for batch in cursor:
                     for values in batch:
-                        yield _directory_entry(normalized, values)
+                        yield _directory_entry(label, values, self._entry_owner)
             except NfsError as error:
-                raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
+                raise error.with_context(operation="scandir", protocol=str(self.version), filename=_error_filename(label)) from error
         return entries()
 
     def scandir_page(
         self,
-        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        path: DirectoryRef | DirEntry | _Path = b".",
         position: DirectoryCookie | None = None,
     ) -> DirectoryPage:
-        normalized, fh = _scandir_target(path)
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
         cookie, verifier = _directory_position(position)
-        return _directory_page(normalized, self._inner.scandir_page(normalized, fh, cookie, verifier))
+        kwargs = {} if parent is None else {"parent": parent}
+        return _directory_page(label, self._inner.scandir_page(target, fh, cookie, verifier, **kwargs), self._entry_owner)
 
-    def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
-        return self._inner.listdir(_normalize_path(path))
+    def listdir(self, path: _Path = b".") -> list[memoryview]:
+        return self._inner.listdir(_byte_path(path))
 
-    def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
-        self._inner.chmod(_normalize_path(path), mode)
+    def chmod(self, path: _Path, mode: int) -> None:
+        self._inner.chmod(_byte_path(path), mode)
 
-    def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
-        self._inner.chown(_normalize_path(path), uid, gid)
+    def chown(self, path: _Path, uid: int, gid: int) -> None:
+        self._inner.chown(_byte_path(path), uid, gid)
 
-    def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+    def utime(self, path: _Path, *, ns: tuple[int, int]) -> None:
         if not isinstance(ns, tuple) or len(ns) != 2:
             raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
-        self._inner.utime(_normalize_path(path), ns[0], ns[1])
+        self._inner.utime(_byte_path(path), ns[0], ns[1])
 
-    def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
-        self._inner.truncate_path(_normalize_path(path), size)
+    def truncate(self, path: _Path, size: int) -> None:
+        self._inner.truncate_path(_byte_path(path), size)
 
-    def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+    def access(self, path: _Path, mode: int) -> bool:
         if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
-        return bool(self._inner.access(_normalize_path(path), mode))
+        return bool(self._inner.access(_byte_path(path), mode))
 
-    def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
-        return _acl41(self._inner.getdacl(_normalize_path(path)))
+    def getdacl(self, path: _Path) -> NfsAcl41:
+        return _acl41(self._inner.getdacl(_byte_path(path)))
 
-    def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    def setdacl(self, path: _Path, acl: NfsAcl41) -> None:
         flags, aces = _acl41_args(acl)
-        self._inner.setdacl(_normalize_path(path), flags, aces)
+        self._inner.setdacl(_byte_path(path), flags, aces)
 
-    def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
-        return _acl41(self._inner.getsacl(_normalize_path(path)))
+    def getsacl(self, path: _Path) -> NfsAcl41:
+        return _acl41(self._inner.getsacl(_byte_path(path)))
 
-    def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    def setsacl(self, path: _Path, acl: NfsAcl41) -> None:
         flags, aces = _acl41_args(acl)
-        self._inner.setsacl(_normalize_path(path), flags, aces)
+        self._inner.setsacl(_byte_path(path), flags, aces)
 
-    def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
-        self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+    def allocate(self, path: _Path, offset: int, length: int) -> None:
+        self._inner.v42("allocate", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
-        self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+    def deallocate(self, path: _Path, offset: int, length: int) -> None:
+        self._inner.v42("deallocate", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
 
-    def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    def seek_content(self, path: _Path, offset: int, what: SeekContent) -> SeekResult:
         if not isinstance(what, SeekContent):
             raise TypeError("what must be a SeekContent")
-        values = self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
+        values = self._inner.v42("seek_content", _byte_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
         return SeekResult(**values)
 
-    def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
-        values = self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
+    def read_plus(self, path: _Path, offset: int, count: int) -> ReadPlusResult:
+        values = self._inner.v42("read_plus", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
         return _read_plus_result(values)
 
-    def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
-        values = self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+    def copy_range(self, source: _Path, destination: _Path, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+        values = self._inner.v42("copy_range", _byte_path(source), _byte_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
         return CopyResult(**values)
 
-    def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
-        self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+    def clone_range(self, source: _Path, destination: _Path, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+        self._inner.v42("clone_range", _byte_path(source), _byte_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
 
-    def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
-        values = self._inner.v42("nfs42_attributes", _normalize_path(path))
+    def nfs42_attributes(self, path: _Path = ".") -> Nfs42Attributes:
+        values = self._inner.v42("nfs42_attributes", _byte_path(path))
         return _nfs42_attributes(values)
 
-    def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
-        return bytes(self._inner.getxattr(_normalize_path(path), name))
+    def getxattr(self, path: _Path, name: str) -> bytes:
+        return bytes(self._inner.getxattr(_byte_path(path), name))
 
-    def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
+    def setxattr(self, path: _Path, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
         if not isinstance(mode, XattrSetMode):
             raise TypeError("mode must be an XattrSetMode")
         if mode is XattrSetMode.EITHER:
-            self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+            self._inner.setxattr(_byte_path(path), name, _snapshot_bytes(value))
         else:
-            self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
+            self._inner.v42("setxattr", _byte_path(path), name, int(mode), value=_snapshot_bytes(value))
 
-    def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
-        return list(self._inner.listxattr(_normalize_path(path)))
+    def listxattr(self, path: _Path) -> list[str]:
+        return list(self._inner.listxattr(_byte_path(path)))
 
-    def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
-        self._inner.removexattr(_normalize_path(path), name)
+    def removexattr(self, path: _Path, name: str) -> None:
+        self._inner.removexattr(_byte_path(path), name)
 
     def fs_info(self) -> FsInfo:
         return _fs_info(self._inner.fs_info())
@@ -850,19 +1004,15 @@ class Client(_ClientOptions):
         return _fs_stat(self._inner.fs_stat())
 
     def mkdir(
-        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+        self, path: _Path, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         """Create directories non-transactionally when ``parents`` is true."""
-        normalized = _normalize_path(path)
-        paths = [normalized]
-        if parents:
-            parts = normalized.split("/")
-            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
-        for candidate in paths:
+        normalized = _namespace_path(path)
+        for candidate, is_leaf in _mkdir_paths(normalized, parents):
             try:
                 self._inner.mkdir(candidate, mode)
             except FileExistsError:
-                if not ((parents and candidate != normalized) or exist_ok):
+                if is_leaf and not exist_ok:
                     raise
                 try:
                     existing = self.stat(candidate)
@@ -871,53 +1021,49 @@ class Client(_ClientOptions):
                 if existing.type is not FileType.DIRECTORY:
                     raise
 
-    def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+    def remove(self, path: _Path, *, missing_ok: bool = False) -> None:
         try:
-            self._inner.remove(_normalize_path(path))
+            self._inner.remove(_namespace_path(path))
         except FileNotFoundError:
             if not missing_ok:
                 raise
 
     unlink = remove
 
-    def rmdir(self, path: os.PathLike[str] | str) -> None:
-        self._inner.rmdir(_normalize_path(path))
+    def rmdir(self, path: _Path) -> None:
+        self._inner.rmdir(_namespace_path(path))
 
-    def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
-        self._inner.rename(_normalize_path(source), _normalize_path(destination))
+    def rename(self, source: _Path, destination: _Path) -> None:
+        self._inner.rename(_namespace_path(source), _namespace_path(destination))
 
-    def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
-        self._inner.link(_normalize_path(source), _normalize_path(destination))
+    def link(self, source: _Path, destination: _Path) -> None:
+        self._inner.link(_namespace_path(source), _namespace_path(destination))
 
-    def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
-        target_text = os.fspath(target)
-        if isinstance(target_text, bytes):
-            raise TypeError("symlink targets must be strings, not bytes")
-        if "\0" in target_text:
-            raise ValueError("symlink targets may not contain NUL")
-        self._inner.symlink(target_text, _normalize_path(link_path))
+    def symlink(self, target: _Path, link_path: _Path) -> None:
+        self._inner.symlink(_stored_path(target), _namespace_path(link_path))
 
-    def readlink(self, path: os.PathLike[str] | str) -> str:
-        return self._inner.readlink(_normalize_path(path))
+    def readlink(self, path: _Path) -> memoryview:
+        return self._inner.readlink(_byte_path(path))
 
-    def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
-        normalized = _normalize_path(path)
+    def touch(self, path: _Path, *, exist_ok: bool = True) -> None:
+        normalized = _namespace_path(path)
         if not exist_ok:
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         self.open(normalized, "ab").close()
         now = time.time_ns()
         self.utime(normalized, ns=(now, now))
 
-    def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> File:
+    def open(self, path: DirEntry | _Path, mode: str = "rb") -> File:
         """Open a binary file.
 
         Creating and truncating modes may require multiple NFS operations. Their
         effects are non-transactional: a created or truncated file can remain if
         a later open step fails.
         """
-        normalized = _normalize_path(path)
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
         mode = _validate_binary_mode(mode)
-        return File(self._inner.open(normalized, mode), normalized, mode, _CONSTRUCTION_TOKEN)
+        inner = self._inner.open(target, mode, **_open_options(path, mode, fh, parent))
+        return File(inner, label, mode, _CONSTRUCTION_TOKEN)
 
     def __enter__(self) -> Client:
         return self
@@ -935,7 +1081,7 @@ class Client(_ClientOptions):
 
 
 class AsyncClient(_ClientOptions):
-    __slots__ = ("_inner", "_loop")
+    __slots__ = ("_inner", "_loop", "_entry_owner")
 
     def __init__(
         self,
@@ -948,6 +1094,7 @@ class AsyncClient(_ClientOptions):
         major, minor = inner.version
         protocol = str(major) if minor is None else f"{major}.{minor}"
         self._inner = _AdapterContext(inner, protocol)
+        self._entry_owner = object()
         self._loop = loop
 
     @classmethod
@@ -1000,145 +1147,146 @@ class AsyncClient(_ClientOptions):
         self._check_loop()
         await self._inner.close()
 
-    async def stat(self, path: os.PathLike[str] | str) -> FileInfo:
+    async def stat(self, path: DirEntry | _Path) -> FileInfo:
         self._check_loop()
-        normalized = _normalize_path(path)
-        return _file_info(normalized, await self._inner.stat(normalized))
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
+        return _file_info(label, await self._inner.stat(target, **_entry_options(fh, parent)))
 
-    async def exists(self, path: os.PathLike[str] | str) -> bool:
+    async def exists(self, path: DirEntry | _Path) -> bool:
         try:
             await self.stat(path)
         except FileNotFoundError:
             return False
         return True
 
-    async def resolve(self, path: os.PathLike[str] | str) -> PathResolution:
+    async def resolve(self, path: _Path) -> PathResolution:
         self._check_loop()
         return _path_resolution(await self._inner.resolve(_resolution_path(path)))
 
-    async def scandir(self, path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".") -> AsyncIterator[DirEntry]:
+    async def scandir(self, path: DirectoryRef | DirEntry | _Path = b".") -> AsyncIterator[DirEntry]:
         self._check_loop()
-        normalized, fh = _scandir_target(path)
-        cursor = self._inner.scandir(normalized, fh) if fh is not None else self._inner.scandir(normalized)
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
+        cursor = self._inner.scandir(target, **_entry_options(fh, parent))
         if inspect.isawaitable(cursor):
             cursor = await cursor
         try:
             async for batch in cursor:
                 for values in batch:
-                    yield _directory_entry(normalized, values)
+                    yield _directory_entry(label, values, self._entry_owner)
         except NfsError as error:
-            raise error.with_context(operation="scandir", protocol=str(self.version), filename=normalized) from error
+            raise error.with_context(operation="scandir", protocol=str(self.version), filename=_error_filename(label)) from error
 
     async def scandir_page(
         self,
-        path: DirectoryRef | DirEntry | os.PathLike[str] | str = ".",
+        path: DirectoryRef | DirEntry | _Path = b".",
         position: DirectoryCookie | None = None,
     ) -> DirectoryPage:
         self._check_loop()
-        normalized, fh = _scandir_target(path)
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
         cookie, verifier = _directory_position(position)
-        return _directory_page(normalized, await self._inner.scandir_page(normalized, fh, cookie, verifier))
+        kwargs = {} if parent is None else {"parent": parent}
+        return _directory_page(label, await self._inner.scandir_page(target, fh, cookie, verifier, **kwargs), self._entry_owner)
 
-    async def listdir(self, path: os.PathLike[str] | str = ".") -> list[str]:
+    async def listdir(self, path: _Path = b".") -> list[memoryview]:
         self._check_loop()
-        return await self._inner.listdir(_normalize_path(path))
+        return await self._inner.listdir(_byte_path(path))
 
-    async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None:
+    async def chmod(self, path: _Path, mode: int) -> None:
         self._check_loop()
-        await self._inner.chmod(_normalize_path(path), mode)
+        await self._inner.chmod(_byte_path(path), mode)
 
-    async def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None:
+    async def chown(self, path: _Path, uid: int, gid: int) -> None:
         self._check_loop()
-        await self._inner.chown(_normalize_path(path), uid, gid)
+        await self._inner.chown(_byte_path(path), uid, gid)
 
-    async def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None:
+    async def utime(self, path: _Path, *, ns: tuple[int, int]) -> None:
         self._check_loop()
         if not isinstance(ns, tuple) or len(ns) != 2:
             raise TypeError("ns must be an (atime_ns, mtime_ns) tuple")
-        await self._inner.utime(_normalize_path(path), ns[0], ns[1])
+        await self._inner.utime(_byte_path(path), ns[0], ns[1])
 
-    async def truncate(self, path: os.PathLike[str] | str, size: int) -> None:
+    async def truncate(self, path: _Path, size: int) -> None:
         self._check_loop()
-        await self._inner.truncate_path(_normalize_path(path), size)
+        await self._inner.truncate_path(_byte_path(path), size)
 
-    async def access(self, path: os.PathLike[str] | str, mode: int) -> bool:
+    async def access(self, path: _Path, mode: int) -> bool:
         self._check_loop()
         if isinstance(mode, bool) or not isinstance(mode, int) or mode & ~0o7:
             raise ValueError("mode must contain only F_OK, R_OK, W_OK, and X_OK")
-        return bool(await self._inner.access(_normalize_path(path), mode))
+        return bool(await self._inner.access(_byte_path(path), mode))
 
-    async def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
+    async def getdacl(self, path: _Path) -> NfsAcl41:
         self._check_loop()
-        return _acl41(await self._inner.getdacl(_normalize_path(path)))
+        return _acl41(await self._inner.getdacl(_byte_path(path)))
 
-    async def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
-        self._check_loop()
-        flags, aces = _acl41_args(acl)
-        await self._inner.setdacl(_normalize_path(path), flags, aces)
-
-    async def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41:
-        self._check_loop()
-        return _acl41(await self._inner.getsacl(_normalize_path(path)))
-
-    async def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None:
+    async def setdacl(self, path: _Path, acl: NfsAcl41) -> None:
         self._check_loop()
         flags, aces = _acl41_args(acl)
-        await self._inner.setsacl(_normalize_path(path), flags, aces)
+        await self._inner.setdacl(_byte_path(path), flags, aces)
 
-    async def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    async def getsacl(self, path: _Path) -> NfsAcl41:
         self._check_loop()
-        await self._inner.v42("allocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+        return _acl41(await self._inner.getsacl(_byte_path(path)))
 
-    async def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+    async def setsacl(self, path: _Path, acl: NfsAcl41) -> None:
         self._check_loop()
-        await self._inner.v42("deallocate", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+        flags, aces = _acl41_args(acl)
+        await self._inner.setsacl(_byte_path(path), flags, aces)
 
-    async def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+    async def allocate(self, path: _Path, offset: int, length: int) -> None:
+        self._check_loop()
+        await self._inner.v42("allocate", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    async def deallocate(self, path: _Path, offset: int, length: int) -> None:
+        self._check_loop()
+        await self._inner.v42("deallocate", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(length, "length"))
+
+    async def seek_content(self, path: _Path, offset: int, what: SeekContent) -> SeekResult:
         self._check_loop()
         if not isinstance(what, SeekContent):
             raise TypeError("what must be a SeekContent")
-        values = await self._inner.v42("seek_content", _normalize_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
+        values = await self._inner.v42("seek_content", _byte_path(path), offset=_v42_uint(offset, "offset"), second_offset=int(what))
         return SeekResult(**values)
 
-    async def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+    async def read_plus(self, path: _Path, offset: int, count: int) -> ReadPlusResult:
         self._check_loop()
-        values = await self._inner.v42("read_plus", _normalize_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
+        values = await self._inner.v42("read_plus", _byte_path(path), offset=_v42_uint(offset, "offset"), count=_v42_uint(count, "count", 32))
         return _read_plus_result(values)
 
-    async def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
+    async def copy_range(self, source: _Path, destination: _Path, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> CopyResult:
         self._check_loop()
-        values = await self._inner.v42("copy_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+        values = await self._inner.v42("copy_range", _byte_path(source), _byte_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
         return CopyResult(**values)
 
-    async def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
+    async def clone_range(self, source: _Path, destination: _Path, *, source_offset: int = 0, destination_offset: int = 0, count: int = 0) -> None:
         self._check_loop()
-        await self._inner.v42("clone_range", _normalize_path(source), _normalize_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
+        await self._inner.v42("clone_range", _byte_path(source), _byte_path(destination), _v42_uint(source_offset, "source_offset"), _v42_uint(destination_offset, "destination_offset"), _v42_uint(count, "count"))
 
-    async def nfs42_attributes(self, path: os.PathLike[str] | str = ".") -> Nfs42Attributes:
+    async def nfs42_attributes(self, path: _Path = ".") -> Nfs42Attributes:
         self._check_loop()
-        values = await self._inner.v42("nfs42_attributes", _normalize_path(path))
+        values = await self._inner.v42("nfs42_attributes", _byte_path(path))
         return _nfs42_attributes(values)
 
-    async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes:
+    async def getxattr(self, path: _Path, name: str) -> bytes:
         self._check_loop()
-        return bytes(await self._inner.getxattr(_normalize_path(path), name))
+        return bytes(await self._inner.getxattr(_byte_path(path), name))
 
-    async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
+    async def setxattr(self, path: _Path, name: str, value: Any, *, mode: XattrSetMode = XattrSetMode.EITHER) -> None:
         self._check_loop()
         if not isinstance(mode, XattrSetMode):
             raise TypeError("mode must be an XattrSetMode")
         if mode is XattrSetMode.EITHER:
-            await self._inner.setxattr(_normalize_path(path), name, _snapshot_bytes(value))
+            await self._inner.setxattr(_byte_path(path), name, _snapshot_bytes(value))
         else:
-            await self._inner.v42("setxattr", _normalize_path(path), name, int(mode), value=_snapshot_bytes(value))
+            await self._inner.v42("setxattr", _byte_path(path), name, int(mode), value=_snapshot_bytes(value))
 
-    async def listxattr(self, path: os.PathLike[str] | str) -> list[str]:
+    async def listxattr(self, path: _Path) -> list[str]:
         self._check_loop()
-        return list(await self._inner.listxattr(_normalize_path(path)))
+        return list(await self._inner.listxattr(_byte_path(path)))
 
-    async def removexattr(self, path: os.PathLike[str] | str, name: str) -> None:
+    async def removexattr(self, path: _Path, name: str) -> None:
         self._check_loop()
-        await self._inner.removexattr(_normalize_path(path), name)
+        await self._inner.removexattr(_byte_path(path), name)
 
     async def fs_info(self) -> FsInfo:
         self._check_loop()
@@ -1149,19 +1297,15 @@ class AsyncClient(_ClientOptions):
         return _fs_stat(await self._inner.fs_stat())
 
     async def mkdir(
-        self, path: os.PathLike[str] | str, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+        self, path: _Path, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
         self._check_loop()
-        normalized = _normalize_path(path)
-        paths = [normalized]
-        if parents:
-            parts = normalized.split("/")
-            paths = ["/".join(parts[:index]) for index in range(1, len(parts) + 1)]
-        for candidate in paths:
+        normalized = _namespace_path(path)
+        for candidate, is_leaf in _mkdir_paths(normalized, parents):
             try:
                 await self._inner.mkdir(candidate, mode)
             except FileExistsError:
-                if not ((parents and candidate != normalized) or exist_ok):
+                if is_leaf and not exist_ok:
                     raise
                 try:
                     existing = await self.stat(candidate)
@@ -1170,44 +1314,39 @@ class AsyncClient(_ClientOptions):
                 if existing.type is not FileType.DIRECTORY:
                     raise
 
-    async def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool = False) -> None:
+    async def remove(self, path: _Path, *, missing_ok: bool = False) -> None:
         self._check_loop()
         try:
-            await self._inner.remove(_normalize_path(path))
+            await self._inner.remove(_namespace_path(path))
         except FileNotFoundError:
             if not missing_ok:
                 raise
 
     unlink = remove
 
-    async def rmdir(self, path: os.PathLike[str] | str) -> None:
+    async def rmdir(self, path: _Path) -> None:
         self._check_loop()
-        await self._inner.rmdir(_normalize_path(path))
+        await self._inner.rmdir(_namespace_path(path))
 
-    async def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    async def rename(self, source: _Path, destination: _Path) -> None:
         self._check_loop()
-        await self._inner.rename(_normalize_path(source), _normalize_path(destination))
+        await self._inner.rename(_namespace_path(source), _namespace_path(destination))
 
-    async def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+    async def link(self, source: _Path, destination: _Path) -> None:
         self._check_loop()
-        await self._inner.link(_normalize_path(source), _normalize_path(destination))
+        await self._inner.link(_namespace_path(source), _namespace_path(destination))
 
-    async def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None:
+    async def symlink(self, target: _Path, link_path: _Path) -> None:
         self._check_loop()
-        target_text = os.fspath(target)
-        if isinstance(target_text, bytes):
-            raise TypeError("symlink targets must be strings, not bytes")
-        if "\0" in target_text:
-            raise ValueError("symlink targets may not contain NUL")
-        await self._inner.symlink(target_text, _normalize_path(link_path))
+        await self._inner.symlink(_stored_path(target), _namespace_path(link_path))
 
-    async def readlink(self, path: os.PathLike[str] | str) -> str:
+    async def readlink(self, path: _Path) -> memoryview:
         self._check_loop()
-        return await self._inner.readlink(_normalize_path(path))
+        return await self._inner.readlink(_byte_path(path))
 
-    async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool = True) -> None:
+    async def touch(self, path: _Path, *, exist_ok: bool = True) -> None:
         self._check_loop()
-        normalized = _normalize_path(path)
+        normalized = _namespace_path(path)
         if not exist_ok:
             raise NotImplementedError("touch(exist_ok=False) requires atomic exclusive create support")
         file = await self.open(normalized, "ab")
@@ -1215,13 +1354,13 @@ class AsyncClient(_ClientOptions):
         now = time.time_ns()
         await self.utime(normalized, ns=(now, now))
 
-    async def open(self, path: os.PathLike[str] | str, mode: str = "rb") -> AsyncFile:
+    async def open(self, path: DirEntry | _Path, mode: str = "rb") -> AsyncFile:
         """Open a binary file with the same non-transactional effects as Client.open()."""
         self._check_loop()
-        normalized = _normalize_path(path)
+        target, label, fh, parent = _entry_target(path, self._entry_owner)
         mode = _validate_binary_mode(mode)
-        inner = await self._inner.open(normalized, mode)
-        return AsyncFile(inner, normalized, mode, self._loop, _CONSTRUCTION_TOKEN)
+        inner = await self._inner.open(target, mode, **_open_options(path, mode, fh, parent))
+        return AsyncFile(inner, label, mode, self._loop, _CONSTRUCTION_TOKEN)
 
     async def __aenter__(self) -> AsyncClient:
         self._check_loop()
@@ -1274,7 +1413,7 @@ def _snapshot_bytes(source: Any) -> bytes:
 class File(io.RawIOBase):
     __slots__ = ("_inner", "_name", "_mode", "_closing_base")
 
-    def __init__(self, inner: Any, name: str, mode: str, token: object = None) -> None:
+    def __init__(self, inner: Any, name: _PathReference, mode: str, token: object = None) -> None:
         if token is not _CONSTRUCTION_TOKEN:
             raise TypeError("File objects are created only by Client.open()")
         super().__init__()
@@ -1284,8 +1423,8 @@ class File(io.RawIOBase):
         self._closing_base = False
 
     @property
-    def name(self) -> str:
-        return self._name
+    def name(self) -> str | bytes:
+        return _materialize_path(self._name)
 
     @property
     def mode(self) -> str:
@@ -1300,7 +1439,7 @@ class File(io.RawIOBase):
 
     def _check_closed(self, operation: str) -> None:
         if self.closed:
-            raise NfsClosedResourceError(message="I/O operation on closed file", operation=operation, filename=self.name)
+            raise NfsClosedResourceError(message="I/O operation on closed file", operation=operation, filename=_error_filename(self._name))
 
     def writable(self) -> bool:
         return self._mode.startswith(("w", "a")) or "+" in self._mode
@@ -1311,26 +1450,26 @@ class File(io.RawIOBase):
     def read(self, size: int = -1) -> bytes:
         self._check_closed("read")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="read", filename=self.name)
+            raise NfsModeError(message="not readable", operation="read", filename=_error_filename(self._name))
         return self._inner.read(size)
 
     def readinto(self, target: Any) -> int:
         self._check_closed("readinto")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
+            raise NfsModeError(message="not readable", operation="readinto", filename=_error_filename(self._name))
         with _writable_byte_view(target) as view:
             return self._inner.readinto(view)
 
     def read_at(self, offset: int, size: int = -1) -> bytes:
         self._check_closed("read_at")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="read_at", filename=self.name)
+            raise NfsModeError(message="not readable", operation="read_at", filename=_error_filename(self._name))
         return self._inner.read_at(offset, size)
 
     def readinto_at(self, target: Any, offset: int) -> int:
         self._check_closed("readinto_at")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
+            raise NfsModeError(message="not readable", operation="readinto_at", filename=_error_filename(self._name))
         with _writable_byte_view(target) as view:
             return self._inner.readinto_at(view, offset)
 
@@ -1345,21 +1484,21 @@ class File(io.RawIOBase):
     def write(self, data: Any) -> int:
         self._check_closed("write")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="write", filename=self.name)
+            raise NfsModeError(message="not writable", operation="write", filename=_error_filename(self._name))
         return self._inner.write(_snapshot_bytes(data))
 
     def write_at(self, data: Any, offset: int) -> int:
         self._check_closed("write_at")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="write_at", filename=self.name)
+            raise NfsModeError(message="not writable", operation="write_at", filename=_error_filename(self._name))
         if self._mode.startswith("a"):
-            raise NfsModeError(message="positional writes are unavailable in append mode", operation="write_at", filename=self.name)
+            raise NfsModeError(message="positional writes are unavailable in append mode", operation="write_at", filename=_error_filename(self._name))
         return self._inner.write_at(_snapshot_bytes(data), offset)
 
     def truncate(self, size: int | None = None) -> int:
         self._check_closed("truncate")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="truncate", filename=self.name)
+            raise NfsModeError(message="not writable", operation="truncate", filename=_error_filename(self._name))
         return self._inner.truncate(size)
 
     def flush(self) -> None:
@@ -1370,20 +1509,20 @@ class File(io.RawIOBase):
             self._inner.flush()
 
     def fileno(self) -> int:
-        raise NfsModeError(message="nfs-rs files do not expose OS file descriptors", operation="fileno", filename=self.name)
+        raise NfsModeError(message="nfs-rs files do not expose OS file descriptors", operation="fileno", filename=_error_filename(self._name))
 
     def close(self) -> None:
         error: BaseException | None = None
         try:
             self._inner.close()
         except NfsFileCloseError as caught:
-            error = caught.with_context(operation="close", filename=self.name)
+            error = caught.with_context(operation="close", filename=_error_filename(self._name))
         except NfsError as caught:
-            child = caught.with_context(operation="close", filename=self.name)
+            child = caught.with_context(operation="close", filename=_error_filename(self._name))
             error = NfsFileCloseError(
                 message=f"file close completed with errors: {caught}",
                 operation="close",
-                filename=self.name,
+                filename=_error_filename(self._name),
                 errors=(child,),
             )
         except BaseException as caught:
@@ -1424,7 +1563,7 @@ class AsyncFile:
     def __init__(
         self,
         inner: Any,
-        name: str,
+        name: _PathReference,
         mode: str,
         loop: asyncio.AbstractEventLoop,
         token: object = None,
@@ -1441,8 +1580,8 @@ class AsyncFile:
             raise RuntimeError("AsyncFile may only be used from its creating event loop")
 
     @property
-    def name(self) -> str:
-        return self._name
+    def name(self) -> str | bytes:
+        return _materialize_path(self._name)
 
     @property
     def mode(self) -> str:
@@ -1461,21 +1600,21 @@ class AsyncFile:
             raise NfsClosedResourceError(
                 message="I/O operation on closed file",
                 operation=operation,
-                filename=self.name,
+                filename=_error_filename(self._name),
             )
 
     async def read(self, size: int = -1) -> bytes:
         self._check_loop()
         self._check_closed("read")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="read", filename=self.name)
+            raise NfsModeError(message="not readable", operation="read", filename=_error_filename(self._name))
         return await self._inner.read(size)
 
     async def readinto(self, target: Any) -> int:
         self._check_loop()
         self._check_closed("readinto")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="readinto", filename=self.name)
+            raise NfsModeError(message="not readable", operation="readinto", filename=_error_filename(self._name))
         with _writable_byte_view(target) as view:
             return await self._inner.readinto(view)
 
@@ -1483,14 +1622,14 @@ class AsyncFile:
         self._check_loop()
         self._check_closed("read_at")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="read_at", filename=self.name)
+            raise NfsModeError(message="not readable", operation="read_at", filename=_error_filename(self._name))
         return await self._inner.read_at(offset, size)
 
     async def readinto_at(self, target: Any, offset: int) -> int:
         self._check_loop()
         self._check_closed("readinto_at")
         if not self.readable():
-            raise NfsModeError(message="not readable", operation="readinto_at", filename=self.name)
+            raise NfsModeError(message="not readable", operation="readinto_at", filename=_error_filename(self._name))
         with _writable_byte_view(target) as view:
             return await self._inner.readinto_at(view, offset)
 
@@ -1509,19 +1648,19 @@ class AsyncFile:
         self._check_loop()
         self._check_closed("write")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="write", filename=self.name)
+            raise NfsModeError(message="not writable", operation="write", filename=_error_filename(self._name))
         return await self._inner.write(_snapshot_bytes(data))
 
     async def write_at(self, data: Any, offset: int) -> int:
         self._check_loop()
         self._check_closed("write_at")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="write_at", filename=self.name)
+            raise NfsModeError(message="not writable", operation="write_at", filename=_error_filename(self._name))
         if self._mode.startswith("a"):
             raise NfsModeError(
                 message="positional writes are unavailable in append mode",
                 operation="write_at",
-                filename=self.name,
+                filename=_error_filename(self._name),
             )
         return await self._inner.write_at(_snapshot_bytes(data), offset)
 
@@ -1529,7 +1668,7 @@ class AsyncFile:
         self._check_loop()
         self._check_closed("truncate")
         if not self.writable():
-            raise NfsModeError(message="not writable", operation="truncate", filename=self.name)
+            raise NfsModeError(message="not writable", operation="truncate", filename=_error_filename(self._name))
         return await self._inner.truncate(size)
 
     async def flush(self) -> None:
@@ -1543,13 +1682,13 @@ class AsyncFile:
         try:
             await self._inner.close()
         except NfsFileCloseError as caught:
-            raise caught.with_context(operation="close", filename=self.name) from caught
+            raise caught.with_context(operation="close", filename=_error_filename(self._name)) from caught
         except NfsError as caught:
-            child = caught.with_context(operation="close", filename=self.name)
+            child = caught.with_context(operation="close", filename=_error_filename(self._name))
             raise NfsFileCloseError(
                 message=f"file close completed with errors: {caught}",
                 operation="close",
-                filename=self.name,
+                filename=_error_filename(self._name),
                 errors=(child,),
             ) from caught
 

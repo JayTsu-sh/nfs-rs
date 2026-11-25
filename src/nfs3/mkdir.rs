@@ -18,22 +18,23 @@ use super::{
     MKDIR3args, MKDIR3resok, Mount, ObjRes, Result, diropargs3, filename3, from_post_op_fh3,
     nfs_fh3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
 };
-use crate::split_path;
+use crate::path_resolution::split_byte_path;
 use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn mkdir_path(&self, path: &str, mode: u32) -> Result<ObjRes> {
-        let (dir, dirname) = split_path(path)?;
-        let dir_fh = self.lookup_path(&dir).await?.fh;
-        self.mkdir(dir_fh, &dirname, mode).await
+    pub async fn mkdir_path(&self, path: &[u8], mode: u32) -> Result<ObjRes> {
+        let (dir, dirname) = split_byte_path(path)?;
+        let dir_fh = self.lookup_path(dir).await?.fh;
+        self.mkdir(dir_fh, dirname, mode).await
     }
 
-    pub async fn mkdir(&self, dir_fh: Bytes, dirname: &str, mode: u32) -> Result<ObjRes> {
+    pub async fn mkdir(&self, dir_fh: Bytes, dirname: &[u8], mode: u32) -> Result<ObjRes> {
+        crate::path_resolution::validate_leaf(dirname)?;
         let args = MKDIR3args {
             where_: diropargs3 {
                 dir: nfs_fh3 { data: dir_fh },
-                name: filename3(dirname.to_string()),
+                name: filename3(dirname),
             },
             attrs: sattr3 {
                 mode: set_mode3::TRUE(mode),

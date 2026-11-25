@@ -19,7 +19,7 @@ use bytes::Bytes;
 
 #[allow(unused)]
 impl Mount {
-    pub async fn read_path(&self, path: &str, offset: u64, count: u32) -> Result<Bytes> {
+    pub async fn read_path(&self, path: &[u8], offset: u64, count: u32) -> Result<Bytes> {
         self.read(self.lookup_path(path).await?.fh, offset, count)
             .await
     }

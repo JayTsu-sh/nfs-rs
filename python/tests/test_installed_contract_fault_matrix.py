@@ -300,7 +300,7 @@ def test_protocol_state_callback_and_pnfs_failures_are_structured(
     assert error.recovery_action.value == recovery
     assert error.outcome is None if outcome is None else error.outcome.value == outcome
     assert error.protocol in {"3", "4.1"}
-    assert error.filename == path
+    assert error.filename == path.encode()
 
 
 def test_every_public_exception_has_stable_installed_shape_and_mro() -> None:

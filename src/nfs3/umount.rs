@@ -28,7 +28,7 @@ impl Mount {
             &self.auth,
         )
         .encode(&mut buf);
-        encode_dirpath(&mut buf, self.dir.trim_end_matches('/'));
+        encode_dirpath(&mut buf, &self.dir);
 
         // UMNT is advisory (RFC 1813 Appendix I) — use small retry count to avoid
         // blocking the caller when the server is unreachable.

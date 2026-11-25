@@ -91,7 +91,7 @@ def test_async_v42_uses_the_same_types_and_error_context():
                 await client.seek_content("file", 0, nfs_rs.SeekContent.HOLE)
             assert caught.value.protocol == "4.2"
             assert caught.value.operation == "seek_content"
-            assert caught.value.filename == "file"
+            assert caught.value.filename == b"file"
     asyncio.run(scenario())
 
 

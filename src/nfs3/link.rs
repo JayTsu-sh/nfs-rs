@@ -16,28 +16,29 @@
 
 use super::{LINK3args, Mount, diropargs3, filename3, nfs_fh3};
 use crate::error::{NfsError, Result};
-use crate::split_path;
+use crate::path_resolution::split_byte_path;
 use bytes::Bytes;
 
 impl Mount {
-    pub async fn link_path(&self, src_path: &str, dst_path: &str) -> Result<crate::mount::Attr> {
-        let (dst_dir, dst_filename) = split_path(dst_path)?;
+    pub async fn link_path(&self, src_path: &[u8], dst_path: &[u8]) -> Result<crate::mount::Attr> {
+        let (dst_dir, dst_filename) = split_byte_path(dst_path)?;
         let src_fh = self.lookup_path(src_path).await?.fh;
-        let dst_dir_fh = self.lookup_path(&dst_dir).await?.fh;
-        self.link(src_fh, dst_dir_fh, &dst_filename).await
+        let dst_dir_fh = self.lookup_path(dst_dir).await?.fh;
+        self.link(src_fh, dst_dir_fh, dst_filename).await
     }
 
     pub async fn link(
         &self,
         src_fh: Bytes,
         dst_dir_fh: Bytes,
-        dst_filename: &str,
+        dst_filename: &[u8],
     ) -> Result<crate::mount::Attr> {
+        crate::path_resolution::validate_leaf(dst_filename)?;
         let args = LINK3args {
             file: nfs_fh3 { data: src_fh },
             link: diropargs3 {
                 dir: nfs_fh3 { data: dst_dir_fh },
-                name: filename3(dst_filename.to_string()),
+                name: filename3(dst_filename),
             },
         };
         let ok = self._link(args).await?;

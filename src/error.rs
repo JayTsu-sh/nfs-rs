@@ -58,10 +58,16 @@ pub enum RetryExhaustion {
 /// The filehandle is valid in both cases; only the open state differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateidFailure {
-    /// BAD/STALE/OLD stateid: nfs-rs refreshes the lane and retries in place.
-    RecoverableState,
-    /// The bounded recovery attempt did not restore usable open state.
-    StateRecoveryExhausted,
+    /// BAD/OLD stateid: nfs-rs refreshes the lane and retries in place.
+    ///
+    /// STALE_STATEID is also classified here because the close path treats it
+    /// as an already-released open, but READ/WRITE report it as
+    /// [`NfsError::LostOpenState`] instead of refreshing in place: the state
+    /// belongs to an earlier server instance, so the caller must reopen.
+    Recoverable,
+    /// The bounded recovery attempt did not restore usable open state, which
+    /// callers observe as [`NfsError::StateRecoveryExhausted`].
+    Exhausted,
 }
 
 /// An NFSv4.0 open stateid could not be restored within the bounded budget.
@@ -243,6 +249,10 @@ pub enum NfsError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
+    /// The RPC server rejected the call because the procedure could not decode its arguments.
+    #[error("RPC GARBAGE_ARGS: server could not decode the request arguments")]
+    RpcGarbageArgs,
+
     /// XDR encoding/decoding error.
     #[error("XDR error: {0}")]
     Xdr(String),
@@ -351,27 +361,26 @@ impl NfsError {
             _ => false,
         }
     }
-    /// True when the failure is an NFSv4.0 stateid that nfs-rs can refresh in place.
+    /// True when the failure is an NFSv4.0 stateid that nfs-rs handles in
+    /// place: BAD/OLD refresh the lane, STALE is treated as released by CLOSE
+    /// but reported as [`NfsError::LostOpenState`] by READ/WRITE.
     #[must_use]
     pub fn is_recoverable_state(&self) -> bool {
-        matches!(
-            self,
-            Self::Nfs4(
-                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
-                    | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-            )
-        )
+        matches!(self.stateid_failure(), Some(StateidFailure::Recoverable))
     }
 
     /// Classification of a stateid failure without requiring callers to parse status codes.
+    ///
+    /// Single source for the stateid status set; other classifiers delegate here.
     #[must_use]
     pub fn stateid_failure(&self) -> Option<StateidFailure> {
-        if self.is_recoverable_state() {
-            return Some(StateidFailure::RecoverableState);
-        }
         match self {
-            Self::StateRecoveryExhausted(_) => Some(StateidFailure::StateRecoveryExhausted),
+            Self::Nfs4(
+                crate::nfs4::Nfs4ErrorCode::NFS4ERR_BAD_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_STALE_STATEID
+                | crate::nfs4::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
+            ) => Some(StateidFailure::Recoverable),
+            Self::StateRecoveryExhausted(_) => Some(StateidFailure::Exhausted),
             _ => None,
         }
     }
@@ -409,6 +418,7 @@ impl NfsError {
                 .and_then(|source| source.downcast_ref::<TransportFailure>())
                 .map(|failure| failure.transmission),
             Self::OperationOutcome(error) => Some(error.transmission),
+            Self::RpcGarbageArgs => Some(RequestTransmission::Sent),
             _ => None,
         }
     }
@@ -490,7 +500,7 @@ impl NfsError {
             NfsError::Nfs4(_) => std::io::ErrorKind::Other,
             NfsError::LockDenied { .. } => std::io::ErrorKind::WouldBlock,
             NfsError::Mount(_) => std::io::ErrorKind::Other,
-            NfsError::Rpc(_) => std::io::ErrorKind::Other,
+            NfsError::Rpc(_) | NfsError::RpcGarbageArgs => std::io::ErrorKind::Other,
             NfsError::Xdr(_) => std::io::ErrorKind::Other,
             NfsError::Unsupported(_) => std::io::ErrorKind::Unsupported,
             NfsError::InvalidInput(_) => std::io::ErrorKind::InvalidInput,
@@ -525,6 +535,11 @@ pub(crate) fn classify_sent_nfs3_error(
     context: RequestContext,
     source: NfsError,
 ) -> NfsError {
+    if matches!(source, NfsError::RpcGarbageArgs) {
+        // RFC 5531 §9: the server could not decode the arguments. NFSv3
+        // mutations use a single transport attempt, so this rules out execution.
+        return source;
+    }
     classify_non_authoritative_error(operation_class, context, source, false)
 }
 
@@ -590,6 +605,7 @@ impl From<NfsError> for std::io::Error {
             }
             NfsError::Mount(code) => std::io::Error::other(code),
             NfsError::Rpc(msg) => std::io::Error::other(msg),
+            NfsError::RpcGarbageArgs => std::io::Error::other(e),
             NfsError::Xdr(msg) => std::io::Error::other(msg),
             NfsError::Unsupported(msg) => std::io::Error::new(std::io::ErrorKind::Unsupported, msg),
             NfsError::InvalidInput(msg) => {
@@ -968,6 +984,42 @@ mod tests {
         assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
         assert_eq!(outcome.transmission, RequestTransmission::Sent);
         assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+    }
+
+    #[test]
+    fn nfs3_mutation_with_garbage_args_has_a_definite_rejection() {
+        let mut nfs3_context = context();
+        nfs3_context.protocol = NFSVersion::NFSv3;
+        nfs3_context.request_id = None;
+        let error = classify_sent_nfs3_error(
+            OperationClass::ReplaySensitive,
+            nfs3_context,
+            NfsError::RpcGarbageArgs,
+        );
+        assert!(matches!(error, NfsError::RpcGarbageArgs));
+
+        let io: std::io::Error = error.into();
+        assert_eq!(io.kind(), std::io::ErrorKind::Other);
+        assert!(matches!(
+            io.get_ref()
+                .and_then(|source| source.downcast_ref::<NfsError>()),
+            Some(NfsError::RpcGarbageArgs)
+        ));
+    }
+
+    #[test]
+    fn nfs4_mutation_with_garbage_args_retains_recovery_guidance() {
+        for classify in [classify_sent_nfs40_error, classify_sent_nfs41_error] {
+            let error = classify(
+                OperationClass::ReplaySensitive,
+                context(),
+                NfsError::RpcGarbageArgs,
+            );
+            let outcome = error.operation_outcome().unwrap();
+            assert_eq!(outcome.outcome, OperationOutcome::Uncertain);
+            assert_eq!(outcome.recovery, RecoveryAction::VerifyThenResume);
+            assert!(matches!(outcome.source.as_ref(), NfsError::RpcGarbageArgs));
+        }
     }
 
     #[test]

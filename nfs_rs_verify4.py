@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -26,7 +27,7 @@ import statistics
 import time
 import uuid
 
-from nfs_rs import Client, DirectoryRef, DirEntry, FileInfo, FileType
+from nfs_rs import Client, DirectoryRef, FileInfo, FileType
 
 MIB = 1024 * 1024
 HOST, EXPORT = "10.131.7.202", "/jsj-data-set/LN_NET"
@@ -67,13 +68,21 @@ class KernelFile:
         return total
 
 
+@dataclass(frozen=True)
+class KernelDirEntry:
+    name: bytes
+    path: bytes
+    info: FileInfo
+    fh: None = None
+
+
 class KernelClient:
     """Present equivalent directory attributes; never follow directory symlinks."""
     def __init__(self, root):
         self.root = root.resolve(strict=True)
 
     def local_path(self, relative):
-        relative = Path(str(relative).lstrip("/"))
+        relative = Path(os.fsdecode(relative).lstrip("/"))
         if ".." in relative.parts:
             raise ValueError("path escapes the benchmark root")
         return self.root / relative
@@ -82,8 +91,8 @@ class KernelClient:
         return KernelFile(self.local_path(path), mode)
 
     def scandir(self, target):
-        parent = str(target.path)
-        with os.scandir(self.local_path(parent)) as entries:
+        parent = os.fsencode(target.path)
+        with os.scandir(os.fsencode(self.local_path(parent))) as entries:
             for entry in entries:
                 attrs = entry.stat(follow_symlinks=False)
                 kind = next((kind for check, kind in (
@@ -92,16 +101,16 @@ class KernelClient:
                     (stat.S_ISCHR, FileType.CHARACTER_DEVICE), (stat.S_ISFIFO, FileType.FIFO),
                     (stat.S_ISSOCK, FileType.SOCKET),
                 ) if check(attrs.st_mode)), FileType.UNKNOWN)
-                path = entry.name if parent == "." else f"{parent}/{entry.name}"
+                path = entry.name if parent == b"." else b"/".join((parent, entry.name))
                 info = FileInfo(
-                    path=path, type=kind, mode=stat.S_IMODE(attrs.st_mode),
+                    _path=path, type=kind, mode=stat.S_IMODE(attrs.st_mode),
                     nlink=attrs.st_nlink, uid=attrs.st_uid, gid=attrs.st_gid,
                     size=attrs.st_size, used=attrs.st_blocks * 512,
                     fsid=attrs.st_dev, fileid=attrs.st_ino,
                     atime=attrs.st_atime_ns, mtime=attrs.st_mtime_ns,
                     ctime=attrs.st_ctime_ns, owner=None, group=None,
                 )
-                yield DirEntry(entry.name, path, info)
+                yield KernelDirEntry(entry.name, path, info)
 
 
 def mount_information(root):
@@ -129,13 +138,13 @@ def walk(client, root, *, use_fh, max_dirs):
             path_scans += 1
         else:
             fh_scans += 1
-        entries = [entry for entry in client.scandir(target) if entry.name not in (".", "..")]
+        entries = [entry for entry in client.scandir(target) if entry.name not in (b".", b"..")]
         # Stable BFS order means the bounded runs visit the same directories.
-        entries.sort(key=lambda entry: entry.name)
+        entries.sort(key=lambda entry: bytes(entry.name))
         directories.append((directory, len(entries)))
         entries_count += len(entries)
         for entry in entries:
-            records.append((entry.path, entry.info.type.value, entry.info.fileid, entry.info.size))
+            records.append((entry.path.hex(), entry.info.type.value, entry.info.fileid, entry.info.size))
             if entry.info.type is FileType.DIRECTORY:
                 queue.append(DirectoryRef(entry.path, entry.fh))
             elif entry.info.type is FileType.FILE:
@@ -208,7 +217,7 @@ def read_samples(client, kernel, files, buffer):
     samples = []
     for entry in sorted(files, key=lambda entry: entry.info.size, reverse=True)[:3]:
         result = read_file(lambda: client.open(entry.path, "rb"), entry.info.size, buffer)
-        result.update(path=entry.path, mtime=entry.info.mtime)  # mtime: ns since Unix epoch.
+        result.update(path=os.fsdecode(entry.path), mtime=entry.info.mtime)  # mtime: ns since Unix epoch.
         print(f"SAMPLE {entry.path!r}: {entry.info.size} bytes, "
               f"{result['seconds']:.4f}s, sha256={result['sha256']}", flush=True)
         result["kernel"] = read_file(lambda: kernel.open(entry.path, "rb"), entry.info.size, buffer)

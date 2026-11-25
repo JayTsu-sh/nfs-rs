@@ -324,7 +324,7 @@ async fn fake_protocol_stops_at_before_and_after_send_barriers() {
 fn recovery_event(operation: &str) -> crate::client_core::CoreRecoveryEvent {
     crate::client_core::CoreRecoveryEvent {
         operation: operation.to_string(),
-        safe_path: Some("/safe/path".to_string()),
+        safe_path: Some(bytes::Bytes::from_static(b"/safe/path")),
         protocol: NFSVersion::NFSv3,
         outcome: OperationOutcome::DefiniteFailure,
         recovery: RecoveryAction::Retry,

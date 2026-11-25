@@ -1566,7 +1566,7 @@ async fn cancelled_umount_waiter_does_not_cancel_cleanup_or_admit_new_opens() {
         .unwrap();
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
-    let error = crate::Mount::open_path(wrapper.as_ref(), "another", crate::OPEN_BOTH)
+    let error = crate::Mount::open_path(wrapper.as_ref(), b"another", crate::OPEN_BOTH)
         .await
         .unwrap_err();
     assert!(matches!(error, NfsError::ClientClosed(_)));

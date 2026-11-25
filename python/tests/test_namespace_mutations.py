@@ -37,13 +37,13 @@ class SyncInner:
     def connect(cls, *_args, **_kwargs): return cls()
     def mkdir(self, path, mode):
         self.calls.append(("mkdir", path, mode))
-        if path.startswith("existing-"): raise FileExistsError(path)
+        if isinstance(path, str) and path.startswith("existing-"): raise FileExistsError(path)
     def remove(self, path): self.calls.append(("remove", path))
     def rmdir(self, path): self.calls.append(("rmdir", path))
     def rename(self, source, destination): self.calls.append(("rename", source, destination))
     def link(self, source, destination): self.calls.append(("link", source, destination))
     def symlink(self, target, link_path): self.calls.append(("symlink", target, link_path))
-    def readlink(self, path): self.calls.append(("readlink", path)); return "../raw-target"
+    def readlink(self, path): self.calls.append(("readlink", path)); return memoryview(b"../raw-target")
     def utime(self, path, atime_ns, mtime_ns): self.calls.append(("utime", path, atime_ns, mtime_ns))
     def stat(self, path):
         if path == "existing-dir":
@@ -94,7 +94,7 @@ def test_sync_namespace_paths_targets_and_conveniences():
     client.link("new", "links/item")
     client.symlink("../raw/./target", "links/sym")
     assert ("symlink", "../raw/./target", "links/sym") in client._inner.calls
-    assert client.readlink("links/./sym") == "../raw-target"
+    assert client.readlink("links/./sym") == b"../raw-target"
     with client.open("data", "wb") as file:
         assert file.write(bytearray(b"value")) == 5
     with client.open("data", "rb") as file:
@@ -103,11 +103,25 @@ def test_sync_namespace_paths_targets_and_conveniences():
     assert ("open", "created", "ab") in client._inner.calls
 
 
-def test_symlink_target_validates_text_without_normalizing():
+def test_symlink_target_preserves_bytes_without_normalizing():
     client = Client.connect("nfs://server/export")
-    with pytest.raises(TypeError): client.symlink(b"target", "link")
+    client.symlink(b"../raw-\xff/.", b"link-\xff")
+    assert ("symlink", b"../raw-\xff/.", b"link-\xff") in client._inner.calls
     with pytest.raises(ValueError): client.symlink("bad\0target", "link")
     with pytest.raises(ValueError): client.symlink("target", "../escape")
+
+
+def test_binary_mkdir_parents_borrows_prefixes_and_validates_before_mutation():
+    client = Client.connect("nfs://server/export")
+    path = b"root-\xff/cancel/../leaf-\xff"
+    client.mkdir(memoryview(path), parents=True)
+    prefixes = [call[1] for call in client._inner.calls]
+    assert prefixes == [b"root-\xff", path]
+    assert all(view.obj is path for view in prefixes)
+    for invalid in [b"some/../../outside", b"some/end/..", b"some/bad\0name"]:
+        with pytest.raises(ValueError):
+            client.mkdir(invalid, parents=True)
+    assert len(client._inner.calls) == 2
 
 
 def test_mkdir_suppresses_exists_only_for_a_confirmed_directory():
@@ -128,7 +142,7 @@ def test_async_surface_matches_sync():
         await client.rename("a", "b")
         await client.link("b", "hard")
         await client.symlink("../target", "sym")
-        assert await client.readlink("sym") == "../raw-target"
+        assert await client.readlink("sym") == b"../raw-target"
         async with await client.open("data", "wb") as file:
             assert await file.write(memoryview(b"async")) == 5
         async with await client.open("data", "rb") as file:

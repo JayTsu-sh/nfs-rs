@@ -13,7 +13,7 @@ mod mount_generated {
 
 use bytes::Bytes;
 use nfs_generated::xdr::{
-    DeserialiserExt as _, Error as XdrError, cookie3, cookieverf3, fileid3, filename3,
+    DeserialiserExt as _, Error as XdrError, cookie3, cookieverf3, fileid3, filename3, nfs_fh3,
 };
 
 // Non-generic response types — re-export directly.
@@ -53,6 +53,7 @@ pub(crate) use nfs_generated::xdr::stable_how;
 #[allow(non_camel_case_types)]
 pub(crate) type mountres3_ok = mount_generated::xdr::mountres3_ok<Bytes>;
 pub use mount_generated::xdr::mountstat3 as mount_mountstat3;
+pub(crate) use mount_generated::xdr::{MNTNAMLEN, MNTPATHLEN};
 
 /// A READDIR3resok / READDIRPLUS3resok (RFC 1813 §3.3.16, §3.3.17) with its entries in a `Vec`.
 ///
@@ -106,7 +107,10 @@ impl TryFrom<&mut Bytes> for DirectoryReply<entry3> {
         decode_directory_reply(v, |v| {
             Ok(entry3 {
                 fileid: fileid3::try_from(&mut *v)?,
-                name: filename3::try_from(&mut *v)?,
+                name: filename3(
+                    crate::directory_buffer::decode_name(v)
+                        .map_err(|err| XdrError::Unknown(err.to_string()))?,
+                ),
                 cookie: cookie3::try_from(&mut *v)?,
                 nextentry: None,
             })
@@ -121,10 +125,24 @@ impl TryFrom<&mut Bytes> for DirectoryReply<entryplus3> {
         decode_directory_reply(v, |v| {
             Ok(entryplus3 {
                 fileid: fileid3::try_from(&mut *v)?,
-                name: filename3::try_from(&mut *v)?,
+                name: filename3(
+                    crate::directory_buffer::decode_name(v)
+                        .map_err(|err| XdrError::Unknown(err.to_string()))?,
+                ),
                 cookie: cookie3::try_from(&mut *v)?,
                 name_attributes: post_op_attr::try_from(&mut *v)?,
-                name_handle: post_op_fh3::try_from(&mut *v)?,
+                name_handle: match v.try_u32()? {
+                    0 => post_op_fh3::FALSE,
+                    1 => {
+                        let handle = crate::directory_buffer::decode_opaque(v)
+                            .map_err(|err| XdrError::Unknown(err.to_string()))?;
+                        if handle.len() > 64 {
+                            return Err(XdrError::InvalidLength);
+                        }
+                        post_op_fh3::TRUE(nfs_fh3(handle))
+                    }
+                    d => return Err(XdrError::UnknownOptionVariant(d)),
+                },
                 nextentry: None,
             })
         })

@@ -18,6 +18,7 @@
 
 use crate::{NFSVersion, NfsError, OperationOutcome, RecoveryAction, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
@@ -123,7 +124,7 @@ impl DrainCounter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreRecoveryEvent {
     pub operation: String,
-    pub safe_path: Option<String>,
+    pub safe_path: Option<Bytes>,
     pub protocol: NFSVersion,
     pub outcome: OperationOutcome,
     pub recovery: RecoveryAction,

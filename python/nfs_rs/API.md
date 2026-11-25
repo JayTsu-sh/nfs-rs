@@ -7,7 +7,7 @@ are private. `__version__` is the installed distribution version string.
 
 ## Shared argument, I/O and error rules
 
-Paths accept `str` or `os.PathLike[str]` and are relative to the mounted export.
+Filesystem paths are relative to the mounted export. `_Path` denotes `str`, `bytes`, `os.PathLike[str]`, `os.PathLike[bytes]` or a contiguous read-only `memoryview` backed by immutable bytes.
 Absolute paths, escaping `..`, NULs and byte-string paths are rejected. Symlink
 target strings are the explicit exception: their stored text is preserved.
 `resolve` evaluates `..` during traversal and reports OUTSIDE_MOUNT when it
@@ -321,7 +321,7 @@ Frozen diagnostic event retained in a bounded client queue. Read it with recover
 | Member | Type / value | Meaning |
 |---|---|---|
 | `RecoveryEvent.operation` | `str` | Operation name, or None when no operation context is available. |
-| `RecoveryEvent.path` | `str \| None` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `RecoveryEvent.path` | `bytes \| None` | Export-relative path or diagnostic path in its original encoding. |
 | `RecoveryEvent.protocol` | `str` | Protocol identifier, or None on an error without protocol context. |
 | `RecoveryEvent.outcome` | `OperationOutcome` | OperationOutcome failure classification; optional on generic NfsError. |
 | `RecoveryEvent.recovery_action` | `RecoveryAction` | RecoveryAction to consider next; optional on generic NfsError. |
@@ -334,7 +334,7 @@ Frozen file metadata. Counts are integers; atime, mtime and ctime retain their n
 
 | Member | Type / value | Meaning |
 |---|---|---|
-| `FileInfo.path` | `str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `FileInfo._path` | Internal path reference | Backing storage for the public path property. |
 | `FileInfo.type` | `FileType` | FileType kind. |
 | `FileInfo.mode` | `int` | Unix permission/mode bits. |
 | `FileInfo.nlink` | `int` | Hard-link count. |
@@ -350,25 +350,43 @@ Frozen file metadata. Counts are integers; atime, mtime and ctime retain their n
 | `FileInfo.owner` | `str \| None` | Server owner name, or None when unavailable. |
 | `FileInfo.group` | `str \| None` | Server group name, or None when unavailable. |
 
+#### FileInfo.path
+
+```python
+def path(self) -> str | bytes: ...
+```
+
+Export-relative path. Directory entries materialize their original byte path when this property is read.
+
 ### DirectoryRef
 
 Frozen scan input. path is used for returned entry paths and diagnostics. When fh is present, it identifies the directory directly; otherwise path lookup obtains the handle.
 
 | Member | Type / value | Meaning |
 |---|---|---|
-| `DirectoryRef.path` | `os.PathLike[str] \| str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `DirectoryRef.path` | `_Path` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
 | `DirectoryRef.fh` | `bytes \| None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
 
 ### DirEntry
 
-Frozen directory entry with eager metadata and an optional opaque file handle. It can be passed directly to scandir when it describes a directory.
+Frozen directory entry with eager metadata and an optional opaque file handle. Pass it to scandir or scandir_page for a directory, or to stat and open on the originating client.
 
 | Member | Type / value | Meaning |
 |---|---|---|
-| `DirEntry.name` | `str` | Entry basename. |
-| `DirEntry.path` | `str` | Export-relative path or diagnostic path; see the containing type for normalization rules. |
+| `DirEntry.name` | `memoryview` | Read-only view of the original basename bytes. |
 | `DirEntry.info` | `FileInfo` | Eager FileInfo metadata for the entry. |
 | `DirEntry.fh` | `bytes \| None = None` | Opaque bytes file handle, or None when unavailable. Do not synthesize it or reuse it across unrelated clients. |
+
+| `DirEntry._parent_fh` | Internal handle | Identifies the parent directory for direct lookup or OPEN. |
+| `DirEntry._owner` | Internal mount marker | Keeps entry references scoped to their originating client. |
+
+#### DirEntry.path
+
+```python
+def path(self) -> bytes: ...
+```
+
+Build the full export-relative path from the original name components when explicitly requested.
 
 ### DirectoryCookie
 
@@ -407,8 +425,8 @@ Frozen MOUNT export-list entry. This is export discovery information, not proof 
 
 | Member | Type / value | Meaning |
 |---|---|---|
-| `ExportEntry.path` | `str` | Server-advertised export path (normally absolute). |
-| `ExportEntry.groups` | `tuple[str, ...]` | Tuple of server-advertised export access groups/hosts. |
+| `ExportEntry.path` | `bytes` | Server-advertised export path (normally absolute), in its original encoding. |
+| `ExportEntry.groups` | `tuple[bytes, ...]` | Server-advertised export access groups/hosts in their original encoding. |
 
 ### FsInfo
 
@@ -483,7 +501,7 @@ Immutable structured base for all library NFS failures. Subclasses also preserve
 | `NfsError.operation_class` | `OperationClass \| None` | OperationClass request classification, or None. |
 | `NfsError.completed_bytes` | `int \| None` | Acknowledged write bytes, or None when unknown/not applicable. May cover non-contiguous ranges; not a resume offset or proof of durability. |
 | `NfsError.errno` | `int \| None` | Mapped OS error number, or None. |
-| `NfsError.filename` | `str \| None` | Path context, or None. |
+| `NfsError.filename` | `bytes \| None` | Path context as bytes, when available. |
 | `NfsError.errors` | `tuple[NfsError, ...]` | Tuple of child NfsError values, especially for cleanup aggregation. |
 | `NfsError.retry_count` | `int \| None` | Busy reissues admitted by the shared operation budget; None on other errors. |
 | `NfsError.retry_elapsed_ms` | `int \| None` | Elapsed operation budget in milliseconds. |
@@ -505,7 +523,7 @@ def __init__(
     operation_class: OperationClass | str | None = None,
     completed_bytes: int | None = None,
     errno: int | None = None,
-    filename: str | None = None,
+    filename: bytes | None = None,
     errors: tuple[NfsError, ...] = (),
     retry_count: int | None = None,
     retry_elapsed_ms: int | None = None,
@@ -523,7 +541,7 @@ def with_context(
     *,
     operation: str | None = None,
     protocol: str | None = None,
-    filename: str | None = None,
+    filename: bytes | None = None,
 ) -> NfsError: ...
 ```
 
@@ -585,7 +603,9 @@ Bases: `NfsError`. Inherits all documented NfsError fields and methods.
 
 ### NfsRpcError
 
-RPC framing, decoding or request handling failed.
+RPC framing, decoding or request handling failed. An NFSv3 request rejected
+with RPC `GARBAGE_ARGS` sets `code=4`, `code_name="GARBAGE_ARGS"`, and
+`recovery_action="do_not_retry"`.
 
 Bases: `NfsError`. Inherits all documented NfsError fields and methods.
 
@@ -705,6 +725,9 @@ Bases: `NfsError`. Inherits all documented NfsError fields and methods.
 
 ### Client
 
+In the path signatures below, `_Path` includes byte paths, immutable contiguous
+byte views, strings, and path-like objects returning bytes or strings.
+
 Synchronous client. Blocking native I/O releases the GIL. Create with connect; the client owns its open files.
 
 #### Client.__init__
@@ -814,7 +837,7 @@ Close the client and its owned resources, wait for active operations to settle, 
 #### Client.stat
 
 ```python
-def stat(self, path: os.PathLike[str] | str) -> FileInfo: ...
+def stat(self, path: DirEntry | _Path) -> FileInfo: ...
 ```
 
 Return FileInfo for the export-relative path. Missing paths raise NfsNotFoundError; other failures are not converted into a missing result. See FileInfo for byte counts and nanosecond timestamps.
@@ -822,7 +845,7 @@ Return FileInfo for the export-relative path. Missing paths raise NfsNotFoundErr
 #### Client.exists
 
 ```python
-def exists(self, path: os.PathLike[str] | str) -> bool: ...
+def exists(self, path: DirEntry | _Path) -> bool: ...
 ```
 
 Return False only when stat raises FileNotFoundError; permission, connection and other errors propagate. Return True when stat succeeds.
@@ -830,7 +853,7 @@ Return False only when stat raises FileNotFoundError; permission, connection and
 #### Client.resolve
 
 ```python
-def resolve(self, path: os.PathLike[str] | str) -> PathResolution: ...
+def resolve(self, path: _Path) -> PathResolution: ...
 ```
 
 Available in 0.12.0. Accept ordinary files/directories or links without a preliminary
@@ -838,30 +861,30 @@ type check. Follow intermediate and final symbolic links and return PathResoluti
 targets start at the link's directory; .. is evaluated during traversal and a
 trailing slash requires a directory. Input must be export-relative. Absolute link
 targets or traversal above the mounted root return OUTSIDE_MOUNT, not MISSING.
-At most 40 links, 4096 cumulative components and 64 KiB of cumulative UTF-8 path
-text are accepted; oversized or NUL-containing text raises ValueError. The complete
+At most 40 links, 4096 cumulative components and 64 KiB of cumulative path
+bytes are accepted; oversized or NUL-containing paths raises ValueError. The complete
 resolution shares operation_timeout. Permission, connection, timeout, stale-handle
 and other errors propagate. The observation neither checks read/write permission
 nor guarantees the result of a subsequent open. stat/exists continue to inspect
-the link itself; readlink returns the original target text.
+the link itself; readlink returns the original target as a read-only byte view.
 
 #### Client.scandir
 
 ```python
 def scandir(
     self,
-    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    path: DirectoryRef | DirEntry | _Path = b'.',
 ) -> Iterator[DirEntry]: ...
 ```
 
-Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup; otherwise the path is resolved first. No recursive traversal or handle fallback is performed. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
+Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup. An entry with no child handle uses its parent handle and original name. Otherwise the byte path is resolved. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
 
 #### Client.scandir_page
 
 ```python
 def scandir_page(
     self,
-    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    path: DirectoryRef | DirEntry | _Path = b'.',
     position: DirectoryCookie | None = None,
 ) -> DirectoryPage: ...
 ```
@@ -871,15 +894,15 @@ Read one directory page (NFSv3 READDIRPLUS, NFSv4.x READDIR with the scandir att
 #### Client.listdir
 
 ```python
-def listdir(self, path: os.PathLike[str] | str='.') -> list[str]: ...
+def listdir(self, path: _Path=b'.') -> list[memoryview]: ...
 ```
 
-Read names using Mount.readdir and return them as a list, without requesting full per-entry metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
+Read raw names using Mount.readdir and return read-only views over compact name storage. The collected name bytes and Rust name handles have a 64 MiB limit per call. Exceeding it raises NfsOSError with errno=EOVERFLOW. The default path is the export root (b"."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
 
 #### Client.chmod
 
 ```python
-def chmod(self, path: os.PathLike[str] | str, mode: int) -> None: ...
+def chmod(self, path: _Path, mode: int) -> None: ...
 ```
 
 Set permission/mode bits on path (for example 0o640). Returns None; server permission and protocol errors propagate.
@@ -887,7 +910,7 @@ Set permission/mode bits on path (for example 0o640). Returns None; server permi
 #### Client.chown
 
 ```python
-def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None: ...
+def chown(self, path: _Path, uid: int, gid: int) -> None: ...
 ```
 
 Set numeric owner uid and group gid. Use -1 for either identity to leave it unchanged. Returns None; server permissions apply.
@@ -895,7 +918,7 @@ Set numeric owner uid and group gid. Use -1 for either identity to leave it unch
 #### Client.utime
 
 ```python
-def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None: ...
+def utime(self, path: _Path, *, ns: tuple[int, int]) -> None: ...
 ```
 
 Set access and modification times using the keyword-only tuple ns=(atime_ns, mtime_ns), both integers in nanoseconds since the Unix epoch. This does not set ctime. A non-tuple or wrong tuple length is rejected.
@@ -903,7 +926,7 @@ Set access and modification times using the keyword-only tuple ns=(atime_ns, mti
 #### Client.truncate
 
 ```python
-def truncate(self, path: os.PathLike[str] | str, size: int) -> None: ...
+def truncate(self, path: _Path, size: int) -> None: ...
 ```
 
 Set the file size at path to a non-negative byte count. Shrinking discards the tail; extension follows server filesystem semantics. Returns None. This path operation is independent of any Python File cursor.
@@ -911,7 +934,7 @@ Set the file size at path to a non-negative byte count. Shrinking discards the t
 #### Client.access
 
 ```python
-def access(self, path: os.PathLike[str] | str, mode: int) -> bool: ...
+def access(self, path: _Path, mode: int) -> bool: ...
 ```
 
 Check the requested access flags, combining os.R_OK, os.W_OK and os.X_OK; os.F_OK is zero. Returns a bool, while unrelated protocol/transport failures raise. Rejects booleans and bits outside 0o7. This check does not reserve permission for a later operation.
@@ -919,7 +942,7 @@ Check the requested access flags, combining os.R_OK, os.W_OK and os.X_OK; os.F_O
 #### Client.getdacl
 
 ```python
-def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+def getdacl(self, path: _Path) -> NfsAcl41: ...
 ```
 
 Return the NFSv4.1 discretionary ACL as NfsAcl41. This is a DACL attribute, not the ordinary NFSv4 acl attribute. Requires protocol/server support; unsupported cases raise NfsUnsupportedError or a server protocol error.
@@ -927,7 +950,7 @@ Return the NFSv4.1 discretionary ACL as NfsAcl41. This is a DACL attribute, not 
 #### Client.setdacl
 
 ```python
-def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+def setdacl(self, path: _Path, acl: NfsAcl41) -> None: ...
 ```
 
 Set the NFSv4.1 discretionary ACL from an NfsAcl41 instance. ACE order is preserved; the caller supplies the entire intended value. Returns None. Requires server support and authorization.
@@ -935,7 +958,7 @@ Set the NFSv4.1 discretionary ACL from an NfsAcl41 instance. ACE order is preser
 #### Client.getsacl
 
 ```python
-def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+def getsacl(self, path: _Path) -> NfsAcl41: ...
 ```
 
 Return the NFSv4.1 system/audit ACL as NfsAcl41. Requires protocol/server support and suitable permissions; it is distinct from getdacl.
@@ -943,7 +966,7 @@ Return the NFSv4.1 system/audit ACL as NfsAcl41. Requires protocol/server suppor
 #### Client.setsacl
 
 ```python
-def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+def setsacl(self, path: _Path, acl: NfsAcl41) -> None: ...
 ```
 
 Set the NFSv4.1 system/audit ACL from an NfsAcl41 instance. Returns None; server feature and authorization checks still apply.
@@ -951,7 +974,7 @@ Set the NFSv4.1 system/audit ACL from an NfsAcl41 instance. Returns None; server
 #### Client.getxattr
 
 ```python
-def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes: ...
+def getxattr(self, path: _Path, name: str) -> bytes: ...
 ```
 
 Read a named extended attribute and return its value as bytes. name is a string. Requires named-attribute support; missing attributes and unsupported operations raise.
@@ -959,7 +982,7 @@ Read a named extended attribute and return its value as bytes. name is a string.
 #### Client.setxattr
 
 ```python
-def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
+def setxattr(self, path: _Path, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
     ...
 ```
 
@@ -968,7 +991,7 @@ Set a named extended attribute from a bytes-like value. The input is snapshotted
 #### Client.listxattr
 
 ```python
-def listxattr(self, path: os.PathLike[str] | str) -> list[str]: ...
+def listxattr(self, path: _Path) -> list[str]: ...
 ```
 
 Return available extended-attribute names as a list of strings. Requires named-attribute support; names are server dependent.
@@ -976,7 +999,7 @@ Return available extended-attribute names as a list of strings. Requires named-a
 #### Client.removexattr
 
 ```python
-def removexattr(self, path: os.PathLike[str] | str, name: str) -> None: ...
+def removexattr(self, path: _Path, name: str) -> None: ...
 ```
 
 Remove one named extended attribute. Returns None; missing attributes and unsupported operations raise.
@@ -1002,7 +1025,7 @@ Return FsStat capacity/inode statistics for the mounted filesystem. Availability
 ```python
 def mkdir(
     self,
-    path: os.PathLike[str] | str,
+    path: _Path,
     mode: int = 511,
     *,
     parents: bool = False,
@@ -1015,7 +1038,7 @@ Create a directory with mode=0o777 by default. parents=True creates missing comp
 #### Client.remove
 
 ```python
-def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool=False) -> None: ...
+def remove(self, path: _Path, *, missing_ok: bool=False) -> None: ...
 ```
 
 Remove a non-directory entry. missing_ok=True suppresses only FileNotFoundError; all other failures propagate. Use rmdir for directories. Returns None.
@@ -1023,7 +1046,7 @@ Remove a non-directory entry. missing_ok=True suppresses only FileNotFoundError;
 #### Client.unlink
 
 ```python
-def unlink(self, path: os.PathLike[str] | str, *, missing_ok: bool=False) -> None: ...
+def unlink(self, path: _Path, *, missing_ok: bool=False) -> None: ...
 ```
 
 Alias of remove, including missing_ok handling and errors. Returns None.
@@ -1031,7 +1054,7 @@ Alias of remove, including missing_ok handling and errors. Returns None.
 #### Client.rmdir
 
 ```python
-def rmdir(self, path: os.PathLike[str] | str) -> None: ...
+def rmdir(self, path: _Path) -> None: ...
 ```
 
 Remove an empty directory. A nonempty directory, wrong file type or denied access raises a server error. Returns None.
@@ -1039,7 +1062,7 @@ Remove an empty directory. A nonempty directory, wrong file type or denied acces
 #### Client.rename
 
 ```python
-def rename(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None: ...
+def rename(self, source: _Path, destination: _Path) -> None: ...
 ```
 
 Rename source to destination within the mounted export. Server replacement and permission rules apply. Returns None; uncertain mutation outcomes require verification before retry.
@@ -1047,7 +1070,7 @@ Rename source to destination within the mounted export. Server replacement and p
 #### Client.link
 
 ```python
-def link(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None: ...
+def link(self, source: _Path, destination: _Path) -> None: ...
 ```
 
 Create destination as a hard link to source within the export. Requires filesystem link support. Returns None; an existing destination normally raises NfsAlreadyExistsError.
@@ -1055,7 +1078,7 @@ Create destination as a hard link to source within the export. Requires filesyst
 #### Client.symlink
 
 ```python
-def symlink(self, target: os.PathLike[str] | str, link_path: os.PathLike[str] | str) -> None: ...
+def symlink(self, target: _Path, link_path: _Path) -> None: ...
 ```
 
 Create link_path containing target. link_path is normalized relative to the export; target is stored as supplied, including ../ or absolute targets, and is not normalized. Byte-string or NUL-containing targets are rejected. Returns None.
@@ -1063,15 +1086,15 @@ Create link_path containing target. link_path is normalized relative to the expo
 #### Client.readlink
 
 ```python
-def readlink(self, path: os.PathLike[str] | str) -> str: ...
+def readlink(self, path: _Path) -> memoryview: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
+Return a read-only view of the stored target bytes. A non-symlink path raises a server error.
 
 #### Client.touch
 
 ```python
-def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool=True) -> None: ...
+def touch(self, path: _Path, *, exist_ok: bool=True) -> None: ...
 ```
 
 Create a missing file without truncating an existing one, then set atime/mtime to the current time. exist_ok=False is unsupported and raises NotImplementedError because atomic exclusive creation is unavailable. The create/close/time-update sequence is non-transactional.
@@ -1079,10 +1102,10 @@ Create a missing file without truncating an existing one, then set atime/mtime t
 #### Client.open
 
 ```python
-def open(self, path: os.PathLike[str] | str, mode: str='rb') -> File: ...
+def open(self, path: DirEntry | _Path, mode: str='rb') -> File: ...
 ```
 
-Return a binary File (AsyncFile for AsyncClient). Supported modes are rb, wb, ab, r+b, w+b and a+b (equivalent b/+ ordering is accepted). r requires an existing file; w creates/truncates; a creates if needed and writes at EOF. Text and exclusive-create modes are rejected. Creating/truncating opens are non-transactional and can leave effects if a later step fails. Close the returned file explicitly or use its context manager.
+Return a binary File (AsyncFile for AsyncClient). Supported modes are rb, wb, ab, r+b, w+b and a+b (equivalent b/+ ordering is accepted). For a path, r requires an existing file, w creates or truncates, and a creates if needed and writes at EOF. For a DirEntry, the name must exist in every mode. A supplied entry handle is verified after OPEN and before any truncation or write. Writable modes require the entry handle. Text and exclusive-create modes are rejected. Creating/truncating opens are non-transactional and can leave effects if a later step fails. Close the returned file explicitly or use its context manager.
 
 #### Client.__enter__
 
@@ -1211,7 +1234,7 @@ Close the client and its owned resources, wait for active operations to settle, 
 #### AsyncClient.stat
 
 ```python
-async def stat(self, path: os.PathLike[str] | str) -> FileInfo: ...
+async def stat(self, path: DirEntry | _Path) -> FileInfo: ...
 ```
 
 Return FileInfo for the export-relative path. Missing paths raise NfsNotFoundError; other failures are not converted into a missing result. See FileInfo for byte counts and nanosecond timestamps.
@@ -1219,7 +1242,7 @@ Return FileInfo for the export-relative path. Missing paths raise NfsNotFoundErr
 #### AsyncClient.exists
 
 ```python
-async def exists(self, path: os.PathLike[str] | str) -> bool: ...
+async def exists(self, path: DirEntry | _Path) -> bool: ...
 ```
 
 Return False only when stat raises FileNotFoundError; permission, connection and other errors propagate. Return True when stat succeeds.
@@ -1227,7 +1250,7 @@ Return False only when stat raises FileNotFoundError; permission, connection and
 #### AsyncClient.resolve
 
 ```python
-async def resolve(self, path: os.PathLike[str] | str) -> PathResolution: ...
+async def resolve(self, path: _Path) -> PathResolution: ...
 ```
 
 Await the same bounded, mount-relative resolution as Client.resolve. Returns the
@@ -1240,18 +1263,18 @@ traversal, and permission/connection/timeout/stale-handle errors remain errors.
 ```python
 def scandir(
     self,
-    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    path: DirectoryRef | DirEntry | _Path = b'.',
 ) -> AsyncIterator[DirEntry]: ...
 ```
 
-Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup; otherwise the path is resolved first. No recursive traversal or handle fallback is performed. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
+Return a lazy iterator of DirEntry values backed by Mount.readdirplus. A DirectoryRef or DirEntry carrying fh skips path lookup. An entry with no child handle uses its parent handle and original name. Otherwise the byte path is resolved. Metadata accompanies each entry; fh can be None. Reuse handles only with the originating client. Errors may arise while consuming the iterator. AsyncClient.scandir is called without await and consumed with async for. Do not assume dot entries are filtered.
 
 #### AsyncClient.scandir_page
 
 ```python
 async def scandir_page(
     self,
-    path: DirectoryRef | DirEntry | os.PathLike[str] | str = '.',
+    path: DirectoryRef | DirEntry | _Path = b'.',
     position: DirectoryCookie | None = None,
 ) -> DirectoryPage: ...
 ```
@@ -1261,15 +1284,15 @@ Await one directory page starting after position; the semantics, errors and resu
 #### AsyncClient.listdir
 
 ```python
-async def listdir(self, path: os.PathLike[str] | str='.') -> list[str]: ...
+async def listdir(self, path: _Path=b'.') -> list[memoryview]: ...
 ```
 
-Read names using Mount.readdir and return them as a list, without requesting full per-entry metadata or handles. The default path is the export root ("."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
+Read raw names using Mount.readdir and return read-only views over compact name storage. The collected name bytes and Rust name handles have a 64 MiB limit per call. Exceeding it raises NfsOSError with errno=EOVERFLOW. The default path is the export root (b"."). Errors propagate during enumeration; directory contents are not an atomic snapshot. Use scandir for metadata and handles.
 
 #### AsyncClient.chmod
 
 ```python
-async def chmod(self, path: os.PathLike[str] | str, mode: int) -> None: ...
+async def chmod(self, path: _Path, mode: int) -> None: ...
 ```
 
 Set permission/mode bits on path (for example 0o640). Returns None; server permission and protocol errors propagate.
@@ -1277,7 +1300,7 @@ Set permission/mode bits on path (for example 0o640). Returns None; server permi
 #### AsyncClient.chown
 
 ```python
-async def chown(self, path: os.PathLike[str] | str, uid: int, gid: int) -> None: ...
+async def chown(self, path: _Path, uid: int, gid: int) -> None: ...
 ```
 
 Set numeric owner uid and group gid. Use -1 for either identity to leave it unchanged. Returns None; server permissions apply.
@@ -1285,7 +1308,7 @@ Set numeric owner uid and group gid. Use -1 for either identity to leave it unch
 #### AsyncClient.utime
 
 ```python
-async def utime(self, path: os.PathLike[str] | str, *, ns: tuple[int, int]) -> None: ...
+async def utime(self, path: _Path, *, ns: tuple[int, int]) -> None: ...
 ```
 
 Set access and modification times using the keyword-only tuple ns=(atime_ns, mtime_ns), both integers in nanoseconds since the Unix epoch. This does not set ctime. A non-tuple or wrong tuple length is rejected.
@@ -1293,7 +1316,7 @@ Set access and modification times using the keyword-only tuple ns=(atime_ns, mti
 #### AsyncClient.truncate
 
 ```python
-async def truncate(self, path: os.PathLike[str] | str, size: int) -> None: ...
+async def truncate(self, path: _Path, size: int) -> None: ...
 ```
 
 Set the file size at path to a non-negative byte count. Shrinking discards the tail; extension follows server filesystem semantics. Returns None. This path operation is independent of any Python File cursor.
@@ -1301,7 +1324,7 @@ Set the file size at path to a non-negative byte count. Shrinking discards the t
 #### AsyncClient.access
 
 ```python
-async def access(self, path: os.PathLike[str] | str, mode: int) -> bool: ...
+async def access(self, path: _Path, mode: int) -> bool: ...
 ```
 
 Check the requested access flags, combining os.R_OK, os.W_OK and os.X_OK; os.F_OK is zero. Returns a bool, while unrelated protocol/transport failures raise. Rejects booleans and bits outside 0o7. This check does not reserve permission for a later operation.
@@ -1309,7 +1332,7 @@ Check the requested access flags, combining os.R_OK, os.W_OK and os.X_OK; os.F_O
 #### AsyncClient.getdacl
 
 ```python
-async def getdacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+async def getdacl(self, path: _Path) -> NfsAcl41: ...
 ```
 
 Return the NFSv4.1 discretionary ACL as NfsAcl41. This is a DACL attribute, not the ordinary NFSv4 acl attribute. Requires protocol/server support; unsupported cases raise NfsUnsupportedError or a server protocol error.
@@ -1317,7 +1340,7 @@ Return the NFSv4.1 discretionary ACL as NfsAcl41. This is a DACL attribute, not 
 #### AsyncClient.setdacl
 
 ```python
-async def setdacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+async def setdacl(self, path: _Path, acl: NfsAcl41) -> None: ...
 ```
 
 Set the NFSv4.1 discretionary ACL from an NfsAcl41 instance. ACE order is preserved; the caller supplies the entire intended value. Returns None. Requires server support and authorization.
@@ -1325,7 +1348,7 @@ Set the NFSv4.1 discretionary ACL from an NfsAcl41 instance. ACE order is preser
 #### AsyncClient.getsacl
 
 ```python
-async def getsacl(self, path: os.PathLike[str] | str) -> NfsAcl41: ...
+async def getsacl(self, path: _Path) -> NfsAcl41: ...
 ```
 
 Return the NFSv4.1 system/audit ACL as NfsAcl41. Requires protocol/server support and suitable permissions; it is distinct from getdacl.
@@ -1333,7 +1356,7 @@ Return the NFSv4.1 system/audit ACL as NfsAcl41. Requires protocol/server suppor
 #### AsyncClient.setsacl
 
 ```python
-async def setsacl(self, path: os.PathLike[str] | str, acl: NfsAcl41) -> None: ...
+async def setsacl(self, path: _Path, acl: NfsAcl41) -> None: ...
 ```
 
 Set the NFSv4.1 system/audit ACL from an NfsAcl41 instance. Returns None; server feature and authorization checks still apply.
@@ -1341,7 +1364,7 @@ Set the NFSv4.1 system/audit ACL from an NfsAcl41 instance. Returns None; server
 #### AsyncClient.getxattr
 
 ```python
-async def getxattr(self, path: os.PathLike[str] | str, name: str) -> bytes: ...
+async def getxattr(self, path: _Path, name: str) -> bytes: ...
 ```
 
 Read a named extended attribute and return its value as bytes. name is a string. Requires named-attribute support; missing attributes and unsupported operations raise.
@@ -1349,7 +1372,7 @@ Read a named extended attribute and return its value as bytes. name is a string.
 #### AsyncClient.setxattr
 
 ```python
-async def setxattr(self, path: os.PathLike[str] | str, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
+async def setxattr(self, path: _Path, name: str, value: Any, *, mode: XattrSetMode=XattrSetMode.EITHER) -> None:
     ...
 ```
 
@@ -1358,7 +1381,7 @@ Set a named extended attribute from a bytes-like value. The input is snapshotted
 #### AsyncClient.listxattr
 
 ```python
-async def listxattr(self, path: os.PathLike[str] | str) -> list[str]: ...
+async def listxattr(self, path: _Path) -> list[str]: ...
 ```
 
 Return available extended-attribute names as a list of strings. Requires named-attribute support; names are server dependent.
@@ -1366,7 +1389,7 @@ Return available extended-attribute names as a list of strings. Requires named-a
 #### AsyncClient.removexattr
 
 ```python
-async def removexattr(self, path: os.PathLike[str] | str, name: str) -> None: ...
+async def removexattr(self, path: _Path, name: str) -> None: ...
 ```
 
 Remove one named extended attribute. Returns None; missing attributes and unsupported operations raise.
@@ -1392,7 +1415,7 @@ Return FsStat capacity/inode statistics for the mounted filesystem. Availability
 ```python
 async def mkdir(
     self,
-    path: os.PathLike[str] | str,
+    path: _Path,
     mode: int = 511,
     *,
     parents: bool = False,
@@ -1405,7 +1428,7 @@ Create a directory with mode=0o777 by default. parents=True creates missing comp
 #### AsyncClient.remove
 
 ```python
-async def remove(self, path: os.PathLike[str] | str, *, missing_ok: bool=False) -> None: ...
+async def remove(self, path: _Path, *, missing_ok: bool=False) -> None: ...
 ```
 
 Remove a non-directory entry. missing_ok=True suppresses only FileNotFoundError; all other failures propagate. Use rmdir for directories. Returns None.
@@ -1413,7 +1436,7 @@ Remove a non-directory entry. missing_ok=True suppresses only FileNotFoundError;
 #### AsyncClient.unlink
 
 ```python
-async def unlink(self, path: os.PathLike[str] | str, *, missing_ok: bool=False) -> None: ...
+async def unlink(self, path: _Path, *, missing_ok: bool=False) -> None: ...
 ```
 
 Alias of remove, including missing_ok handling and errors. Returns None.
@@ -1421,7 +1444,7 @@ Alias of remove, including missing_ok handling and errors. Returns None.
 #### AsyncClient.rmdir
 
 ```python
-async def rmdir(self, path: os.PathLike[str] | str) -> None: ...
+async def rmdir(self, path: _Path) -> None: ...
 ```
 
 Remove an empty directory. A nonempty directory, wrong file type or denied access raises a server error. Returns None.
@@ -1431,8 +1454,8 @@ Remove an empty directory. A nonempty directory, wrong file type or denied acces
 ```python
 async def rename(
     self,
-    source: os.PathLike[str] | str,
-    destination: os.PathLike[str] | str,
+    source: _Path,
+    destination: _Path,
 ) -> None: ...
 ```
 
@@ -1443,8 +1466,8 @@ Rename source to destination within the mounted export. Server replacement and p
 ```python
 async def link(
     self,
-    source: os.PathLike[str] | str,
-    destination: os.PathLike[str] | str,
+    source: _Path,
+    destination: _Path,
 ) -> None: ...
 ```
 
@@ -1455,8 +1478,8 @@ Create destination as a hard link to source within the export. Requires filesyst
 ```python
 async def symlink(
     self,
-    target: os.PathLike[str] | str,
-    link_path: os.PathLike[str] | str,
+    target: _Path,
+    link_path: _Path,
 ) -> None: ...
 ```
 
@@ -1465,15 +1488,15 @@ Create link_path containing target. link_path is normalized relative to the expo
 #### AsyncClient.readlink
 
 ```python
-async def readlink(self, path: os.PathLike[str] | str) -> str: ...
+async def readlink(self, path: _Path) -> memoryview: ...
 ```
 
-Return the stored symlink target as a string without normalizing or resolving it. A non-symlink path raises a server error. A non-UTF-8 target raises NfsEncodingError; undecodable bytes are never replaced with a different filename.
+Return a read-only view of the stored target bytes. A non-symlink path raises a server error.
 
 #### AsyncClient.touch
 
 ```python
-async def touch(self, path: os.PathLike[str] | str, *, exist_ok: bool=True) -> None: ...
+async def touch(self, path: _Path, *, exist_ok: bool=True) -> None: ...
 ```
 
 Create a missing file without truncating an existing one, then set atime/mtime to the current time. exist_ok=False is unsupported and raises NotImplementedError because atomic exclusive creation is unavailable. The create/close/time-update sequence is non-transactional.
@@ -1481,10 +1504,10 @@ Create a missing file without truncating an existing one, then set atime/mtime t
 #### AsyncClient.open
 
 ```python
-async def open(self, path: os.PathLike[str] | str, mode: str='rb') -> AsyncFile: ...
+async def open(self, path: DirEntry | _Path, mode: str='rb') -> AsyncFile: ...
 ```
 
-Return a binary File (AsyncFile for AsyncClient). Supported modes are rb, wb, ab, r+b, w+b and a+b (equivalent b/+ ordering is accepted). r requires an existing file; w creates/truncates; a creates if needed and writes at EOF. Text and exclusive-create modes are rejected. Creating/truncating opens are non-transactional and can leave effects if a later step fails. Close the returned file explicitly or use its context manager.
+Return a binary File (AsyncFile for AsyncClient). Supported modes are rb, wb, ab, r+b, w+b and a+b (equivalent b/+ ordering is accepted). For a path, r requires an existing file, w creates or truncates, and a creates if needed and writes at EOF. For a DirEntry, the name must exist in every mode. A supplied entry handle is verified after OPEN and before any truncation or write. Writable modes require the entry handle. Text and exclusive-create modes are rejected. Creating/truncating opens are non-transactional and can leave effects if a later step fails. Close the returned file explicitly or use its context manager.
 
 #### AsyncClient.__aenter__
 
@@ -1522,7 +1545,7 @@ Direct construction is unsupported and raises TypeError. Use client.open; await 
 #### File.name
 
 ```python
-def name(self) -> str: ...
+def name(self) -> str | bytes: ...
 ```
 
 Read as a property; do not call it. Read-only normalized export-relative filename retained by this object; renaming externally does not update this label.
@@ -1694,7 +1717,7 @@ Direct construction is unsupported and raises TypeError. Use client.open; await 
 #### AsyncFile.name
 
 ```python
-def name(self) -> str: ...
+def name(self) -> str | bytes: ...
 ```
 
 Read as a property; do not call it. Read-only normalized export-relative filename retained by this object; renaming externally does not update this label.
@@ -1938,7 +1961,7 @@ All methods below require exact negotiated v4.2; optional server rejection remai
 #### Client.allocate
 
 ```python
-def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+def allocate(self, path: _Path, offset: int, length: int) -> None:
     ...
 ```
 
@@ -1947,7 +1970,7 @@ Reserve a nonempty range and possibly extend EOF. Requires NFSv4.2 and a server 
 #### Client.deallocate
 
 ```python
-def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+def deallocate(self, path: _Path, offset: int, length: int) -> None:
     ...
 ```
 
@@ -1956,7 +1979,7 @@ Punch a hole without changing EOF; reads of the deallocated range return zeros. 
 #### Client.seek_content
 
 ```python
-def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+def seek_content(self, path: _Path, offset: int, what: SeekContent) -> SeekResult:
     ...
 ```
 
@@ -1965,7 +1988,7 @@ Locate DATA or HOLE using server-side SEEK. Returns a typed boundary and EOF fla
 #### Client.read_plus
 
 ```python
-def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+def read_plus(self, path: _Path, offset: int, count: int) -> ReadPlusResult:
     ...
 ```
 
@@ -1974,7 +1997,7 @@ Return data/hole extents without materializing holes. count is at most u32 and t
 #### Client.copy_range
 
 ```python
-def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
+def copy_range(self, source: _Path, destination: _Path, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
     ...
 ```
 
@@ -1983,7 +2006,7 @@ Copy a range between existing files on this mounted server, using synchronous CO
 #### Client.clone_range
 
 ```python
-def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
+def clone_range(self, source: _Path, destination: _Path, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
     ...
 ```
 
@@ -1992,7 +2015,7 @@ Atomically clone between existing files using server CLONE. count zero means sou
 #### Client.nfs42_attributes
 
 ```python
-def nfs42_attributes(self, path: os.PathLike[str] | str='.') -> Nfs42Attributes:
+def nfs42_attributes(self, path: _Path='.') -> Nfs42Attributes:
     ...
 ```
 
@@ -2001,7 +2024,7 @@ Inspect supported_attrs, optional clone_blksize and RFC 8276 xattr_support on th
 #### AsyncClient.allocate
 
 ```python
-async def allocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+async def allocate(self, path: _Path, offset: int, length: int) -> None:
     ...
 ```
 
@@ -2010,7 +2033,7 @@ Reserve a nonempty range and possibly extend EOF. Requires NFSv4.2 and a server 
 #### AsyncClient.deallocate
 
 ```python
-async def deallocate(self, path: os.PathLike[str] | str, offset: int, length: int) -> None:
+async def deallocate(self, path: _Path, offset: int, length: int) -> None:
     ...
 ```
 
@@ -2019,7 +2042,7 @@ Punch a hole without changing EOF; reads of the deallocated range return zeros. 
 #### AsyncClient.seek_content
 
 ```python
-async def seek_content(self, path: os.PathLike[str] | str, offset: int, what: SeekContent) -> SeekResult:
+async def seek_content(self, path: _Path, offset: int, what: SeekContent) -> SeekResult:
     ...
 ```
 
@@ -2028,7 +2051,7 @@ Locate DATA or HOLE using server-side SEEK. Returns a typed boundary and EOF fla
 #### AsyncClient.read_plus
 
 ```python
-async def read_plus(self, path: os.PathLike[str] | str, offset: int, count: int) -> ReadPlusResult:
+async def read_plus(self, path: _Path, offset: int, count: int) -> ReadPlusResult:
     ...
 ```
 
@@ -2037,7 +2060,7 @@ Return data/hole extents without materializing holes. count is at most u32 and t
 #### AsyncClient.copy_range
 
 ```python
-async def copy_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
+async def copy_range(self, source: _Path, destination: _Path, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> CopyResult:
     ...
 ```
 
@@ -2046,7 +2069,7 @@ Copy a range between existing files on this mounted server, using synchronous CO
 #### AsyncClient.clone_range
 
 ```python
-async def clone_range(self, source: os.PathLike[str] | str, destination: os.PathLike[str] | str, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
+async def clone_range(self, source: _Path, destination: _Path, *, source_offset: int=0, destination_offset: int=0, count: int=0) -> None:
     ...
 ```
 
@@ -2055,7 +2078,7 @@ Atomically clone between existing files using server CLONE. count zero means sou
 #### AsyncClient.nfs42_attributes
 
 ```python
-async def nfs42_attributes(self, path: os.PathLike[str] | str='.') -> Nfs42Attributes:
+async def nfs42_attributes(self, path: _Path='.') -> Nfs42Attributes:
     ...
 ```
 
@@ -2091,7 +2114,7 @@ are raised instead of being represented as an absent target.
 | Field | Type | Meaning |
 |---|---|---|
 | `PathResolution.status` | `PathResolutionStatus` | The resolution outcome. |
-| `PathResolution.path` | `str \| None` | Canonical export-relative final path, or None unless resolved; root is '.'. |
+| `PathResolution.path` | `memoryview \| None` | Read-only canonical export-relative path bytes, or None unless resolved. Root is `b"."`. |
 | `PathResolution.info` | `FileInfo \| None` | Final object metadata with the resolved path, or None unless resolved. |
 
 #### PathResolution.exists

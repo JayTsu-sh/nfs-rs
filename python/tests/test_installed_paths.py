@@ -34,16 +34,40 @@ def test_installed_sync_paths_metadata_and_streaming_directory():
     with pytest.raises(PermissionError):
         client.exists("denied")
     entries = client.scandir("folder")
-    assert next(entries).name == "first"
-    assert [entry.name for entry in entries] == ["second"]
-    assert client.listdir("folder") == ["first", "second"]
+    assert next(entries).name == b"first"
+    assert [entry.name for entry in entries] == [b"second"]
+    assert client.listdir("folder") == [b"first", b"second"]
     client.close()
+
+
+def test_installed_metadata_accepts_opaque_paths_in_sync_and_async():
+    from nfs_rs import NfsUnsupportedError
+
+    path = b"metadata-\xff"
+    with Client.connect("nfs-test://fixture/export") as client:
+        client.setxattr(memoryview(path), "user.raw", b"value")
+        assert client.getxattr(path, "user.raw") == b"value"
+        assert client.listxattr(memoryview(path)) == ["user.raw"]
+        assert client.listxattr(b"metadata-\xfe") == []
+        with pytest.raises(NfsUnsupportedError):
+            client.getdacl(path)
+
+    async def scenario():
+        async with await AsyncClient.connect("nfs-test://fixture/export") as client:
+            await client.setxattr(path, "user.raw", b"value")
+            assert await client.getxattr(memoryview(path), "user.raw") == b"value"
+            await client.removexattr(memoryview(path), "user.raw")
+            assert await client.listxattr(path) == []
+            with pytest.raises(NfsUnsupportedError):
+                await client.nfs42_attributes(path)
+
+    asyncio.run(scenario())
 
 
 def test_client_close_cancels_unconsumed_directory_producer_without_hanging():
     client = Client.connect("nfs-test://fixture/export")
     entries = client.scandir("large")
-    assert next(entries).name == "entry-0"
+    assert next(entries).name == b"entry-0"
     client.close()
     assert client.closed
 
@@ -79,15 +103,15 @@ def test_installed_async_paths_match_sync_values():
         client = await AsyncClient.connect("nfs-test://fixture/export")
         assert (await client.stat("file")).fileid == 9
         assert not await client.exists("missing")
-        assert [entry.name async for entry in client.scandir("folder")] == ["first", "second"]
-        assert await client.listdir("folder") == ["first", "second"]
+        assert [entry.name async for entry in client.scandir("folder")] == [b"first", b"second"]
+        assert await client.listdir("folder") == [b"first", b"second"]
         await client.close()
 
     asyncio.run(scenario())
 
 
 def test_listdir_names_cover_large_directories_errors_and_deadlines():
-    expected = [f"entry-{i}" for i in range(128 * 4 + 7)]
+    expected = [f"entry-{i}".encode() for i in range(128 * 4 + 7)]
     client = Client.connect("nfs-test://fixture/export", operation_timeout=0.01)
     assert client.listdir("large") == expected
     with pytest.raises(PermissionError):
@@ -127,7 +151,7 @@ def test_installed_sync_and_async_permission_families_and_stream_errors_match():
         with pytest.raises(PermissionError):
             sync_client.stat(path)
     entries = sync_client.scandir("denied-directory")
-    assert next(entries).name == "first"
+    assert next(entries).name == b"first"
     with pytest.raises(PermissionError):
         next(entries)
 
@@ -137,7 +161,7 @@ def test_installed_sync_and_async_permission_families_and_stream_errors_match():
             with pytest.raises(PermissionError):
                 await client.stat(path)
         entries = client.scandir("denied-directory")
-        assert (await anext(entries)).name == "first"
+        assert (await anext(entries)).name == b"first"
         with pytest.raises(PermissionError):
             await anext(entries)
         await client.close()
@@ -149,11 +173,11 @@ def test_installed_export_discovery_matches_sync_and_async():
     sync_values = list_exports("nfs-test://fixture/")
     async_values = asyncio.run(list_exports_async("nfs-test://fixture/"))
     assert sync_values == async_values
-    assert sync_values[0].path == "/data"
-    assert sync_values[0].groups == ("team",)
+    assert sync_values[0].path == b"/data"
+    assert sync_values[0].groups == (b"team",)
 
 
-@pytest.mark.parametrize("path", [b"bytes", "bad\0name", "../escape"])
+@pytest.mark.parametrize("path", [b"bad\0bytes", "bad\0name", "../escape"])
 def test_installed_invalid_paths_never_reach_native_adapter(path):
     client = Client.connect("nfs-test://fixture/export")
     with pytest.raises((TypeError, ValueError)):
@@ -167,21 +191,21 @@ def test_scandir_reference_crosses_native_boundary_in_sync_and_async():
     with Client.connect("nfs-test://fixture/export") as client:
         for fh in (None, b"opaque\x00directory-handle"):
             entries = list(client.scandir(DirectoryRef("folder", fh)))
-            assert [entry.path for entry in entries] == ["folder/first", "folder/second"]
+            assert [entry.path for entry in entries] == [b"folder/first", b"folder/second"]
             assert all(entry.fh is None for entry in entries)  # fixture omits handles
 
     async def scenario():
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
             for fh in (None, b"opaque\x00directory-handle"):
                 entries = [entry async for entry in client.scandir(DirectoryRef("folder", fh))]
-                assert [entry.path for entry in entries] == ["folder/first", "folder/second"]
+                assert [entry.path for entry in entries] == [b"folder/first", b"folder/second"]
                 assert all(entry.fh is None for entry in entries)
 
     asyncio.run(scenario())
 
 
 def test_batched_scandir_preserves_all_entries_in_sync_and_async():
-    expected = [f"entry-{i}" for i in range(519)]
+    expected = [f"entry-{i}".encode() for i in range(519)]
     with Client.connect("nfs-test://fixture/export") as client:
         entries = list(client.scandir("batched"))
         assert [entry.name for entry in entries] == expected
@@ -198,7 +222,7 @@ def test_batched_scandir_preserves_all_entries_in_sync_and_async():
 def test_scandir_page_resumes_from_saved_position_in_a_new_client():
     from nfs_rs import DirectoryCookie, NfsBadCookieError
 
-    expected = [f"page-entry-{index}" for index in range(7)]
+    expected = [f"page-entry-{index}".encode() for index in range(7)]
     with Client.connect("nfs-test://fixture/export") as client:
         pages = [client.scandir_page("paged")]
         while not pages[-1].eof:
@@ -213,7 +237,7 @@ def test_scandir_page_resumes_from_saved_position_in_a_new_client():
     assert not after_end.entries and after_end.eof
     assert after_end.next == pages[-1].next
     assert all(page.next.verifier == b"fixture1" for page in pages)
-    assert pages[0].entries[0].path == "paged/page-entry-0"
+    assert pages[0].entries[0].path == b"paged/page-entry-0"
     assert pages[0].entries[0].info.fileid == 1
 
     saved = DirectoryCookie(pages[0].next.cookie, pages[0].next.verifier)
@@ -235,7 +259,7 @@ def test_scandir_page_resumes_from_saved_position_in_a_new_client():
             assert error.code == 10003
             assert error.code_name == "NFS3ERR_BAD_COOKIE"
             assert error.operation == "scandir_page"
-            assert error.filename == "paged"
+            assert error.filename == b"paged"
             assert error.protocol == "3"
 
 
@@ -246,11 +270,11 @@ def test_async_scandir_page_resumes_and_types_stale_cookies():
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
             first = await client.scandir_page("paged")
             assert [entry.name for entry in first.entries] == [
-                "page-entry-0", "page-entry-1", "page-entry-2"
+                b"page-entry-0", b"page-entry-1", b"page-entry-2"
             ]
         async with await AsyncClient.connect("nfs-test://fixture/export") as client:
             second = await client.scandir_page("paged", first.next)
-            assert second.entries[0].name == "page-entry-3"
+            assert second.entries[0].name == b"page-entry-3"
             with pytest.raises(NfsBadCookieError) as caught:
                 await client.scandir_page("paged", DirectoryCookie(5, first.next.verifier))
             assert isinstance(caught.value, NfsProtocolError)
@@ -268,3 +292,18 @@ def test_scandir_page_without_progress_raises_encoding_error():
     assert not isinstance(caught.value, NfsProtocolError)
     assert caught.value.operation == "scandir_page"
     assert "no progress" in str(caught.value)
+
+
+def test_directory_name_views_are_read_only_and_outlive_the_client():
+    with Client.connect("nfs-test://fixture/export") as client:
+        entry = next(client.scandir(b"folder"))
+        view = entry.name
+        child = view[1:]
+        assert view.readonly
+        assert view.obj is child.obj
+        assert entry.path == b"folder/first"
+        with pytest.raises(TypeError):
+            view[0] = 0
+        del entry
+    view.release()
+    assert child.tobytes() == b"irst"

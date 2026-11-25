@@ -12,7 +12,7 @@ pub(crate) struct OwnerLane {
     /// Directory handle and name used by OPEN, retained so a released state can
     /// be re-established with a fresh OPEN (CLAIM_NULL) without a path walk.
     pub dir_fh: Bytes,
-    pub name: String,
+    pub name: Bytes,
     pub access: u32,
     pub write_verifier: Option<[u8; 8]>,
     /// Shared permits cover in-flight stateid I/O. CLOSE takes the exclusive
@@ -37,10 +37,59 @@ pub(crate) struct LockLane {
     pub length: u64,
 }
 
+/// The lock state that recovery could not retain for a file handle.
+///
+/// Reads and writes on that handle stay gated with `StateRecoveryExhausted`
+/// until a new lock restores the lost protection or the handle is closed, so an
+/// application cannot keep writing through an open whose advisory lock is
+/// already gone.
+#[derive(Clone, Debug)]
+pub(crate) struct LostLock {
+    pub(crate) status: crate::Nfs4ErrorCode,
+    pub(crate) lock_type: u32,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) owner: bytes::Bytes,
+}
+
+/// RFC 7530 §16.10: a lock length of `u64::MAX` means "to the end of file".
+const LOCK_TO_EOF: u64 = u64::MAX;
+
+/// Whether a newly granted lock restores the protection of a lost lock.
+///
+/// A WRITE lock (2) restores a lost READ (1) or WRITE lock; a READ lock does not
+/// restore a lost WRITE lock. The grant must start at or before the lost range
+/// and reach at least as far. `u64::MAX` is NFSv4's end-of-file sentinel, so only
+/// another open-ended lock covers a lost open-ended lock; the public LOCK API
+/// rejects a zero length, which therefore covers nothing.
+fn restores(loss: &LostLock, lock_type: u32, offset: u64, length: u64) -> bool {
+    if lock_type < loss.lock_type || offset > loss.offset {
+        return false;
+    }
+    match (end(offset, length), end(loss.offset, loss.length)) {
+        (Some(granted_end), Some(lost_end)) => granted_end >= lost_end,
+        // A lock to EOF covers any lost range; a lost lock to EOF needs one.
+        (None, _) => true,
+        (_, None) => false,
+    }
+}
+
+/// One past the last byte the lock covers, or `None` when it runs to EOF.
+///
+/// A finite range that overflows `u64` saturates instead of being mistaken for
+/// the sentinel; such a range is invalid and a conforming server rejects it.
+fn end(offset: u64, length: u64) -> Option<u64> {
+    (length != LOCK_TO_EOF).then(|| offset.saturating_add(length))
+}
+
 #[derive(Default)]
 pub(crate) struct LockState {
     lanes: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
     aliases: RwLock<HashMap<[u8; 16], Arc<Mutex<LockLane>>>>,
+    /// File handles with locks that recovery could not retain and that still
+    /// gate I/O. Several locks on one handle can be lost independently, so each
+    /// unresolved loss is kept until a new lock restores its protection.
+    lost: RwLock<HashMap<Vec<u8>, Vec<LostLock>>>,
     acquisitions: Arc<LockAcquisitions>,
 }
 
@@ -168,7 +217,11 @@ impl LockState {
     pub(crate) async fn register(&self, lane: LockLane) -> Arc<Mutex<LockLane>> {
         let stateid = lane.stateid;
         let lane = Arc::new(Mutex::new(lane));
-        self.lanes.write().await.insert(stateid, Arc::clone(&lane));
+        let previous = self.lanes.write().await.insert(stateid, Arc::clone(&lane));
+        if let Some(previous) = previous {
+            self.retire_lock_stateid_collision(previous, &lane, stateid)
+                .await;
+        }
         lane
     }
 
@@ -268,10 +321,89 @@ impl LockState {
         new_stateid: [u8; 16],
         lane: Arc<Mutex<LockLane>>,
     ) {
+        // Hold both maps for the update: a LOOKUP that runs between them would
+        // miss `old_stateid` in `lanes` before the alias exists and report a
+        // lock that is still live as unknown.
         let mut lanes = self.lanes.write().await;
+        let mut aliases = self.aliases.write().await;
+        aliases.insert(old_stateid, Arc::clone(&lane));
         lanes.remove(&old_stateid);
-        lanes.insert(new_stateid, Arc::clone(&lane));
-        self.aliases.write().await.insert(old_stateid, lane);
+        let previous = lanes.insert(new_stateid, Arc::clone(&lane));
+        drop(lanes);
+        drop(aliases);
+        if let Some(previous) = previous {
+            self.retire_lock_stateid_collision(previous, &lane, new_stateid)
+                .await;
+        }
+    }
+
+    /// A conforming server never reuses a live lock stateid. If it does, the
+    /// older lane would silently disappear from the registry while tokens
+    /// carrying that stateid now resolve to the newer lock. Retire the stale
+    /// lane so neither a snapshot nor an alias keeps addressing the reused
+    /// stateid.
+    async fn retire_lock_stateid_collision(
+        &self,
+        previous: Arc<Mutex<LockLane>>,
+        current: &Arc<Mutex<LockLane>>,
+        stateid: [u8; 16],
+    ) {
+        if Arc::ptr_eq(&previous, current) {
+            return;
+        }
+        // Never await another lane here: `rekey` calls this while holding the
+        // current lane, so two concurrent reclaim groups whose server-assigned
+        // stateids swap would wait on each other forever while the recovery
+        // guard is held. The alias purge below already stops `by_stateid` from
+        // resolving to the retired lane; zeroing only hides it from stale
+        // snapshots, so skipping it under contention is safe.
+        if let Ok(mut previous) = previous.try_lock() {
+            previous.stateid = [0; 16];
+        }
+        self.aliases
+            .write()
+            .await
+            .retain(|_, candidate| !Arc::ptr_eq(candidate, &previous));
+        tracing::warn!(
+            target: "nfs_rs::stateid",
+            stateid = ?stateid,
+            "NFSv4.0 server reused a live lock stateid; retiring the older lock lane"
+        );
+    }
+
+    /// Remember that recovery could not retain a lock for `fh`, so I/O on that
+    /// handle must fail until the caller reacquires or closes it.
+    pub(crate) async fn mark_lost(&self, fh: &[u8], lost: LostLock) {
+        self.lost
+            .write()
+            .await
+            .entry(fh.to_vec())
+            .or_default()
+            .push(lost);
+    }
+
+    /// An unresolved lost-lock record gating I/O on `fh`, if any.
+    pub(crate) async fn lost(&self, fh: &[u8]) -> Option<LostLock> {
+        self.lost.read().await.get(fh)?.first().cloned()
+    }
+
+    /// Resolve only the losses that a newly granted lock restores: its type must
+    /// be at least as strong and its range must cover the lost range. A disjoint
+    /// or weaker lock acknowledges nothing, and other losses on the handle stay.
+    pub(crate) async fn resolve_lost(&self, fh: &[u8], lock_type: u32, offset: u64, length: u64) {
+        let mut lost = self.lost.write().await;
+        let Some(unresolved) = lost.get_mut(fh) else {
+            return;
+        };
+        unresolved.retain(|loss| !restores(loss, lock_type, offset, length));
+        if unresolved.is_empty() {
+            lost.remove(fh);
+        }
+    }
+
+    /// Lift the gate once the handle has no open state left.
+    pub(crate) async fn clear_lost(&self, fh: &[u8]) {
+        self.lost.write().await.remove(fh);
     }
 
     pub(crate) async fn clear(&self) {
@@ -280,6 +412,7 @@ impl LockState {
         // the generation check once the reply arrives.
         self.lanes.write().await.clear();
         self.aliases.write().await.clear();
+        self.lost.write().await.clear();
     }
 }
 
@@ -318,7 +451,12 @@ impl OpenState {
     ) -> Option<Arc<Mutex<OwnerLane>>> {
         let owners = self.by_fh.read().await.get(fh)?.clone();
         for owner in owners.into_iter().rev() {
-            let lane = self.by_owner(owner).await?;
+            // An owner may already be removed from `lanes` while its entry is
+            // still visible in `by_fh`; skip it instead of failing the whole
+            // lookup for a lane that is still usable.
+            let Some(lane) = self.by_owner(owner).await else {
+                continue;
+            };
             if lane.lock().await.access & required_access != 0 {
                 return Some(lane);
             }
@@ -422,10 +560,173 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_owner_entry_does_not_hide_a_live_lane() {
+        let state = OpenState::default();
+        for owner in [11, 12] {
+            state
+                .register(OwnerLane {
+                    owner,
+                    next_seqid: 1,
+                    stateid: [owner as u8; 16],
+                    fh: Bytes::from_static(b"fh"),
+                    dir_fh: Bytes::from_static(b"dir"),
+                    name: "file".into(),
+                    access: crate::OPEN_WRITE,
+                    write_verifier: None,
+                    io_fence: Arc::new(RwLock::new(())),
+                    closing: false,
+                })
+                .await;
+        }
+        // Simulate `remove(12)` racing a lookup: the lane is gone from `lanes`
+        // but its owner is still listed under `by_fh`.
+        state.lanes.write().await.remove(&12);
+        let lane = state
+            .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_WRITE)
+            .await
+            .expect("the remaining owner lane stays usable");
+        assert_eq!(lane.lock().await.owner, 11);
+    }
+
+    #[tokio::test]
+    async fn rekey_keeps_the_old_stateid_resolvable() {
+        let state = LockState::default();
+        let lane = state
+            .register(LockLane {
+                owner: 7,
+                open_owner: 11,
+                owner_wire: Bytes::from_static(b"lock"),
+                next_seqid: 1,
+                stateid: [1; 16],
+                fh: Bytes::from_static(b"fh"),
+                lock_type: 1,
+                offset: 0,
+                length: 0,
+            })
+            .await;
+        state.rekey([1; 16], [2; 16], Arc::clone(&lane)).await;
+
+        // An in-flight LOCKU still carries the pre-reclaim stateid.
+        assert!(state.by_stateid(&[1; 16]).await.is_some());
+        assert!(state.by_stateid(&[2; 16]).await.is_some());
+
+        state.remove(&[2; 16]).await;
+        assert!(state.by_stateid(&[1; 16]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reused_lock_stateid_retires_the_older_lane() {
+        let state = LockState::default();
+        let make = |owner: u64, stateid: [u8; 16]| LockLane {
+            owner,
+            open_owner: 11,
+            owner_wire: Bytes::from_static(b"lock"),
+            next_seqid: 1,
+            stateid,
+            fh: Bytes::from_static(b"fh"),
+            lock_type: 1,
+            offset: 0,
+            length: 0,
+        };
+        let older = state.register(make(7, [1; 16])).await;
+        state.rekey([1; 16], [3; 16], Arc::clone(&older)).await;
+        let newer = state.register(make(8, [3; 16])).await;
+        let current = state.by_stateid(&[3; 16]).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        assert_eq!(
+            older.lock().await.stateid,
+            [0; 16],
+            "the shadowed lane must be retired so a snapshot cannot LOCKU the reused stateid"
+        );
+        assert!(
+            state.by_stateid(&[1; 16]).await.is_none(),
+            "aliases that still resolve to the retired lane must be dropped"
+        );
+
+        // rekey (reclaim) must apply the same policy.
+        let third = state.register(make(9, [2; 16])).await;
+        state.rekey([3; 16], [2; 16], Arc::clone(&newer)).await;
+        let current = state.by_stateid(&[2; 16]).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &newer));
+        assert_eq!(third.lock().await.stateid, [0; 16]);
+
+        // A concurrent reclaim group may hold the lane being retired. Retiring
+        // must not wait for it: with swapped server-assigned stateids, two
+        // groups would otherwise deadlock while the recovery guard is held.
+        let held = newer.lock().await;
+        let fourth = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.register(make(10, [2; 16])),
+        )
+        .await
+        .expect("retiring a lane held elsewhere must not block");
+        drop(held);
+        assert!(
+            state
+                .by_stateid(&[2; 16])
+                .await
+                .is_some_and(|lane| Arc::ptr_eq(&lane, &fourth)),
+            "the newer lane must own the reused stateid even when the retired lane was busy"
+        );
+    }
+
     #[test]
     fn opaque_public_state_only_identifies_the_owner() {
         let encoded = encode_owner(9, 0x0102_0304_0506_0708);
         assert_eq!(decode_owner(&encoded), Some((9, 0x0102_0304_0506_0708)));
         assert_eq!(decode_owner(&Bytes::from_static(b"bad")), None);
+    }
+
+    #[test]
+    fn only_a_lock_that_restores_the_lost_protection_resolves_a_loss() {
+        let loss = |lock_type, offset, length| LostLock {
+            status: crate::Nfs4ErrorCode::NFS4ERR_DENIED,
+            lock_type,
+            offset,
+            length,
+            owner: Bytes::new(),
+        };
+        let write = loss(2, 0, 4096);
+        assert!(restores(&write, 2, 0, 4096), "the same lock");
+        assert!(restores(&write, 2, 0, 8192), "a wider lock");
+        assert!(restores(&write, 2, 0, LOCK_TO_EOF), "a lock to EOF");
+        assert!(!restores(&write, 2, 4096, 1), "a disjoint lock");
+        assert!(!restores(&write, 2, 0, 1), "a partial overlap");
+        assert!(
+            !restores(&write, 1, 0, 4096),
+            "a READ lock over a lost WRITE lock"
+        );
+        let read = loss(1, 0, 4096);
+        assert!(
+            restores(&read, 2, 0, 4096),
+            "a WRITE lock over a lost READ lock"
+        );
+        // RFC 7530 §16.10: u64::MAX, not zero, is the end-of-file sentinel.
+        let tail = loss(2, 4096, LOCK_TO_EOF);
+        assert!(
+            restores(&tail, 2, 0, LOCK_TO_EOF),
+            "the whole file covers a tail lock"
+        );
+        assert!(
+            !restores(&tail, 2, 0, 4096 + 8),
+            "a finite lock leaves the tail uncovered"
+        );
+        assert!(
+            !restores(&tail, 2, 4096, LOCK_TO_EOF - 1),
+            "a shorter finite tail is not a cover"
+        );
+        assert!(
+            !restores(&loss(2, 0, LOCK_TO_EOF), 2, 0, 4096),
+            "a finite lock does not cover a lock to EOF"
+        );
+        assert!(
+            !restores(&loss(2, 0, 8), 2, 0, 0),
+            "a zero length covers nothing"
+        );
+        assert!(
+            !restores(&loss(2, u64::MAX - 1, 8), 2, 0, 8),
+            "an overflowing finite range saturates instead of covering EOF"
+        );
     }
 }

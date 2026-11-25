@@ -19,7 +19,7 @@ def test_recovery_event_snapshot_drain_and_overflow(client_kind: str) -> None:
         client = Client.connect("nfs-test://fixture/export", recovery_event_capacity=2)
         native = client._inner._target
         for index in range(3):
-            native._record_recovery_event(f"write-{index}", f"safe-{index}")
+            native._record_recovery_event(f"write-{index}", f"safe-{index}".encode() + b"\xff")
         snapshot = client.recovery_events()
         assert snapshot == client.recovery_events()
         drained = client.drain_recovery_events()
@@ -34,7 +34,7 @@ def test_recovery_event_snapshot_drain_and_overflow(client_kind: str) -> None:
             )
             native = client._inner._target
             for index in range(3):
-                native._record_recovery_event(f"write-{index}", f"safe-{index}")
+                native._record_recovery_event(f"write-{index}", f"safe-{index}".encode() + b"\xff")
             snapshot = client.recovery_events()
             assert snapshot == client.recovery_events()
             drained = client.drain_recovery_events()
@@ -48,6 +48,7 @@ def test_recovery_event_snapshot_drain_and_overflow(client_kind: str) -> None:
     assert len(snapshot) == 2
     assert all(isinstance(event, RecoveryEvent) for event in snapshot)
     assert [event.operation for event in snapshot] == ["write-1", "write-2"]
+    assert [event.path for event in snapshot] == [b"safe-1\xff", b"safe-2\xff"]
     assert snapshot[0].outcome is OperationOutcome.UNCERTAIN
     assert snapshot[0].recovery_action is RecoveryAction.VERIFY_THEN_RESUME
     assert snapshot[0].completed_bytes == 0
@@ -78,7 +79,7 @@ def test_cancelled_open_keeps_native_cancellation_and_records_later_uncertainty(
         assert len(events) == 1
         event = events[0]
         assert event.operation == "open"
-        assert event.path == "__blocked_open_uncertain__"
+        assert event.path == b"__blocked_open_uncertain__"
         assert event.outcome is OperationOutcome.UNCERTAIN
         assert event.recovery_action is RecoveryAction.VERIFY_THEN_RESUME
         assert "scripted" not in event.message
@@ -103,7 +104,7 @@ def test_lost_open_state_rejects_unsafe_work_but_remains_closable() -> None:
         with pytest.raises(NfsLostOpenStateError) as caught:
             operation()
         assert caught.value.recovery_action is RecoveryAction.REOPEN
-        assert caught.value.filename == "fixture.bin"
+        assert caught.value.filename == b"fixture.bin"
     file.close()
     assert file.closed
     client.close()
@@ -229,7 +230,7 @@ def test_cancelled_path_mutations_report_later_uncertainty(operation: str) -> No
         elif operation == "rename":
             awaitable = client.rename("__after_send__", "destination")
         elif operation == "symlink":
-            awaitable = client.symlink("__after_send__", "safe-link")
+            awaitable = client.symlink("__after_send__", b"safe-link\xff")
         else:
             awaitable = client.setxattr("__after_send__", "user.key", b"value")
         task = asyncio.create_task(awaitable)
@@ -242,7 +243,7 @@ def test_cancelled_path_mutations_report_later_uncertainty(operation: str) -> No
         await settled
         events = client.drain_recovery_events()
         assert len(events) == 1
-        expected_path = "safe-link" if operation == "symlink" else "__after_send__"
+        expected_path = b"safe-link\xff" if operation == "symlink" else b"__after_send__"
         assert events[0].path == expected_path
         assert events[0].outcome is OperationOutcome.UNCERTAIN
         assert "injected" not in events[0].message

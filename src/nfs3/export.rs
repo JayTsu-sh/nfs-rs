@@ -16,30 +16,48 @@
 
 use bytes::{Buf, Bytes};
 
+use super::fastxdr::{MNTNAMLEN, MNTPATHLEN};
 use super::{Mount, MountProc3, rpc_header};
 use crate::error::{NfsError, Result};
 use crate::mount::ExportEntry;
 use crate::rpc;
 
-/// Decode one XDR variable-length string from `bytes`, consuming the data and its 4-byte padding.
-fn decode_xdr_string(bytes: &mut Bytes) -> Result<String> {
+/// Slice a counted MOUNT byte field from the reply, including its XDR padding.
+fn decode_field(bytes: &mut Bytes, limit: u32, field: &str) -> Result<Bytes> {
     if bytes.remaining() < 4 {
-        return Err(NfsError::Xdr(
-            "response truncated (string length)".to_string(),
-        ));
+        return Err(NfsError::Xdr(format!(
+            "MOUNT EXPORT {field} length truncated"
+        )));
     }
-    let len = bytes.get_u32() as usize; // big-endian, advances by 4
+    let len = bytes.get_u32();
+    if len > limit {
+        return Err(NfsError::Xdr(format!(
+            "MOUNT EXPORT {field} exceeds {limit} bytes"
+        )));
+    }
+    let len = len as usize;
     let pad = (4 - len % 4) % 4;
     if bytes.remaining() < len + pad {
-        return Err(NfsError::Xdr(
-            "response truncated (string data)".to_string(),
-        ));
+        return Err(NfsError::Xdr(format!(
+            "MOUNT EXPORT {field} data truncated"
+        )));
     }
-    let s = std::str::from_utf8(&bytes[..len])
-        .map_err(|e| NfsError::Xdr(e.to_string()))?
-        .to_string();
-    bytes.advance(len + pad);
-    Ok(s)
+    let value = bytes.split_to(len);
+    bytes.advance(pad);
+    Ok(value)
+}
+
+fn has_next(bytes: &mut Bytes, list: &str) -> Result<bool> {
+    if bytes.remaining() < 4 {
+        return Err(NfsError::Xdr(format!("MOUNT EXPORT {list} flag truncated")));
+    }
+    match bytes.get_u32() {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(NfsError::Xdr(format!(
+            "MOUNT EXPORT {list} flag is {value}"
+        ))),
+    }
 }
 
 /// Decode the XDR optional-linked-list body returned by MOUNT EXPORT (procedure 5).
@@ -55,23 +73,11 @@ fn decode_xdr_string(bytes: &mut Bytes) -> Result<String> {
 /// ```
 pub(crate) fn decode_exports(bytes: &mut Bytes) -> Result<Vec<ExportEntry>> {
     let mut result = Vec::new();
-    loop {
-        if bytes.remaining() < 4 {
-            return Err(NfsError::Xdr("response truncated (export opt)".to_string()));
-        }
-        if bytes.get_u32() == 0 {
-            break;
-        }
-        let path = decode_xdr_string(bytes)?;
+    while has_next(bytes, "entries")? {
+        let path = decode_field(bytes, MNTPATHLEN, "path")?;
         let mut groups = Vec::new();
-        loop {
-            if bytes.remaining() < 4 {
-                return Err(NfsError::Xdr("response truncated (group opt)".to_string()));
-            }
-            if bytes.get_u32() == 0 {
-                break;
-            }
-            groups.push(decode_xdr_string(bytes)?);
+        while has_next(bytes, "groups")? {
+            groups.push(decode_field(bytes, MNTNAMLEN, "group")?);
         }
         result.push(ExportEntry { path, groups });
     }
@@ -105,17 +111,17 @@ impl Mount {
 mod tests {
     use super::*;
 
-    fn build_xdr_string(s: &str) -> Vec<u8> {
+    fn build_xdr_string(s: &[u8]) -> Vec<u8> {
         let len = s.len();
         let pad = (4 - len % 4) % 4;
         let mut v = Vec::new();
         v.extend_from_slice(&(len as u32).to_be_bytes());
-        v.extend_from_slice(s.as_bytes());
+        v.extend_from_slice(s);
         v.extend(std::iter::repeat_n(0u8, pad));
         v
     }
 
-    fn build_export_response(entries: &[(&str, &[&str])]) -> Vec<u8> {
+    fn build_export_response(entries: &[(&[u8], &[&[u8]])]) -> Vec<u8> {
         let mut v = Vec::new();
         for (path, groups) in entries {
             v.extend_from_slice(&1u32.to_be_bytes()); // more export entries
@@ -140,7 +146,7 @@ mod tests {
 
     #[test]
     fn decode_exports_single_no_groups() {
-        let raw = build_export_response(&[("/vol/data", &[])]);
+        let raw = build_export_response(&[(b"/vol/data", &[])]);
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
         assert_eq!(result.len(), 1);
@@ -150,7 +156,7 @@ mod tests {
 
     #[test]
     fn decode_exports_single_with_groups() {
-        let raw = build_export_response(&[("/exports/share", &["client1", "10.0.0.0/24"])]);
+        let raw = build_export_response(&[(b"/exports/share", &[b"client1", b"10.0.0.0/24"])]);
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
         assert_eq!(result.len(), 1);
@@ -161,9 +167,9 @@ mod tests {
     #[test]
     fn decode_exports_multiple_entries() {
         let raw = build_export_response(&[
-            ("/vol/home", &["@trusted"]),
-            ("/vol/data", &[]),
-            ("/vol/backup", &["host-a", "host-b"]),
+            (b"/vol/home", &[b"@trusted"]),
+            (b"/vol/data", &[]),
+            (b"/vol/backup", &[b"host-a", b"host-b"]),
         ]);
         let mut bytes = Bytes::from(raw);
         let result = decode_exports(&mut bytes).unwrap();
@@ -182,5 +188,32 @@ mod tests {
         let raw = 1u32.to_be_bytes();
         let mut bytes = Bytes::from(raw.to_vec());
         assert!(decode_exports(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn decode_exports_borrows_raw_paths_and_groups() {
+        let reply = Bytes::from(build_export_response(&[
+            (b"/data/\xff", &[b"\xfe"]),
+            (b"/valid", &[]),
+        ]));
+        let entries = decode_exports(&mut reply.clone()).unwrap();
+        assert_eq!(entries[0].path.as_ref(), b"/data/\xff");
+        assert_eq!(entries[0].path.as_ptr(), reply[8..].as_ptr());
+        assert_eq!(entries[0].groups[0].as_ref(), b"\xfe");
+        assert_eq!(entries[1].path.as_ref(), b"/valid");
+    }
+
+    #[test]
+    fn decode_exports_checks_mount_field_limits() {
+        let path = [&b"/"[..], &vec![b'a'; MNTPATHLEN as usize - 1]].concat();
+        let group = vec![b'a'; MNTNAMLEN as usize];
+        for (path, group, valid) in [
+            (path.clone(), group.clone(), true),
+            ([path.as_slice(), b"a"].concat(), group.clone(), false),
+            (path, [group.as_slice(), b"a"].concat(), false),
+        ] {
+            let reply = build_export_response(&[(&path, &[&group])]);
+            assert_eq!(decode_exports(&mut reply.into()).is_ok(), valid);
+        }
     }
 }

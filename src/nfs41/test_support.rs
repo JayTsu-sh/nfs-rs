@@ -176,11 +176,20 @@ async fn serve_version_observed(
 }
 
 pub(super) fn directory_page(cookie: Option<u64>, eof: bool, verifier: [u8; 8]) -> Vec<u8> {
+    named_directory_page(cookie, eof, verifier, b"entry")
+}
+
+pub(super) fn named_directory_page(
+    cookie: Option<u64>,
+    eof: bool,
+    verifier: [u8; 8],
+    name: &[u8],
+) -> Vec<u8> {
     let mut data = verifier.to_vec();
     xdr_u32(&mut data, u32::from(cookie.is_some()));
     if let Some(cookie) = cookie {
         data.extend(cookie.to_be_bytes());
-        xdr_opaque(&mut data, b"entry");
+        xdr_opaque(&mut data, name);
         xdr_u32(&mut data, 1);
         xdr_u32(&mut data, 1 << 20);
         xdr_opaque(&mut data, &42u64.to_be_bytes());

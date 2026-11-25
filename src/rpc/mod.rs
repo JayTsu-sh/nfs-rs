@@ -22,6 +22,7 @@ use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -356,6 +357,23 @@ impl AsyncWrite for ConnectionWriter {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffers: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.half.as_mut() {
+            Some(half) => Pin::new(half).poll_write_vectored(cx, buffers),
+            None => std::task::Poll::Ready(Err(Self::poisoned())),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.half
+            .as_ref()
+            .is_some_and(AsyncWrite::is_write_vectored)
+    }
+
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -384,12 +402,47 @@ struct FrameWriteGuard<'a> {
     complete: bool,
 }
 
+struct OutgoingRecord<'a> {
+    prefix: &'a [u8],
+    body: &'a [u8],
+    data: &'a [u8],
+    padding: usize,
+}
+
+impl OutgoingRecord<'_> {
+    async fn write(self, stream: &mut ConnectionWriter) -> std::io::Result<()> {
+        let mut slices = [
+            IoSlice::new(self.prefix),
+            IoSlice::new(self.body),
+            IoSlice::new(self.data),
+            IoSlice::new(&[0; 3][..self.padding]),
+        ];
+        let mut remaining = slices.as_mut_slice();
+        IoSlice::advance_slices(&mut remaining, 0);
+        while !remaining.is_empty() {
+            let count = stream.write_vectored(remaining).await?;
+            if count == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut remaining, count);
+        }
+        stream.flush().await
+    }
+}
+
 impl Drop for FrameWriteGuard<'_> {
     fn drop(&mut self) {
         if !self.complete {
             self.writer.poison();
         }
     }
+}
+
+/// Per-attempt state for `send_and_receive_inner`.
+struct SendAttempt {
+    bypass_readiness: bool,
+    /// Generation of the connection the write actually landed on.
+    used_generation: u64,
 }
 
 type ConnectionReader = BufReader<ReadHalf<BoxedRpcStream>>;
@@ -428,6 +481,13 @@ pub(crate) struct StreamMux {
     endpoint: Endpoint,
     dialer: Arc<dyn Dialer>,
     generation: AtomicU64,
+    /// Generation of the connection currently installed in `writer`.
+    ///
+    /// Updated under the writer lock when `reconnect` swaps the stream, before
+    /// the post-BIND `generation` publish. A request can therefore observe which
+    /// generation its actual write went to even if it was admitted during
+    /// `REBINDING` and the published `generation` still names the old link.
+    writer_generation: AtomicU64,
     reconnect_lock: TokioMutex<()>,
     reconnect_handler: std::sync::Mutex<Option<ReconnectHandler>>,
     readiness: AtomicU8,
@@ -439,6 +499,10 @@ pub(crate) struct StreamMux {
     stopping: Notify,
     /// Highest closed reader generation plus one; old readers cannot poison a new connection.
     failed_generation: Arc<AtomicU64>,
+    /// Highest generation retired because a sent request timed out. Kept separate
+    /// from `failed_generation`: a retired reader is still running, only later
+    /// callers must avoid queueing behind it.
+    retired_generation: AtomicU64,
 }
 
 impl StreamMux {
@@ -485,6 +549,7 @@ impl StreamMux {
             endpoint,
             dialer,
             generation: AtomicU64::new(0),
+            writer_generation: AtomicU64::new(0),
             reconnect_lock: TokioMutex::new(()),
             reconnect_handler: std::sync::Mutex::new(None),
             readiness: AtomicU8::new(CONNECTION_READY),
@@ -493,11 +558,35 @@ impl StreamMux {
             shutdown_flag: AtomicBool::new(false),
             stopping: Notify::new(),
             failed_generation,
+            retired_generation: AtomicU64::new(0),
         })
     }
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Marks `generation` as retired so that the next request reconnects instead of
+    /// queueing behind a connection that may be half-open.
+    ///
+    /// RFC 5531 section 5: a request that timed out after being sent may or may not
+    /// have executed, so the caller must still report it as uncertain. Retiring only
+    /// affects *later* requests — it never replays the timed-out one.
+    fn retire(&self, generation: u64) {
+        let next = generation.saturating_add(1);
+        let previous = self.retired_generation.fetch_max(next, Ordering::AcqRel);
+        if previous < next {
+            warn!(
+                addr = %self.endpoint,
+                generation,
+                "retiring RPC connection after a sent request timed out"
+            );
+        }
+    }
+
+    /// Whether `generation` has been retired.
+    fn is_retired(&self, generation: u64) -> bool {
+        self.retired_generation.load(Ordering::Acquire) > generation
     }
 
     /// Install the backchannel handler so the reader loop dispatches inbound
@@ -538,20 +627,16 @@ impl StreamMux {
         }
     }
 
-    /// `header` is the pre-assembled RPC frame header + msg_body (prefix already prepended).
-    /// `data` is the optional large payload (e.g. WRITE data), sent zero-copy after the header.
     async fn send_and_receive_inner(
         &self,
         xid: u32,
-        header: &[u8],
-        data: &[u8],
-        data_pad: usize,
+        record: OutgoingRecord<'_>,
         timeout: std::time::Duration,
-        bypass_readiness: bool,
+        send_attempt: &mut SendAttempt,
     ) -> Result<Bytes> {
         let mut transmission = crate::RequestTransmission::NotSent;
         let attempt = async {
-            if !bypass_readiness {
+            if !send_attempt.bypass_readiness {
                 self.wait_until_ready().await.map_err(|error| {
                     NfsError::transport(crate::RequestTransmission::NotSent, error)
                 })?;
@@ -566,7 +651,7 @@ impl StreamMux {
                 })?;
                 // Check under the same lock used when the reader fails waiters: a request
                 // is either rejected here or included in that drain, never stranded after it.
-                if !bypass_readiness
+                if !send_attempt.bypass_readiness
                     && self.failed_generation.load(Ordering::Acquire)
                         > self.generation.load(Ordering::Acquire)
                 {
@@ -586,7 +671,6 @@ impl StreamMux {
             };
 
             // Write request under the writer lock — released before awaiting the response.
-            // `header` already contains the RPC frame prefix + msg_body (zero-copy, no extra alloc).
             // Shutdown interrupts a send waiting for the writer or stalled in
             // it; the frame guard then releases the stream.
             let stopping = self.stopping.notified();
@@ -600,25 +684,18 @@ impl StreamMux {
             }
             let write = async {
                 let writer = self.writer.lock().await;
+                // Record the generation paired with the stream we are about to
+                // write to. A rebind may have been admitted while we waited for
+                // readiness, so the pre-send snapshot is already stale here.
+                send_attempt.used_generation = self.writer_generation.load(Ordering::Acquire);
                 let mut frame = FrameWriteGuard {
                     writer,
                     complete: false,
                 };
                 transmission = crate::RequestTransmission::Sent;
-                async {
-                    frame.writer.write_all(header).await?;
-                    if !data.is_empty() {
-                        frame.writer.write_all(data).await?;
-                        if data_pad > 0 {
-                            frame.writer.write_all(&[0u8; 4][..data_pad]).await?;
-                        }
-                    }
-                    // A buffered stream holds the record until flushed.
-                    frame.writer.flush().await?;
-                    frame.complete = true;
-                    Ok::<(), NfsError>(())
-                }
-                .await
+                record.write(&mut frame.writer).await?;
+                frame.complete = true;
+                Ok::<(), NfsError>(())
             };
             let write_result = tokio::select! {
                 biased;
@@ -670,6 +747,7 @@ impl StreamMux {
             )));
         }
         let _reconnect = self.reconnect_lock.lock().await;
+        let next_generation = failed_gen.saturating_add(1);
         info!(addr = %self.endpoint, failed_gen, "initiating reconnection");
         // Fast path: another caller already reconnected (no lock needed).
         let current_gen = self.generation.load(Ordering::Acquire);
@@ -725,8 +803,12 @@ impl StreamMux {
                 ))));
             }
         }
-        // Install new connection.
+        // Install new connection. Pair the swap with its generation under the
+        // same lock so a send that follows can retire the connection it used,
+        // even while the post-BIND `generation` publish is still pending.
         *writer = new_writer;
+        self.writer_generation
+            .store(next_generation, Ordering::Release);
         {
             let mut guard = self
                 .reader_handle
@@ -739,11 +821,10 @@ impl StreamMux {
                 Arc::clone(&self.writer),
                 Arc::clone(&self.backchannel),
                 Arc::clone(&self.failed_generation),
-                failed_gen.saturating_add(1),
+                next_generation,
             )));
         }
         drop(writer);
-        let next_generation = failed_gen.saturating_add(1);
         let handler = self
             .reconnect_handler
             .lock()
@@ -1085,7 +1166,7 @@ impl Client {
 
     async fn call_with_data_inner(
         &self,
-        mut msg_body: Vec<u8>,
+        msg_body: Vec<u8>,
         data: Bytes,
         replay_policy: ReplayPolicy,
         timeout: std::time::Duration,
@@ -1117,12 +1198,11 @@ impl Client {
         let data_pad = (4 - data_len % 4) % 4;
         let payload_len = (8 + msg_body.len() + data_len + data_pad) as u32;
 
-        // Prepend 12-byte RPC frame prefix space to msg_body (one-time allocation).
-        // XID at offset 4..8 is overwritten per retry; the rest is constant.
-        msg_body.splice(0..0, [0u8; PREFIX_LEN]);
-        BigEndian::write_u32(&mut msg_body[0..4], payload_len | SIZE_HDR_BIT);
-        // msg_body[4..8] = xid, written per retry below
-        BigEndian::write_u32(&mut msg_body[8..12], MessageType::Request as u32);
+        // The record marker (RFC 5531 §11), XID and message type precede
+        // the body without moving its encoded bytes.
+        let mut prefix = [0; PREFIX_LEN];
+        BigEndian::write_u32(&mut prefix[0..4], payload_len | SIZE_HDR_BIT);
+        BigEndian::write_u32(&mut prefix[8..12], MessageType::Request as u32);
 
         while attempt < max_attempts {
             let attempt_deadline = disconnect
@@ -1132,9 +1212,47 @@ impl Client {
                 break;
             }
 
+            // A previous sent request may have retired this connection because its
+            // reply never arrived. Replace it before queueing more work behind a
+            // possibly half-open socket; `reconnect` is single-flight and
+            // generation-checked, so concurrent callers converge on one new link.
+            // The redial is bounded by this attempt's deadline: a connect stall
+            // must not push the call past the timeout the caller asked for.
+            if !bypass_readiness {
+                let current_generation = mux.generation();
+                if mux.is_retired(current_generation) {
+                    match tokio::time::timeout_at(
+                        attempt_deadline,
+                        mux.reconnect(current_generation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            return Err(if let Some(recovery) = disconnect {
+                                recovery.failure(logical_transmission)
+                            } else {
+                                NfsError::transport(logical_transmission, error)
+                            });
+                        }
+                        Err(_) => {
+                            let timeout_error = NfsError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "RPC reconnect timeout",
+                            ));
+                            return Err(if let Some(recovery) = disconnect {
+                                recovery.failure(logical_transmission)
+                            } else {
+                                NfsError::transport(logical_transmission, timeout_error)
+                            });
+                        }
+                    }
+                }
+            }
+
             // Each retry uses a fresh XID (the old one may have stale responses in flight).
             let xid = get_xid();
-            BigEndian::write_u32(&mut msg_body[4..8], xid);
+            BigEndian::write_u32(&mut prefix[4..8], xid);
 
             debug!(
                 xid,
@@ -1144,17 +1262,23 @@ impl Client {
                 program,
                 "sending RPC request"
             );
-            let r#gen = mux.generation();
+            let mut send_attempt = SendAttempt {
+                bypass_readiness,
+                used_generation: mux.generation(),
+            };
             let res = mux
                 .send_and_receive_inner(
                     xid,
-                    &msg_body,
-                    &data,
-                    data_pad,
+                    OutgoingRecord {
+                        prefix: &prefix,
+                        body: &msg_body,
+                        data: &data,
+                        padding: data_pad,
+                    },
                     timeout.min(
                         attempt_deadline.saturating_duration_since(tokio::time::Instant::now()),
                     ),
-                    bypass_readiness,
+                    &mut send_attempt,
                 )
                 .await;
 
@@ -1178,7 +1302,14 @@ impl Client {
                     if is_conn_error {
                         let recovery =
                             disconnect.get_or_insert_with(|| DisconnectRecovery::new(e, deadline));
-                        attempt += 1;
+                        // A request that never crossed the send boundary cannot
+                        // have executed, so it does not consume a replay attempt:
+                        // ONE_ATTEMPT (WRITE) must still resend after a reconnect.
+                        // Only sends after a real transmission are bounded by the
+                        // policy's attempt count.
+                        if logical_transmission == crate::RequestTransmission::Sent {
+                            attempt += 1;
+                        }
                         if attempt >= max_attempts {
                             break;
                         }
@@ -1194,7 +1325,10 @@ impl Client {
                         );
                         let reconnect = async {
                             tokio::time::sleep(backoff).await;
-                            mux.reconnect(r#gen).await
+                            // Replace the link this attempt actually used, not the
+                            // generation published before the send: an attempt
+                            // admitted during REBINDING lands on the new writer.
+                            mux.reconnect(send_attempt.used_generation).await
                         };
                         match tokio::time::timeout_at(recovery.deadline, reconnect).await {
                             Ok(Ok(())) => {}
@@ -1209,6 +1343,22 @@ impl Client {
                     } else if is_timeout {
                         attempt += 1;
                         if attempt >= max_attempts {
+                            // Final timeout for a request that was already written.
+                            // Retire the connection so later requests reconnect
+                            // instead of each burning a full timeout on the same
+                            // stalled socket. The request keeps its Sent/uncertain
+                            // outcome; it is never replayed here.
+                            //
+                            // Only operations that cannot be replayed at the
+                            // transport layer (`ONE_ATTEMPT`, i.e. ReplaySensitive)
+                            // retire: a replayed read consumes its own retries, so a
+                            // slow-but-alive server does not lose the connection and
+                            // tear down every other request in flight on it.
+                            if logical_transmission == crate::RequestTransmission::Sent
+                                && replay_policy.max_attempts() == 1
+                            {
+                                mux.retire(send_attempt.used_generation);
+                            }
                             last_error = Some(e);
                             continue;
                         }
@@ -1284,6 +1434,8 @@ impl Client {
 /// Format: [xid(4)] [msgtype(4)] [msg_status(4)] [verf_flavor(4)] [verf_len(4)]
 ///         [verf_data…] [accept_stat(4)] [payload…]
 fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
+    const MAX_AUTH_BODY: usize = 400; // RFC 5531 §8.2, opaque_auth.
+
     let read_u32 = |data: &[u8], p: usize| -> Result<u32> {
         if p + 4 > data.len() {
             return Err(NfsError::Rpc("response truncated".to_string()));
@@ -1345,10 +1497,15 @@ fn parse_rpc_response(res: Bytes, xid: u32) -> Result<Bytes> {
     pos += 4;
     if accept_status != AcceptStatus::Success as i32 {
         error!(xid, accept_status, "RPC request rejected by server");
-        // Preserve authoritative unsupported-program evidence for optional RPC
-        // extensions. Authentication, garbage arguments and system failures
-        // must remain errors rather than silently disabling a feature.
-        // RFC 5531 section 9: PROG_UNAVAIL, PROG_MISMATCH, PROC_UNAVAIL.
+        // RFC 5531 §9 defines a void body for GARBAGE_ARGS.
+        if accept_status == AcceptStatus::GarbageArgs as i32
+            && verf_len <= MAX_AUTH_BODY
+            && pos == res.len()
+        {
+            return Err(NfsError::RpcGarbageArgs);
+        }
+        // Optional RPC extensions use the service-unavailable statuses to
+        // detect support (PROG_UNAVAIL, PROG_MISMATCH, PROC_UNAVAIL).
         if matches!(accept_status, 1..=3) {
             return Err(NfsError::Unsupported(format!(
                 "RPC service unavailable (accept status {accept_status})"
@@ -1381,7 +1538,6 @@ enum AcceptStatus {
     ProgMismatch = 2,
     #[allow(unused)]
     ProcUnavail = 3,
-    #[allow(unused)]
     GarbageArgs = 4,
 }
 
@@ -1430,11 +1586,15 @@ mod tests {
                 Err(NfsError::Unsupported(_))
             ));
         }
+        let mut oversized_verifier = vec![42u32, 1, 0, 0, 404];
+        oversized_verifier.extend([0; 101]);
+        oversized_verifier.push(4);
         for reply in [
-            vec![42u32, 1, 0, 0, 0, 4], // GARBAGE_ARGS
-            vec![42, 1, 0, 0, 0, 5],    // SYSTEM_ERR
-            vec![42, 1, 1, 1, 5],       // MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK
-            vec![42, 1, 0, 0, 0],       // Missing accept status
+            vec![42u32, 1, 0, 0, 0, 4, 0], // GARBAGE_ARGS with unexpected body
+            oversized_verifier,            // GARBAGE_ARGS with malformed verifier
+            vec![42, 1, 0, 0, 0, 5],       // SYSTEM_ERR
+            vec![42, 1, 1, 1, 5],          // MSG_DENIED, AUTH_ERROR, AUTH_TOOWEAK
+            vec![42, 1, 0, 0, 0],          // Missing accept status
         ] {
             let reply = reply
                 .into_iter()
@@ -1601,14 +1761,21 @@ mod tests {
                 .transport_error_kind(),
             Some(std::io::ErrorKind::NotConnected)
         );
+        let mut send_attempt = SendAttempt {
+            bypass_readiness: false,
+            used_generation: 0,
+        };
         let error = mux
             .send_and_receive_inner(
                 7,
-                &[0; 12],
-                &[],
-                0,
+                OutgoingRecord {
+                    prefix: &[0; 12],
+                    body: &[],
+                    data: &[],
+                    padding: 0,
+                },
                 std::time::Duration::from_millis(10),
-                false,
+                &mut send_attempt,
             )
             .await
             .expect_err("failed readiness must reject before sending");
@@ -2030,6 +2197,385 @@ mod tests {
         assert_eq!(reply, Bytes::from_static(b"ok"));
         assert_eq!(dialer.dialed(), vec![endpoint.clone(), endpoint]);
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sent_timeout_retires_connection_and_next_call_uses_a_fresh_one() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let mut second = dialer.accept();
+        let server = tokio::spawn(async move {
+            // First connection: consume the request but never answer, so the
+            // client observes a Sent request that timed out.
+            read_test_record(&mut first).await.unwrap();
+            // Second connection: answer normally.
+            let record = read_test_record(&mut second).await.unwrap();
+            write_test_rpc_reply(&mut second, BigEndian::read_u32(&record[..4]), b"ok")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(Arc::clone(&mux), None);
+
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        assert!(
+            mux.is_retired(mux.generation()),
+            "a Sent request that timed out must retire the connection"
+        );
+
+        // The following call must reconnect instead of queueing behind the
+        // stalled socket; otherwise every later call burns its own timeout.
+        let reply = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, Bytes::from_static(b"ok"));
+        assert_eq!(mux.generation(), 1);
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retired_connection_fails_before_send_when_redial_is_refused() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let server = tokio::spawn(async move {
+            read_test_record(&mut first).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(Arc::clone(&mux), None);
+
+        let _ = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(mux.is_retired(mux.generation()));
+
+        // No queued connection: the retry must fail before writing and must not
+        // put the request on the retired socket.
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        assert_eq!(mux.generation(), 0);
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_before_sending_does_not_retire_connection() {
+        let client = Client::new_dummy().await;
+        client
+            .nfs_mux
+            .readiness
+            .store(CONNECTION_REBINDING, Ordering::Release);
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::ONE_ATTEMPT,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::NotSent)
+        );
+        assert!(
+            !client.nfs_mux.is_retired(client.nfs_mux.generation()),
+            "a request that never reached the socket must not retire the connection"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replayed_timeout_does_not_retire_the_connection() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let server = tokio::spawn(async move {
+            read_test_record(&mut first).await.unwrap();
+            // Swallow the replay as well: the client must not reconnect between
+            // attempts, and a replayable call must leave the link for the next
+            // caller instead of retiring it.
+            read_test_record(&mut first).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let client = Client::new(mux, None);
+
+        let error = client
+            .call(
+                nfs_test_body(),
+                ReplayPolicy::byte_identical(2),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            dialer.dialed().len(),
+            1,
+            "a replayable call must not reconnect between attempts"
+        );
+        assert!(
+            !client.nfs_mux.is_retired(client.nfs_mux.generation()),
+            "only ReplaySensitive (ONE_ATTEMPT) timeouts retire the connection"
+        );
+
+        client.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retiring_a_generation_does_not_retire_its_successor() {
+        let client = Client::new_dummy().await;
+        let mux = &client.nfs_mux;
+        let current = mux.generation();
+
+        mux.retire(current);
+
+        assert!(mux.is_retired(current));
+        assert!(
+            !mux.is_retired(current + 1),
+            "the connection built by reconnect (generation + 1) must stay usable"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replayable_request_keeps_sent_evidence_when_retired_redial_fails() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let mut first = dialer.accept();
+        let _second = dialer.accept();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            read_test_record(&mut first).await.unwrap();
+            let _ = sent_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        mux.set_reconnect_handler(Arc::new(|_client, _generation| {
+            Box::pin(async { Err(NfsError::Rpc("injected bind failure".to_string())) })
+        }))
+        .unwrap();
+
+        let call = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move {
+                Client::new(mux, None)
+                    .call(
+                        nfs_test_body(),
+                        ReplayPolicy::byte_identical(2),
+                        std::time::Duration::from_millis(200),
+                    )
+                    .await
+            }
+        });
+        sent_rx.await.unwrap();
+        // Simulate a concurrent ONE_ATTEMPT request retiring the link after this
+        // replayable request has already been written to it.
+        mux.retire(mux.generation());
+
+        let error = call.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent),
+            "already-sent evidence must survive a failed retirement redial"
+        );
+
+        mux.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_admitted_during_rebind_retires_the_connection_it_used() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let _first = dialer.accept();
+        let mut second = dialer.accept();
+        let server = tokio::spawn(async move {
+            // The rebound connection receives the request but never answers it.
+            read_test_record(&mut second).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            mux.set_reconnect_handler(Arc::new(move |_client, _generation| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+        }
+        let rebind = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move { mux.reconnect(0).await }
+        });
+        entered.notified().await;
+
+        // Admitted while the mux is REBINDING: the pre-send generation is the
+        // old one, but the write below lands on the new connection.
+        let call = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move {
+                Client::new(mux, None)
+                    .call(
+                        nfs_test_body(),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        std::time::Duration::from_millis(300),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        release.notify_one();
+
+        let error = call.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.request_transmission(),
+            Some(crate::RequestTransmission::Sent)
+        );
+        assert_eq!(mux.generation(), 1);
+        assert!(
+            mux.is_retired(mux.generation()),
+            "the retired generation must be the one whose writer sent the request"
+        );
+
+        rebind.await.unwrap().unwrap();
+        mux.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_error_on_the_rebind_link_replaces_that_link() {
+        let dialer = Arc::new(crate::dialer::ScriptedDialer::default());
+        let _first = dialer.accept();
+        let mut second = dialer.accept();
+        let mut third = dialer.accept();
+        let endpoint = Endpoint::new("nfs.example.internal", 2049);
+        let mux = StreamMux::dial(dialer.clone(), endpoint).await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let rebinds = Arc::clone(&rebinds);
+            mux.set_reconnect_handler(Arc::new(move |_client, _generation| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let rebinds = Arc::clone(&rebinds);
+                Box::pin(async move {
+                    // Hold the first BIND open so the call below is admitted
+                    // while `generation` still names the old link.
+                    if rebinds.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(())
+                })
+            }))
+            .unwrap();
+        }
+
+        let server = tokio::spawn(async move {
+            // The rebound link takes the request and dies; the client must
+            // replace *that* link, not the already-replaced predecessor.
+            read_test_record(&mut second).await.unwrap();
+            drop(second);
+            let record = read_test_record(&mut third).await.unwrap();
+            write_test_rpc_reply(&mut third, BigEndian::read_u32(&record[..4]), b"ok")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let rebind = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move { mux.reconnect(0).await }
+        });
+        entered.notified().await;
+
+        let call = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move {
+                Client::new(mux, None)
+                    .call(
+                        nfs_test_body(),
+                        ReplayPolicy::byte_identical(2),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await
+            }
+        });
+        // Let the call capture generation 0 and block on readiness, then finish
+        // the BIND so its write lands on generation 1.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(mux.generation(), 0);
+        release.notify_one();
+
+        let reply = call.await.unwrap().unwrap();
+        assert_eq!(reply, Bytes::from_static(b"ok"));
+        assert_eq!(
+            mux.generation(),
+            2,
+            "the failed rebound link must be replaced by a new generation"
+        );
+        assert_eq!(
+            dialer.dialed().len(),
+            3,
+            "recovery must redial instead of retrying on the dead rebound link"
+        );
+
+        rebind.await.unwrap().unwrap();
+        mux.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]

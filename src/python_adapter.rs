@@ -1,3 +1,5 @@
+mod name_buffer;
+
 mod completion;
 mod dialer;
 
@@ -15,7 +17,7 @@ use futures::{Stream, StreamExt};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple, PyType};
+use pyo3::types::{PyBytes, PyDict, PyMemoryView, PyModule, PyTuple, PyType};
 use std::collections::HashMap;
 use std::future::Future;
 #[cfg(feature = "python-test-support")]
@@ -32,7 +34,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 // Keep protocol work independent of the GIL and bound queued directory memory.
 const DIRECTORY_BATCH_SIZE: usize = 128;
-type DirectoryEntry = (String, Attr, Bytes);
+type DirectoryEntry = (Bytes, Attr, Bytes, Bytes);
 type DirectoryItem = Result<Vec<DirectoryEntry>>;
 type DirectoryPage = (Vec<DirectoryEntry>, DirectoryCookie, bool);
 
@@ -214,9 +216,9 @@ struct ConnectedParts {
 struct AdapterResources {
     files: Mutex<HashMap<ResourceKey, Arc<FileResource>>>,
     #[cfg(feature = "python-test-support")]
-    test_files: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Vec<u8>>>>>,
+    test_files: Mutex<HashMap<Bytes, Arc<tokio::sync::Mutex<Vec<u8>>>>>,
     #[cfg(feature = "python-test-support")]
-    test_xattrs: Mutex<HashMap<(String, String), Vec<u8>>>,
+    test_xattrs: Mutex<HashMap<(Bytes, String), Vec<u8>>>,
 }
 
 impl AdapterResources {
@@ -245,13 +247,13 @@ impl AdapterResources {
     }
 
     #[cfg(feature = "python-test-support")]
-    fn test_file(&self, path: &str) -> Result<Arc<tokio::sync::Mutex<Vec<u8>>>> {
+    fn test_file(&self, path: Bytes) -> Result<Arc<tokio::sync::Mutex<Vec<u8>>>> {
         let mut files = self
             .test_files
             .lock()
             .map_err(|_| NfsError::Rpc("test file registry lock poisoned".to_string()))?;
         Ok(files
-            .entry(path.to_string())
+            .entry(path)
             .or_insert_with(|| {
                 Arc::new(tokio::sync::Mutex::new(
                     b"abcdefghijklmnopqrstuvwxyz".to_vec(),
@@ -328,7 +330,7 @@ impl FileMode {
 
 #[derive(Debug)]
 struct FileResource {
-    safe_path: String,
+    safe_path: Bytes,
     backend: FileBackend,
     mode: FileMode,
     operation_gate: Arc<RwLock<()>>,
@@ -584,7 +586,7 @@ impl crate::fileio::ReadIo for FileResource {
 
 impl FileResource {
     fn mount(
-        safe_path: String,
+        safe_path: Bytes,
         mount: Arc<dyn Mount>,
         file: OpenFile,
         mode: FileMode,
@@ -631,7 +633,7 @@ impl FileResource {
 
     #[cfg(feature = "python-test-support")]
     async fn test(
-        safe_path: String,
+        safe_path: Bytes,
         mode: FileMode,
         data: Arc<tokio::sync::Mutex<Vec<u8>>>,
         fail_commit: bool,
@@ -773,7 +775,7 @@ impl FileResource {
 
     async fn read_chunk(&self, offset: u64, count: u32) -> Result<Bytes> {
         #[cfg(feature = "python-test-support")]
-        if self.safe_path == "__pnfs_data_path_failure__" {
+        if self.safe_path.as_ref() == b"__pnfs_data_path_failure__" {
             return Err(NfsError::OperationOutcome(Box::new(
                 crate::OperationOutcomeError::new(
                     crate::OperationOutcome::SafeToRetry,
@@ -1257,7 +1259,7 @@ struct PythonErrorPayload<'a> {
     operation_class: Option<&'a str>,
     completed_bytes: Option<u64>,
     errno: Option<i32>,
-    filename: Option<&'a str>,
+    filename: Option<&'a [u8]>,
     retry_count: Option<u32>,
     retry_elapsed_ms: Option<u64>,
     retry_reason: Option<&'a str>,
@@ -1299,7 +1301,10 @@ fn structured_error(payload: PythonErrorPayload<'_>) -> PyErr {
         kwargs.set_item("operation_class", payload.operation_class)?;
         kwargs.set_item("completed_bytes", payload.completed_bytes)?;
         kwargs.set_item("errno", payload.errno)?;
-        kwargs.set_item("filename", payload.filename)?;
+        kwargs.set_item(
+            "filename",
+            payload.filename.map(|path| PyBytes::new(py, path)),
+        )?;
         kwargs.set_item("retry_count", payload.retry_count)?;
         kwargs.set_item("retry_elapsed_ms", payload.retry_elapsed_ms)?;
         kwargs.set_item("retry_reason", payload.retry_reason)?;
@@ -1587,7 +1592,9 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
                 std::io::ErrorKind::PermissionDenied => "NfsPermissionError",
                 _ => "NfsOSError",
             },
-            errno: io.raw_os_error(),
+            errno: io.raw_os_error().or_else(|| {
+                (io.kind() == std::io::ErrorKind::WouldBlock).then_some(nix::libc::EAGAIN)
+            }),
             recovery: None,
         },
         NfsError::Nfs3(code) => nfs3_python_mapping::descriptor(code).0,
@@ -1601,6 +1608,11 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
             class_name: "NfsRpcError",
             errno: None,
             recovery: None,
+        },
+        NfsError::RpcGarbageArgs => PythonErrorKind {
+            class_name: "NfsRpcError",
+            errno: None,
+            recovery: Some(recovery_name(crate::RecoveryAction::DoNotRetry)),
         },
         NfsError::Xdr(_) => PythonErrorKind {
             class_name: "NfsEncodingError",
@@ -1674,8 +1686,8 @@ fn error_kind(error: &NfsError) -> PythonErrorKind {
     }
 }
 
-/// Structured `(code, code_name)` for a protocol status, including the status a
-/// state-recovery wrapper retained when its source is not a protocol error.
+/// Structured `(code, code_name)` for an RPC or NFS status, including a status
+/// retained by a state-recovery error.
 fn structured_status(error: &NfsError) -> Option<(i64, String)> {
     match error {
         NfsError::Nfs3(status) => Some((
@@ -1683,6 +1695,7 @@ fn structured_status(error: &NfsError) -> Option<(i64, String)> {
             format!("{status:?}"),
         )),
         NfsError::Nfs4(status) => Some((*status as i64, format!("{status:?}"))),
+        NfsError::RpcGarbageArgs => Some((4, "GARBAGE_ARGS".into())),
         NfsError::StateRecoveryExhausted(details) => {
             Some((details.status as i64, format!("{:?}", details.status)))
         }
@@ -1694,7 +1707,7 @@ fn nfs_error_with_context(
     error: &NfsError,
     explicit_operation: Option<&str>,
     explicit_protocol: Option<NFSVersion>,
-    filename: Option<&str>,
+    filename: Option<&[u8]>,
 ) -> PyErr {
     if let NfsError::ServerBusy(busy) = error {
         let (code, code_name) = match busy.source.as_ref() {
@@ -2021,11 +2034,16 @@ fn directory_batch_dicts(
     py: Python<'_>,
     entries: Vec<DirectoryEntry>,
 ) -> PyResult<Vec<Py<PyDict>>> {
+    let parent_fh = entries
+        .first()
+        .and_then(|(_, _, _, fh)| (!fh.is_empty()).then(|| PyBytes::new(py, fh)));
     entries
         .into_iter()
-        .map(|(name, attr, fh)| {
+        .map(|(name, attr, fh, _)| {
+            let parent_fh = parent_fh.as_ref();
             let values = PyDict::new(py);
-            values.set_item("name", name)?;
+            values.set_item("name", name_buffer::byte_view(py, name)?)?;
+            values.set_item("parent_fh", parent_fh)?;
             values.set_item("fh", (!fh.is_empty()).then(|| PyBytes::new(py, &fh)))?;
             values.set_item("info", attr_dict(py, &attr)?)?;
             Ok(values.unbind())
@@ -2114,22 +2132,28 @@ fn test_attr(_path: &str) -> Option<Result<Attr>> {
 async fn stat_attr(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
+    fh: Option<Bytes>,
+    parent: Option<Bytes>,
 ) -> Result<Attr> {
     let _operation = core.begin_operation()?;
-    if let Some(result) = test_attr(&path) {
+    if let Some(result) = test_attr(std::str::from_utf8(&path).unwrap_or_default()) {
         return result;
     }
     let mount = mount.ok_or_else(|| {
         NfsError::Unsupported("stat requires a connected protocol engine".to_string())
     })?;
-    mount.getattr_path(&path).await
+    if fh.is_none() && parent.is_none() {
+        return mount.getattr_path(&path).await;
+    }
+    let fh = target_handle(&*mount, &path, fh, parent).await?;
+    mount.getattr(fh).await
 }
 
 async fn resolve_path(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
 ) -> Result<crate::PathResolution> {
     let _operation = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
@@ -2168,7 +2192,11 @@ fn resolution_dict<'py>(
             PathResolutionStatus::TooManySymlinks => "too_many_symlinks",
         },
     )?;
-    values.set_item("path", result.path)?;
+    let path = result
+        .path
+        .map(|path| name_buffer::byte_view(py, path))
+        .transpose()?;
+    values.set_item("path", path)?;
     match result.object.and_then(|object| object.attr) {
         Some(attr) => values.set_item("info", attr_dict(py, &attr)?)?,
         None => values.set_item("info", py.None())?,
@@ -2240,10 +2268,10 @@ fn finish_v42_open<T>(result: Result<T>, close: Result<()>) -> Result<T> {
     }
 }
 
-fn v42_recovery_path(operation: &str, path: &str, other: Option<&str>) -> Option<String> {
+fn v42_recovery_path(operation: &str, path: &Bytes, other: Option<&Bytes>) -> Option<Bytes> {
     match operation {
-        "copy_range" | "clone_range" => other.map(str::to_owned),
-        _ => Some(path.to_owned()),
+        "copy_range" | "clone_range" => other.cloned(),
+        _ => Some(path.clone()),
     }
 }
 
@@ -2261,8 +2289,8 @@ async fn v42_operation(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     operation: String,
-    path: String,
-    other: Option<String>,
+    path: Bytes,
+    other: Option<Bytes>,
     offset: u64,
     second_offset: u64,
     count: u64,
@@ -2283,6 +2311,11 @@ async fn v42_operation(
             .map(V42Value::Attributes);
     }
     if operation == "setxattr" {
+        let name = other
+            .as_deref()
+            .ok_or_else(|| NfsError::InvalidInput("xattr name required".into()))?;
+        let name = std::str::from_utf8(name)
+            .map_err(|_| NfsError::InvalidInput("xattr name is not UTF-8".into()))?;
         let object = mount.lookup_path(&path).await?;
         let mode = match offset {
             0 => crate::XattrSetMode::Either,
@@ -2293,9 +2326,7 @@ async fn v42_operation(
         mount
             .setxattr_with_mode(
                 object.fh,
-                other
-                    .as_deref()
-                    .ok_or_else(|| NfsError::InvalidInput("xattr name required".into()))?,
+                name,
                 Bytes::from(value.unwrap_or_default()),
                 mode,
             )
@@ -2397,10 +2428,10 @@ impl NamespaceOperation {
         }
     }
 
-    fn recovery_path(self, first: &str, second: Option<&str>) -> Option<String> {
+    fn recovery_path(self, first: &Bytes, second: Option<&Bytes>) -> Option<Bytes> {
         match self {
-            Self::Symlink => second.map(str::to_owned),
-            _ => Some(first.to_owned()),
+            Self::Symlink | Self::Link => second.cloned(),
+            _ => Some(first.clone()),
         }
     }
 }
@@ -2409,8 +2440,8 @@ async fn namespace_operation(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     operation: NamespaceOperation,
-    first: String,
-    second: Option<String>,
+    first: Bytes,
+    second: Option<Bytes>,
 ) -> Result<()> {
     wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
@@ -2419,6 +2450,7 @@ async fn namespace_operation(
     }
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
+        let first = std::str::from_utf8(&first).unwrap_or_default();
         if first.contains("__notdir__") {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_NOTDIR));
         }
@@ -2497,12 +2529,12 @@ async fn namespace_operation(
 async fn readlink_path(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
-) -> Result<String> {
+    path: Bytes,
+) -> Result<Bytes> {
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        return Ok("../target".to_string());
+        return Ok(Bytes::from_static(b"../target"));
     }
     mount
         .ok_or_else(|| {
@@ -2554,7 +2586,7 @@ async fn metadata_operation(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     operation: MetadataOperation,
-    path: String,
+    path: Bytes,
 ) -> Result<()> {
     wait_at_operation_test_barrier(operation.name()).await;
     let _operation_guard = core.begin_operation()?;
@@ -2563,10 +2595,10 @@ async fn metadata_operation(
     }
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        if path == "denied" {
+        if path.as_ref() == b"denied" {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_ACCES));
         }
-        if path == "protocol-error" {
+        if path.as_ref() == b"protocol-error" {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_IO));
         }
         if let Some(error) = injected_fault(operation.name(), "after-send-before-response").await {
@@ -2613,13 +2645,13 @@ async fn metadata_operation(
 async fn access_path(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     mode: u32,
 ) -> Result<bool> {
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        return Ok(path != "denied" && path != "missing" && mode & !0o7 == 0);
+        return Ok(path.as_ref() != b"denied" && path.as_ref() != b"missing" && mode & !0o7 == 0);
     }
     let mount = mount.ok_or_else(|| {
         NfsError::Unsupported("access requires a connected protocol engine".to_string())
@@ -2689,13 +2721,13 @@ async fn xattr_get(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     _resources: Arc<AdapterResources>,
-    path: String,
+    path: Bytes,
     name: String,
 ) -> Result<Vec<u8>> {
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        if path == "unsupported" {
+        if path.as_ref() == b"unsupported" {
             return Err(NfsError::Unsupported(
                 "named attributes are not supported".to_string(),
             ));
@@ -2726,7 +2758,7 @@ enum Acl41Kind {
 async fn acl41_get(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     kind: Acl41Kind,
 ) -> Result<NfsAcl41> {
     let _operation_guard = core.begin_operation()?;
@@ -2742,7 +2774,7 @@ async fn acl41_get(
 async fn acl41_set(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     value: NfsAcl41,
     kind: Acl41Kind,
 ) -> Result<()> {
@@ -2760,7 +2792,7 @@ async fn xattr_set(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     _resources: Arc<AdapterResources>,
-    path: String,
+    path: Bytes,
     name: String,
     value: Vec<u8>,
 ) -> Result<()> {
@@ -2768,7 +2800,7 @@ async fn xattr_set(
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        if path == "__after_send__" {
+        if path.as_ref() == b"__after_send__" {
             return Err(NfsError::OperationOutcome(Box::new(
                 crate::OperationOutcomeError::new(
                     crate::OperationOutcome::Uncertain,
@@ -2783,7 +2815,7 @@ async fn xattr_set(
                 ),
             )));
         }
-        if path == "unsupported" {
+        if path.as_ref() == b"unsupported" {
             return Err(NfsError::Unsupported(
                 "named attributes are not supported".to_string(),
             ));
@@ -2807,12 +2839,12 @@ async fn xattr_list(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     _resources: Arc<AdapterResources>,
-    path: String,
+    path: Bytes,
 ) -> Result<Vec<String>> {
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        if path == "unsupported" {
+        if path.as_ref() == b"unsupported" {
             return Err(NfsError::Unsupported(
                 "named attributes are not supported".to_string(),
             ));
@@ -2840,14 +2872,14 @@ async fn xattr_remove(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     _resources: Arc<AdapterResources>,
-    path: String,
+    path: Bytes,
     name: String,
 ) -> Result<()> {
     wait_at_operation_test_barrier("removexattr").await;
     let _operation_guard = core.begin_operation()?;
     #[cfg(feature = "python-test-support")]
     if mount.is_none() {
-        if path == "unsupported" {
+        if path.as_ref() == b"unsupported" {
             return Err(NfsError::Unsupported(
                 "named attributes are not supported".to_string(),
             ));
@@ -2922,19 +2954,24 @@ fn test_directory_fails(_path: &str) -> bool {
 async fn directory_names(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     timeout: Option<Duration>,
-) -> Result<Vec<String>> {
+) -> Result<Vec<Bytes>> {
     let _operation = core.begin_operation()?;
     let work = async {
-        if test_directory_blocks(&path) {
+        if test_directory_blocks(std::str::from_utf8(&path).unwrap_or_default()) {
             return with_operation_timeout(timeout, "listdir", std::future::pending()).await;
         }
-        if test_directory_fails(&path) {
+        if test_directory_fails(std::str::from_utf8(&path).unwrap_or_default()) {
             return Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM));
         }
-        if let Some(entries) = test_directory_entries(&path) {
-            return Ok(entries.into_iter().map(|(name, _)| name).collect());
+        if let Some(entries) =
+            test_directory_entries(std::str::from_utf8(&path).unwrap_or_default())
+        {
+            return Ok(entries
+                .into_iter()
+                .map(|(name, _)| Bytes::from(name))
+                .collect());
         }
         let mount = mount.ok_or_else(|| {
             NfsError::Unsupported("listdir requires a connected protocol engine".to_string())
@@ -2945,15 +2982,15 @@ async fn directory_names(
         // RFC 1813 §3.3.16, RFC 7530 §16.24, RFC 5661 §18.23: the
         // protocol stream advances the directory cookie and verifier.
         let mut entries = mount.readdir(fh).await;
-        let mut names = Vec::new();
+        let mut names = name_buffer::PackedNames::default();
         while let Some(entry) = with_operation_timeout(timeout, "listdir", async {
             entries.next().await.transpose()
         })
         .await?
         {
-            names.push(entry.file_name);
+            names.push(&entry.file_name)?;
         }
-        Ok(names)
+        Ok(names.finish())
     };
     tokio::select! {
         result = work => result,
@@ -3000,7 +3037,12 @@ fn test_directory_page(path: &str, position: DirectoryCookie) -> Option<Result<D
                 type_: 1,
                 ..Attr::default()
             };
-            (format!("page-entry-{index}"), attr, Bytes::new())
+            (
+                Bytes::from(format!("page-entry-{index}")),
+                attr,
+                Bytes::new(),
+                Bytes::new(),
+            )
         })
         .collect();
     let next = crate::mount::DirectoryCursor::resume(position).page(
@@ -3018,7 +3060,7 @@ fn test_directory_page(_path: &str, _position: DirectoryCookie) -> Option<Result
 }
 
 /// Directory entries crossing into Python always carry attributes.
-fn directory_entry(entry: ReaddirplusEntry) -> Result<DirectoryEntry> {
+fn directory_entry(entry: ReaddirplusEntry, parent: &Bytes) -> Result<DirectoryEntry> {
     let attr = entry
         .attr
         .ok_or_else(|| NfsError::Rpc("directory entry did not include attributes".to_string()))?;
@@ -3027,7 +3069,7 @@ fn directory_entry(entry: ReaddirplusEntry) -> Result<DirectoryEntry> {
     } else {
         entry.handle
     };
-    Ok((entry.file_name, attr, fh))
+    Ok((entry.file_name, attr, fh, parent.clone()))
 }
 
 fn directory_position(cookie: u64, verifier: Option<Vec<u8>>) -> Result<DirectoryCookie> {
@@ -3044,23 +3086,26 @@ fn directory_position(cookie: u64, verifier: Option<Vec<u8>>) -> Result<Director
 async fn directory_page(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     fh: Option<Bytes>,
+    parent: Option<Bytes>,
     position: DirectoryCookie,
 ) -> Result<DirectoryPage> {
     let _operation = core.begin_operation()?;
-    if let Some(result) = test_directory_page(&path, position) {
+    if let Some(result) =
+        test_directory_page(std::str::from_utf8(&path).unwrap_or_default(), position)
+    {
         return result;
     }
     let mount = mount.ok_or_else(|| {
         NfsError::Unsupported("scandir_page requires a connected protocol engine".to_string())
     })?;
-    let handle = directory_handle(fh, async { Ok(mount.lookup_path(&path).await?.fh) }).await?;
-    let page = mount.readdirplus_page(handle, position).await?;
+    let handle = target_handle(&*mount, &path, fh, parent).await?;
+    let page = mount.readdirplus_page(handle.clone(), position).await?;
     let entries = page
         .entries
         .into_iter()
-        .map(directory_entry)
+        .map(|entry| directory_entry(entry, &handle))
         .collect::<Result<Vec<_>>>()?;
     Ok((entries, page.next, page.eof))
 }
@@ -3073,6 +3118,24 @@ fn directory_page_dict<'py>(py: Python<'py>, page: DirectoryPage) -> PyResult<Bo
     result.set_item("verifier", PyBytes::new(py, &next.verifier))?;
     result.set_item("eof", eof)?;
     Ok(result)
+}
+
+/// An entry's name is relative to the directory that issued it. Only the
+/// fallback for a path supplied by the caller performs a full path lookup.
+async fn target_handle(
+    mount: &dyn Mount,
+    path: &[u8],
+    fh: Option<Bytes>,
+    parent: Option<Bytes>,
+) -> Result<Bytes> {
+    directory_handle(fh, async {
+        let object = match parent {
+            Some(parent) => mount.lookup(parent, path).await?,
+            None => mount.lookup_path(path).await?,
+        };
+        Ok(object.fh)
+    })
+    .await
 }
 
 /// A supplied handle is authoritative; path lookup is evaluated only when absent.
@@ -3128,12 +3191,13 @@ async fn stream_directory_batches(
 async fn directory_receiver(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
-    path: String,
+    path: Bytes,
     fh: Option<Bytes>,
+    parent: Option<Bytes>,
 ) -> Result<mpsc::Receiver<DirectoryItem>> {
     let operation = core.begin_operation()?;
     let (sender, receiver) = mpsc::channel(1);
-    if test_directory_blocks(&path) {
+    if test_directory_blocks(std::str::from_utf8(&path).unwrap_or_default()) {
         tokio::spawn(async move {
             let _operation = operation;
             core.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing)
@@ -3142,7 +3206,7 @@ async fn directory_receiver(
         });
         return Ok(receiver);
     }
-    if test_directory_fails(&path) {
+    if test_directory_fails(std::str::from_utf8(&path).unwrap_or_default()) {
         let closing = core.clone();
         tokio::spawn(async move {
             let _operation = operation;
@@ -3150,20 +3214,25 @@ async fn directory_receiver(
                 .and_then(std::result::Result::ok)
                 .unwrap_or_default();
             let entries = futures::stream::iter([
-                Ok(("first".to_string(), first, Bytes::new())),
+                Ok((
+                    Bytes::from_static(b"first"),
+                    first,
+                    Bytes::new(),
+                    Bytes::new(),
+                )),
                 Err(NfsError::Nfs3(crate::nfs3::ErrorCode::NFS3ERR_PERM)),
             ]);
             stream_directory_batches(entries, sender, &closing).await;
         });
         return Ok(receiver);
     }
-    if let Some(entries) = test_directory_entries(&path) {
+    if let Some(entries) = test_directory_entries(std::str::from_utf8(&path).unwrap_or_default()) {
         let closing = core.clone();
         tokio::spawn(async move {
             let _operation = operation;
             let entries = futures::stream::iter(entries.into_iter().map(|(name, attr)| {
                 let fh = attr.filehandle.clone();
-                Ok((name, attr, fh))
+                Ok((Bytes::from(name), attr, fh, Bytes::new()))
             }));
             stream_directory_batches(entries, sender, &closing).await;
         });
@@ -3177,8 +3246,9 @@ async fn directory_receiver(
         let _operation = operation;
         let stream = tokio::select! {
             result = async {
-                let handle = directory_handle(fh, async { Ok(mount.lookup_path(&path).await?.fh) }).await?;
-                Ok::<_, NfsError>(mount.readdirplus(handle).await)
+                let handle = target_handle(&*mount, &path, fh, parent).await?;
+                let entries = mount.readdirplus(handle.clone()).await;
+                Ok::<_, NfsError>(entries.map(move |entry| directory_entry(entry?, &handle)))
             } => Some(result),
             () = closing.wait_for_lifecycle(crate::client_core::ClientLifecycle::Closing) => None,
             () = sender.closed() => None,
@@ -3188,7 +3258,6 @@ async fn directory_receiver(
         };
         match stream {
             Ok(entries) => {
-                let entries = entries.map(|entry| directory_entry(entry?));
                 stream_directory_batches(entries, sender, &closing).await;
             }
             Err(error) => {
@@ -3288,7 +3357,10 @@ fn recovery_event_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
     result.set_item("operation", event.operation)?;
-    result.set_item("path", event.safe_path)?;
+    result.set_item(
+        "path",
+        event.safe_path.as_ref().map(|path| PyBytes::new(py, path)),
+    )?;
     result.set_item("protocol", protocol_name(event.protocol))?;
     result.set_item("outcome", outcome_name(event.outcome))?;
     result.set_item("recovery_action", recovery_name(event.recovery))?;
@@ -3312,11 +3384,11 @@ fn record_test_recovery_event(
     core: &ClientCore,
     protocol: NFSVersion,
     operation: String,
-    path: Option<String>,
+    path: Option<Vec<u8>>,
 ) -> PyResult<()> {
     core.record_recovery_event(CoreRecoveryEvent {
         operation,
-        safe_path: path,
+        safe_path: path.map(Bytes::from),
         protocol,
         outcome: crate::OperationOutcome::Uncertain,
         recovery: crate::RecoveryAction::VerifyThenResume,
@@ -3431,30 +3503,61 @@ async fn connect_mount(
     }
 }
 
+struct OpenTarget {
+    path: Bytes,
+    parent: Option<Bytes>,
+    expected_fh: Option<Bytes>,
+}
+
 async fn open_file(
     core: Arc<ClientCore>,
     _operation: OperationGuard,
     mount: Option<Arc<dyn Mount>>,
     resources: Arc<AdapterResources>,
-    path: String,
+    target: OpenTarget,
     mode: String,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
+    let OpenTarget {
+        path,
+        parent,
+        expected_fh,
+    } = target;
     let mode = FileMode::parse(&mode)?;
     let fault_operation = if mode.create { "create" } else { "open" };
     if let Some(error) = injected_fault(fault_operation, "before-send").await {
         return Err(error);
     }
     let resource = if let Some(mount) = mount {
-        let file = mount
-            .open_path_with_options(
-                &path,
-                crate::OpenOptions {
-                    access: mode.access(),
-                    create_mode: mode.create_permissions(),
-                    truncate: mode.truncate,
-                },
-            )
-            .await?;
+        let options = crate::OpenOptions {
+            access: mode.access(),
+            create_mode: mode.create_permissions(),
+            truncate: mode.truncate,
+        };
+        let file = if parent.is_some() || expected_fh.is_some() {
+            let file = match parent {
+                Some(parent) => mount.open_stateful(parent, &path, options.access).await?,
+                None => mount.open_path_stateful(&path, options.access).await?,
+            };
+            if expected_fh.is_some_and(|expected| file.file_handle() != expected) {
+                let error = NfsError::InvalidInput("directory entry was replaced".into());
+                return match mount.close_stateful(file).await {
+                    Ok(()) => Err(error),
+                    Err(close) => Err(NfsError::FileClose(vec![
+                        crate::error::FileCloseFailure {
+                            operation: "open",
+                            error: Arc::new(error),
+                        },
+                        crate::error::FileCloseFailure {
+                            operation: "close",
+                            error: Arc::new(close),
+                        },
+                    ])),
+                };
+            }
+            crate::mount::finish_open(&*mount, file, options.truncate).await?
+        } else {
+            mount.open_path_with_options(&path, options).await?
+        };
         let position = if mode.append {
             match mount.getattr(file.file_handle()).await {
                 Ok(attr) => attr.filesize,
@@ -3473,15 +3576,18 @@ async fn open_file(
             FileResource::test(
                 path.clone(),
                 mode,
-                resources.test_file(&path)?,
-                matches!(path.as_str(), "__commit_error__" | "__commit_close_error__"),
-                path == "__commit_close_error__",
-                match path.as_str() {
-                    "__partial_write_error__" => Some(TestWriteFault::DefiniteAt(2)),
-                    "__zero_write__" => Some(TestWriteFault::ZeroAt(0)),
+                resources.test_file(path.clone())?,
+                matches!(
+                    path.as_ref(),
+                    b"__commit_error__" | b"__commit_close_error__"
+                ),
+                path.as_ref() == b"__commit_close_error__",
+                match path.as_ref() {
+                    b"__partial_write_error__" => Some(TestWriteFault::DefiniteAt(2)),
+                    b"__zero_write__" => Some(TestWriteFault::ZeroAt(0)),
                     _ => None,
                 },
-                path == "__verifier_change__",
+                path.as_ref() == b"__verifier_change__",
             )
             .await
         }
@@ -3495,8 +3601,8 @@ async fn open_file(
     }
     #[cfg(feature = "python-test-support")]
     let barrier = if matches!(
-        path.as_str(),
-        "__blocked_open__" | "__blocked_open_uncertain__"
+        path.as_ref(),
+        b"__blocked_open__" | b"__blocked_open_uncertain__"
     ) {
         open_test_barrier()
             .lock()
@@ -3511,7 +3617,7 @@ async fn open_file(
         barrier.release.notified().await;
     }
     #[cfg(feature = "python-test-support")]
-    if path == "__blocked_open_uncertain__" {
+    if path.as_ref() == b"__blocked_open_uncertain__" {
         return Err(NfsError::OperationOutcome(Box::new(
             crate::OperationOutcomeError::new(
                 crate::OperationOutcome::Uncertain,
@@ -3715,7 +3821,7 @@ async fn cancellation_safe_open_file(
     core: Arc<ClientCore>,
     mount: Option<Arc<dyn Mount>>,
     resources: Arc<AdapterResources>,
-    path: String,
+    target: OpenTarget,
     mode: String,
     timeout: Option<Duration>,
 ) -> Result<(ResourceKey, Arc<FileResource>)> {
@@ -3723,18 +3829,18 @@ async fn cancellation_safe_open_file(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let task_core = core.clone();
     let event_core = core.clone();
-    let safe_path = path.clone();
+    let safe_path = target.path.clone();
     #[cfg(feature = "python-test-support")]
     let settlement_barrier = open_test_barrier()
         .lock()
         .ok()
         .and_then(|value| value.clone());
     core.spawn_owned(async move {
-        let result = open_file(task_core, operation, mount, resources, path, mode).await;
+        let result = open_file(task_core, operation, mount, resources, target, mode).await;
         if let Err(result) = sender.send(result)
             && let Err(error) = result
         {
-            record_abandoned_error(&event_core, Some(safe_path), &error);
+            record_abandoned_error(&event_core, Some(&safe_path), &error);
         }
         #[cfg(feature = "python-test-support")]
         if let Some(barrier) = settlement_barrier {
@@ -3749,10 +3855,10 @@ async fn cancellation_safe_open_file(
     .await
 }
 
-fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &NfsError) {
+fn record_abandoned_error(core: &ClientCore, safe_path: Option<&[u8]>, error: &NfsError) {
     if let NfsError::FileClose(failures) = error {
         for failure in failures {
-            record_abandoned_error(core, safe_path.clone(), &failure.error);
+            record_abandoned_error(core, safe_path, &failure.error);
         }
         return;
     }
@@ -3765,7 +3871,7 @@ fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &
         {
             Some(CoreRecoveryEvent {
                 operation: details.context().operation.clone(),
-                safe_path,
+                safe_path: None,
                 protocol: details.context().protocol,
                 outcome: details.outcome,
                 recovery: details.recovery,
@@ -3776,7 +3882,7 @@ fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &
         }
         NfsError::LostOpenState(_) => Some(CoreRecoveryEvent {
             operation: "open state".to_string(),
-            safe_path,
+            safe_path: None,
             protocol: NFSVersion::Unknown,
             outcome: crate::OperationOutcome::Uncertain,
             recovery: crate::RecoveryAction::Reopen,
@@ -3785,7 +3891,9 @@ fn record_abandoned_error(core: &ClientCore, safe_path: Option<String>, error: &
         }),
         _ => None,
     };
-    if let Some(event) = event {
+    if let Some(mut event) = event {
+        // Recovery records can outlive a scan. A compact path releases any backing READDIR page.
+        event.safe_path = safe_path.map(Bytes::copy_from_slice);
         let _ = core.record_recovery_event(event);
     }
 }
@@ -3856,7 +3964,7 @@ where
         if let Err(result) = sender.send(result)
             && let Err(error) = result
         {
-            record_abandoned_error(&event_core, Some(safe_path), &error);
+            record_abandoned_error(&event_core, Some(&safe_path), &error);
         }
         notify_operation_test_settled(operation_name);
     })?;
@@ -3870,7 +3978,7 @@ where
 
 async fn cancellation_safe_owned_operation<T, F>(
     core: Arc<ClientCore>,
-    safe_path: Option<String>,
+    safe_path: Option<Bytes>,
     operation_name: &'static str,
     timeout: Option<Duration>,
     future: F,
@@ -3906,7 +4014,7 @@ where
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some(Err(error)) = unclaimed {
-                record_abandoned_error(&event_core, safe_path, &error);
+                record_abandoned_error(&event_core, safe_path.as_deref(), &error);
             }
         }
         notify_operation_test_settled(operation_name);
@@ -3972,7 +4080,7 @@ async fn cancellation_safe_close_file(
         if let Err(result) = sender.send(result)
             && let Err(error) = result
         {
-            record_abandoned_close_error(&event_core, safe_path, error.as_ref());
+            record_abandoned_error(&event_core, Some(&safe_path), error.as_ref());
         }
         notify_operation_test_settled("close");
     })
@@ -3988,16 +4096,6 @@ async fn cancellation_safe_close_file(
             "file close task ended without a result".to_string(),
         ))
     })?
-}
-
-fn record_abandoned_close_error(core: &ClientCore, safe_path: String, error: &NfsError) {
-    if let NfsError::FileClose(errors) = error {
-        for failure in errors {
-            record_abandoned_error(core, Some(safe_path.clone()), failure.error.as_ref());
-        }
-    } else {
-        record_abandoned_error(core, Some(safe_path), error);
-    }
 }
 
 fn validate_file_mode(mode: &str) -> PyResult<()> {
@@ -4391,35 +4489,56 @@ async fn export_values(
     host: &str,
     timeout: Option<Duration>,
     dialer: Option<Arc<dyn crate::Dialer>>,
-) -> Result<Vec<(String, Vec<String>)>> {
+) -> Result<Vec<crate::ExportEntry>> {
     let exports = async {
         match dialer {
             Some(dialer) => crate::list_exports_with(host, dialer).await,
             None => crate::list_exports(host).await,
         }
     };
-    let exports = if let Some(timeout) = timeout {
+    if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, exports)
             .await
-            .map_err(|_| deadline_exceeded("export discovery"))??
+            .map_err(|_| deadline_exceeded("export discovery"))?
     } else {
-        exports.await?
-    };
-    Ok(exports
-        .into_iter()
-        .map(|entry| (entry.path, entry.groups))
-        .collect())
+        exports.await
+    }
 }
 
 #[cfg(feature = "python-test-support")]
-fn test_export_values(host: &str) -> Option<Vec<(String, Vec<String>)>> {
-    host.starts_with("nfs-test://")
-        .then(|| vec![("/data".to_string(), vec!["team".to_string()])])
+fn test_export_values(host: &str) -> Option<Vec<crate::ExportEntry>> {
+    host.starts_with("nfs-test://").then(|| {
+        vec![crate::ExportEntry {
+            path: Bytes::from_static(b"/data"),
+            groups: vec![Bytes::from_static(b"team")],
+        }]
+    })
 }
 
 #[cfg(not(feature = "python-test-support"))]
-fn test_export_values(_host: &str) -> Option<Vec<(String, Vec<String>)>> {
+fn test_export_values(_host: &str) -> Option<Vec<crate::ExportEntry>> {
     None
+}
+
+type PythonExportEntry = (Py<PyBytes>, Vec<Py<PyBytes>>);
+
+fn python_export_entries(
+    py: Python<'_>,
+    entries: Vec<crate::ExportEntry>,
+) -> Vec<PythonExportEntry> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            (
+                PyBytes::new(py, &entry.path).unbind(),
+                entry
+                    .groups
+                    .iter()
+                    .map(|group| PyBytes::new(py, group).unbind())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[pyfunction(name = "list_exports", signature = (host, **options))]
@@ -4427,9 +4546,9 @@ fn python_list_exports(
     py: Python<'_>,
     host: String,
     options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<(String, Vec<String>)>> {
+) -> PyResult<Vec<PythonExportEntry>> {
     if let Some(values) = test_export_values(&host) {
-        return Ok(values);
+        return Ok(python_export_entries(py, values));
     }
     let timeout = timeout_option(options, "connect_timeout")?;
     let dialer = dialer::dialer_option(options)?;
@@ -4440,6 +4559,7 @@ fn python_list_exports(
         .build()
         .map_err(python_error)?;
     py.detach(|| runtime.block_on(export_values(&host, timeout, dialer)))
+        .map(|values| python_export_entries(py, values))
         .map_err(nfs_error)
 }
 
@@ -4450,6 +4570,7 @@ fn python_async_list_exports<'py>(
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if let Some(values) = test_export_values(&host) {
+        let values = python_export_entries(py, values);
         return completion::future_into_py(py, async move { Ok(values) });
     }
     let timeout = timeout_option(options, "connect_timeout")?;
@@ -4457,6 +4578,7 @@ fn python_async_list_exports<'py>(
     completion::future_into_py(py, async move {
         export_values(&host, timeout, dialer)
             .await
+            .map(|values| Python::attach(|py| python_export_entries(py, values)))
             .map_err(nfs_error)
     })
 }
@@ -4477,7 +4599,7 @@ impl SyncClient {
         &self,
         py: Python<'_>,
         operation: &'static str,
-        safe_path: Option<String>,
+        safe_path: Option<Bytes>,
         future: F,
     ) -> PyResult<T>
     where
@@ -4642,7 +4764,7 @@ impl SyncClient {
     }
 
     #[cfg(feature = "python-test-support")]
-    fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
+    fn _record_recovery_event(&self, operation: String, path: Option<Vec<u8>>) -> PyResult<()> {
         record_test_recovery_event(&self.core, self.version, operation, path)
     }
 
@@ -4655,17 +4777,36 @@ impl SyncClient {
         )
     }
 
-    fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+    #[pyo3(signature = (path, fh = None, parent = None))]
+    fn stat<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+        fh: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
         let attr = self.run_operation(
             py,
             "stat",
             Some(path.clone()),
-            stat_attr(self.core.clone(), self.health_source.clone(), path),
+            stat_attr(
+                self.core.clone(),
+                self.health_source.clone(),
+                path,
+                fh.map(Bytes::from),
+                parent.map(Bytes::from),
+            ),
         )?;
         attr_dict(py, &attr)
     }
 
-    fn resolve<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
         // Resolution owns no mutation or OPEN state. Drop the traversal itself
         // on timeout, so no detached namespace walk can hold client.close open.
         let future = crate::retry::with_timeout(
@@ -4685,7 +4826,8 @@ impl SyncClient {
     }
 
     #[pyo3(signature = (path, mode = 0o777))]
-    fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+    fn mkdir(&self, py: Python<'_>, path: &Bound<'_, PyAny>, mode: u32) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "mkdir",
@@ -4700,7 +4842,8 @@ impl SyncClient {
         )
     }
 
-    fn remove(&self, py: Python<'_>, path: String) -> PyResult<()> {
+    fn remove(&self, py: Python<'_>, path: &Bound<'_, PyAny>) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "remove",
@@ -4715,7 +4858,8 @@ impl SyncClient {
         )
     }
 
-    fn rmdir(&self, py: Python<'_>, path: String) -> PyResult<()> {
+    fn rmdir(&self, py: Python<'_>, path: &Bound<'_, PyAny>) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "rmdir",
@@ -4730,7 +4874,14 @@ impl SyncClient {
         )
     }
 
-    fn rename(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
+    fn rename(
+        &self,
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        destination: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let source = name_buffer::path_bytes(source)?;
+        let destination = name_buffer::path_bytes(destination)?;
         self.run_operation(
             py,
             "rename",
@@ -4745,7 +4896,14 @@ impl SyncClient {
         )
     }
 
-    fn link(&self, py: Python<'_>, source: String, destination: String) -> PyResult<()> {
+    fn link(
+        &self,
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        destination: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let source = name_buffer::path_bytes(source)?;
+        let destination = name_buffer::path_bytes(destination)?;
         self.run_operation(
             py,
             "link",
@@ -4760,7 +4918,14 @@ impl SyncClient {
         )
     }
 
-    fn symlink(&self, py: Python<'_>, target: String, link_path: String) -> PyResult<()> {
+    fn symlink(
+        &self,
+        py: Python<'_>,
+        target: &Bound<'_, PyAny>,
+        link_path: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let target = name_buffer::path_bytes(target)?;
+        let link_path = name_buffer::path_bytes(link_path)?;
         self.run_operation(
             py,
             "symlink",
@@ -4775,16 +4940,23 @@ impl SyncClient {
         )
     }
 
-    fn readlink(&self, py: Python<'_>, path: String) -> PyResult<String> {
-        self.run_operation(
+    fn readlink<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyMemoryView>> {
+        let path = name_buffer::path_bytes(path)?;
+        let target = self.run_operation(
             py,
             "readlink",
             Some(path.clone()),
             readlink_path(self.core.clone(), self.health_source.clone(), path),
-        )
+        )?;
+        name_buffer::byte_view(py, target)
     }
 
-    fn chmod(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+    fn chmod(&self, py: Python<'_>, path: &Bound<'_, PyAny>, mode: u32) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "chmod",
@@ -4798,7 +4970,8 @@ impl SyncClient {
         )
     }
 
-    fn chown(&self, py: Python<'_>, path: String, uid: i64, gid: i64) -> PyResult<()> {
+    fn chown(&self, py: Python<'_>, path: &Bound<'_, PyAny>, uid: i64, gid: i64) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         let uid = optional_identity(uid)?;
         let gid = optional_identity(gid)?;
         self.run_operation(
@@ -4814,7 +4987,14 @@ impl SyncClient {
         )
     }
 
-    fn utime(&self, py: Python<'_>, path: String, atime_ns: u64, mtime_ns: u64) -> PyResult<()> {
+    fn utime(
+        &self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        atime_ns: u64,
+        mtime_ns: u64,
+    ) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "utime",
@@ -4828,7 +5008,8 @@ impl SyncClient {
         )
     }
 
-    fn truncate_path(&self, py: Python<'_>, path: String, size: u64) -> PyResult<()> {
+    fn truncate_path(&self, py: Python<'_>, path: &Bound<'_, PyAny>, size: u64) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "truncate",
@@ -4842,7 +5023,8 @@ impl SyncClient {
         )
     }
 
-    fn access(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<bool> {
+    fn access(&self, py: Python<'_>, path: &Bound<'_, PyAny>, mode: u32) -> PyResult<bool> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "access",
@@ -4851,7 +5033,12 @@ impl SyncClient {
         )
     }
 
-    fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+    fn getdacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
         let value = self.run_operation(
             py,
             "getdacl",
@@ -4869,10 +5056,11 @@ impl SyncClient {
     fn setdacl(
         &self,
         py: Python<'_>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         flags: u32,
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
         self.run_operation(
             py,
@@ -4888,7 +5076,12 @@ impl SyncClient {
         )
     }
 
-    fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyDict>> {
+    fn getsacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
         let value = self.run_operation(
             py,
             "getsacl",
@@ -4906,10 +5099,11 @@ impl SyncClient {
     fn setsacl(
         &self,
         py: Python<'_>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         flags: u32,
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
         self.run_operation(
             py,
@@ -4931,18 +5125,20 @@ impl SyncClient {
         &self,
         py: Python<'py>,
         operation: String,
-        path: String,
-        other: Option<String>,
+        path: &Bound<'_, PyAny>,
+        other: Option<&Bound<'_, PyAny>>,
         offset: u64,
         second_offset: u64,
         count: u64,
         value: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
+        let other = other.map(name_buffer::path_bytes).transpose()?;
         let operation_name = v42_waiter_operation(&operation);
         let result = self.run_operation(
             py,
             operation_name,
-            v42_recovery_path(&operation, &path, other.as_deref()),
+            v42_recovery_path(&operation, &path, other.as_ref()),
             v42_operation(
                 self.core.clone(),
                 self.health_source.clone(),
@@ -4958,7 +5154,8 @@ impl SyncClient {
         v42_dict(py, result)
     }
 
-    fn getxattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<Vec<u8>> {
+    fn getxattr(&self, py: Python<'_>, path: &Bound<'_, PyAny>, name: String) -> PyResult<Vec<u8>> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "getxattr",
@@ -4973,7 +5170,14 @@ impl SyncClient {
         )
     }
 
-    fn setxattr(&self, py: Python<'_>, path: String, name: String, value: Vec<u8>) -> PyResult<()> {
+    fn setxattr(
+        &self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        name: String,
+        value: Vec<u8>,
+    ) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "setxattr",
@@ -4989,7 +5193,8 @@ impl SyncClient {
         )
     }
 
-    fn listxattr(&self, py: Python<'_>, path: String) -> PyResult<Vec<String>> {
+    fn listxattr(&self, py: Python<'_>, path: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "listxattr",
@@ -5003,7 +5208,8 @@ impl SyncClient {
         )
     }
 
-    fn removexattr(&self, py: Python<'_>, path: String, name: String) -> PyResult<()> {
+    fn removexattr(&self, py: Python<'_>, path: &Bound<'_, PyAny>, name: String) -> PyResult<()> {
+        let path = name_buffer::path_bytes(path)?;
         self.run_operation(
             py,
             "removexattr",
@@ -5038,25 +5244,37 @@ impl SyncClient {
         fs_stat_dict(py, info)
     }
 
-    fn listdir(&self, py: Python<'_>, path: String) -> PyResult<Vec<String>> {
-        py.detach(|| {
-            self.runtime.block_on(directory_names(
-                self.core.clone(),
-                self.health_source.clone(),
-                path,
-                self.operation_timeout,
-            ))
-        })
-        .map_err(nfs_error)
+    fn listdir<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyMemoryView>>> {
+        let path = name_buffer::path_bytes(path)?;
+        let entries = py
+            .detach(|| {
+                self.runtime.block_on(directory_names(
+                    self.core.clone(),
+                    self.health_source.clone(),
+                    path,
+                    self.operation_timeout,
+                ))
+            })
+            .map_err(nfs_error)?;
+        entries
+            .into_iter()
+            .map(|name| name_buffer::byte_view(py, name))
+            .collect()
     }
 
-    #[pyo3(signature = (path, fh = None))]
+    #[pyo3(signature = (path, fh = None, parent = None))]
     fn scandir(
         &self,
         py: Python<'_>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         fh: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
     ) -> PyResult<SyncDirectoryCursor> {
+        let path = name_buffer::path_bytes(path)?;
         let receiver = self.run_operation(
             py,
             "scandir",
@@ -5066,6 +5284,7 @@ impl SyncClient {
                 self.health_source.clone(),
                 path,
                 fh.map(Bytes::from),
+                parent.map(Bytes::from),
             ),
         )?;
         Ok(SyncDirectoryCursor {
@@ -5075,15 +5294,17 @@ impl SyncClient {
         })
     }
 
-    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None))]
+    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None, parent = None))]
     fn scandir_page<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         fh: Option<Vec<u8>>,
         cookie: u64,
         verifier: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let path = name_buffer::path_bytes(path)?;
         let position = directory_position(cookie, verifier).map_err(nfs_error)?;
         let page = self.run_operation(
             py,
@@ -5094,14 +5315,23 @@ impl SyncClient {
                 self.health_source.clone(),
                 path,
                 fh.map(Bytes::from),
+                parent.map(Bytes::from),
                 position,
             ),
         )?;
         directory_page_dict(py, page)
     }
 
-    #[pyo3(signature = (path, mode = "rb"))]
-    fn open(&self, py: Python<'_>, path: String, mode: &str) -> PyResult<SyncFile> {
+    #[pyo3(signature = (path, mode = "rb", parent = None, expected_fh = None))]
+    fn open(
+        &self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        mode: &str,
+        parent: Option<Vec<u8>>,
+        expected_fh: Option<Vec<u8>>,
+    ) -> PyResult<SyncFile> {
+        let path = name_buffer::path_bytes(path)?;
         validate_file_mode(mode)?;
         let (key, resource) = py
             .detach(|| {
@@ -5109,7 +5339,11 @@ impl SyncClient {
                     self.core.clone(),
                     self.health_source.clone(),
                     self.resources.clone(),
-                    path,
+                    OpenTarget {
+                        path,
+                        parent: parent.map(Bytes::from),
+                        expected_fh: expected_fh.map(Bytes::from),
+                    },
                     mode.to_string(),
                     self.operation_timeout,
                 ))
@@ -5141,13 +5375,13 @@ impl AsyncClient {
         &self,
         py: Python<'py>,
         operation: NamespaceOperation,
-        first: String,
-        second: Option<String>,
+        first: Bytes,
+        second: Option<Bytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let work_core = core.clone();
         let mount = self.health_source.clone();
-        let safe_path = operation.recovery_path(&first, second.as_deref());
+        let safe_path = operation.recovery_path(&first, second.as_ref());
         let operation_name = operation.name();
         let timeout = self.operation_timeout;
         completion::future_into_py(py, async move {
@@ -5167,7 +5401,7 @@ impl AsyncClient {
         &self,
         py: Python<'py>,
         operation: MetadataOperation,
-        path: String,
+        path: Bytes,
     ) -> PyResult<Bound<'py, PyAny>> {
         let core = self.core.clone();
         let work_core = core.clone();
@@ -5320,7 +5554,7 @@ impl AsyncClient {
     }
 
     #[cfg(feature = "python-test-support")]
-    fn _record_recovery_event(&self, operation: String, path: Option<String>) -> PyResult<()> {
+    fn _record_recovery_event(&self, operation: String, path: Option<Vec<u8>>) -> PyResult<()> {
         record_test_recovery_event(&self.core, self.version, operation, path)
     }
 
@@ -5343,19 +5577,42 @@ impl AsyncClient {
         })
     }
 
-    fn stat<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (path, fh = None, parent = None))]
+    fn stat<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+        fh: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
         completion::future_into_py(py, async move {
-            let attr = with_operation_timeout(timeout, "stat", stat_attr(core, mount, path))
-                .await
-                .map_err(nfs_error)?;
+            let attr = with_operation_timeout(
+                timeout,
+                "stat",
+                stat_attr(
+                    core,
+                    mount,
+                    path,
+                    fh.map(Bytes::from),
+                    parent.map(Bytes::from),
+                ),
+            )
+            .await
+            .map_err(nfs_error)?;
             Python::attach(|py| attr_dict(py, &attr).map(Bound::unbind))
         })
     }
 
-    fn resolve<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
@@ -5372,67 +5629,99 @@ impl AsyncClient {
     }
 
     #[pyo3(signature = (path, mode = 0o777))]
-    fn mkdir<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn mkdir<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+        mode: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.namespace_future(py, NamespaceOperation::Mkdir(mode), path, None)
     }
 
-    fn remove<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn remove<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.namespace_future(py, NamespaceOperation::Remove, path, None)
     }
 
-    fn rmdir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn rmdir<'py>(&self, py: Python<'py>, path: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.namespace_future(py, NamespaceOperation::Rmdir, path, None)
     }
 
     fn rename<'py>(
         &self,
         py: Python<'py>,
-        source: String,
-        destination: String,
+        source: &Bound<'py, PyAny>,
+        destination: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let source = name_buffer::path_bytes(source)?;
+        let destination = name_buffer::path_bytes(destination)?;
         self.namespace_future(py, NamespaceOperation::Rename, source, Some(destination))
     }
 
     fn link<'py>(
         &self,
         py: Python<'py>,
-        source: String,
-        destination: String,
+        source: &Bound<'py, PyAny>,
+        destination: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let source = name_buffer::path_bytes(source)?;
+        let destination = name_buffer::path_bytes(destination)?;
         self.namespace_future(py, NamespaceOperation::Link, source, Some(destination))
     }
 
     fn symlink<'py>(
         &self,
         py: Python<'py>,
-        target: String,
-        link_path: String,
+        target: &Bound<'py, PyAny>,
+        link_path: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let target = name_buffer::path_bytes(target)?;
+        let link_path = name_buffer::path_bytes(link_path)?;
         self.namespace_future(py, NamespaceOperation::Symlink, target, Some(link_path))
     }
 
-    fn readlink<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn readlink<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
         completion::future_into_py(py, async move {
-            with_operation_timeout(timeout, "readlink", readlink_path(core, mount, path))
-                .await
-                .map_err(nfs_error)
+            let target =
+                with_operation_timeout(timeout, "readlink", readlink_path(core, mount, path))
+                    .await
+                    .map_err(nfs_error)?;
+            Python::attach(|py| name_buffer::byte_view(py, target).map(Bound::unbind))
         })
     }
 
-    fn chmod<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn chmod<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+        mode: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.metadata_future(py, MetadataOperation::Chmod(mode), path)
     }
 
     fn chown<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'py, PyAny>,
         uid: i64,
         gid: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.metadata_future(
             py,
             MetadataOperation::Chown(optional_identity(uid)?, optional_identity(gid)?),
@@ -5443,23 +5732,31 @@ impl AsyncClient {
     fn utime<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'py, PyAny>,
         atime_ns: u64,
         mtime_ns: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.metadata_future(py, MetadataOperation::Utime(atime_ns, mtime_ns), path)
     }
 
     fn truncate_path<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'py, PyAny>,
         size: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         self.metadata_future(py, MetadataOperation::Truncate(size), path)
     }
 
-    fn access<'py>(&self, py: Python<'py>, path: String, mode: u32) -> PyResult<Bound<'py, PyAny>> {
+    fn access<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+        mode: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
@@ -5470,7 +5767,12 @@ impl AsyncClient {
         })
     }
 
-    fn getdacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn getdacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
@@ -5489,10 +5791,11 @@ impl AsyncClient {
     fn setdacl<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         flags: u32,
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
         let core = self.core.clone();
         let work_core = core.clone();
@@ -5512,7 +5815,12 @@ impl AsyncClient {
         })
     }
 
-    fn getsacl<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn getsacl<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
@@ -5531,10 +5839,11 @@ impl AsyncClient {
     fn setsacl<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         flags: u32,
         aces: Vec<(u32, u32, u32, String)>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let value = acl41_value(flags, aces).map_err(nfs_error)?;
         let core = self.core.clone();
         let work_core = core.clone();
@@ -5560,19 +5869,21 @@ impl AsyncClient {
         &self,
         py: Python<'py>,
         operation: String,
-        path: String,
-        other: Option<String>,
+        path: &Bound<'_, PyAny>,
+        other: Option<&Bound<'_, PyAny>>,
         offset: u64,
         second_offset: u64,
         count: u64,
         value: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
+        let other = other.map(name_buffer::path_bytes).transpose()?;
         let operation_name = v42_waiter_operation(&operation);
         let core = self.core.clone();
         let work_core = core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
-        let safe_path = v42_recovery_path(&operation, &path, other.as_deref());
+        let safe_path = v42_recovery_path(&operation, &path, other.as_ref());
         completion::future_into_py(py, async move {
             let result = cancellation_safe_owned_operation(
                 core,
@@ -5600,9 +5911,10 @@ impl AsyncClient {
     fn getxattr<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         name: String,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
@@ -5621,10 +5933,11 @@ impl AsyncClient {
     fn setxattr<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         name: String,
         value: Vec<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let work_core = core.clone();
         let mount = self.health_source.clone();
@@ -5644,7 +5957,12 @@ impl AsyncClient {
         })
     }
 
-    fn listxattr<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn listxattr<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let resources = self.resources.clone();
@@ -5663,9 +5981,10 @@ impl AsyncClient {
     fn removexattr<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         name: String,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let work_core = core.clone();
         let mount = self.health_source.clone();
@@ -5709,24 +6028,37 @@ impl AsyncClient {
         })
     }
 
-    fn listdir<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+    fn listdir<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
         completion::future_into_py(py, async move {
-            directory_names(core, mount, path, timeout)
+            let entries = directory_names(core, mount, path, timeout)
                 .await
-                .map_err(nfs_error)
+                .map_err(nfs_error)?;
+            Python::attach(|py| {
+                entries
+                    .into_iter()
+                    .map(|name| name_buffer::byte_view(py, name).map(Bound::unbind))
+                    .collect::<PyResult<Vec<_>>>()
+            })
         })
     }
 
-    #[pyo3(signature = (path, fh = None))]
+    #[pyo3(signature = (path, fh = None, parent = None))]
     fn scandir<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         fh: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
         let timeout = self.operation_timeout;
@@ -5734,7 +6066,13 @@ impl AsyncClient {
             let receiver = with_operation_timeout(
                 timeout,
                 "scandir",
-                directory_receiver(core, mount, path, fh.map(Bytes::from)),
+                directory_receiver(
+                    core,
+                    mount,
+                    path,
+                    fh.map(Bytes::from),
+                    parent.map(Bytes::from),
+                ),
             )
             .await
             .map_err(nfs_error)?;
@@ -5745,15 +6083,17 @@ impl AsyncClient {
         })
     }
 
-    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None))]
+    #[pyo3(signature = (path, fh = None, cookie = 0, verifier = None, parent = None))]
     fn scandir_page<'py>(
         &self,
         py: Python<'py>,
-        path: String,
+        path: &Bound<'_, PyAny>,
         fh: Option<Vec<u8>>,
         cookie: u64,
         verifier: Option<Vec<u8>>,
+        parent: Option<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         let position = directory_position(cookie, verifier).map_err(nfs_error)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
@@ -5762,7 +6102,14 @@ impl AsyncClient {
             let page = with_operation_timeout(
                 timeout,
                 "scandir_page",
-                directory_page(core, mount, path, fh.map(Bytes::from), position),
+                directory_page(
+                    core,
+                    mount,
+                    path,
+                    fh.map(Bytes::from),
+                    parent.map(Bytes::from),
+                    position,
+                ),
             )
             .await
             .map_err(nfs_error)?;
@@ -5770,8 +6117,16 @@ impl AsyncClient {
         })
     }
 
-    #[pyo3(signature = (path, mode = "rb"))]
-    fn open<'py>(&self, py: Python<'py>, path: String, mode: &str) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (path, mode = "rb", parent = None, expected_fh = None))]
+    fn open<'py>(
+        &self,
+        py: Python<'py>,
+        path: &Bound<'_, PyAny>,
+        mode: &str,
+        parent: Option<Vec<u8>>,
+        expected_fh: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = name_buffer::path_bytes(path)?;
         validate_file_mode(mode)?;
         let core = self.core.clone();
         let mount = self.health_source.clone();
@@ -5783,7 +6138,11 @@ impl AsyncClient {
                 core.clone(),
                 mount,
                 resources.clone(),
-                path,
+                OpenTarget {
+                    path,
+                    parent: parent.map(Bytes::from),
+                    expected_fh: expected_fh.map(Bytes::from),
+                },
                 mode,
                 timeout,
             )
@@ -5893,7 +6252,7 @@ mod read_only_file_tests {
 
     async fn test_file(mode: FileMode) -> Arc<FileResource> {
         FileResource::test(
-            "fixture.bin".to_string(),
+            Bytes::from_static(b"fixture.bin"),
             mode,
             Arc::new(tokio::sync::Mutex::new(
                 b"abcdefghijklmnopqrstuvwxyz".to_vec(),
@@ -6049,7 +6408,7 @@ mod read_only_file_tests {
     async fn partial_uncommitted_write_makes_position_uncertain() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
-            "fixture.bin".to_string(),
+            Bytes::from_static(b"fixture.bin"),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
@@ -6075,7 +6434,7 @@ mod read_only_file_tests {
     async fn zero_write_reply_poisons_relative_position() {
         let mode = FileMode::parse("w+b").unwrap_or_else(|_| panic!("w+b mode must be valid"));
         let file = FileResource::test(
-            "fixture.bin".to_string(),
+            Bytes::from_static(b"fixture.bin"),
             mode,
             Arc::new(tokio::sync::Mutex::new(Vec::new())),
             false,
@@ -6165,13 +6524,20 @@ mod directory_batch_tests {
     fn v42_copy_and_clone_recovery_targets_destination() {
         for operation in ["copy_range", "clone_range"] {
             assert_eq!(
-                v42_recovery_path(operation, "source", Some("destination")),
+                v42_recovery_path(
+                    operation,
+                    &Bytes::from_static(b"source"),
+                    Some(&Bytes::from_static(b"destination"))
+                ),
                 Some("destination".into())
             );
-            assert_eq!(v42_recovery_path(operation, "source", None), None);
+            assert_eq!(
+                v42_recovery_path(operation, &Bytes::from_static(b"source"), None),
+                None
+            );
         }
         assert_eq!(
-            v42_recovery_path("allocate", "file", None),
+            v42_recovery_path("allocate", &Bytes::from_static(b"file"), None),
             Some("file".into())
         );
     }
@@ -6218,12 +6584,20 @@ mod directory_batch_tests {
         let events = core.recovery_events().unwrap();
         assert_eq!(events.len(), 1, "lost nested abandoned COPY error");
         assert_eq!(events[0].operation, "copy");
-        assert_eq!(events[0].safe_path.as_deref(), Some("destination"));
+        assert_eq!(
+            events[0].safe_path.as_deref(),
+            Some(b"destination".as_slice())
+        );
         assert_eq!(events[0].outcome, crate::OperationOutcome::Uncertain);
     }
 
     fn entry(i: usize) -> Result<DirectoryEntry> {
-        Ok((i.to_string(), Attr::default(), Bytes::new()))
+        Ok((
+            Bytes::from(i.to_string()),
+            Attr::default(),
+            Bytes::new(),
+            Bytes::new(),
+        ))
     }
 
     #[tokio::test]

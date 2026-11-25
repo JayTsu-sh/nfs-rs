@@ -455,10 +455,10 @@ async fn namespace_session_loss_preserves_uncertainty_without_reestablishing() {
                     .compound("namespace_mutation", |b| {
                         let b = b.putfh(b"parent");
                         match operation {
-                            0 => b.remove("original"),
-                            1 => b.savefh().putfh(b"other").rename("original", "renamed"),
-                            2 => b.savefh().putfh(b"other").link("linked"),
-                            _ => b.create(2, "directory", &[], &[]),
+                            0 => b.remove(b"original"),
+                            1 => b.savefh().putfh(b"other").rename(b"original", b"renamed"),
+                            2 => b.savefh().putfh(b"other").link(b"linked"),
+                            _ => b.create(2, b"directory", &[], &[]),
                         }
                     })
                     .await;

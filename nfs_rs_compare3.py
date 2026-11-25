@@ -62,10 +62,10 @@ def scan(client, limit):
     start = time.perf_counter()
     while queue and dirs < limit:
         parent = queue.popleft()
-        entries = sorted((e for e in client.scandir(parent) if e.name not in (".", "..")),
-                         key=lambda e: e.name)
+        entries = sorted((e for e in client.scandir(parent) if e.name not in (b".", b"..")),
+                         key=lambda e: bytes(e.name))
         for entry in entries:
-            records.append((entry.path, entry.info.type.value, entry.info.fileid, entry.info.size))
+            records.append((entry.path.hex(), entry.info.type.value, entry.info.fileid, entry.info.size))
             if entry.info.type is FileType.DIRECTORY:
                 queue.append(DirectoryRef(entry.path, entry.fh))
         dirs += 1
