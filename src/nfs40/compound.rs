@@ -813,6 +813,7 @@ pub(crate) fn decode_link_response(buf: Bytes) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_lock_response(buf: Bytes, opcode: u32, name: &str) -> Result<[u8; 16]> {
     decode_lock_denied_result(buf.clone(), opcode, name)?;
     decode_stateid_response(buf, opcode, name)
@@ -908,6 +909,10 @@ pub(crate) fn decode_stateid_response(buf: Bytes, opcode: u32, name: &str) -> Re
 /// Parses a COMPOUND reply header **without** rejecting a non-zero overall
 /// status: the overall status only says that some operation failed, not which
 /// one, and the caller needs the per-operation results to tell them apart.
+///
+/// Do not replace this with the shared `response_ops`: it rejects a non-zero
+/// overall status, which would collapse the `NotExecuted` / `Rejected` /
+/// `Executed` distinction the stateid-op decoders rely on for seqid accounting.
 fn response_header(mut buf: Bytes) -> Result<(u32, u32, Bytes)> {
     let overall = take_u32(&mut buf, "COMPOUND status")?;
     let _tag = take_opaque(&mut buf, "COMPOUND tag")?;

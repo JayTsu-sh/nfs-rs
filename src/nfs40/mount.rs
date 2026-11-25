@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use futures::stream;
 use futures::stream::TryStreamExt as _;
-use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -13,23 +12,28 @@ use std::time::Duration;
 
 use super::callback::{CallbackService, CallbackState, CallbackWorker};
 use super::compound::{
-    CallbackAddress, CompoundBuilder, DelegationGrant, DelegationKind, LockOpOutcome, NewLockArgs,
-    OpenArgs, OpenOpOutcome, OpenReclaimArgs, SetClientIdArgs, StateidOpOutcome,
+    CompoundBuilder, DelegationGrant, DelegationKind, NewLockArgs, OpenArgs, StateidOpOutcome,
     create_succeeded_before_compound_failure, decode_access_response, decode_commit_response,
-    decode_confirm_response, decode_create_response, decode_delegreturn_response,
+    decode_create_response, decode_delegreturn_response,
     decode_getattr_response as decode_getattr_compound, decode_link_response,
-    decode_lock_op_outcome, decode_lock_response, decode_lockt_response,
-    decode_lookup_getattr_response, decode_open_op_outcome, decode_open_response,
-    decode_read_response, decode_readdir_response, decode_readlink_response,
+    decode_lock_op_outcome, decode_lockt_response, decode_lookup_getattr_response,
+    decode_open_response, decode_read_response, decode_readdir_response, decode_readlink_response,
     decode_release_lockowner_response, decode_remove_response, decode_rename_response,
-    decode_setattr_response, decode_setclientid_response, decode_stateid_op_outcome,
-    decode_stateid_response, decode_write_response, open_succeeded_before_compound_failure,
+    decode_setattr_response, decode_stateid_op_outcome, decode_stateid_response,
+    decode_write_response, open_succeeded_before_compound_failure,
 };
 use super::lease::{LeaseRenewal, LeaseState, RecoveryHandler};
-use super::state::{LockLane, LockState, OpenState, OwnerLane, decode_owner, encode_owner};
+use super::recovery::{
+    FreshOpenSpec, RecoveryContext, StateidRecovery, classify_stateid_failure, close_fresh_open,
+    establish_identity, fresh_open_lane_with_seqid, lock_op_consumes_seqid, recovery_failure,
+    state_recovery_exhausted, stateid_hex, stateid_op_consumes_seqid, status_consumes_seqid,
+};
+use super::state::{
+    LockLane, LockState, LostLock, OpenState, OwnerLane, decode_owner, encode_owner,
+};
 use crate::dialer::Endpoint;
 use crate::error::{NfsError, OperationClass, RequestContext, Result, classify_sent_nfs40_error};
-use crate::mount::{self, NFSVersion};
+use crate::mount::{self, MountLifecycleState, NFSVersion};
 use crate::nfs4::acl;
 use crate::nfs4::attrs::{
     decode_fattr4_envelope, decode_getattr_response, encode_setattr, fattr4_has,
@@ -41,11 +45,9 @@ use crate::rpc::{self, ReplayPolicy};
 use crate::{Mount, MountArgs};
 
 const NFS4_DEFAULT_PORT: u16 = 2049;
-const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_REPLAY: ReplayPolicy = ReplayPolicy::byte_identical(2);
 const CALLBACK_GETATTR_BITMAP: [u32; 1] = [0x18];
-const MAX_CONCURRENT_RECLAIMS: usize = 16;
-
 struct DetachedSettlement<T: 'static> {
     future: Option<Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>>,
 }
@@ -110,30 +112,67 @@ async fn query_callback_attributes(
     let response = rpc.call(request, SAFE_REPLAY, METADATA_TIMEOUT).await?;
     decode_callback_attributes(decode_getattr_compound(response)?)
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StateidRecovery {
-    Bad,
-    Stale,
-    Old,
+/// The gate error returned while a lost lock has not been reacquired.
+///
+/// Recovery may keep an open after its lock could not be reclaimed. Serving I/O
+/// through it would silently drop the application out of its critical section,
+/// so reads and writes on that handle fail explicitly until the caller
+/// reacquires a lock or closes it.
+fn lost_lock_error(operation: &'static str, lost: &LostLock) -> NfsError {
+    let cause = if lost.status == crate::Nfs4ErrorCode::NFS4ERR_DENIED {
+        NfsError::LockDenied {
+            lock_type: lost.lock_type,
+            offset: lost.offset,
+            length: lost.length,
+            owner: lost.owner.clone(),
+        }
+    } else {
+        NfsError::Nfs4(lost.status)
+    };
+    NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
+        operation: operation.to_string(),
+        status: lost.status,
+        source: Box::new(cause),
+    }))
 }
 
-fn stateid_recovery(error: &NfsError) -> Option<StateidRecovery> {
-    match error {
-        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID) => Some(StateidRecovery::Bad),
-        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID) => Some(StateidRecovery::Stale),
-        NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID) => Some(StateidRecovery::Old),
-        _ => None,
-    }
+/// How a data request carries its state: through a lane's stateid, or through
+/// the anonymous stateid when the handle has no lane left.
+#[derive(PartialEq, Eq)]
+enum DispatchState {
+    /// The request uses a lane stateid, so `begin_stateful` checks the
+    /// lifecycle for it.
+    Stateful,
+    /// The request uses the anonymous stateid, which is legal (RFC 7530
+    /// §9.1.4.3) but only while the mount still holds its state.
+    Anonymous,
 }
 
-fn stateid_hex(stateid: &[u8; 16]) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(32);
-    for byte in stateid {
-        let _ = write!(encoded, "{byte:02x}");
+/// The single admission rule for data I/O on a handle.
+///
+/// A handle carries data I/O only while no lock loss is published for it, and
+/// an anonymous dispatch additionally needs the mount to be `Ready`. Every
+/// READ/WRITE/truncate path goes through here so that adding a new operation
+/// cannot silently skip one of the two checks.
+///
+/// Callers must invoke it at the authoritative point: a stateful request while
+/// holding the lane it will use, because recovery publishes the loss under that
+/// lane; an anonymous request after the blocking lookup returned no lane. Calls
+/// at an operation's entry are only a fast path and never the final word.
+async fn admit_data_io(
+    locks: &LockState,
+    lease: &LeaseState,
+    operation: &'static str,
+    fh: &Bytes,
+    dispatch: DispatchState,
+) -> Result<()> {
+    if let Some(lost) = locks.lost(fh).await {
+        return Err(lost_lock_error(operation, &lost));
     }
-    encoded
+    if dispatch == DispatchState::Anonymous {
+        lease.gate_stateful(operation)?;
+    }
+    Ok(())
 }
 
 struct Mount40 {
@@ -158,9 +197,9 @@ struct Mount40 {
 }
 
 #[derive(Clone)]
-struct ClientIdentity {
-    verifier: [u8; 8],
-    owner: String,
+pub(super) struct ClientIdentity {
+    pub(super) verifier: [u8; 8],
+    pub(super) owner: String,
 }
 
 impl ClientIdentity {
@@ -283,6 +322,9 @@ async fn mount_on_addr(addr: &Endpoint, args: &MountArgs, auth: Auth) -> Result<
         let lease = Arc::clone(&reconnect_lease);
         async move {
             lease.mark_reconnecting();
+            // Probe the client id now: a restart answers STALE_CLIENTID and
+            // starts recovery immediately instead of after the next RENEW tick.
+            lease.wake_renewal();
             Ok(())
         }
     })?;
@@ -398,238 +440,7 @@ async fn query_mount_parameters(
     ))
 }
 
-async fn establish_identity(
-    rpc: &rpc::Client,
-    auth: &Auth,
-    identity: &ClientIdentity,
-    callback_addr: Option<&str>,
-) -> Result<u64> {
-    let callback = callback_addr
-        .map(|addr| CallbackAddress::tcp(addr, 1))
-        .unwrap_or(CallbackAddress::DISABLED);
-    let identity_request = CompoundBuilder::new("identity")
-        .setclientid(SetClientIdArgs {
-            verifier: identity.verifier,
-            owner: identity.owner.as_bytes(),
-            callback,
-        })
-        .encode_with_header(auth);
-    let identity_response = rpc
-        .call(
-            identity_request,
-            ReplayPolicy::ONE_ATTEMPT,
-            METADATA_TIMEOUT,
-        )
-        .await?;
-    let (client_id, confirm_verifier) = decode_setclientid_response(identity_response)?;
-
-    let confirm_request = CompoundBuilder::new("confirm")
-        .setclientid_confirm(client_id, confirm_verifier)
-        .encode_with_header(auth);
-    let confirm_response = rpc
-        .call(confirm_request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-        .await?;
-    decode_confirm_response(confirm_response)?;
-    Ok(client_id)
-}
-
-struct FreshOpen {
-    stateid: [u8; 16],
-    next_seqid: u32,
-    fh: Bytes,
-    delegation: Option<DelegationGrant>,
-}
-
-struct FreshOpenAttempt {
-    result: Result<FreshOpen>,
-    /// Next unconsumed open-owner seqid after every OPEN/OPEN_CONFIRM stage
-    /// that was actually sent, whether it succeeded or failed.
-    next_seqid: u32,
-    /// Seqid carried by the OPEN request. When it equals `next_seqid`, no
-    /// stage consumed anything and callers must keep the lane's existing
-    /// cursor instead of regressing it.
-    sent_seqid: u32,
-}
-
-impl FreshOpenAttempt {
-    fn record_consumption(&self, lane: &mut OwnerLane) {
-        if self.next_seqid != self.sent_seqid {
-            lane.next_seqid = self.next_seqid;
-        }
-    }
-}
-
-/// Issue a normal `CLAIM_NULL` OPEN for a lane, without resolving a path again.
-///
-/// RFC 7530 §9.6.3.4.5 allows a client whose reclaim was rejected by the FSAL
-/// to re-establish state with a normal OPEN. The directory handle and name are
-/// the ones retained on the lane at open time.
-#[allow(clippy::too_many_arguments)]
-async fn fresh_open_lane(
-    rpc: &rpc::Client,
-    auth: &Auth,
-    dir_fh: &Bytes,
-    name: impl AsRef<[u8]>,
-    owner_wire: &[u8],
-    access: u32,
-    client_id: u64,
-    seqid: u32,
-    operation: &str,
-) -> FreshOpenAttempt {
-    let request = CompoundBuilder::new(operation)
-        .putfh(dir_fh)
-        .open(OpenArgs {
-            seqid,
-            share_access: access,
-            client_id,
-            owner: owner_wire,
-            filename: name.as_ref(),
-            create: false,
-        })
-        .getfh()
-        .encode_with_header(auth);
-    // A transmission failure does not prove that the server consumed the
-    // seqid, so keep the cursor unchanged.
-    let response = match rpc
-        .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return FreshOpenAttempt {
-                result: Err(error),
-                next_seqid: seqid,
-                sent_seqid: seqid,
-            };
-        }
-    };
-    let outcome = match decode_open_op_outcome(response) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return FreshOpenAttempt {
-                result: Err(error),
-                next_seqid: seqid,
-                sent_seqid: seqid,
-            };
-        }
-    };
-    // Only an OPEN that actually ran consumed its seqid. A PUTFH failure
-    // reports a non-zero overall status too but must leave the cursor alone.
-    let mut next_seqid = if open_op_consumes_seqid(&outcome) {
-        seqid.wrapping_add(1)
-    } else {
-        seqid
-    };
-    let (opened, fh) = match outcome.into_result() {
-        Ok(value) => value,
-        Err(error) => {
-            return FreshOpenAttempt {
-                result: Err(error),
-                next_seqid,
-                sent_seqid: seqid,
-            };
-        }
-    };
-    let mut stateid = opened.stateid;
-    if opened.confirm_required {
-        let request = CompoundBuilder::new("open_confirm")
-            .putfh(&fh)
-            .open_confirm(&stateid, next_seqid)
-            .encode_with_header(auth);
-        let response = match rpc
-            .call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // OPEN_CONFIRM may have reached the server, but only the
-                // already-consumed OPEN seqid is certain.
-                return FreshOpenAttempt {
-                    result: Err(error),
-                    next_seqid,
-                    sent_seqid: seqid,
-                };
-            }
-        };
-        let confirm = match decode_stateid_op_outcome(response, 20, "OPEN_CONFIRM") {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return FreshOpenAttempt {
-                    result: Err(error),
-                    next_seqid,
-                    sent_seqid: seqid,
-                };
-            }
-        };
-        if stateid_op_consumes_seqid(&confirm) {
-            next_seqid = next_seqid.wrapping_add(1);
-        }
-        match confirm.into_result() {
-            Ok(confirmed) => stateid = confirmed,
-            Err(error) => {
-                return FreshOpenAttempt {
-                    result: Err(error),
-                    next_seqid,
-                    sent_seqid: seqid,
-                };
-            }
-        }
-    }
-    FreshOpenAttempt {
-        result: Ok(FreshOpen {
-            stateid,
-            next_seqid,
-            fh,
-            delegation: opened.delegation,
-        }),
-        next_seqid,
-        sent_seqid: seqid,
-    }
-}
-
-/// Fresh OPEN bounded to two attempts: a released open-owner restarts at
-/// seqid 0, while a still-current open-owner expects the lane's next seqid.
-#[allow(clippy::too_many_arguments)]
-async fn fresh_open_lane_with_seqid(
-    rpc: &rpc::Client,
-    auth: &Auth,
-    dir_fh: &Bytes,
-    name: impl AsRef<[u8]>,
-    owner_wire: &[u8],
-    access: u32,
-    client_id: u64,
-    next_seqid: u32,
-    operation: &str,
-) -> FreshOpenAttempt {
-    let attempt = fresh_open_lane(
-        rpc,
-        auth,
-        dir_fh,
-        name.as_ref(),
-        owner_wire,
-        access,
-        client_id,
-        0,
-        operation,
-    )
-    .await;
-    // BAD_SEQID on a seqid=0 OPEN is the unambiguous "owner still alive"
-    // reply; BAD/OLD_STATEID here do not prove that, so only BAD_SEQID
-    // retries with the lane's next_seqid.
-    if matches!(
-        &attempt.result,
-        Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_BAD_SEQID))
-    ) && next_seqid != 0
-    {
-        return fresh_open_lane(
-            rpc, auth, dir_fh, name, owner_wire, access, client_id, next_seqid, operation,
-        )
-        .await;
-    }
-    attempt
-}
-
-async fn return_delegation(
+pub(super) async fn return_delegation(
     rpc: &rpc::Client,
     auth: &Auth,
     fh: &Bytes,
@@ -651,12 +462,39 @@ async fn return_delegation(
     decode_delegreturn_response(response)
 }
 
-/// Close a fresh OPEN state that must not be published.
-///
-/// Returns `Some(consumed)` when the reply pins down whether CLOSE consumed the
-/// open-owner seqid, and `None` when the outcome is unknown (transport or
-/// decoding failure). Callers must not replay either seqid in that case.
-async fn close_unpublished_state(
+fn context(
+    operation: &str,
+    owner: u64,
+    seqid: u32,
+    class: OperationClass,
+) -> (OperationClass, RequestContext) {
+    (
+        class,
+        RequestContext {
+            operation: operation.to_string(),
+            protocol: NFSVersion::NFSv4p0,
+            request_id: Some(crate::error::RequestId::nfs40(owner, seqid)),
+        },
+    )
+}
+
+/// Decodes a `PUTFH + LOCK` reply together with whether that request consumed
+/// the owner seqid. A PUTFH failure reports a non-zero overall status but never
+/// ran the operation, so it must not advance the cursor.
+fn decode_lock_call(response: Result<Bytes>, opcode: u32, name: &str) -> (Result<[u8; 16]>, bool) {
+    match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
+        Ok(outcome) => {
+            let consumed = lock_op_consumes_seqid(&outcome);
+            (outcome.into_result(), consumed)
+        }
+        Err(error) => (Err(error), false),
+    }
+}
+
+/// CLOSE an OPEN that was never published, reporting whether the request
+/// consumed the owner seqid. `None` means the transmission outcome is unknown,
+/// so the caller must not replay either cursor value.
+pub(super) async fn close_unpublished_state(
     rpc: &rpc::Client,
     auth: &Auth,
     fh: &Bytes,
@@ -694,271 +532,28 @@ async fn close_unpublished_state(
     }
 }
 
-#[derive(Clone)]
-struct RecoveryContext {
-    rpc: rpc::Client,
-    auth: Auth,
-    identity: ClientIdentity,
-    client_id: Arc<AtomicU64>,
-    issuer: u64,
-    state: Arc<OpenState>,
-    locks: Arc<LockState>,
-    lease: Arc<LeaseState>,
-    callback_addr: Option<String>,
-}
-
-impl RecoveryContext {
-    async fn recover(&self) -> Result<()> {
-        let renewed_client_id = establish_identity(
-            &self.rpc,
-            &self.auth,
-            &self.identity,
-            self.callback_addr.as_deref(),
-        )
-        .await?;
-        self.client_id.store(renewed_client_id, Ordering::Release);
-        self.lease.mark_reclaiming();
-
-        stream::iter(
-            self.state
-                .snapshot()
-                .await
-                .into_iter()
-                .map(Ok::<_, NfsError>),
-        )
-        .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lane| async move {
-            // Learn the fence while holding the lane only briefly: the fence
-            // must be acquired before the lane to match close_lane's order.
-            let io_fence = {
-                let open = lane.lock().await;
-                Arc::clone(&open.io_fence)
-            };
-            let _in_flight_settled = io_fence.write_owned().await;
-            let mut open = lane.lock().await;
-            if open.closing || !self.state.is_current(open.owner, &lane).await {
-                // Closed or removed while this reclaim waited: do not resurrect
-                // server state the client no longer tracks.
-                return Ok(());
-            }
-            let owner_wire = format!("nfs-rs-{:016x}-{:016x}", self.issuer, open.owner);
-            let response = self
-                .rpc
-                .call(
-                    CompoundBuilder::new("reclaim-open")
-                        .putfh(&open.fh)
-                        .open_reclaim(OpenReclaimArgs {
-                            seqid: 0,
-                            share_access: open.access,
-                            client_id: renewed_client_id,
-                            owner: owner_wire.as_bytes(),
-                        })
-                        .getfh()
-                        .encode_with_header(&self.auth),
-                    ReplayPolicy::ONE_ATTEMPT,
-                    METADATA_TIMEOUT,
-                )
-                .await?;
-            let (reclaimed, fh) = decode_open_response(response)?;
-            if reclaimed.confirm_required || fh != open.fh {
-                return Err(NfsError::Xdr(
-                    "NFSv4.0 reclaim OPEN returned incompatible state".into(),
-                ));
-            }
-            if let Some(delegation) = reclaimed.delegation {
-                let response = self
-                    .rpc
-                    .call(
-                        CompoundBuilder::new("reclaim-delegreturn")
-                            .putfh(&fh)
-                            .delegreturn(&delegation.stateid)
-                            .encode_with_header(&self.auth),
-                        ReplayPolicy::ONE_ATTEMPT,
-                        METADATA_TIMEOUT,
-                    )
-                    .await?;
-                decode_delegreturn_response(response)?;
-            }
-            open.stateid = reclaimed.stateid;
-            open.next_seqid = 1;
-            Ok(())
-        })
-        .await?;
-
-        let mut lock_groups = BTreeMap::<u64, Vec<_>>::new();
-        for lane in self.locks.snapshot().await {
-            let open_owner = lane.lock().await.open_owner;
-            lock_groups.entry(open_owner).or_default().push(lane);
-        }
-        stream::iter(lock_groups.into_values().map(Ok::<_, NfsError>))
-            .try_for_each_concurrent(Some(MAX_CONCURRENT_RECLAIMS), |lanes| async move {
-                for lane in lanes {
-                    let (open_owner, old_stateid) = {
-                        let lock = lane.lock().await;
-                        (lock.open_owner, lock.stateid)
-                    };
-                    let open_lane = self.state.by_owner(open_owner).await.ok_or_else(|| {
-                        NfsError::Xdr("NFSv4.0 reclaim LOCK lost its open-owner".into())
-                    })?;
-                    // Same fence-before-lane order as close_lane and the OPEN
-                    // reclaim loop.
-                    let io_fence = {
-                        let open = open_lane.lock().await;
-                        if open.closing {
-                            continue;
-                        }
-                        Arc::clone(&open.io_fence)
-                    };
-                    let _in_flight_settled = io_fence.write_owned().await;
-                    let mut open = open_lane.lock().await;
-                    if open.closing || !self.state.is_current(open_owner, &open_lane).await {
-                        continue;
-                    }
-                    let mut lock = lane.lock().await;
-                    if !self.locks.is_current(&lock.stateid, &lane).await {
-                        // A LOCKU released this lock while the reclaim waited;
-                        // reclaiming it would resurrect state the caller closed.
-                        continue;
-                    }
-                    let response = self
-                        .rpc
-                        .call(
-                            CompoundBuilder::new("reclaim-lock")
-                                .putfh(&lock.fh)
-                                .lock_new(NewLockArgs {
-                                    lock_type: lock.lock_type,
-                                    reclaim: true,
-                                    offset: lock.offset,
-                                    length: lock.length,
-                                    open_seqid: open.next_seqid,
-                                    open_stateid: &open.stateid,
-                                    lock_seqid: 0,
-                                    client_id: renewed_client_id,
-                                    owner: &lock.owner_wire,
-                                })
-                                .encode_with_header(&self.auth),
-                            ReplayPolicy::ONE_ATTEMPT,
-                            METADATA_TIMEOUT,
-                        )
-                        .await?;
-                    let new_stateid = decode_lock_response(response, 12, "LOCK")?;
-                    open.next_seqid = open.next_seqid.wrapping_add(1);
-                    lock.stateid = new_stateid;
-                    lock.next_seqid = 1;
-                    // Rekey while the lock lane is still held: otherwise a
-                    // concurrent LOCKU can remove the new key and this rekey
-                    // would re-insert a lane whose stateid is already retired.
-                    self.locks
-                        .rekey(old_stateid, new_stateid, Arc::clone(&lane))
-                        .await;
-                    drop(lock);
-                }
-                Ok(())
-            })
-            .await?;
-        Ok(())
-    }
-
-    async fn recover_or_lose(&self) -> Result<()> {
-        match self.recover().await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.lease.mark_lost().await;
-                self.state.clear().await;
-                self.locks.clear().await;
-                Err(NfsError::OperationOutcome(Box::new(
-                    crate::error::OperationOutcomeError::new(
-                        crate::error::OperationOutcome::Uncertain,
-                        OperationClass::ReplaySensitive,
-                        crate::error::RecoveryAction::Reopen,
-                        RequestContext {
-                            operation: "nfs40_lease_recovery".into(),
-                            protocol: NFSVersion::NFSv4p0,
-                            request_id: None,
-                        },
-                        error,
-                    ),
-                )))
-            }
-        }
-    }
-}
-
-fn context(
-    operation: &str,
-    owner: u64,
-    seqid: u32,
-    class: OperationClass,
-) -> (OperationClass, RequestContext) {
-    (
-        class,
-        RequestContext {
-            operation: operation.to_string(),
-            protocol: NFSVersion::NFSv4p0,
-            request_id: Some(crate::error::RequestId::nfs40(owner, seqid)),
-        },
-    )
-}
-
-/// RFC 7530 §9.1.7: every owner-sequenced request consumes its seqid except
-/// for this exception list. OLD_STATEID is deliberately not an exception, so a
-/// rejected request must still advance the client's seqid before a retry.
-fn status_consumes_seqid(status: crate::Nfs4ErrorCode) -> bool {
-    !matches!(
-        status as u32,
-        10022 | 10023 | 10025 | 10026 | 10036 | 10018 | 10020 | 10019
-    )
-}
-
-fn error_consumes_seqid(error: &NfsError) -> bool {
-    matches!(error, NfsError::Nfs4(status) if status_consumes_seqid(*status))
-}
-
-/// RFC 7530 §9.1.7 consumption of a two-operation `PUTFH + stateid op` reply.
-fn stateid_op_consumes_seqid(outcome: &StateidOpOutcome<[u8; 16]>) -> bool {
-    match outcome {
-        StateidOpOutcome::Completed(_) | StateidOpOutcome::Executed(_) => true,
-        StateidOpOutcome::Rejected(error) => error_consumes_seqid(error),
-        StateidOpOutcome::NotExecuted(_) => false,
-    }
-}
-
-fn open_op_consumes_seqid(outcome: &OpenOpOutcome) -> bool {
-    match outcome {
-        OpenOpOutcome::Completed(_, _) | OpenOpOutcome::Executed(_) => true,
-        OpenOpOutcome::Rejected(error) => error_consumes_seqid(error),
-        OpenOpOutcome::NotExecuted(_) => false,
-    }
-}
-
-fn lock_op_consumes_seqid(outcome: &LockOpOutcome) -> bool {
-    match outcome {
-        LockOpOutcome::Granted(_) | LockOpOutcome::Executed(_) | LockOpOutcome::Denied(_) => true,
-        LockOpOutcome::Rejected(error) => error_consumes_seqid(error),
-        LockOpOutcome::NotExecuted(_) => false,
-    }
-}
-
-fn decode_lock_op_call(
-    response: Result<Bytes>,
-    opcode: u32,
-    name: &str,
-) -> (Result<[u8; 16]>, bool) {
-    match response.and_then(|response| decode_lock_op_outcome(response, opcode, name)) {
-        Ok(outcome) => {
-            let consumed = lock_op_consumes_seqid(&outcome);
-            (outcome.into_result(), consumed)
-        }
-        Err(error) => (Err(error), false),
-    }
-}
-
 async fn settled_call(
     rpc: rpc::Client,
     request: Vec<u8>,
     class: OperationClass,
     ctx: RequestContext,
 ) -> Result<Bytes> {
+    settled_call_holding(rpc, request, class, ctx, None).await
+}
+
+async fn settled_call_holding(
+    rpc: rpc::Client,
+    request: Vec<u8>,
+    class: OperationClass,
+    ctx: RequestContext,
+    in_flight: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+) -> Result<Bytes> {
     tokio::spawn(crate::retry::inherit(async move {
+        // The caller's fence travels with the settlement. Cancelling the caller
+        // drops only its handle, while this task keeps the request (and its busy
+        // retries) on the wire; CLOSE or recovery must not overtake it, so the
+        // fence has to live here rather than in the caller's future.
+        let _in_flight = in_flight;
         call_with_busy_retry(
             &rpc,
             request,
@@ -1014,7 +609,7 @@ impl Mount40 {
         // retry must advance it instead of reusing lock_seqid 0 (which the
         // server would treat as a replay and answer from its cache).
         let mut lock_seqid = 0u32;
-        let mut attempt = 0;
+        let mut retries = 0u8;
         loop {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
@@ -1033,7 +628,25 @@ impl Mount40 {
             let acquisition = self.locks.begin_acquisition(fh.clone());
             let stateid = tokio::spawn(async move {
                 let _acquisition = acquisition;
+                // CLOSE sets `closing` and takes the I/O fence. Take the same
+                // fence-before-lane order as READ/WRITE/close so a LOCK cannot
+                // be issued while that open state is being released.
+                let io_fence = {
+                    let open = open_lane_task.lock().await;
+                    if open.closing {
+                        return Err(NfsError::InvalidInput(
+                            "NFSv4.0 open state is closing or closed".into(),
+                        ));
+                    }
+                    Arc::clone(&open.io_fence)
+                };
+                let _in_flight = io_fence.read_owned().await;
                 let mut open = open_lane_task.lock().await;
+                if open.closing {
+                    return Err(NfsError::InvalidInput(
+                        "NFSv4.0 open state is closing or closed".into(),
+                    ));
+                }
                 let open_owner = open.owner;
                 *used_in_task
                     .lock()
@@ -1058,7 +671,7 @@ impl Mount40 {
                     lock_seqid_for_task,
                     OperationClass::ReplaySensitive,
                 );
-                let (decoded, consumed) = decode_lock_op_call(
+                let (decoded, consumed) = decode_lock_call(
                     rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                         .await,
                     12,
@@ -1073,7 +686,9 @@ impl Mount40 {
                 // Register before the lifecycle fence: the server may already
                 // have granted the lock, and losing the lane would leak it
                 // until lease expiry. A lost mount removes it below; a Suspect
-                // mount keeps it so the caller can unlock after recovery.
+                // or Reconnecting mount keeps it so cleanup can unlock it after
+                // recovery.
+                let gate_fh = fh.clone();
                 locks
                     .register(LockLane {
                         owner,
@@ -1099,6 +714,12 @@ impl Mount40 {
                     }
                     return Err(error);
                 }
+                // Only a lock that restores the lost protection resolves it: a
+                // disjoint or weaker lock on the same handle acknowledges
+                // nothing, and other losses on the handle stay gated.
+                locks
+                    .resolve_lost(&gate_fh, lock_type, offset, length)
+                    .await;
                 Ok::<_, NfsError>(stateid)
             })
             .await
@@ -1108,24 +729,17 @@ impl Mount40 {
                 Err(error) => {
                     // The LOCK carries the open stateid; a stateid failure is the
                     // open lane's to recover before the lock can be created.
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
-                    }
-                    let Some(failed_stateid) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("lock", trigger, error));
-                    };
+                    let (trigger, error) = classify_stateid_failure("lock", &mut retries, error)?;
+                    let failed_stateid = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| state_recovery_exhausted("lock", trigger, error))?;
                     self.refresh_lane_stateid(&open_lane, failed_stateid, trigger, "lock")
                         .await
-                        .map_err(|failure| Self::recovery_failure("lock", trigger, failure))?;
+                        .map_err(|failure| recovery_failure("lock", trigger, failure))?;
                     if trigger == StateidRecovery::Old {
                         lock_seqid = lock_seqid.wrapping_add(1);
                     }
-                    attempt += 1;
                 }
             }
         }
@@ -1316,30 +930,33 @@ impl Mount40 {
                     next_seqid,
                     OperationClass::ReplaySensitive,
                 );
-                let result = async {
-                    let response = rpc
-                        .call(
-                            CompoundBuilder::new("delegreturn")
-                                .putfh(&fh)
-                                .delegreturn(&delegation.stateid)
-                                .encode_with_header(&auth),
-                            ReplayPolicy::ONE_ATTEMPT,
-                            METADATA_TIMEOUT,
-                        )
-                        .await
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))?;
-                    decode_delegreturn_response(response)
-                        .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
-                }
-                .await;
-                if let Err(error) = result {
-                    // The lane is registered before this follow-up so a failed
-                    // DELEGRETURN stays closeable. If the mount was lost in the
-                    // meantime its maps were cleared, and the lane must not be
-                    // left behind.
-                    if lease.generation() != expected_generation {
-                        state.remove(owner, &fh).await;
-                    }
+                let returned = rpc
+                    .call(
+                        CompoundBuilder::new("delegreturn")
+                            .putfh(&fh)
+                            .delegreturn(&delegation.stateid)
+                            .encode_with_header(&auth),
+                        ReplayPolicy::ONE_ATTEMPT,
+                        METADATA_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|error| classify_sent_nfs40_error(class, ctx.clone(), error))
+                    .and_then(|response| {
+                        decode_delegreturn_response(response)
+                            .map_err(|error| classify_sent_nfs40_error(class, ctx, error))
+                    });
+                if let Err(error) = returned {
+                    // The OPEN already succeeded, but the caller never receives
+                    // the handle, so no later close() can complete it. Retire
+                    // the lane after a best-effort CLOSE rather than leaving an
+                    // unreachable open for recovery to adopt; whatever the
+                    // CLOSE did not release expires with the lease. The
+                    // finish_stateful path below keeps the lane instead because
+                    // there the open was already published before the lifecycle
+                    // gate rejected it, and the existing contract keeps
+                    // published lanes on non-lost mounts.
+                    close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
+                    state.remove(owner, &fh).await;
                     return Err(error);
                 }
             }
@@ -1355,28 +972,36 @@ impl Mount40 {
             } else {
                 None
             };
-            let _publication = lease.publication_guard().await;
+            let publication = lease.publication_guard().await;
             if let Err(error) = lease.finish_stateful(expected_generation, "open") {
+                // The lifecycle gate already rejected this open, so release
+                // the guard before the cleanup RPCs: holding it would delay
+                // mark_lost() by a full round trip for no benefit.
+                drop(publication);
+                // The caller never receives the handle, so the delegation was
+                // not registered with the callback state. Return it before any
+                // CLOSE below: an orphaned delegation would otherwise be
+                // recalled against a stateid the client no longer tracks.
+                let _ = return_delegation(&rpc, &auth, &fh, opened.delegation).await;
                 // A lost/rotated mount has already cleared its state maps, so
-                // the lane published above would be unreachable. A Suspect or
-                // Reconnecting mount still owns this open, and removing it
-                // would discard the only handle that can close it.
+                // the lane published above would be unreachable: release the
+                // state we just created instead of leaving an orphan open for
+                // the next recovery pass to adopt. A Suspect or Reconnecting
+                // mount still owns this open, and removing it would discard the
+                // only handle that can close it.
                 if lease.generation() != expected_generation {
+                    close_fresh_open(&rpc, &auth, &fh, &stateid, next_seqid).await;
                     state.remove(owner, &fh).await;
                 }
                 return Err(error);
             }
-            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation)
-                && let Err(error) = callback_state.register_delegation(
+            if let (Some(callback_state), Some(delegation)) = (&callback_state, opened.delegation) {
+                callback_state.register_delegation(
                     fh.clone(),
                     delegation,
                     expected_generation,
                     delegation_attributes,
-                )
-            {
-                // The open itself is valid; keeping the lane lets the caller
-                // close it by file handle after the delegation failure.
-                return Err(error);
+                )?;
             }
             drop(callback_publication);
             if let Err(error) = lease.validate_stateful(expected_generation, "open") {
@@ -1547,7 +1172,7 @@ impl Mount40 {
                     // report the loss (recovery_action=reopen).
                     lane.next_seqid = lane.next_seqid.wrapping_add(1);
                     lane.closing = false;
-                    return Err(Self::state_recovery_exhausted(
+                    return Err(state_recovery_exhausted(
                         "close",
                         StateidRecovery::Old,
                         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID),
@@ -1555,8 +1180,18 @@ impl Mount40 {
                 }
                 // RFC 7530 §9.1.4.3: BAD/STALE mean the server no longer knows
                 // this state, so CLOSE is already satisfied. Treat it as
-                // released instead of wedging the lane in `closing`.
-                Err(error) if error.is_recoverable_state() => {
+                // released instead of wedging the lane in `closing`. An
+                // invalid client id after a restart proves the same thing.
+                Err(error)
+                    if error.is_recoverable_state()
+                        || matches!(
+                            &error,
+                            NfsError::Nfs4(
+                                crate::Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID
+                                    | crate::Nfs4ErrorCode::NFS4ERR_EXPIRED
+                            )
+                        ) =>
+                {
                     tracing::debug!(
                         target: "nfs_rs::stateid",
                         operation = "close",
@@ -1669,7 +1304,10 @@ impl Mount40 {
         }
         let mut open = lane.lock().await;
         if open.closing {
-            return Err(NfsError::InvalidInput(format!(
+            // A concurrent CLOSE already released (or is releasing) this state.
+            // That is a lifecycle answer, not an exhausted recovery: keep it as
+            // a closed-resource error so callers do not retry a reopen.
+            return Err(NfsError::ClosedResource(format!(
                 "NFSv4.0 open state closed during {operation} stateid recovery"
             )));
         }
@@ -1689,18 +1327,15 @@ impl Mount40 {
         // regardless of the gap.
         let current_client_id = client_id.load(Ordering::Acquire);
         let owner_wire = format!("nfs-rs-{issuer:016x}-{:016x}", open.owner);
-        let attempt = fresh_open_lane_with_seqid(
-            &rpc,
-            &auth,
-            &open.dir_fh,
-            &open.name,
-            owner_wire.as_bytes(),
-            open.access,
-            current_client_id,
-            open.next_seqid,
-            operation,
-        )
-        .await;
+        let spec = FreshOpenSpec {
+            dir_fh: &open.dir_fh,
+            name: &open.name,
+            owner_wire: owner_wire.as_bytes(),
+            access: open.access,
+            client_id: current_client_id,
+        };
+        let attempt =
+            fresh_open_lane_with_seqid(&rpc, &auth, &spec, open.next_seqid, operation).await;
         // RFC 7530 §9.1.7: a definitive OPEN/OPEN_CONFIRM failure consumes its
         // owner seqid unless the status is in the exception table. The helper
         // reports the authoritative cursor for every stage that was actually
@@ -1720,13 +1355,17 @@ impl Mount40 {
         // every later attempt would replay this OPEN instead of converging.
         open.next_seqid = fresh.next_seqid;
         if fresh.fh != open.fh {
-            // The re-open resolved to a different filehandle: release the
-            // freshly created state rather than leak it, then refuse to commit
-            // the recovery. The lane's cursor must still reflect the cleanup
-            // CLOSE: it consumes the seqid it was sent with, so discarding the
-            // reply would make the next owner-sequenced request replay it and
-            // fail with BAD_SEQID. An unknown outcome makes both values unsafe
-            // to replay, so retire the lane instead.
+            // The path now resolves to a different object (replaced or
+            // re-created by another client). Release the freshly created state
+            // rather than leak it, then refuse to commit the recovery. The
+            // lane's cursor must still reflect the cleanup CLOSE: it consumes
+            // the seqid it was sent with, so discarding the reply would make
+            // the next owner-sequenced request replay it and fail with
+            // BAD_SEQID. An unknown outcome makes both values unsafe to replay,
+            // so retire the lane instead. The freshly created OPEN may carry a
+            // delegation: return it before closing, otherwise the server keeps
+            // recalling a delegation whose filehandle this lane no longer owns.
+            let _ = return_delegation(&rpc, &auth, &fresh.fh, fresh.delegation).await;
             match close_unpublished_state(&rpc, &auth, &fresh.fh, fresh.next_seqid, &fresh.stateid)
                 .await
             {
@@ -1735,12 +1374,12 @@ impl Mount40 {
                 None => {
                     open.closing = true;
                     let owner = open.owner;
-                    let fh = open.fh.clone();
+                    let stale_fh = open.fh.clone();
                     drop(open);
-                    open_state.remove(owner, &fh).await;
+                    open_state.remove(owner, &stale_fh).await;
                 }
             }
-            return Err(NfsError::Xdr(
+            return Err(NfsError::LostOpenState(
                 "NFSv4.0 stateid recovery opened a different filehandle".into(),
             ));
         }
@@ -1757,7 +1396,7 @@ impl Mount40 {
             // stateid again, so report exhaustion instead of claiming a
             // recovery that did not happen. Do not CLOSE it: the stateid names
             // the very state the lane must keep.
-            return Err(Self::state_recovery_exhausted(
+            return Err(state_recovery_exhausted(
                 operation,
                 trigger,
                 NfsError::Xdr(
@@ -1805,54 +1444,6 @@ impl Mount40 {
             "NFSv4.0 stateid recovered with a fresh OPEN"
         );
         Ok(())
-    }
-
-    /// Classify a failure raised while refreshing a lane.
-    ///
-    /// An authoritative protocol status explains why the lane could not be
-    /// refreshed and keeps its own meaning: busy statuses (GRACE, DELAY) stay
-    /// retryable, and statuses such as NOENT or ACCESS keep their errno
-    /// mapping. Only failures without an authoritative status (transport,
-    /// encoding, closed state) are reported as exhausted recovery.
-    fn recovery_failure(operation: &str, trigger: StateidRecovery, source: NfsError) -> NfsError {
-        // A stateid status raised by the recovery OPEN itself means the
-        // bounded recovery did not restore usable state: report exhaustion
-        // instead of handing callers a status that claims to be recoverable
-        // in place.
-        if stateid_recovery(&source).is_none()
-            && (matches!(&source, NfsError::Nfs4(_))
-                || matches!(&source, NfsError::LostOpenState(_))
-                // A lifecycle/generation gate already carries the right
-                // recovery action (for example Reopen after a lost mount).
-                || matches!(&source, NfsError::OperationOutcome(_)))
-        {
-            return source;
-        }
-        Self::state_recovery_exhausted(operation, trigger, source)
-    }
-
-    fn state_recovery_exhausted(
-        operation: &str,
-        trigger: StateidRecovery,
-        source: NfsError,
-    ) -> NfsError {
-        let status = match trigger {
-            StateidRecovery::Bad => crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
-            StateidRecovery::Stale => crate::Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-            StateidRecovery::Old => crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
-        };
-        tracing::warn!(
-            target: "nfs_rs::stateid",
-            operation,
-            status = %status,
-            error = %source,
-            "NFSv4.0 stateid recovery exhausted"
-        );
-        NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
-            operation: operation.to_string(),
-            status,
-            source: Box::new(source),
-        }))
     }
 
     async fn readdir_payload(
@@ -2242,13 +1833,26 @@ impl Mount40 {
         Ok(response)
     }
 
+    async fn activity_settled_call_holding(
+        &self,
+        request: Vec<u8>,
+        class: OperationClass,
+        context: RequestContext,
+        in_flight: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Bytes> {
+        let response =
+            settled_call_holding(self.rpc.clone(), request, class, context, in_flight).await?;
+        Ok(response)
+    }
+
     async fn set_encoded_attributes(
         &self,
-        operation: &str,
+        operation: &'static str,
         fh: &Bytes,
         bitmap: &[u32],
         values: &[u8],
         invalidate_cached_attributes: bool,
+        needs_open: bool,
     ) -> Result<()> {
         let _io_guard = if let Some(callback_state) = &self.callback_state {
             Some(callback_state.foreground_io(fh).await)
@@ -2259,8 +1863,23 @@ impl Mount40 {
             callback_state.mark_attributes_unknown(fh)?;
         }
         let lane = self.state.for_fh(fh, crate::OPEN_WRITE).await;
-        let mut attempt = 0;
+        let mut retries = 0u8;
         loop {
+            // A truncate writes the truncated range, so like WRITE it keeps its
+            // open lane out of recovery between the lost-lock recheck and the
+            // send. The fence is taken before the check and its guard moves into
+            // the settlement task, so cancelling this caller cannot release it
+            // while the request is still on the wire. Only size changes pay for
+            // it; metadata-only SETATTR stays on the cheap path.
+            let truncate_in_flight = match &lane {
+                // Release the lane before waiting on the fence: close and reclaim
+                // take the fence first and the lane second.
+                Some(lane) if needs_open => {
+                    let fence = Arc::clone(&lane.lock().await.io_fence);
+                    Some(fence.read_owned().await)
+                }
+                _ => None,
+            };
             let (stateid, expected_generation) = match &lane {
                 Some(lane) => {
                     let guard = lane.lock().await;
@@ -2269,9 +1888,38 @@ impl Mount40 {
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
+                    // A truncate writes data, so it observes the same gate as
+                    // READ and WRITE even when a lane survived. Both the lookup
+                    // above and this wait queue behind a reclaim that publishes
+                    // a loss while holding the lane, so the answer is taken
+                    // under that same lane.
+                    if needs_open {
+                        admit_data_io(
+                            &self.locks,
+                            &self.lease,
+                            operation,
+                            fh,
+                            DispatchState::Stateful,
+                        )
+                        .await?;
+                    }
                     (guard.stateid, Some(self.lease.begin_stateful(operation)?))
                 }
-                None => ([0; 16], None),
+                None => {
+                    // Without an open lane the request goes out with the
+                    // anonymous stateid, so it needs both checks.
+                    if needs_open {
+                        admit_data_io(
+                            &self.locks,
+                            &self.lease,
+                            operation,
+                            fh,
+                            DispatchState::Anonymous,
+                        )
+                        .await?;
+                    }
+                    ([0; 16], None)
+                }
             };
             let request = CompoundBuilder::new(operation)
                 .putfh(fh)
@@ -2279,7 +1927,7 @@ impl Mount40 {
                 .encode_with_header(&self.auth);
             let (class, ctx) = context(operation, 0, 0, OperationClass::ReplaySensitive);
             let response = self
-                .activity_settled_call(request, class, ctx.clone())
+                .activity_settled_call_holding(request, class, ctx.clone(), truncate_in_flight)
                 .await?;
             let result = decode_setattr_response(response, bitmap)
                 .map_err(|error| classify_sent_nfs40_error(class, ctx, error));
@@ -2294,16 +1942,10 @@ impl Mount40 {
                     let Some(lane) = &lane else {
                         return Err(error);
                     };
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted(operation, trigger, error));
-                    }
+                    let (trigger, _) = classify_stateid_failure(operation, &mut retries, error)?;
                     self.refresh_lane_stateid(lane, stateid, trigger, operation)
                         .await
-                        .map_err(|failure| Self::recovery_failure(operation, trigger, failure))?;
-                    attempt += 1;
+                        .map_err(|failure| recovery_failure(operation, trigger, failure))?;
                 }
             }
         }
@@ -2318,6 +1960,14 @@ impl Mount40 {
         data: Bytes,
         stability: mount::WriteStability,
     ) -> Result<mount::WriteOutcome> {
+        admit_data_io(
+            &self.locks,
+            &self.lease,
+            "write",
+            &fh,
+            DispatchState::Stateful,
+        )
+        .await?;
         let (count, committed, verifier) = self
             .write_with_stability(fh, offset, data, stability.stable_how())
             .await?;
@@ -2345,13 +1995,22 @@ impl Mount40 {
             .state
             .for_fh(&fh, crate::OPEN_WRITE)
             .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 WRITE requires an open file".into()))?;
+            .ok_or_else(|| {
+                // A lane can be gone because crash recovery dropped it while the
+                // mount itself resumed, so lifecycle alone cannot tell a
+                // programming error from lost open state. Always report the
+                // typed failure so callers can reopen the file.
+                NfsError::LostOpenState(format!(
+                    "NFSv4.0 WRITE: no open state for this filehandle while mount is {:?}",
+                    self.lease.health().lifecycle
+                ))
+            })?;
         let refresh_delegation_attributes = if let Some(callback_state) = &self.callback_state {
             callback_state.mark_attributes_unknown(&fh)?
         } else {
             false
         };
-        let mut attempt = 0;
+        let mut retries = 0u8;
         let (count, committed, verifier) = loop {
             let expected_generation = self.lease.begin_stateful("write")?;
             let io_guard = if let Some(callback_state) = &self.callback_state {
@@ -2362,6 +2021,7 @@ impl Mount40 {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
             let lease = Arc::clone(&self.lease);
+            let locks = Arc::clone(&self.locks);
             let lane_for_settlement = Arc::clone(&lane);
             let fh_for_settlement = fh.clone();
             let data_for_settlement = data.clone();
@@ -2389,6 +2049,17 @@ impl Mount40 {
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
+                    // The waits above can span a whole reclaim. Recovery
+                    // publishes a lost lock while it holds this lane, so
+                    // rechecking here cannot miss it.
+                    admit_data_io(
+                        &locks,
+                        &lease,
+                        "write",
+                        &fh_for_settlement,
+                        DispatchState::Stateful,
+                    )
+                    .await?;
                     (guard.stateid, guard.owner, guard.next_seqid)
                 };
                 *used_in_task
@@ -2419,21 +2090,14 @@ impl Mount40 {
             match settled {
                 Ok(settled) => break settled,
                 Err(error) => {
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("write", trigger, error));
-                    }
-                    let Some(recovered) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("write", trigger, error));
-                    };
+                    let (trigger, error) = classify_stateid_failure("write", &mut retries, error)?;
+                    let recovered = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| state_recovery_exhausted("write", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "write")
                         .await
-                        .map_err(|failure| Self::recovery_failure("write", trigger, failure))?;
-                    attempt += 1;
+                        .map_err(|failure| recovery_failure("write", trigger, failure))?;
                 }
             }
         };
@@ -2571,12 +2235,31 @@ impl Mount for Mount40 {
                 "NFSv4.0 CLOSE requires outstanding locks to be released".into(),
             ));
         }
-        let lane = self
-            .state
-            .for_fh(&fh, crate::OPEN_BOTH)
-            .await
-            .ok_or_else(|| NfsError::InvalidInput("NFSv4.0 CLOSE requires an open file".into()))?;
-        self.close_lane(lane).await
+        let lane = match self.state.for_fh(&fh, crate::OPEN_BOTH).await {
+            Some(lane) => lane,
+            // Recovery dropped this handle's open state, so there is nothing to
+            // release on the server. CLOSE must still succeed: the handle may be
+            // gated on a lock that died with the open, and with no lane there is
+            // no other way to lift that gate.
+            None if self.locks.lost(&fh).await.is_some() => {
+                self.locks.clear_lost(&fh).await;
+                return Ok(());
+            }
+            // A failed recovery already dropped the lane; the server cannot
+            // hold state either, so CLOSE is satisfied instead of surfacing a
+            // programming error.
+            None if self.lease.health().lifecycle != MountLifecycleState::Ready => return Ok(()),
+            None => {
+                return Err(NfsError::InvalidInput(
+                    "NFSv4.0 CLOSE requires an open file".into(),
+                ));
+            }
+        };
+        let result = self.close_lane(lane).await;
+        if result.is_ok() && self.state.for_fh(&fh, crate::OPEN_BOTH).await.is_none() {
+            self.locks.clear_lost(&fh).await;
+        }
+        result
     }
     async fn close_stateful(&self, file: mount::OpenFile) -> Result<()> {
         let (object, protocol_state) = file.into_parts();
@@ -2594,15 +2277,44 @@ impl Mount for Mount40 {
                 "open file belongs to another mount generation".into(),
             ));
         }
-        let lane = self.state.by_owner(owner).await.ok_or_else(|| {
-            NfsError::InvalidInput("NFSv4.0 open state is closed or stale".into())
-        })?;
+        let lane = match self.state.by_owner(owner).await {
+            Some(lane) => lane,
+            // Recovery dropped this handle's open lane, so the server holds no
+            // state to release. CLOSE must still succeed when it was the last
+            // open: the handle may be gated on a lock that died with the open,
+            // and closing it is the only way to lift that gate.
+            None if self.locks.lost(&object.fh).await.is_some()
+                && self
+                    .state
+                    .for_fh(&object.fh, crate::OPEN_BOTH)
+                    .await
+                    .is_none() =>
+            {
+                self.locks.clear_lost(&object.fh).await;
+                return Ok(());
+            }
+            None => {
+                return Err(NfsError::InvalidInput(
+                    "NFSv4.0 open state is closed or stale".into(),
+                ));
+            }
+        };
         if lane.lock().await.fh != object.fh {
             return Err(NfsError::InvalidInput(
                 "NFSv4.0 open state filehandle mismatch".into(),
             ));
         }
-        self.close_lane(lane).await
+        let result = self.close_lane(lane).await;
+        if result.is_ok()
+            && self
+                .state
+                .for_fh(&object.fh, crate::OPEN_BOTH)
+                .await
+                .is_none()
+        {
+            self.locks.clear_lost(&object.fh).await;
+        }
+        result
     }
     async fn commit(&self, fh: Bytes, offset: u64, count: u32) -> Result<()> {
         self.commit_with_verifier(fh, offset, count)
@@ -2820,7 +2532,7 @@ impl Mount for Mount40 {
     async fn setacl(&self, fh: Bytes, acl_value: &mount::Acl) -> Result<()> {
         let (bitmap, values) = acl::encode_setattr_acl(acl_value);
         let result = self
-            .set_encoded_attributes("setacl", &fh, &bitmap, &values, false)
+            .set_encoded_attributes("setacl", &fh, &bitmap, &values, false, false)
             .await;
         acl::attrnotsupp_as_unsupported("SETACL", result)
     }
@@ -2856,7 +2568,10 @@ impl Mount for Mount40 {
         if bitmap.is_empty() {
             return Ok(());
         }
-        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true)
+        // A size change writes the truncated range and therefore needs the open
+        // gate when no lane exists; metadata-only changes stay allowed, since
+        // chmod/utimes legitimately address the file without an open.
+        self.set_encoded_attributes("setattr", &fh, &bitmap, &values, true, size.is_some())
             .await?;
         self.refresh_callback_attributes(&fh).await;
         Ok(())
@@ -3043,7 +2758,7 @@ impl Mount for Mount40 {
                 .putfh(&fh)
                 .locku(lock_type, lane.next_seqid, &lane.stateid, offset, length)
                 .encode_with_header(&auth);
-            let (mut decoded, consumed) = decode_lock_op_call(
+            let (mut decoded, consumed) = decode_lock_call(
                 rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                     .await,
                 14,
@@ -3083,7 +2798,7 @@ impl Mount for Mount40 {
                         lane.next_seqid,
                         OperationClass::ReplaySensitive,
                     );
-                    let (retried, retry_consumed) = decode_lock_op_call(
+                    let (retried, retry_consumed) = decode_lock_call(
                         rpc.call(request, ReplayPolicy::ONE_ATTEMPT, METADATA_TIMEOUT)
                             .await,
                         14,
@@ -3139,11 +2854,9 @@ impl Mount for Mount40 {
                     Ok(())
                 }
                 Err(NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)) => {
-                    // The lock exists with a newer stateid that the status does
-                    // not disclose. Keep the lane (the lock is still held
-                    // server-side) with its last server-issued stateid and let
-                    // the caller decide whether to reopen.
-                    Err(Mount40::state_recovery_exhausted(
+                    // Still behind after one retry: the lock state exists with an
+                    // even newer seqid. Keep the lane so later attempts converge.
+                    Err(state_recovery_exhausted(
                         "locku",
                         StateidRecovery::Old,
                         NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID),
@@ -3207,9 +2920,14 @@ impl Mount for Mount40 {
                 let lane = lane.lock().await;
                 (lane.stateid, lane.lock_type, lane.offset, lane.length)
             };
-            if stateid == [0; 16] {
-                // The lane is being retired by a concurrent LOCKU; the release
-                // is already in progress.
+            // Skip lanes that a concurrent LOCKU/recovery already retired. Do
+            // not use a zero stateid as the retirement marker: a broken server
+            // can return the all-zero stateid for a LOCK, and skipping that
+            // lane would leave it registered, so `close` would reject the fh
+            // forever. A live lane is still the registry entry for its stateid;
+            // releasing it (even with zero) lets the server answer and the lane
+            // is removed normally.
+            if !self.locks.is_current(&stateid, &lane).await {
                 continue;
             }
             if let Err(error) = self
@@ -3353,8 +3071,31 @@ impl Mount for Mount40 {
         if count == 0 {
             return Ok(Bytes::new());
         }
+        admit_data_io(
+            &self.locks,
+            &self.lease,
+            "read",
+            &fh,
+            DispatchState::Stateful,
+        )
+        .await?;
         let lane = self.state.for_fh(&fh, crate::OPEN_READ).await;
         let Some(lane) = lane else {
+            // `for_fh` waits on every lane mutex it visits, and recovery can
+            // publish a loss while holding one of those lanes, so the gate is
+            // rechecked after the wait instead of trusting the entry check.
+            // Serving bytes through the anonymous stateid would also hide a
+            // loss from the caller and could read a range another client now
+            // protects with an advisory lock (servers enforce only share
+            // reservations and mandatory locks).
+            admit_data_io(
+                &self.locks,
+                &self.lease,
+                "read",
+                &fh,
+                DispatchState::Anonymous,
+            )
+            .await?;
             let request = CompoundBuilder::new("read")
                 .putfh(&fh)
                 .read(&[0; 16], offset, count)
@@ -3364,7 +3105,7 @@ impl Mount for Mount40 {
                     .await?,
             );
         };
-        let mut attempt = 0;
+        let mut retries = 0u8;
         loop {
             let expected_generation = self.lease.begin_stateful("read")?;
             let io_guard = if let Some(callback_state) = &self.callback_state {
@@ -3375,6 +3116,7 @@ impl Mount for Mount40 {
             let rpc = self.rpc.clone();
             let auth = self.auth.clone();
             let lease = Arc::clone(&self.lease);
+            let locks = Arc::clone(&self.locks);
             let lane_for_settlement = Arc::clone(&lane);
             let fh_for_settlement = fh.clone();
             let used = Arc::new(std::sync::Mutex::new(None));
@@ -3399,6 +3141,17 @@ impl Mount for Mount40 {
                             "NFSv4.0 open state is closing or closed".into(),
                         ));
                     }
+                    // The waits above can span a whole reclaim. Recovery
+                    // publishes a lost lock while it holds this lane, so
+                    // rechecking here cannot miss it.
+                    admit_data_io(
+                        &locks,
+                        &lease,
+                        "read",
+                        &fh_for_settlement,
+                        DispatchState::Stateful,
+                    )
+                    .await?;
                     guard.stateid
                 };
                 *used_in_task
@@ -3430,21 +3183,14 @@ impl Mount for Mount40 {
             match settled {
                 Ok(data) => return Ok(data),
                 Err(error) => {
-                    let Some(trigger) = stateid_recovery(&error) else {
-                        return Err(error);
-                    };
-                    if attempt == 1 {
-                        return Err(Self::state_recovery_exhausted("read", trigger, error));
-                    }
-                    let Some(recovered) =
-                        *used.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-                    else {
-                        return Err(Self::state_recovery_exhausted("read", trigger, error));
-                    };
+                    let (trigger, error) = classify_stateid_failure("read", &mut retries, error)?;
+                    let recovered = used
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .ok_or_else(|| state_recovery_exhausted("read", trigger, error))?;
                     self.refresh_lane_stateid(&lane, recovered, trigger, "read")
                         .await
-                        .map_err(|failure| Self::recovery_failure("read", trigger, failure))?;
-                    attempt += 1;
+                        .map_err(|failure| recovery_failure("read", trigger, failure))?;
                 }
             }
         }
@@ -3599,6025 +3345,4 @@ impl Mount for Mount40 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::nfs4::compound::xdr_opaque;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{Notify, oneshot};
-
-    /// Answers a v4.0 mount on `stream`: SETCLIENTID, SETCLIENTID_CONFIRM, the root navigation
-    /// and the mount-parameter GETATTR, whose attribute mask and values are `bitmap` / `values`.
-    async fn serve_mount(
-        stream: &mut TcpStream,
-        bitmap: u32,
-        values: &[u8],
-    ) -> std::io::Result<()> {
-        let identity = read_record(stream).await?;
-        assert!(
-            identity
-                .windows(4)
-                .any(|value| value == 35u32.to_be_bytes())
-        );
-        let mut identity_data = Vec::new();
-        identity_data.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-        identity_data.extend_from_slice(&[0x77; 8]);
-        reply(
-            stream,
-            &identity,
-            &compound_result("identity", &[(35, &identity_data)]),
-        )
-        .await?;
-
-        let confirm = read_record(stream).await?;
-        let identity_tuple = [
-            0x0102_0304_0506_0708u64.to_be_bytes().as_slice(),
-            [0x77; 8].as_slice(),
-        ]
-        .concat();
-        assert!(confirm.windows(16).any(|value| value == identity_tuple));
-        reply(stream, &confirm, &compound_result("confirm", &[(36, &[])])).await?;
-
-        let navigation = read_record(stream).await?;
-        let minor_and_ops = [0u32.to_be_bytes(), 3u32.to_be_bytes()].concat();
-        assert!(navigation.windows(8).any(|value| value == minor_and_ops));
-        let mut fh = Vec::new();
-        xdr_opaque(&mut fh, b"scripted-fh");
-        reply(
-            stream,
-            &navigation,
-            &compound_result("navigate", &[(24, &[]), (15, &[]), (10, &fh)]),
-        )
-        .await?;
-        let lease_time = read_record(stream).await?;
-        let mut attrs = Vec::new();
-        attrs.extend_from_slice(&1u32.to_be_bytes());
-        attrs.extend_from_slice(&bitmap.to_be_bytes());
-        xdr_opaque(&mut attrs, values);
-        reply(
-            stream,
-            &lease_time,
-            &compound_result("lease-time", &[(22, &[]), (9, &attrs)]),
-        )
-        .await
-    }
-
-    async fn read_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-        let marker = stream.read_u32().await?;
-        let mut record = vec![0; (marker & 0x7fff_ffff) as usize];
-        stream.read_exact(&mut record).await?;
-        Ok(record)
-    }
-
-    fn compound_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
-        compound_result_with_status(0, tag, ops)
-    }
-
-    fn compound_result_with_status(overall: u32, tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&overall.to_be_bytes());
-        xdr_opaque(&mut result, tag.as_bytes());
-        result.extend_from_slice(&(ops.len() as u32).to_be_bytes());
-        for (opcode, data) in ops {
-            result.extend_from_slice(&opcode.to_be_bytes());
-            result.extend_from_slice(&0u32.to_be_bytes());
-            result.extend_from_slice(data);
-        }
-        result
-    }
-
-    /// A reply whose overall status contradicts a fully successful operation list.
-    fn contradictory_result(tag: &str, ops: &[(u32, &[u8])]) -> Vec<u8> {
-        compound_result_with_status(10006, tag, ops)
-    }
-
-    fn denied_lock_result(tag: &str, opcode: u32) -> Vec<u8> {
-        let mut denied = Vec::new();
-        denied.extend_from_slice(&7u64.to_be_bytes());
-        denied.extend_from_slice(&11u64.to_be_bytes());
-        denied.extend_from_slice(&2u32.to_be_bytes());
-        denied.extend_from_slice(&99u64.to_be_bytes());
-        xdr_opaque(&mut denied, b"holder");
-        let mut result = Vec::new();
-        result.extend_from_slice(&10010u32.to_be_bytes());
-        xdr_opaque(&mut result, tag.as_bytes());
-        result.extend_from_slice(&2u32.to_be_bytes());
-        result.extend_from_slice(&22u32.to_be_bytes());
-        result.extend_from_slice(&0u32.to_be_bytes());
-        result.extend_from_slice(&opcode.to_be_bytes());
-        result.extend_from_slice(&10010u32.to_be_bytes());
-        result.extend_from_slice(&denied);
-        result
-    }
-
-    fn failed_lock_result(tag: &str, opcode: u32, status: u32) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&status.to_be_bytes());
-        xdr_opaque(&mut result, tag.as_bytes());
-        result.extend_from_slice(&2u32.to_be_bytes());
-        result.extend_from_slice(&22u32.to_be_bytes());
-        result.extend_from_slice(&0u32.to_be_bytes());
-        result.extend_from_slice(&opcode.to_be_bytes());
-        result.extend_from_slice(&status.to_be_bytes());
-        result
-    }
-
-    fn close_result(stateid: [u8; 16]) -> Vec<u8> {
-        compound_result("close", &[(22, &[]), (4, &stateid)])
-    }
-
-    fn read_result(data: &[u8]) -> Vec<u8> {
-        let mut read = Vec::new();
-        read.extend_from_slice(&1u32.to_be_bytes());
-        xdr_opaque(&mut read, data);
-        compound_result("read", &[(22, &[]), (25, &read)])
-    }
-
-    fn write_result(count: u32) -> Vec<u8> {
-        let mut write = Vec::new();
-        write.extend_from_slice(&count.to_be_bytes());
-        write.extend_from_slice(&2u32.to_be_bytes());
-        write.extend_from_slice(&[0x33; 8]);
-        compound_result("write", &[(22, &[]), (38, &write)])
-    }
-
-    fn setattr_result() -> Vec<u8> {
-        let mut attrs = Vec::new();
-        attrs.extend_from_slice(&0u32.to_be_bytes());
-        compound_result("setattr", &[(22, &[]), (34, &attrs)])
-    }
-
-    /// A COMPOUND that failed at PUTFH: only the PUTFH result is present, and
-    /// the target CLOSE never ran.
-    fn putfh_failure_result(tag: &str, status: u32) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&status.to_be_bytes());
-        xdr_opaque(&mut result, tag.as_bytes());
-        result.extend_from_slice(&1u32.to_be_bytes());
-        result.extend_from_slice(&22u32.to_be_bytes());
-        result.extend_from_slice(&status.to_be_bytes());
-        result
-    }
-
-    async fn register_stateid_lane(
-        mount: &Mount40,
-        owner: u64,
-        stateid: [u8; 16],
-        access: u32,
-    ) -> Arc<tokio::sync::Mutex<OwnerLane>> {
-        mount
-            .state
-            .register(OwnerLane {
-                owner,
-                next_seqid: 1,
-                stateid,
-                fh: Bytes::from_static(b"fh"),
-                dir_fh: Bytes::from_static(b"dir"),
-                name: "file".into(),
-                access,
-                write_verifier: None,
-                io_fence: Arc::new(tokio::sync::RwLock::new(())),
-                closing: false,
-            })
-            .await
-    }
-
-    #[test]
-    fn stateid_failures_are_classified_for_callers() {
-        use crate::Nfs4ErrorCode;
-        for status in [
-            Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
-            Nfs4ErrorCode::NFS4ERR_STALE_STATEID,
-            Nfs4ErrorCode::NFS4ERR_OLD_STATEID,
-        ] {
-            let error = NfsError::Nfs4(status);
-            assert!(error.is_recoverable_state());
-            assert_eq!(
-                error.stateid_failure(),
-                Some(crate::StateidFailure::RecoverableState)
-            );
-        }
-        let exhausted = NfsError::StateRecoveryExhausted(Box::new(crate::StateRecoveryError {
-            operation: "read".into(),
-            status: Nfs4ErrorCode::NFS4ERR_BAD_STATEID,
-            source: Box::new(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_BAD_STATEID)),
-        }));
-        assert_eq!(
-            exhausted.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        assert_eq!(NfsError::InvalidInput("x".into()).stateid_failure(), None);
-    }
-
-    #[tokio::test]
-    async fn close_with_bad_stateid_is_treated_as_released() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 207, [0xa7; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10025)).await?;
-            // §9.1.4.4: a seqid ahead of the server's also reports BAD_STATEID,
-            // so one probe with the previous stateid seqid is sent first.
-            let probe = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &probe,
-                &failed_lock_result("close-probe", 4, 10025),
-            )
-            .await
-        });
-        mount
-            .close(Bytes::from_static(b"fh"))
-            .await
-            .expect("BAD_STATEID on CLOSE means the server already released the state");
-        assert!(mount.state.by_owner(207).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_probe_putfh_failure_keeps_the_first_consumption() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 219, [0xcc; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            // The overall status reports BAD_STATEID, but PUTFH and CLOSE both
-            // succeeded: the CLOSE ran and consumed its seqid.
-            reply(
-                &mut stream,
-                &close,
-                &compound_result_with_status(10025, "close", &[(22, &[]), (4, &[0xcc; 16])]),
-            )
-            .await?;
-            let probe = read_record(&mut stream).await?;
-            // The probe never reached CLOSE, so it must not erase the fact
-            // that the first request already consumed the seqid.
-            reply(
-                &mut stream,
-                &probe,
-                &putfh_failure_result("close-probe", 10006),
-            )
-            .await
-        });
-        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
-        assert_eq!(
-            lane.lock().await.next_seqid,
-            2,
-            "an unexecuted probe must not discard the first CLOSE's consumption"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_with_stale_stateid_is_treated_as_released() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 218, [0xcb; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            // STALE_STATEID says the server has no such state, so CLOSE is
-            // already satisfied and no seqid probe is needed (unlike
-            // BAD_STATEID, where the state may still exist further ahead).
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10023)).await
-        });
-        mount
-            .close(Bytes::from_static(b"fh"))
-            .await
-            .expect("STALE_STATEID on CLOSE means the server already released the state");
-        assert!(mount.state.by_owner(218).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_bad_stateid_with_ahead_seqid_probes_previous_seqid_then_releases() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 216, [0xca; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10025)).await?;
-            // The open state exists with the previous stateid seqid, so the
-            // probe closes it instead of leaking the server-side state.
-            let probe = read_record(&mut stream).await?;
-            let expected = [
-                1u32.to_be_bytes().as_slice(),
-                &[0xca, 0xca, 0xca, 0xc9],
-                &[0xca; 12],
-            ]
-            .concat();
-            assert!(
-                probe.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE probe did not carry the previous stateid seqid"
-            );
-            reply(&mut stream, &probe, &close_result([0xcb; 16])).await
-        });
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        assert!(mount.state.by_owner(216).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_putfh_failure_does_not_consume_the_owner_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 219, [0xcc; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            // PUTFH fails with SERVERFAULT: CLOSE is never executed, so the
-            // server does not consume the open-owner seqid.
-            reply(&mut stream, &close, &putfh_failure_result("close", 10006)).await?;
-            let retry = read_record(&mut stream).await?;
-            let expected = [1u32.to_be_bytes().as_slice(), &[0xcc; 16]].concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE retry must reuse the seqid that PUTFH never consumed"
-            );
-            reply(&mut stream, &retry, &close_result([0xcd; 16])).await
-        });
-        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
-        assert_eq!(lane.lock().await.next_seqid, 1);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        assert!(mount.state.by_owner(219).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_seqid_consumption_follows_the_rfc7530_exception_table() {
-        // The COMPOUND overall status cannot distinguish "PUTFH failed" from
-        // "CLOSE ran and was rejected", yet only the latter consumes the
-        // open-owner seqid. Assert the cursor and the next request frame for
-        // both stages and both sides of the §9.1.7 exception table.
-        // (label, failure stage, status, expected next unconsumed seqid)
-        let cases = [
-            ("CLOSE SERVERFAULT", false, 10006u32, 2u32),
-            ("CLOSE BAD_SEQID", false, 10026, 1),
-            ("CLOSE MOVED", false, 10019, 1),
-            ("PUTFH SERVERFAULT", true, 10006, 1),
-            ("PUTFH BAD_SEQID", true, 10026, 1),
-        ];
-        for (index, (label, at_putfh, status, expected)) in cases.into_iter().enumerate() {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mount = connected_direct_mount(&listener).await;
-            let owner = 230 + index as u64;
-            let stateid = [0xd0 + index as u8; 16];
-            let lane = register_stateid_lane(&mount, owner, stateid, crate::OPEN_BOTH).await;
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await?;
-                let close = read_record(&mut stream).await?;
-                let first = [1u32.to_be_bytes().as_slice(), &stateid].concat();
-                assert!(
-                    close.windows(first.len()).any(|wire| wire == first),
-                    "{label}: first CLOSE must send seqid 1 and the lane stateid"
-                );
-                let response = if at_putfh {
-                    putfh_failure_result("close", status)
-                } else {
-                    failed_lock_result("close", 4, status)
-                };
-                reply(&mut stream, &close, &response).await?;
-                let retry = read_record(&mut stream).await?;
-                let expected_frame = [expected.to_be_bytes().as_slice(), &stateid].concat();
-                assert!(
-                    retry
-                        .windows(expected_frame.len())
-                        .any(|wire| wire == expected_frame),
-                    "{label}: retry must send seqid {expected} and the lane stateid"
-                );
-                reply(&mut stream, &retry, &close_result([0xe0 + index as u8; 16])).await
-            });
-            assert!(
-                mount.close(Bytes::from_static(b"fh")).await.is_err(),
-                "{label}"
-            );
-            assert_eq!(lane.lock().await.next_seqid, expected, "{label}");
-            mount.close(Bytes::from_static(b"fh")).await.unwrap();
-            assert!(mount.state.by_owner(owner).await.is_none(), "{label}");
-            server.await.unwrap().unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn close_failure_does_not_wedge_the_lane() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 208, [0xa8; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10006)).await?;
-            // SERVERFAULT is outside the §9.1.7 exception list, so it consumed
-            // seqid 1; the next CLOSE must send 2 or the server answers
-            // BAD_SEQID forever.
-            let retry = read_record(&mut stream).await?;
-            let expected = [2u32.to_be_bytes().as_slice(), &[0xa8; 16]].concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE retry reused the seqid consumed by the failed attempt"
-            );
-            reply(&mut stream, &retry, &close_result([0xc8; 16])).await
-        });
-        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
-        assert!(!lane.lock().await.closing);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        assert!(mount.state.by_owner(208).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_with_old_stateid_reports_exhaustion_without_blind_retry() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 209, [0xa9; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            // OLD_STATEID discloses no seqid gap, so the client must not guess
-            // it with a blind stateid +1 and resend. Exactly one CLOSE is sent.
-            reply(&mut stream, &close, &failed_lock_result("close", 4, 10024)).await
-        });
-        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
-        assert_eq!(
-            error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        assert!(matches!(
-            error,
-            NfsError::StateRecoveryExhausted(ref failure)
-                if failure.status == crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID
-        ));
-        // The lane survives (the open state still exists server-side) and stays
-        // closeable for the caller's reopen; only the consumed open-owner seqid
-        // advanced. The stateid seqid is untouched because the server's current
-        // seqid is unknown.
-        let lane = lane.lock().await;
-        assert!(!lane.closing);
-        assert_eq!(lane.next_seqid, 2);
-        assert_eq!(lane.stateid, [0xa9; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_open_returning_same_stateid_reports_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 211, [0xab; 16], crate::OPEN_READ).await;
-        // A lane that already used seqids: the fresh OPEN restarts at seqid 0,
-        // so the recorded value must drop to 1 even though the recovery fails.
-        lane.lock().await.next_seqid = 3;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            let open = read_record(&mut stream).await?;
-            // A fresh OPEN that answers with the stateid that just failed must
-            // not be mistaken for a recovered lane; its seqid is consumed all
-            // the same and the lane must record it.
-            reply(&mut stream, &open, &open_result(0, [0xab; 16], b"fh")).await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        let lane = lane.lock().await;
-        assert_eq!(lane.stateid, [0xab; 16]);
-        assert_eq!(lane.next_seqid, 1);
-        drop(lane);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_open_old_stateid_is_reported_as_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 212, [0xac; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &failed_lock_result("open-recover", 18, 10024),
-            )
-            .await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        // OLD_STATEID from the recovery OPEN itself means the bounded recovery
-        // already failed; it must not surface as recoverable in place.
-        assert_eq!(
-            error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        match error {
-            NfsError::StateRecoveryExhausted(failure) => {
-                assert_eq!(failure.operation, "read");
-                assert_eq!(failure.status, crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID);
-                assert!(matches!(
-                    *failure.source,
-                    NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_OLD_STATEID)
-                ));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert_eq!(lane.lock().await.stateid, [0xac; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn bad_stateid_read_reopens_once_and_retries() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 201, [0xa1; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // Exactly one fresh OPEN (CLAIM_NULL) is allowed for one recovery.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb2; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(&mut stream, &retry, &read_result(b"data")).await
-        });
-        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
-        assert_eq!(data, Bytes::from_static(b"data"));
-        let lane = lane.lock().await;
-        assert_eq!(lane.stateid, [0xb2; 16]);
-        assert_eq!(lane.next_seqid, 1);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn bad_stateid_reopen_falls_back_to_lane_seqid_on_bad_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 215, [0xab; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // The open-owner record survived, so seqid 0 is a BAD_SEQID.
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &failed_lock_result("open-recover", 18, 10026),
-            )
-            .await?;
-            // The bounded fallback resends with the lane's next seqid.
-            let open_retry = read_record(&mut stream).await?;
-            reply(&mut stream, &open_retry, &open_result(0, [0xbc; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(&mut stream, &retry, &read_result(b"data")).await
-        });
-        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
-        assert_eq!(data, Bytes::from_static(b"data"));
-        assert_eq!(lane.lock().await.stateid, [0xbc; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn stale_stateid_returns_typed_state_lost_without_recovery() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 202, [0xa2; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10023)).await?;
-            // Crash recovery (SETCLIENTID + reclaim) is driven by the lease
-            // renewal, never from inside one I/O call: the server must see no
-            // second request here.
-            Ok::<(), std::io::Error>(())
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, NfsError::LostOpenState(_)),
-            "unexpected error: {error:?}"
-        );
-        assert!(error.stateid_failure().is_none());
-        assert_eq!(lane.lock().await.stateid, [0xa2; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn old_stateid_read_recovers_with_fresh_open() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 203, [0xa3; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10024)).await?;
-            // OLD_STATEID does not carry the server's current seqid, so the lane
-            // is refreshed with exactly one fresh OPEN instead of a blind seqid
-            // increment.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(&mut stream, &retry, &read_result(b"data")).await
-        });
-        let data = mount.read(Bytes::from_static(b"fh"), 0, 4).await.unwrap();
-        assert_eq!(data, Bytes::from_static(b"data"));
-        let lane = lane.lock().await;
-        assert_eq!(lane.stateid, [0xb3; 16]);
-        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
-        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds).
-        assert_eq!(lane.next_seqid, 1);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn exhausted_state_recovery_returns_classified_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 204, [0xa4; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // A malformed OPEN reply has no authoritative status, so the lane
-            // cannot be refreshed and the recovery is reported as exhausted.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, b"malformed-open-reply").await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        match error {
-            NfsError::StateRecoveryExhausted(error) => {
-                assert_eq!(error.operation, "read");
-                assert_eq!(error.status, crate::Nfs4ErrorCode::NFS4ERR_BAD_STATEID);
-                assert!(matches!(*error.source, NfsError::Xdr(_)));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        // A failed recovery leaves the lane untouched so a later attempt can retry.
-        assert_eq!(lane.lock().await.stateid, [0xa4; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_open_not_found_is_propagated() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 217, [0xcc; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // The name no longer resolves: report the authoritative NOENT
-            // instead of hiding it behind a state-recovery failure.
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &failed_lock_result("open-recover", 18, 2),
-            )
-            .await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NOENT)),
-            "unexpected error: {error:?}"
-        );
-        assert!(error.stateid_failure().is_none());
-        assert_eq!(lane.lock().await.stateid, [0xcc; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_open_grace_after_bad_seqid_stays_retryable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 218, [0xcd; 16], crate::OPEN_READ).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // The open-owner record survived (seqid 0 is a replay check), then
-            // the server enters grace and refuses the CLAIM_NULL OPEN.
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &failed_lock_result("open-recover", 18, 10026),
-            )
-            .await?;
-            let retry = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &retry,
-                &failed_lock_result("open-grace", 18, 10013),
-            )
-            .await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_GRACE)),
-            "grace must stay retryable, got {error:?}"
-        );
-        // GRACE is outside the §9.1.7 exception table: the failed OPEN consumed
-        // its seqid, so a later recovery must not replay it.
-        let lane = lane.lock().await;
-        assert_eq!(lane.next_seqid, 2);
-        assert_eq!(lane.stateid, [0xcd; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_confirm_failure_records_every_consumed_open_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 221, [0xa5; 16], crate::OPEN_READ).await;
-        lane.lock().await.next_seqid = 5;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // seqid=0 probe: the open-owner record survived.
-            let probe = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &probe,
-                &failed_lock_result("open-recover", 18, 10026),
-            )
-            .await?;
-            // Fallback OPEN(5) succeeds but needs confirmation.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
-            // OPEN_CONFIRM(6) fails with SERVERFAULT, which consumes seqid 6.
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &failed_lock_result("open_confirm", 20, 10006),
-            )
-            .await?;
-            // The lane must now expect 7, not the 6 derived from the OPEN alone.
-            let close = read_record(&mut stream).await?;
-            let expected = [7u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
-            assert!(
-                close.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE must use the seqid consumed by both OPEN and OPEN_CONFIRM"
-            );
-            reply(&mut stream, &close, &close_result([0xa7; 16])).await
-        });
-        let error = mount
-            .read(Bytes::from_static(b"fh"), 0, 4)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_SERVERFAULT)
-            ),
-            "unexpected error: {error:?}"
-        );
-        assert_eq!(lane.lock().await.next_seqid, 7);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_confirm_non_consuming_failure_keeps_open_consumption() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 223, [0xa5; 16], crate::OPEN_READ).await;
-        lane.lock().await.next_seqid = 5;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            let probe = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &probe,
-                &failed_lock_result("open-recover", 18, 10026),
-            )
-            .await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(2, [0xa6; 16], b"fh")).await?;
-            // BAD_STATEID does not consume seqid 6.
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &failed_lock_result("open_confirm", 20, 10025),
-            )
-            .await?;
-            // OPEN(5) still consumed its seqid, so the next request uses 6.
-            let close = read_record(&mut stream).await?;
-            let expected = [6u32.to_be_bytes().as_slice(), &[0xa5; 16]].concat();
-            assert!(
-                close.windows(expected.len()).any(|wire| wire == expected),
-                "CLOSE must keep the seqid consumed by the successful OPEN"
-            );
-            reply(&mut stream, &close, &close_result([0xa7; 16])).await
-        });
-        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
-        assert_eq!(lane.lock().await.next_seqid, 6);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_replacement_filehandle_records_the_cleanup_close_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 227, [0xe1; 16], crate::OPEN_READ).await;
-        lane.lock().await.next_seqid = 5;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            // A released owner restarts at seqid 0.
-            let probe = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &probe,
-                &failed_lock_result("open-recover", 18, 10026),
-            )
-            .await?;
-            // The retry with the lane cursor opens a *different* filehandle.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xe2; 16], b"other")).await?;
-            // OPEN(5) consumed 5, so the cleanup CLOSE uses 6.
-            let cleanup = read_record(&mut stream).await?;
-            let expected = [6u32.to_be_bytes().as_slice(), &[0xe2; 16]].concat();
-            assert!(
-                cleanup.windows(expected.len()).any(|wire| wire == expected),
-                "cleanup CLOSE must use the seqid after the successful OPEN"
-            );
-            reply(&mut stream, &cleanup, &close_result([0xe2; 16])).await?;
-            // Because cleanup CLOSE(6) succeeded, the server now expects 7.
-            let close = read_record(&mut stream).await?;
-            let expected = [7u32.to_be_bytes().as_slice(), &[0xe1; 16]].concat();
-            assert!(
-                close.windows(expected.len()).any(|wire| wire == expected),
-                "the lane must record the seqid consumed by the cleanup CLOSE"
-            );
-            reply(&mut stream, &close, &close_result([0xe1; 16])).await
-        });
-        assert!(mount.read(Bytes::from_static(b"fh"), 0, 4).await.is_err());
-        assert_eq!(lane.lock().await.next_seqid, 7);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn queued_refresh_does_not_open_after_the_mount_is_lost() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 228, [0xf1; 16], crate::OPEN_READ).await;
-        let held = lane.lock().await;
-        let refresh = {
-            let mount = Arc::clone(&mount);
-            let lane = Arc::clone(&lane);
-            tokio::spawn(async move {
-                mount
-                    .refresh_lane_stateid(&lane, [0xf1; 16], StateidRecovery::Bad, "read")
-                    .await
-            })
-        };
-        // Let the detached task queue behind the lane lock, then lose the
-        // mount before it can dispatch its recovery OPEN.
-        tokio::task::yield_now().await;
-        mount.lease.mark_lost().await;
-        drop(held);
-        let error = refresh.await.unwrap().unwrap_err();
-        assert!(
-            matches!(error, NfsError::OperationOutcome(_)),
-            "a queued refresh must report the lifecycle gate, got {error:?}"
-        );
-        assert_eq!(lane.lock().await.stateid, [0xf1; 16]);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "a lost mount must not dispatch a recovery OPEN"
-            );
-            Ok::<(), std::io::Error>(())
-        });
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn open_result_across_a_generation_fence_is_not_published() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(&mut stream, &request, &open_result(0, [0x91; 16], b"fh")).await
-        });
-        let for_open = Arc::clone(&mount);
-        let open = tokio::spawn(async move {
-            for_open
-                .open_file(Bytes::from_static(b"dir"), b"file", crate::OPEN_READ, false)
-                .await
-        });
-        seen_rx.await.unwrap();
-        mount.lease.mark_lost().await;
-        let _ = reply_tx.send(());
-        let error = match open.await.unwrap() {
-            Err(error) => error,
-            Ok(_) => panic!("OPEN must not be published across a generation fence"),
-        };
-        assert_eq!(
-            error.operation_outcome().unwrap().recovery,
-            crate::RecoveryAction::Reopen
-        );
-        assert!(
-            mount.state.snapshot().await.is_empty(),
-            "a fenced OPEN must not leave a lane behind"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn unknown_cleanup_close_retires_the_recovered_lane() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 231, [0xf2; 16], crate::OPEN_READ).await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(&mut stream, &open, &open_result(0, [0xf3; 16], b"fh")).await?;
-            let cleanup = read_record(&mut stream).await?;
-            // The recovery OPEN restarts a released owner at seqid 0, so the
-            // cleanup CLOSE carries the next seqid.
-            let expected = [1u32.to_be_bytes().as_slice(), &[0xf3; 16]].concat();
-            assert!(cleanup.windows(expected.len()).any(|wire| wire == expected));
-            // Drop the connection without replying: the cleanup CLOSE outcome
-            // is unknown and the lane must not stay stuck in `closing`.
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let mount_for_refresh = Arc::clone(&mount);
-        let refresh = tokio::spawn(async move {
-            mount_for_refresh
-                .refresh_lane_stateid(&lane, [0xf2; 16], StateidRecovery::Bad, "read")
-                .await
-        });
-        seen_rx.await.unwrap();
-        mount.lease.mark_lost().await;
-        let _ = reply_tx.send(());
-        let error = refresh.await.unwrap().unwrap_err();
-        assert!(matches!(error, NfsError::OperationOutcome(_)));
-        assert!(
-            mount
-                .state
-                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
-                .await
-                .is_none(),
-            "an unknown cleanup CLOSE must retire the lane"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn suspect_open_error_keeps_the_published_lane() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(&mut stream, &request, &open_result(0, [0x92; 16], b"fh")).await
-        });
-        let for_open = Arc::clone(&mount);
-        let open = tokio::spawn(async move {
-            for_open
-                .open_file(Bytes::from_static(b"dir"), b"file", crate::OPEN_READ, false)
-                .await
-        });
-        seen_rx.await.unwrap();
-        // Lifecycle changes without a generation bump: the open still exists
-        // and must remain tracked so it can be closed by file handle.
-        mount.lease.mark_reconnecting();
-        let _ = reply_tx.send(());
-        let error = open.await.unwrap().unwrap_err();
-        assert!(matches!(error, NfsError::OperationOutcome(_)));
-        assert!(
-            mount
-                .state
-                .for_fh(&Bytes::from_static(b"fh"), crate::OPEN_READ)
-                .await
-                .is_some(),
-            "a non-lost mount must keep the published open lane"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_recovers_an_abandoned_lock_token() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 44, b"fh").await;
-        // Simulate a LOCK that succeeded after its caller was cancelled: the
-        // lock stays registered, but the caller never received the token.
-        register_scripted_lock(&mount, 44, [0x73; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            let expected = [1u32.to_be_bytes().as_slice(), &[0x73; 16]].concat();
-            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x74; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &close_result([0x61; 16])).await
-        });
-        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
-        assert!(
-            error.to_string().contains("outstanding locks"),
-            "the abandoned lock must still be visible to CLOSE: {error}"
-        );
-        mount
-            .release_locks(Bytes::from_static(b"fh"))
-            .await
-            .unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_works_while_the_mount_is_verifying_its_lease() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 45, b"fh").await;
-        register_scripted_lock(&mount, 45, [0x75; 16]).await;
-        // A cancelled LOCK often coincides with a failed RENEW. Teardown must
-        // not be blocked by the lifecycle gate, otherwise close stays wedged.
-        mount.lease.mark_reconnecting();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            let expected = [1u32.to_be_bytes().as_slice(), &[0x75; 16]].concat();
-            assert!(locku.windows(expected.len()).any(|wire| wire == expected));
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x76; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        mount
-            .release_locks(Bytes::from_static(b"fh"))
-            .await
-            .unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_ignores_a_failed_release_lockowner() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 48, b"fh").await;
-        register_scripted_lock(&mount, 48, [0x81; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x82; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            // STALE_CLIENTID: the lock state is already gone even though the
-            // cleanup owner release failed.
-            reply(
-                &mut stream,
-                &release,
-                &compound_result_with_status(10022, "release-lockowner", &[]),
-            )
-            .await
-        });
-        mount
-            .release_locks(Bytes::from_static(b"fh"))
-            .await
-            .unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_accepts_success_when_recovery_starts_mid_release() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 46, b"fh").await;
-        register_scripted_lock(&mount, 46, [0x77; 16]).await;
-        mount.lease.mark_reconnecting();
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x78; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        let for_release = Arc::clone(&mount);
-        let release =
-            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
-        seen_rx.await.unwrap();
-        // Recovery starts while the LOCKU is in flight. The successful reply is
-        // authoritative; reporting failure would make callers retry an
-        // already-released lock.
-        mount.lease.mark_recovering();
-        let _ = reply_tx.send(());
-        release.await.unwrap().unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_read_does_not_abandon_stateid_recovery() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 222, [0xa8; 16], crate::OPEN_READ).await;
-        let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            let open = read_record(&mut stream).await?;
-            opened_tx.send(()).ok();
-            // Hold the recovery OPEN reply until after the caller is cancelled.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            reply(&mut stream, &open, &open_result(0, [0xb1; 16], b"fh")).await
-        });
-        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
-        tokio::select! {
-            _ = opened_rx.recv() => {}
-            result = &mut read => panic!("read completed before cancellation: {result:?}"),
-        }
-        drop(read);
-        // The detached recovery task must still publish the new stateid and the
-        // consumed owner seqid after the caller is gone.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let settled = {
-                    let guard = lane.lock().await;
-                    guard.stateid == [0xb1; 16] && guard.next_seqid == 1
-                };
-                if settled {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("a cancelled read abandoned stateid recovery");
-        server.await.unwrap().unwrap();
-    }
-
-    /// RFC 7530 §9.1.7: a sent OPEN or OPEN_CONFIRM consumes its owner seqid
-    /// unless the status is in the exception table. A transmission failure and
-    /// a non-consuming status leave the cursor where it was, and OPEN and
-    /// OPEN_CONFIRM advance it independently.
-    #[tokio::test]
-    async fn fresh_open_seqid_consumption_matrix() {
-        enum OpenStage {
-            Failure(u32),
-            Success { confirm: Option<u32> },
-        }
-        // (label, scripted stage, expected next unconsumed seqid, succeeds)
-        let cases = [
-            ("OPEN ok", OpenStage::Success { confirm: None }, 2u32, true),
-            ("OPEN SERVERFAULT", OpenStage::Failure(10006), 2, false),
-            ("OPEN BAD_SEQID", OpenStage::Failure(10026), 1, false),
-            ("OPEN MOVED", OpenStage::Failure(10019), 1, false),
-            (
-                "CONFIRM ok",
-                OpenStage::Success { confirm: Some(0) },
-                3,
-                true,
-            ),
-            (
-                "CONFIRM SERVERFAULT",
-                OpenStage::Success {
-                    confirm: Some(10006),
-                },
-                3,
-                false,
-            ),
-            (
-                "CONFIRM BAD_STATEID",
-                OpenStage::Success {
-                    confirm: Some(10025),
-                },
-                2,
-                false,
-            ),
-            (
-                "CONFIRM BAD_SEQID",
-                OpenStage::Success {
-                    confirm: Some(10026),
-                },
-                2,
-                false,
-            ),
-            (
-                "CONFIRM MOVED",
-                OpenStage::Success {
-                    confirm: Some(10019),
-                },
-                2,
-                false,
-            ),
-        ];
-        for (label, stage, expected_next, expected_ok) in cases {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-                .await
-                .unwrap();
-            let client = rpc::Client::new(mux, None);
-            let open_stateid = [0x11; 16];
-            let confirmed_stateid = [0x12; 16];
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await?;
-                let open = read_record(&mut stream).await?;
-                let open_frame = [
-                    1u32.to_be_bytes().as_slice(),
-                    crate::OPEN_READ.to_be_bytes().as_slice(),
-                    0u32.to_be_bytes().as_slice(),
-                    7u64.to_be_bytes().as_slice(),
-                ]
-                .concat();
-                assert!(
-                    open.windows(open_frame.len())
-                        .any(|wire| wire == open_frame),
-                    "{label}: OPEN must carry seqid 1"
-                );
-                match stage {
-                    OpenStage::Failure(status) => {
-                        return reply(&mut stream, &open, &failed_lock_result("open", 18, status))
-                            .await;
-                    }
-                    OpenStage::Success { confirm } => {
-                        let flags = if confirm.is_some() { 2 } else { 0 };
-                        reply(&mut stream, &open, &open_result(flags, open_stateid, b"fh")).await?;
-                        let Some(status) = confirm else {
-                            return Ok(());
-                        };
-                        let confirm_request = read_record(&mut stream).await?;
-                        let confirm_frame =
-                            [open_stateid.as_slice(), 2u32.to_be_bytes().as_slice()].concat();
-                        assert!(
-                            confirm_request
-                                .windows(confirm_frame.len())
-                                .any(|wire| wire == confirm_frame),
-                            "{label}: OPEN_CONFIRM must carry seqid 2"
-                        );
-                        if status == 0 {
-                            reply(
-                                &mut stream,
-                                &confirm_request,
-                                &compound_result(
-                                    "open_confirm",
-                                    &[(22, &[]), (20, &confirmed_stateid)],
-                                ),
-                            )
-                            .await
-                        } else {
-                            reply(
-                                &mut stream,
-                                &confirm_request,
-                                &failed_lock_result("open_confirm", 20, status),
-                            )
-                            .await
-                        }
-                    }
-                }
-            });
-            let attempt = fresh_open_lane(
-                &client,
-                &Auth::new_null(),
-                &Bytes::from_static(b"dir"),
-                "file",
-                b"owner",
-                crate::OPEN_READ,
-                7,
-                1,
-                "recovery-open",
-            )
-            .await;
-            assert_eq!(attempt.next_seqid, expected_next, "{label}");
-            assert_eq!(attempt.result.is_ok(), expected_ok, "{label}");
-            match attempt.result {
-                Ok(open) => {
-                    let expected_stateid = if expected_next == 3 {
-                        confirmed_stateid
-                    } else {
-                        open_stateid
-                    };
-                    assert_eq!(open.stateid, expected_stateid, "{label}");
-                }
-                Err(error) => assert!(
-                    matches!(error, NfsError::Nfs4(_)),
-                    "{label}: unexpected error {error:?}"
-                ),
-            }
-            server.await.unwrap().unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_read_during_open_confirm_still_publishes() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 224, [0xc1; 16], crate::OPEN_READ).await;
-        let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            reply(&mut stream, &read, &failed_lock_result("read", 25, 10025)).await?;
-            let open = read_record(&mut stream).await?;
-            // The recovery OPEN needs confirmation, so the caller can be
-            // cancelled between the two consuming stages.
-            reply(&mut stream, &open, &open_result(2, [0xc2; 16], b"fh")).await?;
-            let confirm = read_record(&mut stream).await?;
-            confirm_tx.send(()).ok();
-            // Hold the OPEN_CONFIRM reply until after the caller is cancelled.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("open_confirm", &[(22, &[]), (20, &[0xc3; 16])]),
-            )
-            .await
-        });
-        let mut read = Box::pin(mount.read(Bytes::from_static(b"fh"), 0, 4));
-        tokio::select! {
-            _ = confirm_rx.recv() => {}
-            result = &mut read => panic!("read completed before cancellation: {result:?}"),
-        }
-        drop(read);
-        // The detached recovery task must finish OPEN_CONFIRM and publish both
-        // the confirmed stateid and the seqid consumed by both stages.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let settled = {
-                    let guard = lane.lock().await;
-                    guard.stateid == [0xc3; 16] && guard.next_seqid == 2
-                };
-                if settled {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("a cancelled read abandoned OPEN_CONFIRM publication");
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn fresh_open_putfh_failure_does_not_consume_the_open_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let client = rpc::Client::new(mux, None);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &putfh_failure_result("open", 10006)).await
-        });
-        let attempt = fresh_open_lane(
-            &client,
-            &Auth::new_null(),
-            &Bytes::from_static(b"dir"),
-            "file",
-            b"owner",
-            crate::OPEN_READ,
-            7,
-            1,
-            "recovery-open",
-        )
-        .await;
-        assert!(
-            matches!(attempt.result, Err(NfsError::Nfs4(_))),
-            "PUTFH failure must surface the status"
-        );
-        assert_eq!(
-            attempt.next_seqid, 1,
-            "a PUTFH failure never ran OPEN and must not consume seqid 1"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_putfh_failure_keeps_the_lane_cursor() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 246, [0xd8; 16], crate::OPEN_BOTH).await;
-        lane.lock().await.next_seqid = 5;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            // The recovery probe starts at seqid 0, but a PUTFH failure means
-            // the OPEN never ran: the lane's real cursor must not regress.
-            reply(
-                &mut stream,
-                &open,
-                &putfh_failure_result("recovery-open", 10006),
-            )
-            .await
-        });
-        assert!(
-            mount
-                .refresh_lane_stateid(&lane, [0xd8; 16], StateidRecovery::Bad, "read")
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            lane.lock().await.next_seqid,
-            5,
-            "a non-executed recovery OPEN must keep the lane's existing cursor"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn open_confirm_putfh_failure_keeps_only_the_open_consumption() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let client = rpc::Client::new(mux, None);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(2, [0x21; 16], b"fh")).await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &putfh_failure_result("open_confirm", 10006),
-            )
-            .await
-        });
-        let attempt = fresh_open_lane(
-            &client,
-            &Auth::new_null(),
-            &Bytes::from_static(b"dir"),
-            "file",
-            b"owner",
-            crate::OPEN_READ,
-            7,
-            1,
-            "recovery-open",
-        )
-        .await;
-        assert!(attempt.result.is_err());
-        assert_eq!(
-            attempt.next_seqid, 2,
-            "OPEN consumed seqid 1, but a PUTFH-failed CONFIRM did not consume 2"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_putfh_failure_does_not_consume_the_open_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 241, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            reply(&mut stream, &lock, &putfh_failure_result("lock", 10006)).await
-        });
-        assert!(
-            mount
-                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-                .await
-                .is_err()
-        );
-        let lane = mount.state.by_owner(241).await.unwrap();
-        assert_eq!(
-            lane.lock().await.next_seqid,
-            1,
-            "a PUTFH failure never ran LOCK and must not consume seqid 1"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_success_while_suspect_keeps_the_granted_lock() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 242, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(
-                &mut stream,
-                &lock,
-                &compound_result("lock", &[(22, &[]), (12, &[0x91; 16])]),
-            )
-            .await
-        });
-        let for_lock = Arc::clone(&mount);
-        let lock =
-            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
-        seen_rx.await.unwrap();
-        mount.lease.mark_reconnecting();
-        let _ = reply_tx.send(());
-        assert!(lock.await.unwrap().is_err());
-        assert!(
-            mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
-            "a granted lock must stay tracked while the mount is verifying its lease"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_success_across_a_lost_mount_is_not_published() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 243, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(
-                &mut stream,
-                &lock,
-                &compound_result("lock", &[(22, &[]), (12, &[0x92; 16])]),
-            )
-            .await
-        });
-        let for_lock = Arc::clone(&mount);
-        let lock =
-            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
-        seen_rx.await.unwrap();
-        mount.lease.mark_lost().await;
-        let _ = reply_tx.send(());
-        assert!(lock.await.unwrap().is_err());
-        assert!(
-            !mount.locks.has_fh(&Bytes::from_static(b"fh")).await,
-            "a lost mount must not keep a lock lane it can never unlock"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_waits_for_a_cancelled_lock_settlement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 245, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(
-                &mut stream,
-                &lock,
-                &compound_result("lock", &[(22, &[]), (12, &[0x9a; 16])]),
-            )
-            .await?;
-            // The grant registered by the detached task must be visible to
-            // release_locks, which then unlocks it.
-            let locku = read_record(&mut stream).await?;
-            let expected = [1u32.to_be_bytes().as_slice(), &[0x9a; 16]].concat();
-            assert!(
-                locku.windows(expected.len()).any(|wire| wire == expected),
-                "release_locks must unlock the lock whose caller was cancelled"
-            );
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x9b; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await?;
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &close_result([0x61; 16])).await
-        });
-        let for_lock = Arc::clone(&mount);
-        let lock =
-            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
-        seen_rx.await.unwrap();
-        // The caller goes away while the LOCK reply is still pending; its
-        // detached task will register the grant on its own.
-        lock.abort();
-        let for_release = Arc::clone(&mount);
-        let mut release =
-            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut release)
-                .await
-                .is_err(),
-            "release_locks returned before the in-flight LOCK settled"
-        );
-        let _ = reply_tx.send(());
-        tokio::time::timeout(Duration::from_secs(5), release)
-            .await
-            .expect("release_locks must finish once the LOCK settles")
-            .unwrap()
-            .unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_returns_immediately_without_acquisitions() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 246, b"fh").await;
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            mount.release_locks(Bytes::from_static(b"fh")),
-        )
-        .await
-        .expect("cleanup without in-flight acquisitions must not wait")
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn release_locks_waits_for_a_cancelled_lock_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 247, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10025)).await?;
-            // Nothing was granted, so cleanup must go straight to CLOSE.
-            let close = read_record(&mut stream).await?;
-            reply(&mut stream, &close, &close_result([0x61; 16])).await
-        });
-        let for_lock = Arc::clone(&mount);
-        let lock =
-            tokio::spawn(async move { for_lock.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
-        seen_rx.await.unwrap();
-        lock.abort();
-        let for_release = Arc::clone(&mount);
-        let mut release =
-            tokio::spawn(async move { for_release.release_locks(Bytes::from_static(b"fh")).await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut release)
-                .await
-                .is_err(),
-            "the failed LOCK must still be tracked as unsettled"
-        );
-        let _ = reply_tx.send(());
-        tokio::time::timeout(Duration::from_secs(5), release)
-            .await
-            .expect("release_locks must finish once the LOCK failed")
-            .unwrap()
-            .unwrap();
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_overall_status_contradiction_consumes_the_owner_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 244, [0xd6; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = read_record(&mut stream).await?;
-            // PUTFH and CLOSE both succeeded, but the overall status claims
-            // failure: the CLOSE still ran and consumed its seqid.
-            reply(
-                &mut stream,
-                &close,
-                &contradictory_result("close", &[(22, &[]), (4, &[0x5b; 16])]),
-            )
-            .await
-        });
-        assert!(mount.close(Bytes::from_static(b"fh")).await.is_err());
-        assert_eq!(lane.lock().await.next_seqid, 2);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_overall_status_contradiction_consumes_the_open_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 245, [0xd7; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &lock,
-                &contradictory_result("lock", &[(22, &[]), (12, &[0x5c; 16])]),
-            )
-            .await
-        });
-        assert!(
-            mount
-                .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-                .await
-                .is_err()
-        );
-        assert_eq!(lane.lock().await.next_seqid, 2);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_recovers_bad_stateid_and_retries_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 205, [0xa5; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let write = read_record(&mut stream).await?;
-            reply(&mut stream, &write, &failed_lock_result("write", 38, 10025)).await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb5; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(&mut stream, &retry, &write_result(3)).await
-        });
-        let outcome = mount
-            .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"abc"))
-            .await
-            .unwrap();
-        assert_eq!(outcome.count, 3);
-        assert_eq!(lane.lock().await.stateid, [0xb5; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn setattr_size_recovers_bad_stateid_and_retries_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let lane = register_stateid_lane(&mount, 206, [0xa6; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let setattr = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &setattr,
-                &failed_lock_result("setattr", 34, 10025),
-            )
-            .await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb6; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            reply(&mut stream, &retry, &setattr_result()).await
-        });
-        mount
-            .setattr(
-                Bytes::from_static(b"fh"),
-                None,
-                None,
-                None,
-                None,
-                Some(3),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(lane.lock().await.stateid, [0xb6; 16]);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn setattr_without_lane_keeps_the_anonymous_stateid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let setattr = read_record(&mut stream).await?;
-            // Path-based metadata (chmod/truncate) has no open lane: RFC 7530
-            // permits the anonymous stateid for these requests, so no recovery
-            // is attempted.
-            let expected = [0u8; 16];
-            assert!(
-                setattr.windows(16).any(|wire| wire == expected),
-                "stateless SETATTR did not use the anonymous stateid"
-            );
-            reply(&mut stream, &setattr, &setattr_result()).await
-        });
-        mount
-            .setattr(
-                Bytes::from_static(b"fh"),
-                None,
-                None,
-                None,
-                None,
-                Some(3),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_recovers_bad_open_stateid_and_retries_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_stateid_lane(&mount, 213, [0xa3; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10025)).await?;
-            // The open stateid is refreshed with exactly one fresh OPEN.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            // BAD_STATEID belongs to the RFC 7530 §9.1.7 exception table, so
-            // neither seqid is consumed: the retry keeps open_seqid 1 and
-            // lock_seqid 0 and only swaps in the refreshed stateid.
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                0u32.to_be_bytes().as_slice(),
-                0u64.to_be_bytes().as_slice(),
-                1u64.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                &[0xb3; 16],
-                0u32.to_be_bytes().as_slice(),
-            ]
-            .concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "LOCK retry after BAD_STATEID did not reuse the refreshed stateid"
-            );
-            reply(
-                &mut stream,
-                &retry,
-                &compound_result("lock-retry", &[(22, &[]), (12, &[0xb5; 16])]),
-            )
-            .await
-        });
-        let stateid = mount
-            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-            .await
-            .unwrap();
-        assert_eq!(stateid, Bytes::from_static(&[0xb5; 16]));
-        let open_lane = mount.state.by_owner(213).await.unwrap();
-        assert_eq!(open_lane.lock().await.stateid, [0xb3; 16]);
-        assert!(mount.locks.by_stateid(&[0xb5; 16]).await.is_some());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_old_stateid_retries_with_advanced_lock_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let open_lane = register_stateid_lane(&mount, 214, [0xaa; 16], crate::OPEN_BOTH).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            reply(&mut stream, &lock, &failed_lock_result("lock", 12, 10024)).await?;
-            // OLD_STATEID is not in the §9.1.7 exception table, so the rejected
-            // LOCK consumes the open-owner seqid; the lane is then refreshed
-            // with one fresh OPEN, and OLD_STATEID also advances the lock-owner
-            // seqid (0 -> 1) on the retry.
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0xb3; 16], b"fh")).await?;
-            let retry = read_record(&mut stream).await?;
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                0u32.to_be_bytes().as_slice(),
-                0u64.to_be_bytes().as_slice(),
-                1u64.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                &[0xb3; 16],
-                1u32.to_be_bytes().as_slice(),
-            ]
-            .concat();
-            assert!(
-                retry.windows(expected.len()).any(|wire| wire == expected),
-                "LOCK retry after OLD_STATEID did not advance the lock seqid or swap the refreshed stateid"
-            );
-            reply(
-                &mut stream,
-                &retry,
-                &compound_result("lock-retry", &[(22, &[]), (12, &[0xb6; 16])]),
-            )
-            .await
-        });
-        let stateid = mount
-            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-            .await
-            .unwrap();
-        assert_eq!(stateid, Bytes::from_static(&[0xb6; 16]));
-        let lane = open_lane.lock().await;
-        // The fresh OPEN re-syncs the stateid authoritatively and restarts the
-        // open-owner seqid at 1 (the OPEN is sent with seqid 0 and succeeds);
-        // the successful retry LOCK then consumes it once more (1 -> 2).
-        assert_eq!(lane.stateid, [0xb3; 16]);
-        assert_eq!(lane.next_seqid, 2);
-        drop(lane);
-        let lock_lane = mount.locks.by_stateid(&[0xb6; 16]).await.unwrap();
-        assert_eq!(lock_lane.lock().await.next_seqid, 2);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn locku_old_stateid_reports_exhaustion_without_blind_bump() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 211, [0xb1; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            // OLD_STATEID does not disclose the server's lock seqid: answer
-            // once and let the lane survive with the issued stateid.
-            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10024)).await
-        });
-        let error = mount
-            .locku(
-                Bytes::from_static(b"fh"),
-                Bytes::from([0xb1; 16].as_slice()),
-                2,
-                0,
-                1,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.stateid_failure(),
-            Some(crate::StateidFailure::StateRecoveryExhausted)
-        );
-        // The lock is still held server-side: the lane must survive with the
-        // stateid the server issued, not a locally fabricated one.
-        let lane = mount.locks.by_stateid(&[0xb1; 16]).await.unwrap();
-        let lane = lane.lock().await;
-        assert_eq!(lane.stateid, [0xb1; 16]);
-        drop(lane);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn locku_bad_stateid_is_treated_as_released() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 212, [0xb4; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10025)).await?;
-            // §9.1.4.4: a seqid ahead of the server's also reports BAD_STATEID,
-            // so one probe with the previous stateid seqid is sent first.
-            let probe = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &probe,
-                &failed_lock_result("locku-probe", 14, 10025),
-            )
-            .await?;
-            // The lock-owner record may outlive the lost lock state; release it.
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        mount
-            .locku(
-                Bytes::from_static(b"fh"),
-                Bytes::from([0xb4; 16].as_slice()),
-                2,
-                0,
-                1,
-            )
-            .await
-            .expect("BAD_STATEID on LOCKU means the lock is already gone");
-        assert!(mount.locks.by_stateid(&[0xb4; 16]).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn locku_bad_stateid_with_ahead_seqid_probes_previous_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 219, [0xd0; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let locku = read_record(&mut stream).await?;
-            reply(&mut stream, &locku, &failed_lock_result("locku", 14, 10025)).await?;
-            // The lock still exists under the previous stateid seqid: the probe
-            // unlocks it instead of leaking the server-side lock.
-            let probe = read_record(&mut stream).await?;
-            let expected = [
-                1u32.to_be_bytes().as_slice(),
-                &[0xd0, 0xd0, 0xd0, 0xcf],
-                &[0xd0; 12],
-            ]
-            .concat();
-            assert!(
-                probe.windows(expected.len()).any(|wire| wire == expected),
-                "LOCKU probe did not carry the previous stateid seqid"
-            );
-            reply(
-                &mut stream,
-                &probe,
-                &compound_result("locku-probe", &[(22, &[]), (14, &[0xd1; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        mount
-            .locku(
-                Bytes::from_static(b"fh"),
-                Bytes::from([0xd0; 16].as_slice()),
-                2,
-                0,
-                1,
-            )
-            .await
-            .unwrap();
-        assert!(mount.locks.by_stateid(&[0xd0; 16]).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    async fn reply(stream: &mut TcpStream, request: &[u8], payload: &[u8]) -> std::io::Result<()> {
-        let xid = u32::from_be_bytes(request[0..4].try_into().unwrap());
-        let mut response = Vec::new();
-        response.extend_from_slice(&xid.to_be_bytes());
-        response.extend_from_slice(&1u32.to_be_bytes());
-        response.extend_from_slice(&0u32.to_be_bytes());
-        response.extend_from_slice(&0u32.to_be_bytes());
-        response.extend_from_slice(&0u32.to_be_bytes());
-        response.extend_from_slice(&0u32.to_be_bytes());
-        response.extend_from_slice(payload);
-        stream
-            .write_u32(0x8000_0000 | response.len() as u32)
-            .await?;
-        stream.write_all(&response).await
-    }
-
-    fn direct_mount(rpc: rpc::Client) -> Arc<Mount40> {
-        direct_mount_with_acl(rpc, false)
-    }
-
-    fn direct_mount_with_acl(rpc: rpc::Client, acl_supported: bool) -> Arc<Mount40> {
-        Arc::new(Mount40 {
-            rpc,
-            auth: Auth::new_null(),
-            root_fh: Bytes::from_static(b"root"),
-            client_id: Arc::new(AtomicU64::new(7)),
-            issuer: 9,
-            next_owner: AtomicU64::new(1),
-            state: Arc::new(OpenState::default()),
-            locks: Arc::new(LockState::default()),
-            lease: LeaseState::ready(1, 60),
-            _renewal: None,
-            _callback: None,
-            _callback_worker: None,
-            callback_state: None,
-            dircount: 8192,
-            maxcount: 32768,
-            rsize: 1_048_576,
-            wsize: 1_048_576,
-            acl_supported,
-        })
-    }
-
-    #[tokio::test]
-    async fn capabilities_report_server_negotiated_acl_support() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _server = tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
-        let mount = direct_mount(rpc::Client::new(mux, None));
-
-        assert!(!mount.capabilities().acl);
-    }
-
-    fn direct_mount_with_renewal(rpc: rpc::Client, interval: Duration) -> Arc<Mount40> {
-        direct_mount_with_lease_renewal(rpc, interval, 60)
-    }
-
-    fn direct_mount_with_lease_renewal(
-        rpc: rpc::Client,
-        interval: Duration,
-        lease_seconds: u32,
-    ) -> Arc<Mount40> {
-        direct_mount_with_recovery(rpc, interval, lease_seconds, None)
-    }
-
-    fn direct_mount_with_recovery(
-        rpc: rpc::Client,
-        interval: Duration,
-        lease_seconds: u32,
-        recovery: Option<RecoveryHandler>,
-    ) -> Arc<Mount40> {
-        let lease = LeaseState::ready(1, lease_seconds);
-        let reconnect_lease = Arc::clone(&lease);
-        rpc.set_reconnect_handler(move |_client, _generation| {
-            let lease = Arc::clone(&reconnect_lease);
-            async move {
-                lease.mark_reconnecting();
-                Ok(())
-            }
-        })
-        .unwrap();
-        let renewal = LeaseRenewal::start(
-            rpc.clone(),
-            Auth::new_null(),
-            Arc::new(AtomicU64::new(7)),
-            interval,
-            Arc::clone(&lease),
-            recovery,
-        );
-        Arc::new(Mount40 {
-            rpc,
-            auth: Auth::new_null(),
-            root_fh: Bytes::from_static(b"root"),
-            client_id: Arc::new(AtomicU64::new(7)),
-            issuer: 9,
-            next_owner: AtomicU64::new(1),
-            state: Arc::new(OpenState::default()),
-            locks: Arc::new(LockState::default()),
-            lease,
-            _renewal: Some(renewal),
-            _callback: None,
-            _callback_worker: None,
-            callback_state: None,
-            dircount: 8192,
-            maxcount: 32768,
-            rsize: 1_048_576,
-            wsize: 1_048_576,
-            acl_supported: false,
-        })
-    }
-
-    fn open_result(flags: u32, stateid: [u8; 16], fh: &[u8]) -> Vec<u8> {
-        let mut open = Vec::new();
-        open.extend_from_slice(&stateid);
-        open.extend_from_slice(&[0; 20]);
-        open.extend_from_slice(&flags.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        let mut getfh = Vec::new();
-        xdr_opaque(&mut getfh, fh);
-        compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
-    }
-
-    #[test]
-    fn delegation_getattr_decodes_exact_change_and_size() {
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(&1u32.to_be_bytes());
-        encoded.extend_from_slice(&0x18u32.to_be_bytes());
-        encoded.extend_from_slice(&16u32.to_be_bytes());
-        encoded.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-        encoded.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
-        assert_eq!(
-            decode_callback_attributes(Bytes::from(encoded)).unwrap(),
-            (0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
-        );
-    }
-
-    #[test]
-    fn delegation_getattr_rejects_missing_required_attributes() {
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(&1u32.to_be_bytes());
-        encoded.extend_from_slice(&0x10u32.to_be_bytes());
-        encoded.extend_from_slice(&8u32.to_be_bytes());
-        encoded.extend_from_slice(&7u64.to_be_bytes());
-        assert!(decode_callback_attributes(Bytes::from(encoded)).is_err());
-    }
-
-    fn open_result_with_read_delegation(
-        stateid: [u8; 16],
-        delegation: [u8; 16],
-        fh: &[u8],
-    ) -> Vec<u8> {
-        let mut open = Vec::new();
-        open.extend_from_slice(&stateid);
-        open.extend_from_slice(&[0; 20]);
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&1u32.to_be_bytes());
-        open.extend_from_slice(&delegation);
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        open.extend_from_slice(&0u32.to_be_bytes());
-        xdr_opaque(&mut open, b"");
-        let mut getfh = Vec::new();
-        xdr_opaque(&mut getfh, fh);
-        compound_result("open", &[(22, &[]), (18, &open), (10, &getfh)])
-    }
-
-    async fn connected_direct_mount(listener: &TcpListener) -> Arc<Mount40> {
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        direct_mount(rpc::Client::new(mux, None))
-    }
-
-    async fn connected_direct_mount_with_acl(listener: &TcpListener) -> Arc<Mount40> {
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        direct_mount_with_acl(rpc::Client::new(mux, None), true)
-    }
-
-    #[tokio::test]
-    async fn public_health_reports_successful_background_renewal() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount =
-            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
-        });
-        server.await.unwrap().unwrap();
-        for _ in 0..20 {
-            let health = mount.health();
-            if health.lease_renewals == 1 {
-                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
-                assert_eq!(health.generation, 1);
-                assert_eq!(health.lease_seconds, Some(60));
-                assert_eq!(health.lease_healthy, Some(true));
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("successful RENEW was not reflected in public health");
-    }
-
-    #[tokio::test]
-    async fn renewal_reconnects_with_byte_identical_request_and_preserves_generation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount =
-            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
-        let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await?;
-            let original = read_record(&mut first).await?;
-            socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
-            drop(first);
-
-            let (mut second, _) = listener.accept().await?;
-            let replay = read_record(&mut second).await?;
-            assert_eq!(&original[4..], &replay[4..]);
-            reply(
-                &mut second,
-                &replay,
-                &compound_result("renew", &[(30, &[])]),
-            )
-            .await
-        });
-        server.await.unwrap().unwrap();
-        for _ in 0..100 {
-            let health = mount.health();
-            if health.lease_renewals == 1 {
-                assert_eq!(health.lifecycle, crate::MountLifecycleState::Ready);
-                assert_eq!(health.generation, 1);
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("replayed RENEW did not restore healthy lease state");
-    }
-
-    #[tokio::test]
-    async fn grace_renewal_is_suspect_until_a_later_success() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount =
-            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
-        let (grace_tx, grace_rx) = oneshot::channel();
-        let (continue_tx, continue_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            let mut grace = Vec::new();
-            grace.extend_from_slice(&10013u32.to_be_bytes());
-            xdr_opaque(&mut grace, b"renew");
-            grace.extend_from_slice(&1u32.to_be_bytes());
-            grace.extend_from_slice(&30u32.to_be_bytes());
-            grace.extend_from_slice(&10013u32.to_be_bytes());
-            reply(&mut stream, &first, &grace).await?;
-            let _ = grace_tx.send(());
-            let _ = continue_rx.await;
-            let second = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("renew", &[(30, &[])]),
-            )
-            .await
-        });
-        grace_rx.await.unwrap();
-        for _ in 0..100 {
-            if mount.health().lifecycle == crate::MountLifecycleState::Suspect {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::Suspect
-        );
-        assert_eq!(mount.health().generation, 1);
-        let _ = continue_tx.send(());
-        server.await.unwrap().unwrap();
-        for _ in 0..100 {
-            if mount.health().lease_renewals == 1 {
-                assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Ready);
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("successful RENEW did not clear GRACE suspicion");
-    }
-
-    #[tokio::test]
-    async fn transient_renewal_failures_lose_state_after_the_lease_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount = direct_mount_with_lease_renewal(
-            rpc::Client::new(mux, None),
-            Duration::from_millis(20),
-            1,
-        );
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            while let Ok(request) = read_record(&mut stream).await {
-                if reply(
-                    &mut stream,
-                    &request,
-                    &failed_lock_result("renew", 30, 10013),
-                )
-                .await
-                .is_err()
-                {
-                    break;
-                }
-            }
-            Ok::<(), std::io::Error>(())
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("transient renewal failures never expired the lease");
-        assert_eq!(mount.health().generation, 2);
-        mount.umount().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn in_flight_renewal_is_fenced_at_deadline_but_still_settles() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount = direct_mount_with_lease_renewal(
-            rpc::Client::new(mux, None),
-            Duration::from_millis(10),
-            1,
-        );
-        let (sent_tx, sent_rx) = oneshot::channel();
-        let (settle_tx, settle_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = sent_tx.send(());
-            let _ = settle_rx.await;
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("renew", &[(30, &[])]),
-            )
-            .await
-        });
-        sent_rx.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("in-flight RENEW prevented conservative lease expiry");
-        assert_eq!(mount.health().generation, 2);
-        let _ = settle_tx.send(());
-        mount.umount().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn successful_stateid_activity_extends_an_in_flight_renew_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount = direct_mount_with_lease_renewal(
-            rpc::Client::new(mux, None),
-            Duration::from_millis(10),
-            1,
-        );
-        register_scripted_open(&mount, 81, b"fh").await;
-        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
-        let (settle_tx, settle_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            let _ = renew_sent_tx.send(());
-            let read = read_record(&mut stream).await?;
-            let mut read_data = Vec::new();
-            read_data.extend_from_slice(&1u32.to_be_bytes());
-            xdr_opaque(&mut read_data, b"x");
-            reply(
-                &mut stream,
-                &read,
-                &compound_result("read", &[(22, &[]), (25, &read_data)]),
-            )
-            .await?;
-            let _ = settle_rx.await;
-            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
-        });
-        renew_sent_rx.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_eq!(
-            mount.read(Bytes::from_static(b"fh"), 0, 1).await.unwrap(),
-            Bytes::from_static(b"x")
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_ne!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::LostState,
-            "successful foreground activity did not extend the lease deadline"
-        );
-        let _ = settle_tx.send(());
-        mount.umount().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn successful_stateless_activity_does_not_extend_the_lease_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount = direct_mount_with_lease_renewal(
-            rpc::Client::new(mux, None),
-            Duration::from_millis(10),
-            1,
-        );
-        let (renew_sent_tx, renew_sent_rx) = oneshot::channel();
-        let (settle_tx, settle_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            let _ = renew_sent_tx.send(());
-            let null = read_record(&mut stream).await?;
-            reply(&mut stream, &null, &[]).await?;
-            let _ = settle_rx.await;
-            reply(&mut stream, &renew, &compound_result("renew", &[(30, &[])])).await
-        });
-        renew_sent_rx.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        mount.null().await.unwrap();
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                if mount.health().lifecycle == crate::MountLifecycleState::LostState {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("stateless NULL incorrectly extended the lease deadline");
-        let _ = settle_tx.send(());
-        mount.umount().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn expired_renewal_loses_generation_and_gates_stateful_work() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let mount =
-            direct_mount_with_renewal(rpc::Client::new(mux, None), Duration::from_millis(10));
-        register_scripted_open(&mount, 82, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            let mut result = Vec::new();
-            result.extend_from_slice(&10011u32.to_be_bytes());
-            xdr_opaque(&mut result, b"renew");
-            result.extend_from_slice(&1u32.to_be_bytes());
-            result.extend_from_slice(&30u32.to_be_bytes());
-            result.extend_from_slice(&10011u32.to_be_bytes());
-            reply(&mut stream, &renew, &result).await
-        });
-        server.await.unwrap().unwrap();
-        for _ in 0..100 {
-            let health = mount.health();
-            if health.lease_healthy == Some(false) {
-                assert_eq!(health.lifecycle, crate::MountLifecycleState::LostState);
-                assert_eq!(health.generation, 2);
-                let error = mount
-                    .read(Bytes::from_static(b"fh"), 0, 1)
-                    .await
-                    .unwrap_err();
-                assert_eq!(
-                    error.operation_outcome().unwrap().recovery,
-                    crate::RecoveryAction::Reopen
-                );
-                let stale = crate::LockToken::new(
-                    Bytes::from_static(b"fh"),
-                    Bytes::from_static(&[0x31; 16]),
-                    2,
-                    0,
-                    1,
-                    mount.issuer,
-                    1,
-                );
-                assert!(mount.unlock_stateful(stale).await.is_err());
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("expired RENEW was not reflected in public health");
-    }
-
-    #[tokio::test]
-    async fn stale_clientid_renewal_runs_recovery_and_preserves_generation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let recoveries = Arc::new(AtomicU64::new(0));
-        let recovery_count = Arc::clone(&recoveries);
-        let recovery: RecoveryHandler = Arc::new(move || {
-            let recovery_count = Arc::clone(&recovery_count);
-            Box::pin(async move {
-                recovery_count.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            })
-        });
-        let mount = direct_mount_with_recovery(
-            rpc::Client::new(mux, None),
-            Duration::from_millis(10),
-            60,
-            Some(recovery),
-        );
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            reply(&mut stream, &renew, &failed_lock_result("renew", 30, 10022)).await
-        });
-        server.await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if recoveries.load(Ordering::Acquire) == 1
-                    && mount.health().lifecycle == crate::MountLifecycleState::Ready
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(mount.health().generation, 1);
-    }
-
-    #[tokio::test]
-    async fn late_lock_result_cannot_publish_across_a_generation_fence() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 83, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let _ = reply_rx.await;
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("lock", &[(22, &[]), (12, &[0x8a; 16])]),
-            )
-            .await
-        });
-        let for_lock = Arc::clone(&mount);
-        let lock = tokio::spawn(async move {
-            for_lock
-                .lock_stateful(Bytes::from_static(b"fh"), 2, 0, 1)
-                .await
-        });
-        seen_rx.await.unwrap();
-        mount.lease.mark_lost().await;
-        let _ = reply_tx.send(());
-        let error = lock.await.unwrap().unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().recovery,
-            crate::RecoveryAction::Reopen
-        );
-        assert!(mount.locks.snapshot().await.is_empty());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn public_umount_stops_renewal_and_reports_closed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let accepted = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await?;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        mount.umount().await.unwrap();
-        let health = mount.health();
-        assert_eq!(health.lifecycle, crate::MountLifecycleState::Closed);
-        assert_eq!(health.lease_healthy, Some(false));
-        assert!(mount.read(Bytes::from_static(b"fh"), 0, 1).await.is_err());
-        accepted.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_umount_keeps_a_sent_reclaim_settling() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let rpc = rpc::Client::new(mux, None);
-        let auth = Auth::new_null();
-        let client_id = Arc::new(AtomicU64::new(7));
-        let lease = LeaseState::ready(1, 60);
-        let state = Arc::new(OpenState::default());
-        state
-            .register(OwnerLane {
-                owner: 75,
-                next_seqid: 1,
-                stateid: [0x75; 16],
-                fh: Bytes::from_static(b"fh"),
-                dir_fh: Bytes::from_static(b"dir"),
-                name: "reclaim-file".into(),
-                access: crate::OPEN_BOTH,
-                write_verifier: None,
-                io_fence: Arc::new(tokio::sync::RwLock::new(())),
-                closing: false,
-            })
-            .await;
-        let locks = Arc::new(LockState::default());
-        let context = RecoveryContext {
-            rpc: rpc.clone(),
-            auth: auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5a; 8],
-                owner: "shutdown-reclaim".into(),
-            },
-            client_id: Arc::clone(&client_id),
-            issuer: 9,
-            state: Arc::clone(&state),
-            locks: Arc::clone(&locks),
-            lease: Arc::clone(&lease),
-            callback_addr: None,
-        };
-        let recovery: RecoveryHandler = Arc::new(move || {
-            let context = context.clone();
-            Box::pin(async move { context.recover_or_lose().await })
-        });
-        let renewal = LeaseRenewal::start(
-            rpc.clone(),
-            auth.clone(),
-            Arc::clone(&client_id),
-            Duration::from_millis(10),
-            Arc::clone(&lease),
-            Some(recovery),
-        );
-        let mount = Arc::new(Mount40 {
-            rpc,
-            auth,
-            root_fh: Bytes::from_static(b"root"),
-            client_id,
-            issuer: 9,
-            next_owner: AtomicU64::new(1),
-            state,
-            locks,
-            lease,
-            _renewal: Some(renewal),
-            _callback: None,
-            _callback_worker: None,
-            callback_state: None,
-            dircount: 8192,
-            maxcount: 32768,
-            rsize: 1_048_576,
-            wsize: 1_048_576,
-            acl_supported: false,
-        });
-        let (reclaim_seen_tx, reclaim_seen_rx) = oneshot::channel();
-        let (release_reclaim_tx, release_reclaim_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let renew = read_record(&mut stream).await?;
-            reply(&mut stream, &renew, &failed_lock_result("renew", 30, 10011)).await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&23u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x7a; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let reclaim = read_record(&mut stream).await?;
-            let _ = reclaim_seen_tx.send(());
-            let _ = release_reclaim_rx.await;
-            reply(&mut stream, &reclaim, &open_result(0, [0x85; 16], b"fh")).await
-        });
-
-        reclaim_seen_rx.await.unwrap();
-        let for_umount = Arc::clone(&mount);
-        let mut umount = tokio::spawn(async move { for_umount.umount().await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut umount)
-                .await
-                .is_err(),
-            "umount completed while the sent reclaim was unsettled"
-        );
-        umount.abort();
-        let _ = umount.await;
-        let _ = release_reclaim_tx.send(());
-        server.await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if mount.state.by_owner(75).await.unwrap().lock().await.stateid == [0x85; 16] {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled umount abandoned the sent reclaim settlement");
-        mount.umount().await.unwrap();
-        assert_eq!(mount.health().lifecycle, crate::MountLifecycleState::Closed);
-    }
-
-    #[tokio::test]
-    async fn scripted_recovery_reclaims_open_before_lock() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 71, b"fh").await;
-        mount
-            .locks
-            .register(LockLane {
-                owner: 72,
-                open_owner: 71,
-                owner_wire: Bytes::from_static(b"lock-owner"),
-                next_seqid: 1,
-                stateid: [0x72; 16],
-                fh: Bytes::from_static(b"fh"),
-                lock_type: 2,
-                offset: 7,
-                length: 11,
-            })
-            .await;
-        let original_lock_token = crate::LockToken::new(
-            Bytes::from_static(b"fh"),
-            Bytes::from_static(&[0x72; 16]),
-            2,
-            7,
-            11,
-            mount.issuer,
-            mount.lease.generation(),
-        );
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&17u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x77; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let reclaim_open = read_record(&mut stream).await?;
-            assert!(
-                reclaim_open
-                    .windows(4)
-                    .any(|wire| wire == 18u32.to_be_bytes())
-            );
-            reply(
-                &mut stream,
-                &reclaim_open,
-                &open_result(0, [0x81; 16], b"fh"),
-            )
-            .await?;
-            let reclaim_lock = read_record(&mut stream).await?;
-            assert!(
-                reclaim_lock
-                    .windows(8)
-                    .any(|wire| { wire == [2u32.to_be_bytes(), 1u32.to_be_bytes()].concat() })
-            );
-            reply(
-                &mut stream,
-                &reclaim_lock,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x82; 16])]),
-            )
-            .await?;
-            let locku = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &locku,
-                &compound_result("locku", &[(22, &[]), (14, &[0x83; 16])]),
-            )
-            .await?;
-            let release = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &release,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        let identity = ClientIdentity {
-            verifier: [0x55; 8],
-            owner: "scripted-recovery".into(),
-        };
-        mount.lease.mark_recovering();
-        RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity,
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover()
-        .await
-        .unwrap();
-        assert_eq!(mount.client_id.load(Ordering::Acquire), 17);
-        assert_eq!(
-            mount.state.by_owner(71).await.unwrap().lock().await.stateid,
-            [0x81; 16]
-        );
-        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_some());
-        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_some());
-        mount.lease.mark_ready();
-        mount.unlock_stateful(original_lock_token).await.unwrap();
-        assert!(mount.locks.by_stateid(&[0x72; 16]).await.is_none());
-        assert!(mount.locks.by_stateid(&[0x82; 16]).await.is_none());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_reclaims_independent_open_and_lock_owners_concurrently() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 76, b"fh-a").await;
-        register_scripted_open(&mount, 77, b"fh-b").await;
-        register_scripted_lock(&mount, 76, [0x76; 16]).await;
-        register_scripted_lock(&mount, 77, [0x77; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&29u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x7b; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-
-            // Reading both before replying proves that one owner's pending OPEN
-            // does not prevent another independent owner from being reclaimed.
-            let first = read_record(&mut stream).await?;
-            let second = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                .await
-                .expect("second owner reclaim was globally serialized")?;
-            reply(&mut stream, &first, &open_result(0, [0x86; 16], b"fh-a")).await?;
-            reply(&mut stream, &second, &open_result(0, [0x87; 16], b"fh-b")).await?;
-
-            let first_lock = read_record(&mut stream).await?;
-            let second_lock =
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .expect("second owner LOCK reclaim was globally serialized")?;
-            reply(
-                &mut stream,
-                &first_lock,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x96; 16])]),
-            )
-            .await?;
-            reply(
-                &mut stream,
-                &second_lock,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x97; 16])]),
-            )
-            .await
-        });
-        let context = RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5b; 8],
-                owner: "concurrent-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        };
-        context.recover().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_bounds_concurrent_open_reclaims() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        for owner in 100..117 {
-            register_scripted_open(&mount, owner, b"fh").await;
-        }
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let identity_data = [31u64.to_be_bytes().as_slice(), &[0x7c; 8]].concat();
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-
-            let mut first_window = Vec::new();
-            for _ in 0..16 {
-                first_window.push(read_record(&mut stream).await?);
-            }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "recovery exceeded its 16-owner concurrency bound"
-            );
-            for request in first_window {
-                reply(&mut stream, &request, &open_result(0, [0x88; 16], b"fh")).await?;
-            }
-            let final_request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &final_request,
-                &open_result(0, [0x89; 16], b"fh"),
-            )
-            .await
-        });
-        mount.lease.mark_recovering();
-        RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5c; 8],
-                owner: "bounded-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover()
-        .await
-        .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_bounds_concurrent_lock_owner_reclaims() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        for owner in 200..217u64 {
-            register_scripted_open(&mount, owner, b"fh").await;
-            register_scripted_lock(&mount, owner, [owner as u8; 16]).await;
-        }
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let identity_data = [32u64.to_be_bytes().as_slice(), &[0x7d; 8]].concat();
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-
-            let mut open_window = Vec::new();
-            for _ in 0..MAX_CONCURRENT_RECLAIMS {
-                open_window.push(read_record(&mut stream).await?);
-            }
-            for (index, request) in open_window.into_iter().enumerate() {
-                reply(
-                    &mut stream,
-                    &request,
-                    &open_result(0, [index as u8; 16], b"fh"),
-                )
-                .await?;
-            }
-            let final_open = read_record(&mut stream).await?;
-            reply(&mut stream, &final_open, &open_result(0, [0xf0; 16], b"fh")).await?;
-
-            let mut lock_window = Vec::new();
-            for _ in 0..MAX_CONCURRENT_RECLAIMS {
-                lock_window.push(read_record(&mut stream).await?);
-            }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "recovery exceeded its lock-owner concurrency bound"
-            );
-            for (index, request) in lock_window.into_iter().enumerate() {
-                reply(
-                    &mut stream,
-                    &request,
-                    &compound_result(
-                        "reclaim-lock",
-                        &[(22, &[]), (12, &[(index as u8).wrapping_add(1); 16])],
-                    ),
-                )
-                .await?;
-            }
-            let final_lock = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &final_lock,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0xf1; 16])]),
-            )
-            .await
-        });
-        mount.lease.mark_recovering();
-        RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5d; 8],
-                owner: "bounded-lock-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover()
-        .await
-        .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn recovery_serializes_locks_that_share_an_open_owner() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 78, b"fh").await;
-        for (owner, stateid) in [(780, [0x78; 16]), (781, [0x79; 16])] {
-            mount
-                .locks
-                .register(LockLane {
-                    owner,
-                    open_owner: 78,
-                    owner_wire: Bytes::from(format!("same-open-{owner}")),
-                    next_seqid: 1,
-                    stateid,
-                    fh: Bytes::from_static(b"fh"),
-                    lock_type: 2,
-                    offset: owner - 780,
-                    length: 1,
-                })
-                .await;
-        }
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&31u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x7c; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let open = read_record(&mut stream).await?;
-            reply(&mut stream, &open, &open_result(0, [0x88; 16], b"fh")).await?;
-
-            let first = read_record(&mut stream).await?;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "same-owner LOCK reclaims were concurrently in flight"
-            );
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x98; 16])]),
-            )
-            .await?;
-            let second = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("reclaim-lock", &[(22, &[]), (12, &[0x99; 16])]),
-            )
-            .await
-        });
-        RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5c; 8],
-                owner: "same-owner-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover()
-        .await
-        .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn no_grace_reclaim_clears_protection_and_advances_generation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 73, b"fh").await;
-        register_scripted_lock(&mount, 74, [0x74; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&19u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x79; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let reclaim = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &reclaim,
-                &failed_lock_result("reclaim-open", 18, 10033),
-            )
-            .await
-        });
-        let context = RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x59; 8],
-                owner: "scripted-no-grace".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        };
-        let error = context.recover_or_lose().await.unwrap_err();
-        let outcome = error.operation_outcome().unwrap();
-        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
-        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
-        assert!(matches!(
-            outcome.source.as_ref(),
-            NfsError::Nfs4(crate::Nfs4ErrorCode::NFS4ERR_NO_GRACE)
-        ));
-        assert_eq!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::LostState
-        );
-        assert_eq!(mount.health().generation, 2);
-        assert!(mount.state.snapshot().await.is_empty());
-        assert!(mount.locks.snapshot().await.is_empty());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn partial_reclaim_compound_loses_state_with_structured_guidance() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 79, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&37u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x7d; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let reclaim = read_record(&mut stream).await?;
-            let mut partial = open_result(0, [0x89; 16], b"fh");
-            partial[..4].copy_from_slice(&10006u32.to_be_bytes());
-            reply(&mut stream, &reclaim, &partial).await
-        });
-        let error = RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5d; 8],
-                owner: "partial-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover_or_lose()
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().recovery,
-            crate::RecoveryAction::Reopen
-        );
-        assert_eq!(
-            mount.health().lifecycle,
-            crate::MountLifecycleState::LostState
-        );
-        assert!(mount.state.snapshot().await.is_empty());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn reclaim_reply_loss_is_not_replayed_and_requires_reopen() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 80, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&41u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x7e; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            let _reclaim = read_record(&mut stream).await?;
-            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let error = RecoveryContext {
-            rpc: mount.rpc.clone(),
-            auth: mount.auth.clone(),
-            identity: ClientIdentity {
-                verifier: [0x5e; 8],
-                owner: "reply-loss-reclaim".into(),
-            },
-            client_id: Arc::clone(&mount.client_id),
-            issuer: mount.issuer,
-            state: Arc::clone(&mount.state),
-            locks: Arc::clone(&mount.locks),
-            lease: Arc::clone(&mount.lease),
-            callback_addr: None,
-        }
-        .recover_or_lose()
-        .await
-        .unwrap_err();
-        let outcome = error.operation_outcome().unwrap();
-        assert_eq!(outcome.outcome, crate::OperationOutcome::Uncertain);
-        assert_eq!(outcome.recovery, crate::RecoveryAction::Reopen);
-        assert_eq!(mount.health().generation, 2);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_open_after_send_finishes_owner_state_settlement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            tokio::task::yield_now().await;
-            reply(
-                &mut stream,
-                &request,
-                &open_result(0, [0x51; 16], b"opened-fh"),
-            )
-            .await
-        });
-        let for_task = Arc::clone(&mount);
-        let task = tokio::spawn(async move {
-            for_task
-                .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
-                .await
-        });
-        seen_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        server.await.unwrap().unwrap();
-        for _ in 0..20 {
-            if mount
-                .state
-                .for_fh(&Bytes::from_static(b"opened-fh"), crate::OPEN_BOTH)
-                .await
-                .is_some()
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("detached OPEN reply did not register owner state");
-    }
-
-    #[tokio::test]
-    async fn open_reply_loss_is_structured_as_uncertain() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let _request = read_record(&mut stream).await?;
-            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let error = mount
-            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().outcome,
-            crate::OperationOutcome::Uncertain
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn partial_open_compound_is_structured_as_uncertain() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let mut partial = compound_result("open", &[(22, &[]), (18, &[])]);
-            partial[..4].copy_from_slice(&10006u32.to_be_bytes()); // NFS4ERR_SERVERFAULT after OPEN
-            reply(&mut stream, &request, &partial).await
-        });
-        let error = mount
-            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().outcome,
-            crate::OperationOutcome::Uncertain
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn conditional_open_confirm_uses_next_seqid_and_returned_stateid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &open_result(2, [0x61; 16], b"confirmed-fh"),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            let expected = [[0x61; 16].as_slice(), 1u32.to_be_bytes().as_slice()].concat();
-            assert!(confirm.windows(expected.len()).any(|wire| wire == expected));
-            let data = [0x62; 16];
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("open_confirm", &[(22, &[]), (20, &data)]),
-            )
-            .await
-        });
-        let opened = mount
-            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
-            .await
-            .unwrap();
-        let owner = decode_owner(&opened.into_parts().1.unwrap()).unwrap().1;
-        let lane = mount.state.by_owner(owner).await.unwrap();
-        assert_eq!(lane.lock().await.stateid, [0x62; 16]);
-        assert_eq!(lane.lock().await.next_seqid, 2);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn disabled_retention_returns_an_unsolicited_delegation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
-            )
-            .await?;
-            let delegreturn =
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .expect("unsolicited delegation was not returned")?;
-            assert!(delegreturn.windows(16).any(|value| value == [0x71; 16]));
-            reply(
-                &mut stream,
-                &delegreturn,
-                &compound_result("delegreturn", &[(22, &[]), (8, &[])]),
-            )
-            .await
-        });
-        mount
-            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn disabled_retention_reports_unsolicited_delegreturn_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
-            )
-            .await?;
-            let delegreturn = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &delegreturn,
-                &failed_lock_result("delegreturn", 8, 10006),
-            )
-            .await?;
-            let close = tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                .await
-                .map_err(|_| std::io::Error::other("OPEN state was not retained for CLOSE"))??;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
-            )
-            .await
-        });
-
-        let error = mount
-            .open_stateful(Bytes::from_static(b"root"), b"file", crate::OPEN_READ)
-            .await
-            .expect_err("OPEN must not publish a delegation the client failed to return");
-        assert!(matches!(error, NfsError::Nfs4(_)) || error.operation_outcome().is_some());
-        mount
-            .close(Bytes::from_static(b"delegated-fh"))
-            .await
-            .expect("failed DELEGRETURN must retain a closeable OPEN state");
-        assert!(mount.state.snapshot().await.is_empty());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn scripted_mount_reconnect_preserves_confirmed_identity() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mounted = Arc::new(Notify::new());
-        let mounted_for_server = Arc::clone(&mounted);
-        let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await?;
-            let values = [
-                60u32.to_be_bytes().as_slice(),
-                65536u64.to_be_bytes().as_slice(),
-                32768u64.to_be_bytes().as_slice(),
-            ]
-            .concat();
-            serve_mount(&mut first, (1 << 10) | (1 << 30) | (1 << 31), &values).await?;
-            mounted_for_server.notified().await;
-            socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
-            drop(first);
-
-            let (mut second, _) = listener.accept().await?;
-            let null = read_record(&mut second).await?;
-            reply(&mut second, &null, &[]).await?;
-            Ok::<(), std::io::Error>(())
-        });
-
-        let args = crate::MountArgs {
-            versions: vec![NFSVersion::NFSv4p0],
-            host: "127.0.0.1".to_string(),
-            dirpath: "/export".to_string(),
-            mountport: 0,
-            nfsport: addr.port(),
-            uid: 0,
-            gid: 0,
-            readdir_buffer: None,
-            noresvport: true,
-            retain_delegations: false,
-            dialer: None,
-        };
-        let mount = mount_on_addr(&addr.into(), &args, Auth::new_null())
-            .await
-            .unwrap();
-        assert_eq!(mount.get_max_read_size(), 65536);
-        assert_eq!(mount.get_max_write_size(), 32768);
-        // Without `readdir-buffer`, READDIR replies are sized from the published MAXREAD.
-        assert_eq!((mount.dircount, mount.maxcount), (65536, 65536));
-        assert_eq!(mount.root_fh, Bytes::from_static(b"scripted-fh"));
-        mounted.notify_one();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        mount.null().await.unwrap();
-        server.await.unwrap().unwrap();
-        mount.umount().await.unwrap();
-    }
-
-    /// A v4.0 server that publishes no MAXREAD: READ falls back to the client ceiling, but
-    /// READDIR replies keep the 8 KiB default rather than growing to it (0.8.6); an explicit
-    /// `readdir-buffer` is used as given.
-    #[tokio::test]
-    async fn scripted_mount_without_maxread_keeps_the_default_directory_reply_size() {
-        let lease_and_maxwrite = [
-            60u32.to_be_bytes().as_slice(),
-            32768u64.to_be_bytes().as_slice(),
-        ]
-        .concat();
-        let default = crate::mount::DEFAULT_READDIR_BUFFER;
-        for (readdir_buffer, expected) in [
-            (None, (default, default)),
-            (Some((2048, 4096)), (2048, 4096)),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let values = lease_and_maxwrite.clone();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await?;
-                serve_mount(&mut stream, (1 << 10) | (1 << 31), &values).await?;
-                Ok::<TcpStream, std::io::Error>(stream)
-            });
-            let args = crate::MountArgs {
-                versions: vec![NFSVersion::NFSv4p0],
-                host: "127.0.0.1".to_string(),
-                dirpath: "/export".to_string(),
-                mountport: 0,
-                nfsport: addr.port(),
-                uid: 0,
-                gid: 0,
-                readdir_buffer,
-                noresvport: true,
-                retain_delegations: false,
-                dialer: None,
-            };
-            let mount = mount_on_addr(&addr.into(), &args, Auth::new_null())
-                .await
-                .unwrap();
-            assert_eq!(mount.get_max_read_size(), crate::mount::MAX_IO_SIZE);
-            assert_eq!(mount.get_max_write_size(), 32768);
-            assert_eq!((mount.dircount, mount.maxcount), expected);
-            let _stream = server.await.unwrap().unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn retained_delegations_publish_callback_before_setclientid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            assert!(
-                identity.windows(3).any(|value| value == b"tcp"),
-                "SETCLIENTID did not publish a ready TCP callback listener"
-            );
-            let netid = identity
-                .windows(3)
-                .position(|value| value == b"tcp")
-                .expect("TCP netid missing");
-            let addr_len_offset = netid + 4;
-            let addr_len = u32::from_be_bytes(
-                identity[addr_len_offset..addr_len_offset + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let universal =
-                std::str::from_utf8(&identity[addr_len_offset + 4..addr_len_offset + 4 + addr_len])
-                    .unwrap();
-            let fields: Vec<_> = universal.split('.').collect();
-            assert_eq!(fields.len(), 6, "invalid callback universal address");
-            let callback_addr = format!(
-                "{}.{}.{}.{}:{}",
-                fields[0],
-                fields[1],
-                fields[2],
-                fields[3],
-                fields[4].parse::<u16>().unwrap() * 256 + fields[5].parse::<u16>().unwrap()
-            );
-            TcpStream::connect(callback_addr).await?;
-            Ok::<(), std::io::Error>(())
-        });
-        let args = crate::MountArgs {
-            versions: vec![NFSVersion::NFSv4p0],
-            host: "127.0.0.1".to_string(),
-            dirpath: "/export".to_string(),
-            mountport: 0,
-            nfsport: addr.port(),
-            uid: 0,
-            gid: 0,
-            readdir_buffer: Some((32 * 1024, 32 * 1024)),
-            noresvport: true,
-            retain_delegations: true,
-            dialer: None,
-        };
-
-        let error = mount_on_addr(&addr.into(), &args, Auth::new_null())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, NfsError::Rpc(_) | NfsError::Io(_)));
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn scripted_public_io_survives_a_lost_callback_reply() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mux = rpc::StreamMux::connect(addr, true).await.unwrap();
-        let rpc = rpc::Client::new(mux, None);
-        let callback = CallbackService::bind_for(addr).await.unwrap();
-        let callback_addr = callback.universal_addr().to_string();
-        let callback_state = callback.state();
-        let recalls = callback.take_recall_receiver().unwrap();
-        let worker = CallbackWorker::start(
-            recalls,
-            rpc.clone(),
-            Auth::new_null(),
-            Arc::clone(&callback_state),
-        );
-        let mount = Arc::new(Mount40 {
-            rpc,
-            auth: Auth::new_null(),
-            root_fh: Bytes::from_static(b"root"),
-            client_id: Arc::new(AtomicU64::new(7)),
-            issuer: 9,
-            next_owner: AtomicU64::new(1),
-            state: Arc::new(OpenState::default()),
-            locks: Arc::new(LockState::default()),
-            lease: LeaseState::ready(1, 60),
-            _renewal: None,
-            _callback: Some(callback),
-            _callback_worker: Some(worker),
-            callback_state: Some(callback_state),
-            dircount: 8192,
-            maxcount: 32768,
-            rsize: 1_048_576,
-            wsize: 1_048_576,
-            acl_supported: false,
-        });
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let open = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &open,
-                &open_result_with_read_delegation([0x61; 16], [0x71; 16], b"delegated-fh"),
-            )
-            .await?;
-            let mut operations = Vec::new();
-            for _ in 0..5 {
-                let request = read_record(&mut stream).await?;
-                let (tag, result) = if request.windows(11).any(|part| part == b"delegreturn") {
-                    (
-                        "delegreturn",
-                        compound_result("delegreturn", &[(22, &[]), (8, &[])]),
-                    )
-                } else if request.windows(5).any(|part| part == b"write") {
-                    let data = [
-                        4u32.to_be_bytes().as_slice(),
-                        2u32.to_be_bytes().as_slice(),
-                        [0x33; 8].as_slice(),
-                    ]
-                    .concat();
-                    ("write", compound_result("write", &[(22, &[]), (38, &data)]))
-                } else if request.windows(6).any(|part| part == b"commit") {
-                    (
-                        "commit",
-                        compound_result("commit", &[(22, &[]), (5, &[0x33; 8])]),
-                    )
-                } else if request.windows(4).any(|part| part == b"read") {
-                    let mut data = 1u32.to_be_bytes().to_vec();
-                    xdr_opaque(&mut data, b"data");
-                    ("read", compound_result("read", &[(22, &[]), (25, &data)]))
-                } else {
-                    (
-                        "close",
-                        compound_result("close", &[(22, &[]), (4, &[0x62; 16])]),
-                    )
-                };
-                operations.push(tag);
-                reply(&mut stream, &request, &result).await?;
-            }
-            Ok::<_, std::io::Error>(operations)
-        });
-
-        let opened = mount
-            .open(Bytes::from_static(b"root"), b"file", crate::OPEN_BOTH)
-            .await
-            .unwrap();
-        let fields = callback_addr
-            .split('.')
-            .map(|field| field.parse::<u16>().unwrap())
-            .collect::<Vec<_>>();
-        let callback_socket = SocketAddr::from((
-            [
-                fields[0] as u8,
-                fields[1] as u8,
-                fields[2] as u8,
-                fields[3] as u8,
-            ],
-            fields[4] * 256 + fields[5],
-        ));
-        let mut words = vec![
-            77,
-            0,
-            2,
-            super::super::callback::CB_PROGRAM,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-        ];
-        words.extend_from_slice(&[0, 0, 1, 1, 4]);
-        words.extend_from_slice(&[0x7171_7171; 4]);
-        words.extend_from_slice(&[0, 12]);
-        words.extend(
-            b"delegated-fh"
-                .chunks_exact(4)
-                .map(|word| u32::from_be_bytes(word.try_into().unwrap())),
-        );
-        let call = words
-            .iter()
-            .flat_map(|word| word.to_be_bytes())
-            .collect::<Vec<_>>();
-        let mut first = TcpStream::connect(callback_socket).await.unwrap();
-        first
-            .write_u32(0x8000_0000 | call.len() as u32)
-            .await
-            .unwrap();
-        first.write_all(&call).await.unwrap();
-        drop(first);
-        let mut retry = TcpStream::connect(callback_socket).await.unwrap();
-        retry
-            .write_u32(0x8000_0000 | call.len() as u32)
-            .await
-            .unwrap();
-        retry.write_all(&call).await.unwrap();
-        let marker = retry.read_u32().await.unwrap();
-        let mut reply_body = vec![0; (marker & 0x7fff_ffff) as usize];
-        retry.read_exact(&mut reply_body).await.unwrap();
-        assert_eq!(u32::from_be_bytes(reply_body[0..4].try_into().unwrap()), 77);
-        for _ in 0..100 {
-            if mount.callback_stats().await.returns_completed == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(mount.callback_stats().await.returns_completed, 1);
-        assert_eq!(
-            crate::write_all(&*mount, opened.fh.clone(), 0, Bytes::from_static(b"data"))
-                .await
-                .unwrap(),
-            4
-        );
-        mount.commit(opened.fh.clone(), 0, 4).await.unwrap();
-        assert_eq!(
-            mount.read(opened.fh.clone(), 0, 4).await.unwrap(),
-            Bytes::from_static(b"data")
-        );
-        mount.close(opened.fh).await.unwrap();
-        assert_eq!(
-            server.await.unwrap().unwrap(),
-            ["delegreturn", "write", "commit", "read", "close"]
-        );
-    }
-
-    #[tokio::test]
-    async fn public_getacl_uses_the_nfsv40_getattr_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let expected = mount::Acl {
-            aces: vec![mount::NfsAce {
-                ace_type: mount::AceType::AccessAllowed,
-                flags: mount::AceFlags(0),
-                access_mask: mount::AceMask(mount::AceMask::READ_DATA),
-                who: "OWNER@".to_string(),
-            }],
-        };
-        let expected_for_server = expected.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let (bitmap, values) = crate::nfs4::acl::encode_setattr_acl(&expected_for_server);
-            let mut getattr = Vec::new();
-            getattr.extend_from_slice(&1u32.to_be_bytes());
-            getattr.extend_from_slice(&bitmap[0].to_be_bytes());
-            xdr_opaque(&mut getattr, &values);
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("getacl", &[(22, &[]), (9, &getattr)]),
-            )
-            .await
-        });
-        assert_eq!(
-            mount.getacl(Bytes::from_static(b"file")).await.unwrap(),
-            expected
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn getacl_attrnotsupp_is_per_call_and_preserves_aclsupport() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount_with_acl(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let support_request = read_record(&mut stream).await?;
-            let mut getattr = Vec::new();
-            getattr.extend_from_slice(&1u32.to_be_bytes());
-            getattr.extend_from_slice(&(1u32 << 13).to_be_bytes());
-            xdr_opaque(&mut getattr, &mount::AclSupport::ALLOW.to_be_bytes());
-            reply(
-                &mut stream,
-                &support_request,
-                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
-            )
-            .await?;
-            let request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &request,
-                &failed_lock_result("getacl", 9, 10032),
-            )
-            .await?;
-            let support_request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &support_request,
-                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
-            )
-            .await?;
-            let request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &request,
-                &failed_lock_result("getacl", 9, 10032),
-            )
-            .await?;
-            Ok::<_, std::io::Error>(())
-        });
-
-        assert_eq!(
-            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
-            mount::AclSupport(mount::AclSupport::ALLOW)
-        );
-        let first = mount.getacl(Bytes::from_static(b"file")).await.unwrap_err();
-        assert!(matches!(first, NfsError::Unsupported(_)));
-        assert!(mount.capabilities().acl);
-        assert_eq!(
-            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
-            mount::AclSupport(mount::AclSupport::ALLOW)
-        );
-        let second = mount
-            .getacl(Bytes::from_static(b"other"))
-            .await
-            .unwrap_err();
-        assert!(matches!(second, NfsError::Unsupported(_)));
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn setacl_attrnotsupp_does_not_suppress_a_later_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount_with_acl(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &request,
-                &failed_lock_result("setacl", 34, 10032),
-            )
-            .await?;
-            let request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &request,
-                &failed_lock_result("setacl", 34, 10032),
-            )
-            .await?;
-            Ok::<_, std::io::Error>(())
-        });
-
-        let first = mount
-            .setacl(Bytes::from_static(b"file"), &mount::Acl::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(first, NfsError::Unsupported(_)));
-        assert!(mount.capabilities().acl);
-        let second = mount
-            .setacl(Bytes::from_static(b"other"), &mount::Acl::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(second, NfsError::Unsupported(_)));
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn public_setacl_and_aclsupport_use_nfsv40_attributes() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let acl = mount::Acl {
-            aces: vec![mount::NfsAce {
-                ace_type: mount::AceType::AccessAllowed,
-                flags: mount::AceFlags(0),
-                access_mask: mount::AceMask(mount::AceMask::READ_DATA),
-                who: "OWNER@".to_string(),
-            }],
-        };
-        let (_, encoded_acl) = crate::nfs4::acl::encode_setattr_acl(&acl);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let setacl = read_record(&mut stream).await?;
-            assert!(
-                setacl
-                    .windows(encoded_acl.len())
-                    .any(|wire| wire == encoded_acl)
-            );
-            let attrsset = [1u32.to_be_bytes(), (1u32 << 12).to_be_bytes()].concat();
-            reply(
-                &mut stream,
-                &setacl,
-                &compound_result("setacl", &[(22, &[]), (34, &attrsset)]),
-            )
-            .await?;
-            let support = read_record(&mut stream).await?;
-            let mut getattr = Vec::new();
-            getattr.extend_from_slice(&1u32.to_be_bytes());
-            getattr.extend_from_slice(&(1u32 << 13).to_be_bytes());
-            xdr_opaque(
-                &mut getattr,
-                &(mount::AclSupport::ALLOW | mount::AclSupport::DENY).to_be_bytes(),
-            );
-            reply(
-                &mut stream,
-                &support,
-                &compound_result("aclsupport", &[(22, &[]), (9, &getattr)]),
-            )
-            .await
-        });
-        mount
-            .setacl(Bytes::from_static(b"file"), &acl)
-            .await
-            .unwrap();
-        assert_eq!(
-            mount.aclsupport(Bytes::from_static(b"file")).await.unwrap(),
-            mount::AclSupport(mount::AclSupport::ALLOW | mount::AclSupport::DENY)
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelling_after_setclientid_detaches_while_confirm_settles() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (identity_seen_tx, identity_seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let identity = read_record(&mut stream).await?;
-            assert!(
-                identity
-                    .windows(4)
-                    .any(|value| value == 35u32.to_be_bytes())
-            );
-            let _ = identity_seen_tx.send(());
-            let mut identity_data = Vec::new();
-            identity_data.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-            identity_data.extend_from_slice(&[0x77; 8]);
-            reply(
-                &mut stream,
-                &identity,
-                &compound_result("identity", &[(35, &identity_data)]),
-            )
-            .await?;
-            let confirm = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &confirm,
-                &compound_result("confirm", &[(36, &[])]),
-            )
-            .await?;
-            Ok::<bool, std::io::Error>(confirm.windows(4).any(|value| value == 36u32.to_be_bytes()))
-        });
-        let args = crate::MountArgs {
-            versions: vec![NFSVersion::NFSv4p0],
-            host: "127.0.0.1".to_string(),
-            dirpath: "/export".to_string(),
-            mountport: 0,
-            nfsport: addr.port(),
-            uid: 0,
-            gid: 0,
-            readdir_buffer: Some((32 * 1024, 32 * 1024)),
-            noresvport: true,
-            retain_delegations: false,
-            dialer: None,
-        };
-        let task =
-            tokio::spawn(async move { mount_on_addr(&addr.into(), &args, Auth::new_null()).await });
-        identity_seen_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        assert!(
-            server.await.unwrap().unwrap(),
-            "sent SETCLIENTID was not settled with confirm"
-        );
-    }
-
-    fn directory_page(entry_cookie: u64, include_eof: bool) -> Bytes {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"verifier");
-        data.extend_from_slice(&1u32.to_be_bytes());
-        data.extend_from_slice(&entry_cookie.to_be_bytes());
-        xdr_opaque(&mut data, b"file");
-        data.extend_from_slice(&1u32.to_be_bytes());
-        data.extend_from_slice(&(1u32 << 20).to_be_bytes());
-        data.extend_from_slice(&8u32.to_be_bytes());
-        data.extend_from_slice(&42u64.to_be_bytes());
-        data.extend_from_slice(&0u32.to_be_bytes());
-        if include_eof {
-            data.extend_from_slice(&1u32.to_be_bytes());
-        }
-        Bytes::from(data)
-    }
-
-    fn readdir_result(verifier: [u8; 8], cookie: u64, name: &[u8], eof: bool) -> Vec<u8> {
-        let mut page = Vec::new();
-        page.extend_from_slice(&verifier);
-        page.extend_from_slice(&1u32.to_be_bytes());
-        page.extend_from_slice(&cookie.to_be_bytes());
-        xdr_opaque(&mut page, name);
-        page.extend_from_slice(&1u32.to_be_bytes());
-        page.extend_from_slice(&(1u32 << 20).to_be_bytes());
-        page.extend_from_slice(&8u32.to_be_bytes());
-        page.extend_from_slice(&(cookie + 100).to_be_bytes());
-        page.extend_from_slice(&0u32.to_be_bytes());
-        page.extend_from_slice(&u32::from(eof).to_be_bytes());
-        compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
-    }
-
-    #[tokio::test]
-    async fn public_readdir_stream_propagates_cookie_and_verifier_across_pages() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &first,
-                &readdir_result(*b"firstver", 7, b"one", false),
-            )
-            .await?;
-            let second = read_record(&mut stream).await?;
-            let continuation = [7u64.to_be_bytes().as_slice(), b"firstver"].concat();
-            assert!(
-                second
-                    .windows(continuation.len())
-                    .any(|wire| wire == continuation)
-            );
-            reply(
-                &mut stream,
-                &second,
-                &readdir_result(*b"secondve", 11, b"two", true),
-            )
-            .await
-        });
-        let entries = mount
-            .readdir(Bytes::from_static(b"root"))
-            .await
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.file_name.as_ref())
-                .collect::<Vec<_>>(),
-            [b"one".as_slice(), b"two".as_slice()]
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    fn failed_readdir_result(status: u32) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&status.to_be_bytes());
-        xdr_opaque(&mut result, b"readdir");
-        result.extend_from_slice(&2u32.to_be_bytes());
-        for (opcode, op_status) in [(22u32, 0u32), (26, status)] {
-            result.extend_from_slice(&opcode.to_be_bytes());
-            result.extend_from_slice(&op_status.to_be_bytes());
-        }
-        result
-    }
-
-    #[tokio::test]
-    async fn readdirplus_page_resumes_from_caller_position_and_types_stale_cookies() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let position = [7u64.to_be_bytes().as_slice(), b"firstver"].concat();
-            assert!(request.windows(position.len()).any(|wire| wire == position));
-            reply(
-                &mut stream,
-                &request,
-                &readdir_result(*b"secondve", 11, b"two", false),
-            )
-            .await?;
-            for status in [10003u32, 10027] {
-                let request = read_record(&mut stream).await?;
-                reply(&mut stream, &request, &failed_readdir_result(status)).await?;
-            }
-            Ok::<_, std::io::Error>(())
-        });
-        let position = mount::DirectoryCookie {
-            cookie: 7,
-            verifier: *b"firstver",
-        };
-        let page = mount
-            .readdirplus_page(Bytes::from_static(b"root"), position)
-            .await
-            .unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].file_name, "two");
-        assert_eq!(page.entries[0].fileid, 111);
-        assert!(!page.eof);
-        assert_eq!(
-            page.next,
-            mount::DirectoryCookie {
-                cookie: 11,
-                verifier: *b"secondve"
-            }
-        );
-        for _ in 0..2 {
-            let error = mount
-                .readdirplus_page(Bytes::from_static(b"root"), page.next)
-                .await
-                .unwrap_err();
-            assert!(error.is_bad_directory_cookie(), "{error:?}");
-        }
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn readdirplus_page_rejects_page_ending_at_requested_cookie() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &request,
-                &readdir_result(*b"verifier", 0, b"zero", false),
-            )
-            .await
-        });
-        let error = mount
-            .readdirplus_page(
-                Bytes::from_static(b"root"),
-                mount::DirectoryCookie::default(),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("did not advance cookie"),
-            "{error}"
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    fn empty_readdir_result(verifier: [u8; 8], eof: bool) -> Vec<u8> {
-        let mut page = verifier.to_vec();
-        page.extend_from_slice(&0u32.to_be_bytes());
-        page.extend_from_slice(&u32::from(eof).to_be_bytes());
-        compound_result("readdir", &[(26 - 4, &[]), (26, &page)])
-    }
-
-    #[tokio::test]
-    async fn readdirplus_page_rejects_empty_page_before_eof_and_keeps_position_at_eof() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            for eof in [false, true] {
-                let request = read_record(&mut stream).await?;
-                reply(
-                    &mut stream,
-                    &request,
-                    &empty_readdir_result(*b"newverif", eof),
-                )
-                .await?;
-            }
-            Ok::<_, std::io::Error>(())
-        });
-        let position = mount::DirectoryCookie {
-            cookie: 7,
-            verifier: *b"firstver",
-        };
-        let error = mount
-            .readdirplus_page(Bytes::from_static(b"root"), position)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("made no progress"), "{error}");
-        let page = mount
-            .readdirplus_page(Bytes::from_static(b"root"), position)
-            .await
-            .unwrap();
-        assert!(page.entries.is_empty() && page.eof);
-        assert_eq!(page.next, position);
-        server.await.unwrap().unwrap();
-    }
-
-    #[test]
-    fn readdir_page_decodes_cookie_name_and_fileid() {
-        let mut data = directory_page(7, true);
-        let (verifier, entries, eof) = decode_directory_page(&mut data, 0).unwrap();
-        assert_eq!(&verifier, b"verifier");
-        assert_eq!(entries.len(), 1);
-        let entry = entries[0].as_ref().unwrap();
-        assert_eq!(entry.cookie, 7);
-        assert_eq!(entry.name, "file");
-        assert_eq!(entry.attr.fileid, 42);
-        assert!(eof);
-    }
-
-    #[test]
-    fn readdir_page_keeps_non_utf8_name_addressable() {
-        let mut page = Vec::new();
-        page.extend_from_slice(b"verifier");
-        page.extend_from_slice(&1u32.to_be_bytes());
-        page.extend_from_slice(&7u64.to_be_bytes());
-        xdr_opaque(&mut page, b"\xd6\xd0\xce\xc4");
-        page.extend_from_slice(&1u32.to_be_bytes());
-        page.extend_from_slice(&(1u32 << 20).to_be_bytes());
-        page.extend_from_slice(&8u32.to_be_bytes());
-        page.extend_from_slice(&42u64.to_be_bytes());
-        page.extend_from_slice(&0u32.to_be_bytes());
-        page.extend_from_slice(&1u32.to_be_bytes());
-        let (_, entries, eof) = decode_directory_page(&mut Bytes::from(page), 0).unwrap();
-        let entry = entries[0].as_ref().unwrap();
-        assert_eq!(entry.name.as_ref(), b"\xd6\xd0\xce\xc4");
-        assert!(eof);
-    }
-
-    #[test]
-    fn readdir_page_rejects_non_advancing_cookie() {
-        let mut data = directory_page(7, true);
-        let (_, entries, _) = decode_directory_page(&mut data, 7).unwrap();
-        let error = entries[0].as_ref().unwrap_err();
-        assert!(error.to_string().contains("did not advance cookie"));
-    }
-
-    #[test]
-    fn readdir_page_rejects_missing_eof_flag() {
-        let mut data = directory_page(7, false);
-        let (_, entries, _) = decode_directory_page(&mut data, 0).unwrap();
-        let error = entries[1].as_ref().unwrap_err();
-        assert!(error.to_string().contains("eof flag truncated"));
-    }
-
-    #[test]
-    fn readdir_page_enforces_negotiated_maxcount() {
-        let error = validate_readdir_payload(Bytes::from_static(b"12345"), 4).unwrap_err();
-        assert!(error.to_string().contains("exceeds requested maxcount"));
-    }
-
-    #[test]
-    fn malformed_later_entry_preserves_prior_entry_result() {
-        let mut data = directory_page(7, true).to_vec();
-        data.truncate(data.len() - 8);
-        data.extend_from_slice(&1u32.to_be_bytes());
-        data.extend_from_slice(&8u64.to_be_bytes());
-        data.extend_from_slice(&99u32.to_be_bytes());
-        let (_, entries, eof) = decode_directory_page(&mut Bytes::from(data), 0).unwrap();
-        assert_eq!(entries[0].as_ref().unwrap().name, "file");
-        assert!(entries[1].is_err());
-        assert!(eof);
-    }
-
-    #[test]
-    fn metadata_results_reject_missing_required_attributes() {
-        let error = require_fattrs(&[0], &[30], "FSINFO").unwrap_err();
-        assert!(matches!(error, NfsError::Unsupported(_)));
-    }
-
-    #[tokio::test]
-    async fn guarded_setattr_is_explicitly_unsupported() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let error = mount
-            .setattr(
-                Bytes::from_static(b"fh"),
-                Some(crate::Time::default()),
-                Some(0o600),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, NfsError::Unsupported(_)));
-    }
-
-    #[tokio::test]
-    async fn remove_reply_loss_is_structured_as_uncertain() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let _request = read_record(&mut stream).await?;
-            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let error = mount
-            .remove(Bytes::from_static(b"root"), b"victim")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().outcome,
-            crate::OperationOutcome::Uncertain
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_remove_after_send_is_settled() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            let change_info = [0u8; 20];
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("remove", &[(22, &[]), (28, &change_info)]),
-            )
-            .await
-        });
-        let task_mount = Arc::clone(&mount);
-        let task = tokio::spawn(async move {
-            task_mount
-                .remove(Bytes::from_static(b"root"), b"victim")
-                .await
-        });
-        seen_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn scripted_public_metadata_and_namespace_families_succeed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let access = read_record(&mut stream).await?;
-            let access_data = [0x3fu32.to_be_bytes(), 0x21u32.to_be_bytes()].concat();
-            reply(
-                &mut stream,
-                &access,
-                &compound_result("access", &[(22, &[]), (3, &access_data)]),
-            )
-            .await?;
-
-            let setattr = read_record(&mut stream).await?;
-            let attrsset = [1u32.to_be_bytes(), (1u32 << 4).to_be_bytes()].concat();
-            reply(
-                &mut stream,
-                &setattr,
-                &compound_result("setattr", &[(22, &[]), (34, &attrsset)]),
-            )
-            .await?;
-
-            let readlink = read_record(&mut stream).await?;
-            let mut target = Vec::new();
-            xdr_opaque(&mut target, b"target");
-            reply(
-                &mut stream,
-                &readlink,
-                &compound_result("readlink", &[(22, &[]), (27, &target)]),
-            )
-            .await?;
-
-            let rename = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &rename,
-                &compound_result("rename", &[(22, &[]), (32, &[]), (22, &[]), (29, &[0; 40])]),
-            )
-            .await?;
-
-            let link = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &link,
-                &compound_result("link", &[(22, &[]), (32, &[]), (22, &[]), (11, &[0; 20])]),
-            )
-            .await?;
-            let linked_getattr = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &linked_getattr,
-                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
-            )
-            .await?;
-
-            let remove = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &remove,
-                &compound_result("remove", &[(22, &[]), (28, &[0; 20])]),
-            )
-            .await
-        });
-
-        assert_eq!(
-            mount.access(Bytes::from_static(b"fh"), 0x21).await.unwrap(),
-            0x21
-        );
-        mount
-            .setattr(
-                Bytes::from_static(b"fh"),
-                None,
-                None,
-                None,
-                None,
-                Some(7),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            mount.readlink(Bytes::from_static(b"fh")).await.unwrap(),
-            "target"
-        );
-        mount
-            .rename(
-                Bytes::from_static(b"from"),
-                b"old",
-                Bytes::from_static(b"to"),
-                b"new",
-            )
-            .await
-            .unwrap();
-        mount
-            .link(
-                Bytes::from_static(b"source"),
-                Bytes::from_static(b"target"),
-                b"link",
-            )
-            .await
-            .unwrap();
-        mount
-            .remove(Bytes::from_static(b"root"), b"file")
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    fn fattr_result(bitmap: &[u32], values: &[u8]) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
-        for word in bitmap {
-            result.extend_from_slice(&word.to_be_bytes());
-        }
-        xdr_opaque(&mut result, values);
-        result
-    }
-
-    fn bitmap4_value(bitmap: &[u32]) -> Vec<u8> {
-        let mut value = Vec::new();
-        value.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
-        for word in bitmap {
-            value.extend_from_slice(&word.to_be_bytes());
-        }
-        value
-    }
-
-    #[tokio::test]
-    async fn scripted_public_getattr_and_filesystem_metadata_succeed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let getattr = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &getattr,
-                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
-            )
-            .await?;
-            let fsinfo = read_record(&mut stream).await?;
-            let bm = [
-                (1 << 5) | (1 << 6) | (1 << 15) | (1 << 27) | (1 << 30) | (1 << 31),
-                1 << 19,
-            ];
-            let values = [
-                1u32.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-                u64::MAX.to_be_bytes().as_slice(),
-                65536u64.to_be_bytes().as_slice(),
-                32768u64.to_be_bytes().as_slice(),
-                0i64.to_be_bytes().as_slice(),
-                1u32.to_be_bytes().as_slice(),
-            ]
-            .concat();
-            let data = fattr_result(&bm, &values);
-            reply(
-                &mut stream,
-                &fsinfo,
-                &compound_result("fsinfo", &[(22, &[]), (9, &data)]),
-            )
-            .await?;
-            let fsstat = read_record(&mut stream).await?;
-            let bm = [
-                (1 << 21) | (1 << 22) | (1 << 23),
-                (1 << 10) | (1 << 11) | (1 << 12),
-            ];
-            let values = (1u64..=6).flat_map(u64::to_be_bytes).collect::<Vec<_>>();
-            let data = fattr_result(&bm, &values);
-            reply(
-                &mut stream,
-                &fsstat,
-                &compound_result("fsstat", &[(22, &[]), (9, &data)]),
-            )
-            .await?;
-            let pathconf = read_record(&mut stream).await?;
-            let bm = [
-                (1 << 0) | (1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
-                1 << 2,
-            ];
-            let mut values = bitmap4_value(&bm);
-            values.extend_from_slice(&7u64.to_be_bytes());
-            values.extend_from_slice(&9u64.to_be_bytes());
-            values.extend_from_slice(&0u32.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            values.extend_from_slice(&1024u32.to_be_bytes());
-            values.extend_from_slice(&255u32.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            let data = fattr_result(&bm, &values);
-            reply(
-                &mut stream,
-                &pathconf,
-                &compound_result("pathconf", &[(22, &[]), (9, &data)]),
-            )
-            .await
-        });
-        mount.getattr(Bytes::from_static(b"fh")).await.unwrap();
-        let info = mount.fsinfo().await.unwrap();
-        assert_eq!((info.rtmax, info.wtmax), (65536, 32768));
-        let stat = mount.fsstat().await.unwrap();
-        assert_eq!((stat.afiles, stat.tbytes), (1, 6));
-        let pathconf = mount.pathconf(Bytes::from_static(b"fh")).await.unwrap();
-        assert_eq!((pathconf.linkmax, pathconf.name_max), (1024, 255));
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn pathconf_tolerates_an_omitted_recommended_case_attribute() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let bitmap = [
-                (1 << 0) | (1 << 8) | (1 << 17) | (1 << 18) | (1 << 28) | (1 << 29),
-                1 << 2,
-            ];
-            let mut values = bitmap4_value(&bitmap);
-            values.extend_from_slice(&7u64.to_be_bytes());
-            values.extend_from_slice(&9u64.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            values.extend_from_slice(&1024u32.to_be_bytes());
-            values.extend_from_slice(&255u32.to_be_bytes());
-            values.extend_from_slice(&1u32.to_be_bytes());
-            let data = fattr_result(&bitmap, &values);
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("pathconf", &[(22, &[]), (9, &data)]),
-            )
-            .await
-        });
-
-        let result = mount
-            .pathconf_with_support(Bytes::from_static(b"fh"))
-            .await
-            .unwrap();
-        assert!(!result.available.case_insensitive);
-        assert!(result.available.case_preserving);
-        assert_eq!(result.fsid, Some((7, 9)));
-        assert!(!result.values.case_insensitive);
-        assert!(result.values.case_preserving);
-        assert_eq!((result.values.linkmax, result.values.name_max), (1024, 255));
-        server.await.unwrap().unwrap();
-    }
-
-    fn create_object_result(tag: &str, fh_value: &[u8]) -> Vec<u8> {
-        let mut create = vec![0; 20];
-        create.extend_from_slice(&0u32.to_be_bytes());
-        let mut fh = Vec::new();
-        xdr_opaque(&mut fh, fh_value);
-        compound_result(tag, &[(22, &[]), (6, &create), (10, &fh), (9, &[0; 8])])
-    }
-
-    #[tokio::test]
-    async fn scripted_public_create_directory_and_symlink_succeed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let create = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &create,
-                &open_result(0, [0x31; 16], b"file-fh"),
-            )
-            .await?;
-            let getattr = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &getattr,
-                &compound_result("getattr", &[(22, &[]), (9, &[0; 8])]),
-            )
-            .await?;
-
-            let mkdir = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &mkdir,
-                &create_object_result("mkdir", b"dir-fh"),
-            )
-            .await?;
-            let setattr = read_record(&mut stream).await?;
-            let attrsset = [
-                2u32.to_be_bytes(),
-                0u32.to_be_bytes(),
-                (1u32 << 1).to_be_bytes(),
-            ]
-            .concat();
-            reply(
-                &mut stream,
-                &setattr,
-                &compound_result("setattr", &[(22, &[]), (34, &attrsset)]),
-            )
-            .await?;
-
-            let symlink = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &symlink,
-                &create_object_result("symlink", b"link-fh"),
-            )
-            .await
-        });
-        let file = mount
-            .create(Bytes::from_static(b"root"), b"file", None)
-            .await
-            .unwrap();
-        assert_eq!(file.fh, Bytes::from_static(b"file-fh"));
-        let directory = mount
-            .mkdir(Bytes::from_static(b"root"), b"dir", 0o755)
-            .await
-            .unwrap();
-        assert_eq!(directory.fh, Bytes::from_static(b"dir-fh"));
-        let symlink = mount
-            .symlink(b"target", Bytes::from_static(b"root"), b"link")
-            .await
-            .unwrap();
-        assert_eq!(symlink.fh, Bytes::from_static(b"link-fh"));
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_create_setattr_never_removes_an_unchecked_open_target() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let create = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &create,
-                &open_result(0, [0x41; 16], b"possibly-existing-fh"),
-            )
-            .await?;
-
-            let setattr = read_record(&mut stream).await?;
-            reply(&mut stream, &setattr, &failed_lock_result("setattr", 34, 5)).await?;
-
-            let close = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x42; 16])]),
-            )
-            .await?;
-
-            Ok::<bool, std::io::Error>(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_ok(),
-            )
-        });
-
-        assert!(
-            mount
-                .create(Bytes::from_static(b"root"), b"raced-name", Some(0o600),)
-                .await
-                .is_err()
-        );
-        assert!(
-            !server.await.unwrap().unwrap(),
-            "UNCHECKED4 rollback must not remove a name that may predate this OPEN"
-        );
-    }
-
-    #[tokio::test]
-    async fn stateful_create_preserves_write_only_share_access() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let create = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &create,
-                &open_result(0, [0x51; 16], b"write-only-fh"),
-            )
-            .await?;
-            let close = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x52; 16])]),
-            )
-            .await
-        });
-
-        let opened = mount
-            .create_path_stateful_with_access(b"file", None, crate::OPEN_WRITE)
-            .await
-            .unwrap();
-        let fh = opened.file_handle();
-        assert!(mount.state.for_fh(&fh, crate::OPEN_WRITE).await.is_some());
-        assert!(mount.state.for_fh(&fh, crate::OPEN_READ).await.is_none());
-        mount.close_stateful(opened).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn guarded_open_options_preserve_access_confirm_and_race_cleanup() {
-        use crate::nfs4::compound::take_opaque;
-        use bytes::Buf;
-        // New wb / w+b, attribute fallback, concurrent creation, OPEN_CONFIRM,
-        // lost create reply, and partial OPEN success followed by GETFH failure.
-        for (access, case) in [(2, 0), (3, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5)] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mount = connected_direct_mount(&listener).await;
-            let seen = Arc::new(std::sync::Mutex::new(vec![]));
-            let recorded = seen.clone();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut opens = 0;
-                let mut creates = 0;
-                loop {
-                    let request = read_record(&mut stream).await.unwrap();
-                    let mut args = Bytes::copy_from_slice(&request[40..]);
-                    let tag =
-                        String::from_utf8(take_opaque(&mut args, "tag").unwrap().to_vec()).unwrap();
-                    recorded.lock().unwrap().push(tag.clone());
-                    assert_eq!(args.get_u32(), 0);
-                    args.advance(4); // opcount
-                    assert_eq!(args.get_u32(), 22);
-                    let fh = take_opaque(&mut args, "fh").unwrap();
-                    let opcode = args.get_u32();
-                    let response = match tag.as_str() {
-                        "lookup" => {
-                            assert_eq!(recorded.lock().unwrap().len(), 1, "parent resolved twice");
-                            assert_eq!(opcode, 15);
-                            assert_eq!(fh.as_ref(), b"root");
-                            assert_eq!(take_opaque(&mut args, "name").unwrap().as_ref(), b"parent");
-                            let mut parent = vec![];
-                            xdr_opaque(&mut parent, b"parent");
-                            compound_result(
-                                "lookup",
-                                &[(22, &[]), (15, &[]), (10, &parent), (9, &[0; 8])],
-                            )
-                        }
-                        "open" | "create_guarded" => {
-                            assert_eq!(fh.as_ref(), b"parent");
-                            assert_eq!(opcode, 18);
-                            assert_eq!(args.get_u32(), 0);
-                            assert_eq!(args.get_u32(), access);
-                            assert_eq!(args.get_u32(), 0);
-                            args.advance(8);
-                            take_opaque(&mut args, "owner").unwrap();
-                            let create = args.get_u32();
-                            if tag == "open" {
-                                opens += 1;
-                                assert_eq!(create, 0);
-                                if opens == 1 {
-                                    failed_lock_result("open", 18, 2)
-                                } else {
-                                    open_result(0, [7; 16], b"file")
-                                }
-                            } else {
-                                creates += 1;
-                                assert_eq!(create, 1);
-                                assert_eq!(args.get_u32(), 1, "RFC 7530 GUARDED4");
-                                if creates == 1 {
-                                    assert_eq!(args.get_u32(), 2);
-                                    assert_eq!(args.get_u32(), 0);
-                                    assert_eq!(args.get_u32(), 2);
-                                    assert_eq!(
-                                        take_opaque(&mut args, "mode").unwrap().as_ref(),
-                                        &0o666u32.to_be_bytes()
-                                    );
-                                } else {
-                                    assert_eq!(args.get_u32(), 0);
-                                    assert!(take_opaque(&mut args, "attrs").unwrap().is_empty());
-                                }
-                                match case {
-                                    1 if creates == 1 => {
-                                        failed_lock_result("create_guarded", 18, 10032)
-                                    }
-                                    2 => failed_lock_result("create_guarded", 18, 17),
-                                    4 => return,
-                                    5 => {
-                                        let mut result = open_result(0, [7; 16], b"file");
-                                        // Preserve successful OPEN but replace GETFH success with failure.
-                                        result.truncate(result.len() - 8);
-                                        let last = result.len() - 4;
-                                        result[last..].copy_from_slice(&10032u32.to_be_bytes());
-                                        result[..4].copy_from_slice(&10032u32.to_be_bytes());
-                                        result
-                                    }
-                                    _ => {
-                                        open_result(if case == 3 { 2 } else { 0 }, [7; 16], b"file")
-                                    }
-                                }
-                            }
-                        }
-                        "open_confirm" => {
-                            assert_eq!(case, 3);
-                            assert_eq!(opcode, 20);
-                            compound_result("open_confirm", &[(22, &[]), (20, &[8; 16])])
-                        }
-                        "setattr" => {
-                            assert_eq!(opcode, 34);
-                            args.advance(16);
-                            if case == 1 {
-                                assert_eq!(args.get_u32(), 2);
-                                assert_eq!(args.get_u32(), 0);
-                                assert_eq!(args.get_u32(), 2);
-                                assert_eq!(
-                                    take_opaque(&mut args, "mode").unwrap().as_ref(),
-                                    &0o666u32.to_be_bytes()
-                                );
-                            } else {
-                                assert_eq!(case, 2);
-                                assert_eq!(args.get_u32(), 1);
-                                assert_eq!(args.get_u32(), 1 << 4);
-                                assert_eq!(
-                                    take_opaque(&mut args, "size").unwrap().as_ref(),
-                                    &[0; 8]
-                                );
-                            }
-                            compound_result("setattr", &[(22, &[]), (34, &[0; 4])])
-                        }
-                        "close" => {
-                            assert_eq!(opcode, 4);
-                            compound_result("close", &[(22, &[]), (4, &[9; 16])])
-                        }
-                        _ => panic!("unexpected RPC {tag}"),
-                    };
-                    reply(&mut stream, &request, &response).await.unwrap();
-                    if tag == "close" || (case == 5 && tag == "create_guarded") {
-                        return;
-                    }
-                }
-            });
-            let result = mount
-                .open_path_with_options(
-                    b"parent/new",
-                    crate::OpenOptions {
-                        access,
-                        create_mode: Some(0o666),
-                        truncate: true,
-                    },
-                )
-                .await;
-            if case >= 4 {
-                assert_eq!(
-                    result.unwrap_err().operation_outcome().unwrap().outcome,
-                    crate::OperationOutcome::Uncertain
-                );
-                assert_eq!(
-                    seen.lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|tag| *tag == "create_guarded")
-                        .count(),
-                    1
-                );
-            } else {
-                mount.close_stateful(result.unwrap()).await.unwrap();
-                assert_eq!(seen.lock().unwrap().last().unwrap(), "close");
-                if case == 0 {
-                    assert_eq!(seen.lock().unwrap().len(), 4);
-                }
-                if case == 3 {
-                    assert_eq!(seen.lock().unwrap().len(), 5);
-                }
-            }
-            tokio::time::timeout(Duration::from_secs(2), server)
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "scripted server did not finish: access={access}, case={case}, requests={:?}",
-                        seen.lock().unwrap()
-                    )
-                })
-                .unwrap();
-        }
-    }
-
-    async fn register_scripted_open(mount: &Mount40, owner: u64, fh: &'static [u8]) {
-        mount
-            .state
-            .register(OwnerLane {
-                owner,
-                next_seqid: 1,
-                stateid: [0x61; 16],
-                fh: Bytes::from_static(fh),
-                dir_fh: Bytes::from_static(b"dir"),
-                name: "scripted-file".into(),
-                access: crate::OPEN_BOTH,
-                write_verifier: None,
-                io_fence: Arc::new(tokio::sync::RwLock::new(())),
-                closing: false,
-            })
-            .await;
-    }
-
-    async fn register_scripted_lock(mount: &Mount40, owner: u64, stateid: [u8; 16]) {
-        mount
-            .locks
-            .register(LockLane {
-                owner,
-                open_owner: owner,
-                owner_wire: Bytes::from(format!("scripted-lock-{owner}")),
-                next_seqid: 1,
-                stateid,
-                fh: Bytes::from_static(b"fh"),
-                lock_type: 2,
-                offset: 0,
-                length: 1,
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn public_typed_lock_blocks_close_until_exact_unlock() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 41, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let lock = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &lock,
-                &compound_result("lock", &[(22, &[]), (12, &[0x71; 16])]),
-            )
-            .await?;
-            let unlock = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &unlock,
-                &compound_result("locku", &[(22, &[]), (14, &[0x72; 16])]),
-            )
-            .await?;
-            let cleanup = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &cleanup,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        let token = mount
-            .lock_stateful(Bytes::from_static(b"fh"), 2, 7, 11)
-            .await
-            .unwrap();
-        let error = mount.close(Bytes::from_static(b"fh")).await.unwrap_err();
-        assert!(error.to_string().contains("outstanding locks"));
-        mount.unlock_stateful(token).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn lock_reply_loss_is_uncertain_and_does_not_register_protection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 42, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let _ = read_record(&mut stream).await?;
-            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let error = mount
-            .lock(Bytes::from_static(b"fh"), 2, 0, 1)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().outcome,
-            crate::OperationOutcome::Uncertain
-        );
-        assert!(!mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_lock_after_send_finishes_owner_settlement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 43, b"fh").await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("lock", &[(22, &[]), (12, &[0x73; 16])]),
-            )
-            .await
-        });
-        let task_mount = Arc::clone(&mount);
-        let task =
-            tokio::spawn(async move { task_mount.lock(Bytes::from_static(b"fh"), 2, 0, 1).await });
-        seen_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        server.await.unwrap().unwrap();
-        for _ in 0..20 {
-            if mount.locks.has_fh(&Bytes::from_static(b"fh")).await {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("detached LOCK reply did not register protection");
-    }
-
-    #[tokio::test]
-    async fn locku_reply_loss_is_uncertain_and_retains_local_protection() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 61, [0x91; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let _ = read_record(&mut stream).await?;
-            socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
-            drop(stream);
-            Ok::<(), std::io::Error>(())
-        });
-        let error = mount
-            .locku(
-                Bytes::from_static(b"fh"),
-                Bytes::from_static(&[0x91; 16]),
-                2,
-                0,
-                1,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.operation_outcome().unwrap().outcome,
-            crate::OperationOutcome::Uncertain
-        );
-        assert!(mount.locks.has_fh(&Bytes::from_static(b"fh")).await);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn authoritative_locku_error_consumes_owner_seqid() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 63, [0x94; 16]).await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            reply(&mut stream, &first, &failed_lock_result("locku", 14, 22)).await?;
-            let second = read_record(&mut stream).await?;
-            let expected = [
-                2u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                &[0x94; 16],
-            ]
-            .concat();
-            assert!(second.windows(expected.len()).any(|wire| wire == expected));
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("locku", &[(22, &[]), (14, &[0x95; 16])]),
-            )
-            .await?;
-            let cleanup = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &cleanup,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        let args = || {
-            (
-                Bytes::from_static(b"fh"),
-                Bytes::from_static(&[0x94; 16]),
-                2,
-                0,
-                1,
-            )
-        };
-        let (fh, stateid, kind, offset, length) = args();
-        assert!(matches!(
-            mount.locku(fh, stateid, kind, offset, length).await,
-            Err(NfsError::Nfs4(_))
-        ));
-        let (fh, stateid, kind, offset, length) = args();
-        mount
-            .locku(fh, stateid, kind, offset, length)
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_locku_after_send_finishes_release_settlement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_lock(&mount, 62, [0x92; 16]).await;
-        let (seen_tx, seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            let _ = seen_tx.send(());
-            reply(
-                &mut stream,
-                &request,
-                &compound_result("locku", &[(22, &[]), (14, &[0x93; 16])]),
-            )
-            .await?;
-            let cleanup = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &cleanup,
-                &compound_result("release-lockowner", &[(39, &[])]),
-            )
-            .await
-        });
-        let task_mount = Arc::clone(&mount);
-        let task = tokio::spawn(async move {
-            task_mount
-                .locku(
-                    Bytes::from_static(b"fh"),
-                    Bytes::from_static(&[0x92; 16]),
-                    2,
-                    0,
-                    1,
-                )
-                .await
-        });
-        seen_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        server.await.unwrap().unwrap();
-        for _ in 0..20 {
-            if !mount.locks.has_fh(&Bytes::from_static(b"fh")).await {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("detached LOCKU reply did not remove released protection");
-    }
-
-    #[tokio::test]
-    async fn typed_lock_rejects_foreign_or_mismatched_tokens_without_rpc() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        let foreign = crate::LockToken::new(
-            Bytes::from_static(b"fh"),
-            Bytes::from_static(&[0x21; 16]),
-            2,
-            0,
-            1,
-            mount.issuer ^ 1,
-            1,
-        );
-        assert!(mount.unlock_stateful(foreign).await.is_err());
-        let unknown = crate::LockToken::new(
-            Bytes::from_static(b"fh"),
-            Bytes::from_static(&[0x22; 16]),
-            2,
-            0,
-            1,
-            mount.issuer,
-            1,
-        );
-        assert!(mount.unlock_stateful(unknown).await.is_err());
-        let stale = crate::LockToken::new(
-            Bytes::from_static(b"fh"),
-            Bytes::from_static(&[0x23; 16]),
-            2,
-            0,
-            1,
-            mount.issuer,
-            mount.lease.generation() + 1,
-        );
-        assert!(mount.unlock_stateful(stale).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn scripted_public_lock_conflict_exposes_denied_range() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 50, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let request = read_record(&mut stream).await?;
-            reply(&mut stream, &request, &denied_lock_result("lock", 12)).await?;
-            let next = read_record(&mut stream).await?;
-            let expected = [
-                1u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                &[0x61; 16],
-            ]
-            .concat();
-            assert!(next.windows(expected.len()).any(|wire| wire == expected));
-            reply(
-                &mut stream,
-                &next,
-                &compound_result("lock", &[(22, &[]), (12, &[0xb1; 16])]),
-            )
-            .await
-        });
-        assert!(matches!(
-            mount.lock(Bytes::from_static(b"fh"), 2, 0, 1).await,
-            Err(NfsError::LockDenied {
-                lock_type: 2,
-                offset: 7,
-                length: 11,
-                ..
-            })
-        ));
-        mount
-            .lock(Bytes::from_static(b"fh"), 2, 2, 1)
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn independent_opens_of_same_file_lock_without_global_serialization() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 54, b"fh").await;
-        register_scripted_open(&mount, 55, b"fh").await;
-        let opened_a = mount::OpenFile::with_protocol_state(
-            mount::ObjRes {
-                fh: Bytes::from_static(b"fh"),
-                attr: None,
-            },
-            encode_owner(mount.issuer, 54),
-        );
-        let opened_b = mount::OpenFile::with_protocol_state(
-            mount::ObjRes {
-                fh: Bytes::from_static(b"fh"),
-                attr: None,
-            },
-            encode_owner(mount.issuer, 55),
-        );
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            let second =
-                tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream)).await??;
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("lock", &[(22, &[]), (12, &[0xa1; 16])]),
-            )
-            .await?;
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("lock", &[(22, &[]), (12, &[0xa2; 16])]),
-            )
-            .await
-        });
-        let (a, b) = tokio::join!(
-            mount.lock_open_stateful(&opened_a, 2, 0, 1),
-            mount.lock_open_stateful(&opened_b, 2, 2, 1),
-        );
-        assert!(a.is_ok() && b.is_ok());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn different_open_owners_send_locks_without_global_serialization() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 51, b"fh-a").await;
-        register_scripted_open(&mount, 52, b"fh-b").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            let second =
-                tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream)).await??;
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("lock", &[(22, &[]), (12, &[0x81; 16])]),
-            )
-            .await?;
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("lock", &[(22, &[]), (12, &[0x82; 16])]),
-            )
-            .await
-        });
-        let (a, b) = tokio::join!(
-            mount.lock(Bytes::from_static(b"fh-a"), 2, 0, 1),
-            mount.lock(Bytes::from_static(b"fh-b"), 2, 0, 1),
-        );
-        assert!(a.is_ok() && b.is_ok());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn durable_write_batches_unstable_chunks_before_one_commit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 65, b"fh").await;
-        let chunk = mount.get_max_write_size() as usize;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let mut requests = Vec::new();
-            let mut offsets = Vec::new();
-            // All three requests must arrive before any response is sent.
-            // A serial writer times out here; reply order deliberately differs.
-            for _ in 0..3 {
-                let n = chunk;
-                let request =
-                    tokio::time::timeout(Duration::from_secs(2), read_record(&mut stream))
-                        .await??;
-                let padded = (n + 3) & !3;
-                let stable_at = request.len() - padded - 8;
-                assert_eq!(
-                    &request[stable_at..stable_at + 4],
-                    &[0; 4],
-                    "WRITE must request UNSTABLE"
-                );
-                offsets.push(u64::from_be_bytes(
-                    request[stable_at - 8..stable_at].try_into().unwrap(),
-                ));
-                requests.push(request);
-            }
-            offsets.sort_unstable();
-            assert_eq!(offsets, vec![0, chunk as u64, (chunk * 2) as u64]);
-            for request in requests.into_iter().rev() {
-                let n = chunk;
-                let result = [
-                    (n as u32).to_be_bytes().as_slice(),
-                    0u32.to_be_bytes().as_slice(),
-                    [0x71; 8].as_slice(),
-                ]
-                .concat();
-                reply(
-                    &mut stream,
-                    &request,
-                    &compound_result("write", &[(22, &[]), (38, &result)]),
-                )
-                .await?;
-            }
-            let commit = read_record(&mut stream).await?;
-            assert!(commit.windows(6).any(|part| part == b"commit"));
-            reply(
-                &mut stream,
-                &commit,
-                &compound_result("commit", &[(22, &[]), (5, &[0x71; 8])]),
-            )
-            .await
-        });
-        let data = Bytes::from(vec![42; chunk * 3]);
-        assert_eq!(
-            crate::write_all(&*mount, Bytes::from_static(b"fh"), 0, data)
-                .await
-                .unwrap(),
-            (chunk * 3) as u64
-        );
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn same_open_file_writes_use_rpc_xids_without_owner_lane_serialization() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 66, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            let second = tokio::time::timeout(Duration::from_millis(250), read_record(&mut stream))
-                .await
-                .map_err(|_| {
-                    std::io::Error::other("second WRITE was serialized behind the first reply")
-                })??;
-            let write_result = [
-                1u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                [0x71; 8].as_slice(),
-            ]
-            .concat();
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("write", &[(22, &[]), (38, &write_result)]),
-            )
-            .await?;
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("write", &[(22, &[]), (38, &write_result)]),
-            )
-            .await
-        });
-
-        let (first, second) = tokio::join!(
-            mount.write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a")),
-            mount.write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b")),
-        );
-        assert_eq!(first.unwrap().count, 1);
-        assert_eq!(second.unwrap().count, 1);
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_waits_for_an_in_flight_read_to_settle() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 67, b"fh").await;
-        let (read_seen_tx, read_seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            let _ = read_seen_tx.send(());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "CLOSE overtook an in-flight READ"
-            );
-            let mut read_result = 1u32.to_be_bytes().to_vec();
-            xdr_opaque(&mut read_result, b"x");
-            reply(
-                &mut stream,
-                &read,
-                &compound_result("read", &[(22, &[]), (25, &read_result)]),
-            )
-            .await?;
-            let close = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x98; 16])]),
-            )
-            .await
-        });
-
-        let reading_mount = Arc::clone(&mount);
-        let read =
-            tokio::spawn(async move { reading_mount.read(Bytes::from_static(b"fh"), 0, 1).await });
-        read_seen_rx.await.unwrap();
-        let close = mount.close(Bytes::from_static(b"fh"));
-        let (read, close) = tokio::join!(read, close);
-        assert_eq!(read.unwrap().unwrap(), Bytes::from_static(b"x"));
-        close.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_read_keeps_its_close_fence_until_rpc_settlement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 69, b"fh").await;
-        let (read_seen_tx, read_seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let read = read_record(&mut stream).await?;
-            let _ = read_seen_tx.send(());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "CLOSE overtook a cancelled READ that was still settling"
-            );
-            let mut read_result = 1u32.to_be_bytes().to_vec();
-            xdr_opaque(&mut read_result, b"x");
-            reply(
-                &mut stream,
-                &read,
-                &compound_result("read", &[(22, &[]), (25, &read_result)]),
-            )
-            .await?;
-            let close = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x9a; 16])]),
-            )
-            .await
-        });
-
-        let reading_mount = Arc::clone(&mount);
-        let read =
-            tokio::spawn(async move { reading_mount.read(Bytes::from_static(b"fh"), 0, 1).await });
-        read_seen_rx.await.unwrap();
-        read.abort();
-        let _ = read.await;
-        mount.close(Bytes::from_static(b"fh")).await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_waits_for_concurrent_writes_to_settle() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 68, b"fh").await;
-        let (writes_seen_tx, writes_seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            let second = read_record(&mut stream).await?;
-            let _ = writes_seen_tx.send(());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err(),
-                "CLOSE overtook concurrent WRITEs"
-            );
-            let write_result = [
-                1u32.to_be_bytes().as_slice(),
-                2u32.to_be_bytes().as_slice(),
-                [0x72; 8].as_slice(),
-            ]
-            .concat();
-            for write in [&second, &first] {
-                reply(
-                    &mut stream,
-                    write,
-                    &compound_result("write", &[(22, &[]), (38, &write_result)]),
-                )
-                .await?;
-            }
-            let close = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x99; 16])]),
-            )
-            .await
-        });
-
-        let first_mount = Arc::clone(&mount);
-        let first = tokio::spawn(async move {
-            first_mount
-                .write(Bytes::from_static(b"fh"), 0, Bytes::from_static(b"a"))
-                .await
-        });
-        let second_mount = Arc::clone(&mount);
-        let second = tokio::spawn(async move {
-            second_mount
-                .write(Bytes::from_static(b"fh"), 1, Bytes::from_static(b"b"))
-                .await
-        });
-        writes_seen_rx.await.unwrap();
-        let close = mount.close(Bytes::from_static(b"fh"));
-        let (first, second, close) = tokio::join!(first, second, close);
-        assert_eq!(first.unwrap().unwrap().count, 1);
-        assert_eq!(second.unwrap().unwrap().count, 1);
-        close.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn same_open_owner_serializes_lock_seqid_consumption() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 53, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_err()
-            );
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("lock", &[(22, &[]), (12, &[0x83; 16])]),
-            )
-            .await?;
-            let second = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &second,
-                &compound_result("lock", &[(22, &[]), (12, &[0x84; 16])]),
-            )
-            .await
-        });
-        let (a, b) = tokio::join!(
-            mount.lock(Bytes::from_static(b"fh"), 2, 0, 1),
-            mount.lock(Bytes::from_static(b"fh"), 2, 2, 1),
-        );
-        assert!(a.is_ok() && b.is_ok());
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_public_closes_emit_one_wire_close() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mount = connected_direct_mount(&listener).await;
-        register_scripted_open(&mount, 64, b"fh").await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let first = read_record(&mut stream).await?;
-            reply(
-                &mut stream,
-                &first,
-                &compound_result("close", &[(22, &[]), (4, &[0x96; 16])]),
-            )
-            .await?;
-            Ok::<bool, std::io::Error>(
-                tokio::time::timeout(Duration::from_millis(100), read_record(&mut stream))
-                    .await
-                    .is_ok(),
-            )
-        });
-
-        let fh = Bytes::from_static(b"fh");
-        let (first, second) = tokio::join!(mount.close(fh.clone()), mount.close(fh));
-        assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
-        let rejected = if first.is_err() { first } else { second }.unwrap_err();
-        assert!(
-            matches!(rejected, NfsError::InvalidInput(ref message) if message.contains("closing or closed")),
-            "the losing close must receive a typed local error: {rejected}"
-        );
-        assert!(!server.await.unwrap().unwrap(), "CLOSE was emitted twice");
-    }
-
-    #[tokio::test]
-    async fn cancelled_close_waiting_for_recall_gate_still_settles() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mux = rpc::StreamMux::connect(listener.local_addr().unwrap(), true)
-            .await
-            .unwrap();
-        let callback = CallbackService::bind_for(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let callback_state = callback.state();
-        let mut mount = direct_mount(rpc::Client::new(mux, None));
-        Arc::get_mut(&mut mount).unwrap().callback_state = Some(Arc::clone(&callback_state));
-        register_scripted_open(&mount, 65, b"fh").await;
-        let io_guard = callback_state
-            .foreground_io(&Bytes::from_static(b"fh"))
-            .await;
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let close = tokio::time::timeout(Duration::from_secs(1), read_record(&mut stream))
-                .await
-                .map_err(|_| std::io::Error::other("cancelled CLOSE was never settled"))??;
-            reply(
-                &mut stream,
-                &close,
-                &compound_result("close", &[(22, &[]), (4, &[0x97; 16])]),
-            )
-            .await
-        });
-
-        let closing_mount = Arc::clone(&mount);
-        let close =
-            tokio::spawn(async move { closing_mount.close(Bytes::from_static(b"fh")).await });
-        tokio::task::yield_now().await;
-        close.abort();
-        let _ = close.await;
-        drop(io_guard);
-        server.await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if mount.state.snapshot().await.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled CLOSE did not remove settled owner state");
-        callback.stop().await;
-    }
-    #[tokio::test]
-    async fn busy_v40_read_retries_delay_with_or_without_open() {
-        for stateful in [false, true] {
-            for status in [10008, 10013] {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let mount = connected_direct_mount(&listener).await;
-                if stateful {
-                    register_scripted_open(&mount, 99, b"fh").await;
-                }
-                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let seen = calls.clone();
-                let server = tokio::spawn(async move {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    while let Ok(request) = read_record(&mut stream).await {
-                        let n = seen.fetch_add(1, Ordering::SeqCst);
-                        let payload = if n == 0 {
-                            failed_lock_result("read", 25, status)
-                        } else {
-                            let mut data = 1u32.to_be_bytes().to_vec();
-                            xdr_opaque(&mut data, b"abc");
-                            compound_result("read", &[(22, &[]), (25, &data)])
-                        };
-                        reply(&mut stream, &request, &payload).await.unwrap();
-                    }
-                });
-                let first = mount.read(Bytes::from_static(b"fh"), 0, 3).await;
-                eprintln!(
-                    "v4.0 stateful={stateful}: first={first:?}, calls={}",
-                    calls.load(Ordering::SeqCst)
-                );
-                assert_eq!(first.unwrap(), b"abc"[..]);
-                assert_eq!(calls.load(Ordering::SeqCst), 2);
-                server.abort();
-            }
-        }
-    }
-}
+mod tests;

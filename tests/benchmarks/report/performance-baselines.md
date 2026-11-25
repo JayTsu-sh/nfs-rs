@@ -1,6 +1,6 @@
 # Performance baseline report
 
-Overall status: `complete`
+Overall status: `complete_with_warnings`
 
 | Environment | Endpoint | Protocol | Status | Capture runs | Baseline write median MiB/s | Baseline read median MiB/s | Current write MiB/s | Current read MiB/s |
 |---|---|---:|---|---:|---:|---:|---:|---:|
@@ -10,11 +10,11 @@ Overall status: `complete`
 | linux-destination-v3 | `10.10.1.13:/srv/nfs/v3` | 3 | `accepted` | 45 | 27.408 | 1118.429 | — | — |
 | linux-destination-v40 | `10.10.1.13:/srv/nfs/v4` | 4.0 | `accepted` | 45 | 27.131 | 1110.925 | — | — |
 | linux-destination-v41 | `10.10.1.13:/srv/nfs/v4` | 4.1 | `accepted` | 45 | 23.877 | 928.453 | — | — |
-| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 35.158 | 99.908 | — | — |
+| dxn-v40 | `10.131.7.201:/jay_nfs` | 4.0 | `accepted` | 45 | 30.834 | 88.967 | — | — |
 | fas2750-v40-lif-a | `10.128.61.200:/nfsrs_v40_test` | 4.0 | `accepted` | 45 | 46.417 | 52.299 | — | — |
 | fas2750-v40-lif-b | `10.128.61.201:/nfsrs_v40_test` | 4.0 | `accepted` | 45 | 37.875 | 44.337 | — | — |
-| netapp-pnfs-mds | `10.128.56.160:/nfsrs_pnfs_b` | 4.1 | `accepted` | 45 | 82.735 | 87.439 | — | — |
-| netapp-pnfs-ds | `10.128.56.161:/nfsrs_pnfs_b` | 4.1 | `accepted` | 45 | 82.745 | 88.310 | — | — |
+| ots-pnfs-mds | `10.30.3.154:/nfsrs_pnfs_a` | 4.1 | `executor_pending` | 5 | 19.172 | 183.024 | — | — |
+| ots-pnfs-ds | `10.30.3.155:/nfsrs_pnfs_b` | 4.1 | `executor_pending` | 5 | 19.051 | 182.968 | — | — |
 
 An environment remains `baseline_missing` until its independent baseline has the required number of accepted capture runs.
 
@@ -22,28 +22,28 @@ An environment remains `baseline_missing` until its independent baseline has the
 
 ### Key observations
 
-- netapp-pnfs-ds has the highest median write throughput at 82.745 MiB/s, 258.3% above linux-source-v41 (23.094 MiB/s).
+- fas2750-v40-lif-a has the highest median write throughput at 46.417 MiB/s, 143.6% above ots-pnfs-ds (19.051 MiB/s).
 - linux-source-v3 has the highest median read throughput at 1176.835 MiB/s, 2554.3% above fas2750-v40-lif-b (44.337 MiB/s).
 - FAS2750 LIF A exceeds LIF B by 22.6% for median write throughput and 18.0% for median read throughput; retain per-LIF baselines rather than combining them.
 - linux-source: NFS 3 leads median writes (28.030 MiB/s), while NFS 3 leads median reads (1176.835 MiB/s).
 - linux-destination: NFS 3 leads median writes (27.408 MiB/s), while NFS 3 leads median reads (1118.429 MiB/s).
-- PATHCONF uses the interoperable case-insensitive default on fas2750-v40-lif-a, fas2750-v40-lif-b, netapp-pnfs-mds, netapp-pnfs-ds; this is an accepted capability difference, not a benchmark failure.
+- PATHCONF uses the interoperable case-insensitive default on fas2750-v40-lif-a, fas2750-v40-lif-b, ots-pnfs-mds, ots-pnfs-ds; this is an accepted capability difference, not a benchmark failure.
 
 ### Write-throughput ranking
 
 | Rank | Environment | Write median MiB/s |
 |---:|---|---:|
-| 1 | netapp-pnfs-ds | 82.745 |
-| 2 | netapp-pnfs-mds | 82.735 |
-| 3 | fas2750-v40-lif-a | 46.417 |
-| 4 | fas2750-v40-lif-b | 37.875 |
-| 5 | dxn-v40 | 35.158 |
-| 6 | linux-source-v3 | 28.030 |
-| 7 | linux-destination-v3 | 27.408 |
-| 8 | linux-destination-v40 | 27.131 |
-| 9 | linux-source-v40 | 26.831 |
-| 10 | linux-destination-v41 | 23.877 |
-| 11 | linux-source-v41 | 23.094 |
+| 1 | fas2750-v40-lif-a | 46.417 |
+| 2 | fas2750-v40-lif-b | 37.875 |
+| 3 | dxn-v40 | 30.834 |
+| 4 | linux-source-v3 | 28.030 |
+| 5 | linux-destination-v3 | 27.408 |
+| 6 | linux-destination-v40 | 27.131 |
+| 7 | linux-source-v40 | 26.831 |
+| 8 | linux-destination-v41 | 23.877 |
+| 9 | linux-source-v41 | 23.094 |
+| 10 | ots-pnfs-mds | 19.172 |
+| 11 | ots-pnfs-ds | 19.051 |
 
 ### Read-throughput ranking
 
@@ -55,9 +55,9 @@ An environment remains `baseline_missing` until its independent baseline has the
 | 4 | linux-destination-v40 | 1110.925 |
 | 5 | linux-source-v41 | 941.643 |
 | 6 | linux-destination-v41 | 928.453 |
-| 7 | dxn-v40 | 99.908 |
-| 8 | netapp-pnfs-ds | 88.310 |
-| 9 | netapp-pnfs-mds | 87.439 |
+| 7 | ots-pnfs-mds | 183.024 |
+| 8 | ots-pnfs-ds | 182.968 |
+| 9 | dxn-v40 | 88.967 |
 | 10 | fas2750-v40-lif-a | 52.299 |
 | 11 | fas2750-v40-lif-b | 44.337 |
 
@@ -78,21 +78,21 @@ These are ranking observations across unlike operations, not causal diagnoses.
 
 | Rank | Environment | Interface | p95 ms | p99 ms |
 |---:|---|---|---:|---:|
-| 1 | fas2750-v40-lif-b | READ | 388.999 | 680.464 |
-| 2 | fas2750-v40-lif-a | READ | 347.594 | 633.940 |
-| 3 | linux-destination-v41 | WRITE | 325.605 | 554.489 |
-| 4 | linux-source-v41 | WRITE | 287.533 | 572.170 |
-| 5 | linux-source-v41 | MOUNT | 265.356 | 395.567 |
-| 6 | linux-source-v40 | WRITE | 262.842 | 486.825 |
-| 7 | dxn-v40 | WRITE | 257.021 | 308.052 |
-| 8 | linux-destination-v40 | WRITE | 232.206 | 456.930 |
-| 9 | linux-destination-v3 | WRITE | 232.155 | 555.489 |
-| 10 | linux-source-v3 | WRITE | 228.979 | 398.241 |
+| 1 | dxn-v40 | WRITE | 469.721 | 1949.937 |
+| 2 | fas2750-v40-lif-b | READ | 388.999 | 680.464 |
+| 3 | fas2750-v40-lif-a | READ | 347.594 | 633.940 |
+| 4 | linux-destination-v41 | WRITE | 325.605 | 554.489 |
+| 5 | ots-pnfs-mds | WRITE | 288.183 | 409.525 |
+| 6 | linux-source-v41 | WRITE | 287.533 | 572.170 |
+| 7 | ots-pnfs-ds | WRITE | 282.811 | 349.001 |
+| 8 | linux-source-v41 | MOUNT | 265.356 | 395.567 |
+| 9 | linux-source-v40 | WRITE | 262.842 | 486.825 |
+| 10 | ots-pnfs-mds | READ | 241.838 | 249.025 |
 
 ### PATHCONF capability groups
 
 - `pass`: linux-source-v3, linux-source-v40, linux-source-v41, linux-destination-v3, linux-destination-v40, linux-destination-v41, dxn-v40
-- `pass_with_defaults: case_insensitive`: fas2750-v40-lif-a, fas2750-v40-lif-b, netapp-pnfs-mds, netapp-pnfs-ds
+- `pass_with_defaults: case_insensitive`: fas2750-v40-lif-a, fas2750-v40-lif-b, ots-pnfs-mds, ots-pnfs-ds
 
 ## Per-interface latency
 
@@ -268,29 +268,29 @@ These are ranking observations across unlike operations, not causal diagnoses.
 
 | Interface | Baseline p95 ms | Current p95 ms | Current status |
 |---|---:|---:|---|
-| MOUNT | 3.446 | — | — |
-| UMOUNT | 0.215 | — | — |
-| NULL | 0.246 | — | — |
-| FSINFO | 0.274 | — | — |
-| FSSTAT | 0.267 | — | — |
-| MKDIR | 5.278 | — | — |
-| CREATE | 4.791 | — | — |
-| LOOKUP | 0.466 | — | — |
-| GETATTR | 0.358 | — | — |
-| ACCESS | 0.296 | — | — |
-| PATHCONF | 0.265 | — | — |
-| WRITE | 257.021 | — | — |
-| COMMIT | 0.532 | — | — |
-| CLOSE | 0.449 | — | — |
-| OPEN | 1.369 | — | — |
-| READ | 78.230 | — | — |
-| RENAME | 4.276 | — | — |
-| LINK | 4.016 | — | — |
-| SYMLINK | 2.810 | — | — |
-| READLINK | 0.347 | — | — |
-| READDIR | 0.547 | — | — |
-| REMOVE | 2.623 | — | — |
-| RMDIR | 3.810 | — | — |
+| MOUNT | 2.646 | — | — |
+| UMOUNT | 0.175 | — | — |
+| NULL | 0.282 | — | — |
+| FSINFO | 0.321 | — | — |
+| FSSTAT | 0.319 | — | — |
+| MKDIR | 5.705 | — | — |
+| CREATE | 4.749 | — | — |
+| LOOKUP | 0.508 | — | — |
+| GETATTR | 0.418 | — | — |
+| ACCESS | 0.359 | — | — |
+| PATHCONF | 0.345 | — | — |
+| WRITE | 469.721 | — | — |
+| COMMIT | 0.491 | — | — |
+| CLOSE | 0.470 | — | — |
+| OPEN | 1.511 | — | — |
+| READ | 85.666 | — | — |
+| RENAME | 8.877 | — | — |
+| LINK | 7.286 | — | — |
+| SYMLINK | 3.209 | — | — |
+| READLINK | 0.413 | — | — |
+| READDIR | 0.801 | — | — |
+| REMOVE | 2.604 | — | — |
+| RMDIR | 3.436 | — | — |
 
 ### fas2750-v40-lif-a
 
@@ -348,58 +348,58 @@ These are ranking observations across unlike operations, not causal diagnoses.
 | REMOVE | 2.077 | — | — |
 | RMDIR | 2.732 | — | — |
 
-### netapp-pnfs-mds
+### ots-pnfs-mds
 
 | Interface | Baseline p95 ms | Current p95 ms | Current status |
 |---|---:|---:|---|
-| MOUNT | 3.275 | — | — |
-| UMOUNT | 16.518 | — | — |
-| NULL | 0.387 | — | — |
-| FSINFO | 0.649 | — | — |
-| FSSTAT | 0.678 | — | — |
-| MKDIR | 3.437 | — | — |
-| CREATE | 6.080 | — | — |
-| LOOKUP | 1.916 | — | — |
-| GETATTR | 0.657 | — | — |
-| ACCESS | 0.676 | — | — |
-| PATHCONF | 0.685 | — | — |
-| WRITE | 67.715 | — | — |
-| COMMIT | 0.681 | — | — |
-| CLOSE | 1.364 | — | — |
-| OPEN | 2.745 | — | — |
-| READ | 84.037 | — | — |
-| RENAME | 3.508 | — | — |
-| LINK | 5.511 | — | — |
-| SYMLINK | 3.111 | — | — |
-| READLINK | 0.659 | — | — |
-| READDIR | 0.774 | — | — |
-| REMOVE | 3.058 | — | — |
-| RMDIR | 3.078 | — | — |
+| MOUNT | 1.664 | — | — |
+| UMOUNT | 8.924 | — | — |
+| NULL | 0.857 | — | — |
+| FSINFO | 0.723 | — | — |
+| FSSTAT | 0.806 | — | — |
+| MKDIR | 14.615 | — | — |
+| CREATE | 10.016 | — | — |
+| LOOKUP | 2.719 | — | — |
+| GETATTR | 1.000 | — | — |
+| ACCESS | 0.948 | — | — |
+| PATHCONF | 1.021 | — | — |
+| WRITE | 288.183 | — | — |
+| COMMIT | 2.923 | — | — |
+| CLOSE | 0.670 | — | — |
+| OPEN | 5.250 | — | — |
+| READ | 241.838 | — | — |
+| RENAME | 6.689 | — | — |
+| LINK | 8.067 | — | — |
+| SYMLINK | 5.198 | — | — |
+| READLINK | 0.988 | — | — |
+| READDIR | 2.385 | — | — |
+| REMOVE | 6.766 | — | — |
+| RMDIR | 5.732 | — | — |
 
-### netapp-pnfs-ds
+### ots-pnfs-ds
 
 | Interface | Baseline p95 ms | Current p95 ms | Current status |
 |---|---:|---:|---|
-| MOUNT | 3.613 | — | — |
-| UMOUNT | 7.987 | — | — |
-| NULL | 0.421 | — | — |
-| FSINFO | 0.563 | — | — |
-| FSSTAT | 0.553 | — | — |
-| MKDIR | 3.158 | — | — |
-| CREATE | 3.226 | — | — |
-| LOOKUP | 0.595 | — | — |
-| GETATTR | 0.529 | — | — |
-| ACCESS | 0.510 | — | — |
-| PATHCONF | 0.505 | — | — |
-| WRITE | 68.176 | — | — |
-| COMMIT | 0.636 | — | — |
-| CLOSE | 0.650 | — | — |
-| OPEN | 1.999 | — | — |
-| READ | 76.885 | — | — |
-| RENAME | 2.574 | — | — |
-| LINK | 3.187 | — | — |
-| SYMLINK | 2.627 | — | — |
-| READLINK | 0.521 | — | — |
-| READDIR | 0.658 | — | — |
-| REMOVE | 2.485 | — | — |
-| RMDIR | 3.073 | — | — |
+| MOUNT | 3.538 | — | — |
+| UMOUNT | 8.745 | — | — |
+| NULL | 0.647 | — | — |
+| FSINFO | 0.995 | — | — |
+| FSSTAT | 0.711 | — | — |
+| MKDIR | 13.682 | — | — |
+| CREATE | 14.582 | — | — |
+| LOOKUP | 4.435 | — | — |
+| GETATTR | 0.918 | — | — |
+| ACCESS | 0.982 | — | — |
+| PATHCONF | 0.989 | — | — |
+| WRITE | 282.811 | — | — |
+| COMMIT | 0.938 | — | — |
+| CLOSE | 0.990 | — | — |
+| OPEN | 6.654 | — | — |
+| READ | 28.127 | — | — |
+| RENAME | 6.957 | — | — |
+| LINK | 12.309 | — | — |
+| SYMLINK | 5.610 | — | — |
+| READLINK | 1.113 | — | — |
+| READDIR | 2.311 | — | — |
+| REMOVE | 6.691 | — | — |
+| RMDIR | 6.272 | — | — |

@@ -10,8 +10,8 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use nfs_rs::{
     AceFlags, AceMask, AceType, Acl, Acl41Flags, DirectoryCookie, Mount, MountCapabilities,
-    MountLifecycleState, NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, Time,
-    parse_url_and_mount,
+    MountLifecycleState, NFSVersion, NfsAce, NfsAcl41, NfsError, OPEN_BOTH, OPEN_READ, OpenOptions,
+    Time, parse_url_and_mount,
 };
 
 const LAB_ENABLE_ENV: &str = "NFS_RS_LAB_E2E";
@@ -27,6 +27,9 @@ const LAB_ACL_FAS2750_V41_URL_ENV: &str = "NFS_RS_LAB_ACL_FAS2750_V41_URL";
 const LAB_READDIR_URLS_ENV: &str = "NFS_RS_LAB_READDIR_URLS";
 const LAB_READDIR_PARENT_ENV: &str = "NFS_RS_LAB_READDIR_PARENT";
 const LAB_READDIR_FILES_ENV: &str = "NFS_RS_LAB_READDIR_FILES";
+const LAB_V40_STATEID_URL_ENV: &str = "NFS_RS_LAB_V40_STATEID_RECOVERY_URL";
+const LAB_V40_STATEID_CMD_ENV: &str = "NFS_RS_LAB_V40_STATEID_RECOVERY_CMD";
+const LAB_V40_STATEID_WAIT_ENV: &str = "NFS_RS_LAB_V40_STATEID_RECOVERY_WAIT_MS";
 const CASE_DIR: &str = "nfs-rs-e2e";
 const ORIGINAL_FILE: &str = "nfs-rs-e2e/payload.bin";
 const RENAMED_FILE: &str = "nfs-rs-e2e/renamed.bin";
@@ -191,6 +194,303 @@ async fn nfs_v40_single_export_end_to_end() -> TestResult {
         return Err(error);
     }
     Ok(())
+}
+
+/// Shared fixture for the NFSv4.0 stateid-recovery E2E cases: a writable
+/// export plus a runner-side command that makes the server drop our state
+/// (re-export, restart, or lease expiry).
+fn stateid_recovery_fixture() -> TestResult<(String, String, u64)> {
+    let url = env::var(LAB_V40_STATEID_URL_ENV)?;
+    ensure(
+        url.contains("version=4.0"),
+        format!("not an exact v4.0 URL: {url}"),
+    )?;
+    let release = env::var(LAB_V40_STATEID_CMD_ENV)?;
+    let settle_ms = env::var(LAB_V40_STATEID_WAIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000);
+    Ok((url, release, settle_ms))
+}
+
+async fn release_server_state(command: &str, settle_ms: u64) -> TestResult {
+    let status = Command::new("sh").arg("-c").arg(command).status()?;
+    ensure(status.success(), "state-release command failed")?;
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    Ok(())
+}
+
+/// E2E for GitHub issue #153: hold an open state, make the server release it
+/// (re-export or restart), then prove the next WRITE/READ recovers in place
+/// instead of surfacing `BAD_STATEID` / `STALE_STATEID`.
+///
+/// Run with:
+/// `NFS_RS_LAB_V40_STATEID_RECOVERY_URL=nfs://host/export?version=4.0`
+/// `NFS_RS_LAB_V40_STATEID_RECOVERY_CMD='<command that resets server state>'`
+/// `cargo test --test lab_e2e nfs_v40_stateid_recovery_after_state_loss -- --ignored --nocapture`
+/// TFS 不支持 CLAIM_PREVIOUS（reclaim 返回 -95），此时恢复的契约是返回
+/// 类型化 LostOpenState，而不是假装成功。其它 lab 服务端默认要求完整恢复。
+fn stateid_reclaim_supported() -> bool {
+    std::env::var("NFS_RS_LAB_V40_STATEID_RECLAIM").map_or(true, |value| value != "unsupported")
+}
+
+fn is_lost_state(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<NfsError>(),
+        Some(NfsError::LostOpenState(_))
+    )
+}
+
+fn expect_recovery_outcome(result: TestResult) -> TestResult {
+    if stateid_reclaim_supported() {
+        return result;
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_lost_state(error.as_ref()) => Ok(()),
+        Err(error) => Err(format!(
+            "expected LostOpenState from a server without reclaim support, got: {error}"
+        )
+        .into()),
+    }
+}
+
+fn expect_close_outcome(result: TestResult) -> TestResult {
+    if stateid_reclaim_supported() {
+        return result;
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_lost_state(error.as_ref()) => Ok(()),
+        Err(error) => Err(format!(
+            "CLOSE must succeed or report LostOpenState without reclaim support, got: {error}"
+        )
+        .into()),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a writable NFSv4.0 fixture and a runner-side state-release command"]
+async fn nfs_v40_stateid_recovery_after_state_loss() -> TestResult {
+    let (url, release, settle_ms) = stateid_recovery_fixture()?;
+    let path = format!("nfs-rs-stateid-recovery-{}.bin", std::process::id());
+    let payload = Bytes::from(
+        (0..4096)
+            .map(|index| ((index * 13 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(
+        mount.version() == NFSVersion::NFSv4p0,
+        "stateid recovery fixture negotiated the wrong protocol",
+    )?;
+    let _ = mount.remove_path(&path).await;
+
+    let result: TestResult = async {
+        let file = mount
+            .open_path_with_options(
+                &path,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
+        nfs_rs::write_all(mount.as_ref(), file.fh.clone(), 0, payload.clone()).await?;
+        mount
+            .commit(file.fh.clone(), 0, payload.len() as u32)
+            .await?;
+
+        release_server_state(&release, settle_ms).await?;
+
+        // The lane still holds the pre-reset stateid. A BAD_STATEID is
+        // refreshed with one CLAIM_NULL OPEN; a STALE_STATEID (earlier server
+        // instance) drives crash recovery: new client ID plus reclaim of every
+        // open and lock, then the operation is retried once.
+        nfs_rs::write_all(
+            mount.as_ref(),
+            file.fh.clone(),
+            payload.len() as u64,
+            payload.clone(),
+        )
+        .await?;
+        mount
+            .commit(file.fh.clone(), 0, (payload.len() * 2) as u32)
+            .await?;
+        let expected = Bytes::from([payload.as_ref(), payload.as_ref()].concat());
+        ensure(
+            read_all(mount.as_ref(), file.fh.clone(), payload.len() * 2).await? == expected,
+            "payload mismatch after NFSv4.0 stateid recovery",
+        )?;
+        mount.close(file.fh).await?;
+        Ok(())
+    }
+    .await;
+
+    let _ = mount.remove_path(&path).await;
+    mount.umount().await?;
+    expect_recovery_outcome(result)
+}
+
+/// E2E for nfs-rs#158: once the server has dropped our open state, CLOSE must
+/// be treated as already-released instead of failing with BAD/STALE_STATEID
+/// (the old code surfaced the error and left the close path retrying).
+#[tokio::test]
+#[ignore = "requires a writable NFSv4.0 fixture and a runner-side state-release command"]
+async fn nfs_v40_close_after_state_loss() -> TestResult {
+    let (url, release, settle_ms) = stateid_recovery_fixture()?;
+    let path = format!("nfs-rs-stateid-close-{}.bin", std::process::id());
+    let payload = Bytes::from(
+        (0..1024)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(
+        mount.version() == NFSVersion::NFSv4p0,
+        "stateid close fixture negotiated the wrong protocol",
+    )?;
+    let _ = mount.remove_path(&path).await;
+
+    let result: TestResult = async {
+        let file = mount
+            .open_path_with_options(
+                &path,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
+        nfs_rs::write_all(mount.as_ref(), file.fh.clone(), 0, payload.clone()).await?;
+        mount
+            .commit(file.fh.clone(), 0, payload.len() as u32)
+            .await?;
+
+        release_server_state(&release, settle_ms).await?;
+
+        mount
+            .close(file.fh)
+            .await
+            .map_err(|error| format!("CLOSE after state loss failed: {error}"))?;
+        Ok(())
+    }
+    .await;
+
+    let _ = mount.remove_path(&path).await;
+    mount.umount().await?;
+    expect_close_outcome(result)
+}
+
+/// E2E for nfs-rs#159: two lanes lose their open state at the same time. Each
+/// must recover on its own and keep its own data; a global recovery (or one
+/// that drops the other lane) would mix payloads or fail the second write.
+#[tokio::test]
+#[ignore = "requires a writable NFSv4.0 fixture and a runner-side state-release command"]
+async fn nfs_v40_multi_lane_recovery_after_state_loss() -> TestResult {
+    let (url, release, settle_ms) = stateid_recovery_fixture()?;
+    let first = format!("nfs-rs-stateid-lane-a-{}.bin", std::process::id());
+    let second = format!("nfs-rs-stateid-lane-b-{}.bin", std::process::id());
+    let payload_a = Bytes::from(
+        (0..2048)
+            .map(|index| ((index * 11 + 5) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let payload_b = Bytes::from(
+        (0..1536)
+            .map(|index| ((index * 29 + 3) % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+
+    let mount = parse_url_and_mount(&url).await?;
+    ensure(
+        mount.version() == NFSVersion::NFSv4p0,
+        "multi-lane fixture negotiated the wrong protocol",
+    )?;
+    let _ = mount.remove_path(&first).await;
+    let _ = mount.remove_path(&second).await;
+
+    let result: TestResult = async {
+        let file_a = mount
+            .open_path_with_options(
+                &first,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
+        let file_b = mount
+            .open_path_with_options(
+                &second,
+                OpenOptions {
+                    access: OPEN_BOTH,
+                    create_mode: Some(0o666),
+                    truncate: true,
+                },
+            )
+            .await?
+            .object;
+        nfs_rs::write_all(mount.as_ref(), file_a.fh.clone(), 0, payload_a.clone()).await?;
+        nfs_rs::write_all(mount.as_ref(), file_b.fh.clone(), 0, payload_b.clone()).await?;
+        mount
+            .commit(file_a.fh.clone(), 0, payload_a.len() as u32)
+            .await?;
+        mount
+            .commit(file_b.fh.clone(), 0, payload_b.len() as u32)
+            .await?;
+
+        release_server_state(&release, settle_ms).await?;
+
+        nfs_rs::write_all(
+            mount.as_ref(),
+            file_a.fh.clone(),
+            payload_a.len() as u64,
+            payload_a.clone(),
+        )
+        .await?;
+        nfs_rs::write_all(
+            mount.as_ref(),
+            file_b.fh.clone(),
+            payload_b.len() as u64,
+            payload_b.clone(),
+        )
+        .await?;
+        mount
+            .commit(file_a.fh.clone(), 0, (payload_a.len() * 2) as u32)
+            .await?;
+        mount
+            .commit(file_b.fh.clone(), 0, (payload_b.len() * 2) as u32)
+            .await?;
+
+        let expected_a = Bytes::from([payload_a.as_ref(), payload_a.as_ref()].concat());
+        let expected_b = Bytes::from([payload_b.as_ref(), payload_b.as_ref()].concat());
+        ensure(
+            read_all(mount.as_ref(), file_a.fh.clone(), payload_a.len() * 2).await? == expected_a,
+            "lane A payload mismatch after NFSv4.0 state recovery",
+        )?;
+        ensure(
+            read_all(mount.as_ref(), file_b.fh.clone(), payload_b.len() * 2).await? == expected_b,
+            "lane B payload mismatch after NFSv4.0 state recovery",
+        )?;
+        mount.close(file_a.fh).await?;
+        mount.close(file_b.fh).await?;
+        Ok(())
+    }
+    .await;
+
+    let _ = mount.remove_path(&first).await;
+    let _ = mount.remove_path(&second).await;
+    mount.umount().await?;
+    expect_recovery_outcome(result)
 }
 
 #[tokio::test]

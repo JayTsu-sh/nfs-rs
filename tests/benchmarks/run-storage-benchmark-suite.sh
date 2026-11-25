@@ -55,11 +55,17 @@ run_environment() {
   done
 }
 
+# Executor-marked environments are acquired from a data-network executor host
+# the runner cannot reach directly; skip them in both capture and gate mode.
+while IFS= read -r skipped; do
+  echo "skipping benchmark environment ${skipped} (executor acquisition not wired on this runner)"
+done < <(jq -r '.environments[] | select(.executor != null) | .id' "$manifest")
+
 while IFS=$'\t' read -r environment template; do
   runs="${NFS_RS_BENCHMARK_CAPTURE_RUNS:-1}"
   [[ "$mode" == gate ]] && runs="${NFS_RS_BENCHMARK_GATE_RUNS:-5}"
   run_environment "$environment" "$template" "$runs" "$output"
-done < <(jq -r '.environments[] | [.id, .url_template] | @tsv' "$manifest")
+done < <(jq -r '.environments[] | select(.executor == null) | [.id, .url_template] | @tsv' "$manifest")
 
 if [[ "$mode" == gate ]]; then
   python3 tests/benchmarks/check-performance-baselines.py \

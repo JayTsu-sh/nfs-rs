@@ -8,8 +8,10 @@ The lab is shared by `nfs-rs`, `data-mover-rs`, and `terrasync-rs`.
 | Source | 10.131.9.12 | 10.10.1.12 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Destination | 10.131.9.13 | 10.10.1.13 | NFSv3, NFSv4.0, NFSv4.1, RustFS |
 | Worker | 10.131.9.14 | 10.10.1.14 | RustFS, fault injection |
-| Legacy NetApp primary LIF | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y`; pNFS unsupported |
+| Legacy NetApp primary LIF | 10.128.61.20 (management) | 10.128.56.160 | ONTAP 9.19.1, SVM `Test-y`; pNFS unsupported; retired from the benchmark suite (stable mount-latency drift since August 2025); interim physical target for the runner-side NFSv4.1 compatibility, channel-limit, and pNFS-client E2E steps |
 | Legacy NetApp secondary LIF | — | 10.128.56.161 | Independent NFSv4.1 data LIF; not proof of DS routing |
+| OTS pNFS MDS LIF | — | 10.30.3.154 | ONTAP; pNFS advertised (verified 2026-11-24); dedicated export `/nfsrs_pnfs_a`; data network unreachable from the runner, reached through 10.128.134.90 -> 10.128.135.141 |
+| OTS pNFS DS LIF | — | 10.30.3.155 | ONTAP; pNFS advertised (verified 2026-11-24); dedicated export `/nfsrs_pnfs_b` |
 | DXN NFSv4.0 | — | 10.131.7.201 | NFSv4.0 export `/jay_nfs` |
 
 Every run must call `prepare-run.sh` with a unique `nightly-*` or `release-*`
@@ -75,8 +77,13 @@ real storage endpoint and protocol. Each entry owns a distinct baseline file;
 sharing a baseline across LIFs, servers, or protocol versions is forbidden.
 With accepted baselines committed, the scheduled `Performance baseline
 capture` workflow runs at 02:00, 10:00, and 18:00 UTC, records five independent
-captures for all eleven combinations, and uploads the raw JSON and generated
-report. The reduced cadence monitors drift without retaining the temporary
+captures for every runner-direct environment, and uploads the raw JSON and
+generated report. Environments marked `executor` in the manifest (OTS pNFS)
+are acquired from a data-network executor host the runner cannot reach
+directly; the runner skips them in capture and gate mode, and the gate and
+baseline report show them as `executor_pending` (a warning, not a release
+failure) until executor acquisition is wired and their baseline is accepted.
+The reduced cadence monitors drift without retaining the temporary
 20-minute bootstrap schedule.
 
 Build candidate baselines from downloaded capture artifacts with:

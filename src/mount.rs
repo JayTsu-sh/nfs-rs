@@ -893,6 +893,7 @@ pub trait Mount: std::fmt::Debug + Send + Sync {
 
     /// Procedure LOCK acquires a byte-range lock (NFSv4.0/NFSv4.1 only; Unsupported on NFSv3).
     /// lock_type: 1=READ, 2=WRITE. Returns the lock stateid on success.
+    /// `length` must be non-zero; `u64::MAX` (RFC 7530 §16.10) locks through EOF.
     async fn lock(&self, _fh: Bytes, _lock_type: u32, _offset: u64, _length: u64) -> Result<Bytes> {
         Err(NfsError::Unsupported(
             "LOCK requires NFSv4.0 or NFSv4.1".to_string(),

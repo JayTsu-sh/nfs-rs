@@ -4,6 +4,7 @@ mod callback;
 mod compound;
 mod lease;
 mod mount;
+mod recovery;
 mod state;
 
 pub(crate) use mount::mount;
